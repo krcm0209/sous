@@ -275,13 +275,21 @@ class ToolExecutor:
 
     # -- command execution --
 
-    def _tree_snapshot(self) -> dict[str, tuple[int, int]]:
+    def _tree_snapshot(self) -> dict[str, tuple[int, int, int]]:
         """Cheap stat-based snapshot of the project tree: rel path ->
-        (mtime_ns, size). Skips .git (case-folded) and never follows symlinks
-        — a symlink's target may live outside the root, and its content must
-        be neither read nor reported. Stat-only on purpose: this runs before
-        AND after every command, so no hashing here."""
-        snap: dict[str, tuple[int, int]] = {}
+        (mtime_ns, size, ctime_ns). Skips .git (case-folded) and never follows
+        symlinks — a symlink's target may live outside the root, and its
+        content must be neither read nor reported. Stat-only on purpose: this
+        runs before AND after every command, so no hashing here.
+
+        ctime is in the signature specifically because mtime and size are
+        forgeable by executed code (allowlisted test runners execute code the
+        worker just wrote): an equal-length rewrite plus os.utime restores
+        both. ctime — the inode CHANGE time — cannot be set from userspace;
+        os.utime only sets atime/mtime, and calling it bumps ctime itself, so
+        the forgery is self-defeating. Costs nothing: it rides in the same
+        stat struct already being read."""
+        snap: dict[str, tuple[int, int, int]] = {}
         stack: list[str] = [str(self.project_root)]
         while stack:
             d = stack.pop()
@@ -298,14 +306,15 @@ class ToolExecutor:
                                 st = entry.stat(follow_symlinks=False)
                                 rel = os.path.relpath(entry.path,
                                                       self.project_root)
-                                snap[rel] = (st.st_mtime_ns, st.st_size)
+                                snap[rel] = (st.st_mtime_ns, st.st_size,
+                                             st.st_ctime_ns)
                         except OSError:
                             continue
             except OSError:
                 continue
         return snap
 
-    def _record_command_changes(self, before: dict[str, tuple[int, int]]) -> None:
+    def _record_command_changes(self, before: dict[str, tuple[int, int, int]]) -> None:
         """Record files a command created or modified (the default allowlist
         ships formatters — black, npx prettier, ruff — whose whole job is
         editing files). Content is read only for files whose stat changed.

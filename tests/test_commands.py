@@ -147,6 +147,57 @@ def test_command_edit_refreshes_stale_hash_of_tracked_file(pyex: ToolExecutor):
     assert after.after_sha != before.after_sha  # hash refreshed
 
 
+# --- forged stat metadata must not hide a modification from the audit ---
+
+def test_forged_mtime_and_size_rewrite_still_recorded(pyex: ToolExecutor):
+    """Allowlisted test runners execute code the worker just wrote (e.g. a
+    conftest.py pytest imports), so executed code can rewrite a file with
+    EQUAL-LENGTH content and restore the original mtime via os.utime, making
+    a (mtime_ns, size) pair byte-identical before and after. The audit must
+    still record the file: ctime bumps on every inode change — including the
+    os.utime call itself — and cannot be set back from userspace."""
+    (pyex.project_root / "secret.py").write_text("SECRET = 'aaa'\n")
+    (pyex.project_root / "forge.py").write_text(
+        "import os\n"
+        "st = os.stat('secret.py')\n"
+        "open('secret.py', 'w').write(\"SECRET = 'bbb'\\n\")\n"  # same length
+        "os.utime('secret.py', ns=(st.st_atime_ns, st.st_mtime_ns))\n"
+    )
+    out = pyex.run_command(f"{sys.executable} forge.py")
+    assert "exit code 0" in out
+    changes = {c.path: c for c in pyex.changed_files()}
+    assert "secret.py" in changes, (
+        "equal-length rewrite with restored mtime evaded the audit")
+    assert changes["secret.py"].kind == "modified"
+
+
+def test_snapshot_tuple_includes_ctime(pyex: ToolExecutor):
+    """Unit-level: two stats of an unchanged file compare equal, while a
+    same-length rewrite with restored mtime compares unequal — only possible
+    if the snapshot signature carries ctime alongside (mtime_ns, size)."""
+    f = pyex.project_root / "s.txt"
+    f.write_text("aaa")
+    first = pyex._tree_snapshot()["s.txt"]
+    assert pyex._tree_snapshot()["s.txt"] == first  # unchanged file: equal
+    assert len(first) == 3  # (mtime_ns, size, ctime_ns)
+    st = os.stat(f)
+    f.write_text("bbb")  # same length
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+    forged = pyex._tree_snapshot()["s.txt"]
+    assert forged[:2] == first[:2]  # the forgery really did fool mtime+size
+    assert forged != first          # ...but ctime still betrays it
+
+
+def test_unchanged_files_not_reported_after_command(pyex: ToolExecutor):
+    """Merely reading a file (atime-only traffic) must not put it in the
+    audit: over-reporting every untouched file would bury the real diff."""
+    (pyex.project_root / "ro.txt").write_text("stable")
+    out = pyex.run_command(
+        f"{sys.executable} -c \"print(open('ro.txt').read())\"")
+    assert "exit code 0" in out
+    assert pyex.changed_files() == []
+
+
 # --- timeout must kill the whole process group, not just the direct child ---
 
 @pytest.fixture()

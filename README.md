@@ -109,6 +109,15 @@ still argmaxes to the same wrong output every time.
   double-forks and calls `setsid()` escapes into a new session and survives
   the group kill. Closing that residual requires cgroup/OS-level confinement
   that macOS does not offer.
+- The before/after file audit around each command is stat-based:
+  `(mtime_ns, size, ctime_ns)` per file. mtime and size alone are forgeable
+  by code the command executes (equal-length rewrite + `os.utime` restore);
+  ctime is what makes the audit tamper-resistant, because no userspace API
+  can set it and `os.utime` itself bumps it. That resistance has limits: a
+  process running as root (e.g. via a mount trick or raw-device write) or
+  manipulation of the system clock between the two snapshots could still
+  hide a change. The audit is a safety net against the sandboxed worker and
+  the code it runs — not against a privileged attacker.
 - Every worker turn is journaled to `~/.sous/tasks/<id>/transcript.jsonl`.
 - The MCP endpoint binds to 127.0.0.1 only.
 
