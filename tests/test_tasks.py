@@ -125,3 +125,15 @@ def test_prune_keeps_recent(store: TaskStore):
     assert store.get(ids[0]) is None
     assert store.get(ids[-1]) is not None
     assert store.get(active.id) is not None  # never prunes non-finished
+
+
+def test_cancel_running_cannot_clobber_state(store: TaskStore):
+    """Verifies cancel() on a running task does not clobber state atomically."""
+    t = _enqueue(store)
+    store.claim_next()  # Now running
+    # Cancel the running task - should set flag, not transition state
+    assert store.cancel(t.id) is True
+    got = store.get(t.id)
+    assert got.state == TaskState.RUNNING  # Still running, not cancelled
+    assert got.cancel_requested is True  # Flag is set
+    assert got.finished_at is None  # Not finished

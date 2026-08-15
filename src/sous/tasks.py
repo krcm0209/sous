@@ -131,15 +131,13 @@ class TaskStore:
     def claim_next(self) -> Task | None:
         with self._conn() as c:
             row = c.execute(
-                "SELECT id FROM tasks WHERE state=? ORDER BY created_at LIMIT 1",
-                (TaskState.QUEUED,),
+                "UPDATE tasks SET state=?, started_at=? WHERE id = ("
+                " SELECT id FROM tasks WHERE state=? ORDER BY created_at LIMIT 1"
+                ") RETURNING id",
+                (TaskState.RUNNING, time.time(), TaskState.QUEUED),
             ).fetchone()
             if row is None:
                 return None
-            c.execute(
-                "UPDATE tasks SET state=?, started_at=? WHERE id=?",
-                (TaskState.RUNNING, time.time(), row["id"]),
-            )
         return self.get(row["id"])
 
     def set_activity(self, task_id: str, text: str, turns_used: int) -> None:
@@ -198,13 +196,23 @@ class TaskStore:
             )
 
     def cancel(self, task_id: str) -> bool:
-        task = self.get(task_id)
-        if task is None or task.state in FINISHED_STATES:
-            return False
-        if task.state == TaskState.QUEUED:
-            self.mark_cancelled(task_id)
-            return True
-        with self._conn() as c:  # running / awaiting_approval
+        with self._conn() as c:
+            # Try to cancel if queued (atomic transition with state guard)
+            cur = c.execute(
+                "UPDATE tasks SET state=?, report=?, finished_at=? WHERE id=? AND state=?",
+                (TaskState.CANCELLED, json.dumps({}), time.time(), task_id,
+                 TaskState.QUEUED),
+            )
+            if cur.rowcount == 1:
+                return True
+
+            # If not queued, check if it's still active and set cancel_requested
+            row = c.execute(
+                "SELECT state FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            if row is None or row["state"] in FINISHED_STATES:
+                return False
+            # Must be running or awaiting_approval
             c.execute("UPDATE tasks SET cancel_requested=1 WHERE id=?", (task_id,))
         return True
 
