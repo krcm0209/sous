@@ -59,6 +59,35 @@ def test_delegate_accepts_sibling_of_data_dir(svc):
     assert "task_id" in service.delegate_task("t", "x", str(root))
 
 
+def _fs_is_case_insensitive(tmp_path: Path) -> bool:
+    probe = tmp_path / "sous_case_probe_x"
+    probe.write_text("x")
+    hit = (tmp_path / "sous_case_probe_X").exists()
+    probe.unlink()
+    return hit
+
+
+def test_delegate_rejects_case_variant_root_containing_data_dir(tmp_path: Path):
+    """C1 (case bypass): a case-variant ancestor of the data dir must be
+    rejected just like the exact-case ancestor, or the boundary check is
+    defeated on a case-insensitive FS."""
+    if not _fs_is_case_insensitive(tmp_path):
+        pytest.skip("requires a case-insensitive filesystem (APFS/HFS+)")
+    home = tmp_path / "home"
+    home.mkdir()
+    data = home / "data"
+    data.mkdir()
+    cfg = SousConfig(data_dir=data, config_path=home / "config.toml")
+    store = TaskStore(tmp_path / "tasks.db")
+    engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
+    service = SousService(store, engines, cfg)
+    # exact-case ancestor is rejected (sanity)
+    assert "error" in service.delegate_task("t", "x", str(home))
+    # case-variant ancestor must be rejected the same way
+    out = service.delegate_task("t", "x", str(tmp_path / "HOME"))
+    assert "error" in out and "data dir" in out["error"]
+
+
 def test_delegate_rejects_non_allowlisted_verify(svc):
     service, _, root = svc
     out = service.delegate_task("t", "x", str(root), verify_commands=["rm -rf /"])

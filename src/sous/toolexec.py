@@ -44,6 +44,18 @@ class PathViolation(Exception):
     pass
 
 
+def _is_within(path: Path, ancestor: Path) -> bool:
+    """True if `path` equals or lives inside `ancestor`, folding case so a
+    case-variant path cannot slip past on a case-insensitive filesystem
+    (APFS/HFS+ are the product's target). Path.resolve() preserves case on
+    macOS, and os.path.normcase is a no-op on POSIX, so we fold each path
+    component explicitly rather than relying on either. Callers should pass
+    already-.resolve()d paths."""
+    p = [part.lower() for part in path.parts]
+    a = [part.lower() for part in ancestor.parts]
+    return len(p) >= len(a) and p[:len(a)] == a
+
+
 def resolve_confined(project_root: Path, candidate: str, for_write: bool,
                      *, protected: tuple[Path, ...] = ()) -> Path:
     root = project_root.resolve()
@@ -58,10 +70,12 @@ def resolve_confined(project_root: Path, candidate: str, for_write: bool,
     rel = resolved.relative_to(root)
     if for_write and any(part.lower() == ".git" for part in rel.parts):
         raise PathViolation("writes into .git/ are not allowed")
-    if for_write and any(resolved.is_relative_to(shield) for shield in protected):
+    if for_write and any(_is_within(resolved, shield) for shield in protected):
         # The sous control directory (config.toml with the command allowlist,
         # tasks.db, transcripts) must never be writable from inside the
         # sandbox, even when the project root contains it (e.g. root=$HOME).
+        # Case-folded so a path-case variant can't reach the real inode on a
+        # case-insensitive FS.
         raise PathViolation(f"writes into the sous data dir are not allowed: {candidate}")
     return resolved
 

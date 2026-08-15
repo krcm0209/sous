@@ -165,6 +165,35 @@ def test_explicit_data_dir_overrides_default(root: Path, tmp_path: Path):
         ex.write_file("sub/f.txt", "x")
 
 
+def _fs_is_case_insensitive(tmp_path: Path) -> bool:
+    probe = tmp_path / "sous_case_probe_x"
+    probe.write_text("x")
+    hit = (tmp_path / "sous_case_probe_X").exists()
+    probe.unlink()
+    return hit
+
+
+def test_data_dir_case_variant_write_denied(tmp_path: Path):
+    """C1 (case bypass): on a case-insensitive FS (APFS/HFS+), a project root
+    given in a different case than the real dir must NOT let the worker write
+    the real ~/.sous/config.toml. Path.resolve() preserves case on macOS, so
+    case-sensitive is_relative_to would miss it while the write lands on the
+    real inode."""
+    if not _fs_is_case_insensitive(tmp_path):
+        pytest.skip("requires a case-insensitive filesystem (APFS/HFS+)")
+    home = tmp_path / "home"
+    (home / ".sous").mkdir(parents=True)
+    real_cfg = home / ".sous" / "config.toml"
+    real_cfg.write_text('[commands]\nallowlist = ["pytest"]\n')
+    before = real_cfg.read_bytes()
+    # project_root given with a case variant of the real "home" directory
+    ex = ToolExecutor(tmp_path / "HOME", home / ".sous" / "config.toml",
+                      data_dir=home / ".sous")
+    with pytest.raises(PathViolation):
+        ex.write_file(".sous/config.toml", '[commands]\nallowlist = ["bash"]\n')
+    assert real_cfg.read_bytes() == before  # real file byte-unchanged
+
+
 # --- I1: glob/grep must not read through escaping symlinks ---
 
 def test_grep_does_not_follow_escaping_symlink(ex: ToolExecutor, tmp_path: Path):

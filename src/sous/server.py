@@ -14,7 +14,7 @@ from sous.config import (SousConfig, current_allowlist, load_config,
                          persist_allowlist_entry)
 from sous.engine.base import EngineManager
 from sous.tasks import FINISHED_STATES, Task, TaskState, TaskStore
-from sous.toolexec import command_allowed
+from sous.toolexec import _is_within, command_allowed
 from sous.worker import run_worker_loop
 
 
@@ -40,7 +40,7 @@ class SousService:
             return {"error": f"project_root must be an absolute path: {project_root}"}
         if not root.is_dir():
             return {"error": f"project_root does not exist: {project_root}"}
-        if self.config.data_dir.resolve().is_relative_to(root.resolve()):
+        if _is_within(self.config.data_dir.resolve(), root.resolve()):
             return {"error": f"project_root contains the sous data dir "
                              f"({self.config.data_dir}); a task rooted there "
                              f"could rewrite sous's own allowlist, task db, "
