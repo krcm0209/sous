@@ -1,0 +1,50 @@
+name: Feature request
+description: Suggest a capability or a change in behaviour
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Worth skimming
+        [what's in scope](https://github.com/krcm0209/sous/blob/main/CONTRIBUTING.md#whats-in-scope)
+        first — it saves writing up something the project has already decided
+        against.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you hitting?
+      description: >-
+        The situation that prompted this, rather than the solution. What were
+        you trying to get sous to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What should sous do instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered (optional)
+      description: >-
+        Including anything you tried that nearly worked — a config change, a
+        different allowlist entry, a different model.
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: >-
+            I understand sous deliberately targets Apple silicon, and that
+            running the worker elsewhere is not a current goal
+          required: true
+        - label: >-
+            This does not widen what a worker may do without human approval —
+            or if it does, I have said so explicitly above
+          required: true

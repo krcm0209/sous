@@ -1,0 +1,116 @@
+name: Bug report
+description: Something in sous behaves differently than documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Found a way out of the sandbox — writing outside `project_root`,
+        running a non-allowlisted command, leaking secrets past the env
+        scrub? Please close this and use
+        [private reporting](https://github.com/krcm0209/sous/security/advisories/new)
+        instead. See [SECURITY.md](https://github.com/krcm0209/sous/blob/main/SECURITY.md).
+
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Prerequisites
+      options:
+        - label: I am on an Apple silicon Mac (sous does not run anywhere else)
+          required: true
+        - label: I searched existing issues
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Which commit are you running?
+      description: >-
+        sous has no released versions yet, so the commit identifies the build:
+        run `git rev-parse --short HEAD` in the checkout you installed from.
+      placeholder: "02278fb"
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and chip
+      placeholder: "15.5, M4 Pro, 48 GB"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: "`uv run python -V`"
+      placeholder: "3.14.7"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: model
+    attributes:
+      label: Model
+      description: >-
+        Which backend loads depends on this — a model with a `vision_config`
+        runs through VLMEngine, everything else through LMEngine.
+      options:
+        - The default (mlx-community/Qwen3.8-27B-mxfp8)
+        - A different MLX model
+        - Not applicable — the bug does not involve the worker
+    validations:
+      required: true
+
+  - type: input
+    id: model_id
+    attributes:
+      label: Model id, if not the default
+      placeholder: "mlx-community/Qwen3-0.6B-4bit"
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened
+      description: >-
+        What you delegated, what you expected, and what sous did instead.
+        Include the exact task instructions if the worker misbehaved.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. sous serve
+        2. Ask Claude to delegate: "..."
+        3. ...
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: >-
+        **Before pasting a transcript:** every worker turn is journaled, so
+        transcripts routinely contain files from the project sous was working
+        in. Please redact anything you would not publish.
+
+  - type: textarea
+    id: transcript
+    attributes:
+      label: Transcript excerpt (optional)
+      description: >-
+        Relevant lines from `~/.sous/tasks/<id>/transcript.jsonl`. The report
+        of a failed task includes its `transcript_path`.
+      render: text
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config (optional)
+      description: >-
+        The parts of `~/.sous/config.toml` that matter — usually
+        `[commands] allowlist` for anything involving command execution.
+      render: toml
