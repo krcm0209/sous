@@ -21,10 +21,18 @@ from pathlib import Path
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
-from sous.tasks import FINISHED_STATES, TaskStore
+from sous.tasks import FINISHED_STATES, Task, TaskStore
 from sous.worker import run_worker_loop
 
 TINY = "mlx-community/Qwen3-0.6B-4bit"
+
+
+def _require(store: TaskStore, task_id: str) -> Task:
+    """The smoke task, which must exist — this script enqueued it itself."""
+    task = store.get(task_id)
+    if task is None:
+        raise RuntimeError(f"task {task_id} vanished from the store")
+    return task
 
 
 def main() -> None:
@@ -55,14 +63,13 @@ def main() -> None:
             args=(store, EngineManager(cfg), cfg, stop),
             daemon=True,
         ).start()
-        while store.get(task.id).state not in FINISHED_STATES:
-            t = store.get(task.id)
-            print(f"  state={t.state} turns={t.turns_used} {t.last_activity}")
+        # One read per iteration; the task that ends the loop is the final one.
+        while (current := _require(store, task.id)).state not in FINISHED_STATES:
+            print(f"  state={current.state} turns={current.turns_used} {current.last_activity}")
             time.sleep(2)
         stop.set()
-        final = store.get(task.id)
-        print(f"\nstate={final.state} outcome={final.outcome}")
-        print(f"report: {final.report}")
+        print(f"\nstate={current.state} outcome={current.outcome}")
+        print(f"report: {current.report}")
         hello = proj / "hello.txt"
         print(f"hello.txt exists: {hello.exists()}")
         if hello.exists():

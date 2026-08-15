@@ -85,7 +85,7 @@ jobs:
         run: uv sync
 
       - name: ty
-        run: uv run --no-sync ty check src
+        run: uv run --no-sync ty check
 
   build:
     name: Build sdist + wheel
