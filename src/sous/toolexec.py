@@ -1,4 +1,4 @@
-"""Worker tool execution: path-confined file ops. Command runner added in Task 4."""
+"""Worker tool execution: path-confined file ops and a no-shell command runner."""
 
 from __future__ import annotations
 
@@ -15,12 +15,9 @@ from sous.config import current_allowlist
 
 MAX_TOOL_OUTPUT = 16_000
 
-# --- command execution (Task 4) ---
-
 ApprovalHook = Callable[[str], bool]
 
 _ENV_PASS = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR")
-_ENV_DENY_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD")
 
 
 def command_allowed(argv: list[str], allowlist: list[list[str]]) -> bool:
@@ -35,18 +32,20 @@ def command_allowed(argv: list[str], allowlist: list[list[str]]) -> bool:
 
 
 def scrubbed_env() -> dict[str, str]:
-    """Return environment with only safe vars; scrub secret-related ones."""
-    return {
-        k: v for k, v in os.environ.items()
-        if k in _ENV_PASS and not any(k.endswith(suffix) for suffix in _ENV_DENY_SUFFIXES)
-    }
+    """Return an environment restricted to a strict pass-list.
+
+    The pass-list IS the secret-scrubbing mechanism: anything not named in
+    _ENV_PASS (tokens, keys, cloud credentials, ...) is simply dropped.
+    """
+    return {k: v for k, v in os.environ.items() if k in _ENV_PASS}
 
 
 class PathViolation(Exception):
     pass
 
 
-def resolve_confined(project_root: Path, candidate: str, for_write: bool) -> Path:
+def resolve_confined(project_root: Path, candidate: str, for_write: bool,
+                     *, protected: tuple[Path, ...] = ()) -> Path:
     root = project_root.resolve()
     raw = Path(candidate)
     joined = raw if raw.is_absolute() else root / raw
@@ -59,6 +58,11 @@ def resolve_confined(project_root: Path, candidate: str, for_write: bool) -> Pat
     rel = resolved.relative_to(root)
     if for_write and any(part.lower() == ".git" for part in rel.parts):
         raise PathViolation("writes into .git/ are not allowed")
+    if for_write and any(resolved.is_relative_to(shield) for shield in protected):
+        # The sous control directory (config.toml with the command allowlist,
+        # tasks.db, transcripts) must never be writable from inside the
+        # sandbox, even when the project root contains it (e.g. root=$HOME).
+        raise PathViolation(f"writes into the sous data dir are not allowed: {candidate}")
     return resolved
 
 
@@ -81,9 +85,12 @@ def _truncate(text: str) -> str:
 
 
 class ToolExecutor:
-    def __init__(self, project_root: Path, config_path: Path):
+    def __init__(self, project_root: Path, config_path: Path,
+                 data_dir: Path | None = None):
         self.project_root = project_root.resolve()
         self.config_path = config_path
+        # Default matches how SousConfig derives data_dir from config_path.
+        self._data_dir = (data_dir if data_dir is not None else config_path.parent).resolve()
         self._changes: dict[str, ChangedFile] = {}
 
     # -- files --
@@ -103,7 +110,8 @@ class ToolExecutor:
         self._changes[rel] = ChangedFile(rel, kind, original_sha, _sha(after))
 
     def write_file(self, path: str, content: str) -> str:
-        p = resolve_confined(self.project_root, path, for_write=True)
+        p = resolve_confined(self.project_root, path, for_write=True,
+                             protected=(self._data_dir,))
         before = p.read_bytes() if p.is_file() else None
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
@@ -111,7 +119,8 @@ class ToolExecutor:
         return f"wrote {len(content)} chars to {path}"
 
     def edit_file(self, path: str, old: str, new: str) -> str:
-        p = resolve_confined(self.project_root, path, for_write=True)
+        p = resolve_confined(self.project_root, path, for_write=True,
+                             protected=(self._data_dir,))
         text = p.read_text()
         n = text.count(old)
         if n != 1:
@@ -134,6 +143,9 @@ class ToolExecutor:
             str(p.relative_to(self.project_root))
             for p in self.project_root.glob(pattern)
             if ".git" not in p.parts
+            # Skip symlinks (or paths under symlinked dirs) that escape the
+            # root: their NAME is inside but their target is not.
+            and p.resolve().is_relative_to(self.project_root)
         )
         return _truncate("\n".join(hits[:500]) or "(no matches)")
 
@@ -143,6 +155,8 @@ class ToolExecutor:
         for p in sorted(self.project_root.glob(glob_pattern)):
             if not p.is_file() or ".git" in p.parts:
                 continue
+            if not p.resolve().is_relative_to(self.project_root):
+                continue  # escaping symlink: reads outside the root are denied
             try:
                 for i, line in enumerate(p.read_text(errors="replace").splitlines(), 1):
                     if rx.search(line):

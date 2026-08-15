@@ -39,6 +39,26 @@ def test_delegate_rejects_missing_root(svc):
     assert "error" in service.delegate_task("t", "x", "/nope/not/here")
 
 
+def test_delegate_rejects_root_containing_data_dir(svc, tmp_path: Path):
+    """C1 (MCP boundary): a project_root that is an ancestor of the sous
+    data dir would put config.toml/tasks.db inside the sandbox."""
+    service, _, _ = svc
+    out = service.delegate_task("t", "x", str(tmp_path))  # tmp_path contains data_dir
+    assert "error" in out and "data dir" in out["error"]
+
+
+def test_delegate_rejects_root_equal_to_data_dir(svc, tmp_path: Path):
+    service, _, _ = svc
+    (tmp_path / "data").mkdir()
+    out = service.delegate_task("t", "x", str(tmp_path / "data"))
+    assert "error" in out and "data dir" in out["error"]
+
+
+def test_delegate_accepts_sibling_of_data_dir(svc):
+    service, _, root = svc
+    assert "task_id" in service.delegate_task("t", "x", str(root))
+
+
 def test_delegate_rejects_non_allowlisted_verify(svc):
     service, _, root = svc
     out = service.delegate_task("t", "x", str(root), verify_commands=["rm -rf /"])
@@ -142,6 +162,24 @@ def test_respond_approves_and_persists(svc):
     from sous.config import current_allowlist
     assert ["go", "vet", "./..."] in current_allowlist(service.config.config_path)
     assert store.poll_approval(tid) == "approved"
+
+
+def test_respond_race_does_not_persist_allowlist(svc, monkeypatch):
+    """M2: if the approval races a timeout-deny (respond_approval returns
+    False), the command must NOT already be persisted to the allowlist."""
+    service, store, root = svc
+    tid = service.delegate_task("t", "x", str(root))["task_id"]
+    store.claim_next()
+    store.request_approval(tid, "go vet ./...")
+    before = service.config.config_path.read_text()
+    monkeypatch.setattr(store, "respond_approval",
+                        lambda task_id, approve: False)
+    out = service.respond_to_command_request(tid, approve=True,
+                                             persist_to_allowlist=True)
+    assert out["ok"] is False
+    assert service.config.config_path.read_text() == before
+    from sous.config import current_allowlist
+    assert ["go", "vet", "./..."] not in current_allowlist(service.config.config_path)
 
 
 def test_server_status(svc):

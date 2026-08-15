@@ -19,7 +19,11 @@ def root(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def ex(root: Path, tmp_path: Path) -> ToolExecutor:
-    return ToolExecutor(root, tmp_path / "config.toml")
+    # The config lives in its own data dir (like ~/.sous), NOT directly in
+    # the parent of the project root: data_dir defaults to config_path.parent
+    # and is write-protected, so placing config.toml at tmp_path would shield
+    # the whole tmp tree including the project root itself.
+    return ToolExecutor(root, tmp_path / "sous-home" / "config.toml")
 
 
 # --- resolve_confined: the security core ---
@@ -94,6 +98,95 @@ def test_git_read_still_allowed(root: Path):
     """.git/config read is allowed (only writes are blocked)."""
     result = resolve_confined(root, ".git/config", for_write=False)
     assert result.exists()
+
+
+# --- C1: the sous data dir is write-protected inside the sandbox ---
+
+@pytest.fixture()
+def home_ex(tmp_path: Path) -> ToolExecutor:
+    """Executor whose project root CONTAINS the sous data dir (the $HOME
+    delegation case): data_dir defaults to config_path.parent."""
+    home = tmp_path / "home"
+    (home / ".sous" / "tasks" / "x").mkdir(parents=True)
+    (home / ".sous" / "config.toml").write_text('[commands]\nallowlist = ["pytest"]\n')
+    (home / ".sous" / "tasks.db").write_text("db-bytes")
+    (home / ".sous" / "tasks" / "x" / "transcript.jsonl").write_text('{"event":"tool"}\n')
+    (home / "notes.txt").write_text("plain project file")
+    return ToolExecutor(home, home / ".sous" / "config.toml")
+
+
+def test_resolve_confined_protected_write_denied(root: Path):
+    guarded = root / "src"
+    with pytest.raises(PathViolation):
+        resolve_confined(root, "src/a.py", True, protected=(guarded.resolve(),))
+    # reads of a protected path stay allowed
+    assert resolve_confined(root, "src/a.py", False, protected=(guarded.resolve(),))
+
+
+def test_data_dir_config_write_denied_and_unchanged(home_ex: ToolExecutor):
+    before = (home_ex.project_root / ".sous" / "config.toml").read_text()
+    with pytest.raises(PathViolation):
+        home_ex.write_file(".sous/config.toml", '[commands]\nallowlist = ["bash"]\n')
+    assert (home_ex.project_root / ".sous" / "config.toml").read_text() == before
+
+
+def test_data_dir_tasksdb_write_denied(home_ex: ToolExecutor):
+    with pytest.raises(PathViolation):
+        home_ex.write_file(".sous/tasks.db", "junk")
+    assert (home_ex.project_root / ".sous" / "tasks.db").read_text() == "db-bytes"
+
+
+def test_data_dir_transcript_write_denied(home_ex: ToolExecutor):
+    with pytest.raises(PathViolation):
+        home_ex.write_file(".sous/tasks/x/transcript.jsonl", "[]")
+    assert (home_ex.project_root / ".sous" / "tasks" / "x"
+            / "transcript.jsonl").read_text() == '{"event":"tool"}\n'
+
+
+def test_data_dir_edit_denied(home_ex: ToolExecutor):
+    with pytest.raises(PathViolation):
+        home_ex.edit_file(".sous/config.toml", "pytest", "bash")
+
+
+def test_data_dir_read_still_allowed(home_ex: ToolExecutor):
+    assert "allowlist" in home_ex.read_file(".sous/config.toml")
+
+
+def test_write_outside_data_dir_still_works(home_ex: ToolExecutor):
+    home_ex.write_file("notes.txt", "updated")
+    assert (home_ex.project_root / "notes.txt").read_text() == "updated"
+
+
+def test_explicit_data_dir_overrides_default(root: Path, tmp_path: Path):
+    data = tmp_path / "elsewhere-data"
+    (root / "sub").mkdir()
+    ex = ToolExecutor(root, tmp_path / "config.toml", data_dir=root / "sub")
+    with pytest.raises(PathViolation):
+        ex.write_file("sub/f.txt", "x")
+
+
+# --- I1: glob/grep must not read through escaping symlinks ---
+
+def test_grep_does_not_follow_escaping_symlink(ex: ToolExecutor, tmp_path: Path):
+    (tmp_path / "secret.txt").write_text("TOPSECRET-MARKER")
+    os.symlink(tmp_path / "secret.txt", ex.project_root / "leak.txt")
+    assert "TOPSECRET-MARKER" not in ex.grep("TOPSECRET-MARKER")
+    assert "src/a.py:1" in ex.grep("x = 1")  # in-root grep still works
+
+
+def test_glob_does_not_list_escaping_symlink(ex: ToolExecutor, tmp_path: Path):
+    (tmp_path / "secret.txt").write_text("TOPSECRET-MARKER")
+    os.symlink(tmp_path / "secret.txt", ex.project_root / "leak.txt")
+    hits = ex.glob("**/*")
+    assert "leak.txt" not in hits
+    assert "src/a.py" in hits  # in-root glob still works
+
+
+def test_grep_skips_escaping_symlinked_dir(ex: ToolExecutor, tmp_path: Path):
+    (tmp_path / "vault").mkdir()
+    (tmp_path / "vault" / "s.txt").write_text("TOPSECRET-MARKER")
+    os.symlink(tmp_path / "vault", ex.project_root / "vaultlink")
+    assert "TOPSECRET-MARKER" not in ex.grep("TOPSECRET-MARKER", "vaultlink/*")
 
 
 # --- file tools ---

@@ -40,6 +40,11 @@ class SousService:
             return {"error": f"project_root must be an absolute path: {project_root}"}
         if not root.is_dir():
             return {"error": f"project_root does not exist: {project_root}"}
+        if self.config.data_dir.resolve().is_relative_to(root.resolve()):
+            return {"error": f"project_root contains the sous data dir "
+                             f"({self.config.data_dir}); a task rooted there "
+                             f"could rewrite sous's own allowlist, task db, "
+                             f"and audit transcripts"}
         allowlist = current_allowlist(self.config.config_path)
         bad = [c for c in (verify_commands or [])
                if not command_allowed(shlex.split(c), allowlist)]
@@ -118,9 +123,12 @@ class SousService:
             return {"error": f"unknown task: {task_id}"}
         if t.state != TaskState.AWAITING_APPROVAL:
             return {"error": f"task is {t.state}, not awaiting approval"}
-        if approve and persist_to_allowlist and t.pending_command:
+        ok = self.store.respond_approval(task_id, approve)
+        # Persist only after the approval actually landed — a timeout-deny
+        # racing this call must not leave the command allowlisted forever.
+        if ok and approve and persist_to_allowlist and t.pending_command:
             persist_allowlist_entry(t.pending_command, self.config.config_path)
-        return {"ok": self.store.respond_approval(task_id, approve)}
+        return {"ok": ok}
 
     def server_status(self) -> dict:
         recent = self.store.list_recent(limit=200)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import queue
+import sys
 import threading
 import time
 from pathlib import Path
@@ -164,7 +165,7 @@ def _failure_extra(ex: ToolExecutor, transcript: _Transcript) -> dict:
 
 def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -> None:
     root = Path(task.project_root)
-    ex = ToolExecutor(root, config.config_path)
+    ex = ToolExecutor(root, config.config_path, data_dir=config.data_dir)
     transcript = _Transcript(config.data_dir / "tasks" / task.id / "transcript.jsonl")
     approval = _make_approval_hook(task, store, config)
 
@@ -280,16 +281,24 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
 def run_worker_loop(store: TaskStore, engines: EngineManager, config: SousConfig,
                     stop: threading.Event, poll_interval: float = 0.5) -> None:
     while not stop.is_set():
-        task = store.claim_next()
-        if task is None:
-            engines.unload_if_idle()
-            stop.wait(poll_interval)
-            continue
         try:
-            engine = engines.get()
-            run_task(task, store, engine, config)
+            task = store.claim_next()
+            if task is None:
+                engines.unload_if_idle()
+                stop.wait(poll_interval)
+                continue
+            try:
+                engine = engines.get()
+                run_task(task, store, engine, config)
+            except Exception as e:  # noqa: BLE001 — task-scoped failure
+                store.fail(task.id, f"worker error: {e}")
+            finally:
+                engines.touch()
+                store.prune(config.task_retention)
         except Exception as e:  # noqa: BLE001 — worker thread must never die
-            store.fail(task.id, f"worker error: {e}")
-        finally:
-            engines.touch()
-            store.prune(config.task_retention)
+            # Bookkeeping failure (claim/prune/unload, or even fail() itself):
+            # the MCP main thread keeps serving, so a dead worker thread would
+            # wedge the queue forever with no launchd self-heal. Log, back
+            # off one poll interval, keep looping.
+            print(f"sous: worker loop error (continuing): {e}", file=sys.stderr)
+            stop.wait(poll_interval)

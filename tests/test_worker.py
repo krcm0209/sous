@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -7,8 +8,9 @@ from pathlib import Path
 import pytest
 
 from sous.config import SousConfig
+from sous.engine.base import EngineManager
 from sous.tasks import TaskState, TaskStore
-from sous.worker import run_task
+from sous.worker import run_task, run_worker_loop
 from tests.fake_engine import FakeEngine
 
 
@@ -281,6 +283,26 @@ def test_verify_command_that_raises_is_reported_not_fatal(env):
     [v] = got.report["verify"]
     assert v["command"] == str(script)
     assert "error" in v["output"].lower() or "permission" in v["output"].lower()
+
+
+def test_worker_loop_survives_bookkeeping_exception(env, capsys):
+    """M1: a transient failure in claim_next (outside the per-task try) must
+    not kill the worker thread — the loop should log and keep polling."""
+    root, cfg, store = env
+    stop = threading.Event()
+    calls = {"n": 0}
+
+    class FlakyStore:
+        def claim_next(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            stop.set()
+            return None
+
+    engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
+    run_worker_loop(FlakyStore(), engines, cfg, stop, poll_interval=0.01)
+    assert calls["n"] >= 2  # survived the first failure and polled again
 
 
 def test_engine_exception_fails_task_cleanly(env):
