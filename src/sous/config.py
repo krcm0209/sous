@@ -154,8 +154,15 @@ def persist_allowlist_entry(command: str, config_path: Path) -> None:
     else:
         doc = tomlkit.document()
     commands = doc.setdefault("commands", tomlkit.table())
+    # Seed the defaults ONLY when the key is absent — i.e. the array is being
+    # created for the first time (new file, or a section that never had an
+    # allowlist). An explicitly empty allowlist (`allowlist = []`) is a
+    # deliberate fail-closed posture — deny everything, make a human approve
+    # each command — and must gain only the command just approved, never be
+    # silently repopulated with the defaults.
+    seed_defaults = "allowlist" not in commands
     allow = commands.setdefault("allowlist", tomlkit.array())
-    if not list(allow):
+    if seed_defaults:
         for entry in DEFAULT_ALLOWLIST:
             allow.append(entry)
     if command not in list(allow):

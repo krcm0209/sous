@@ -165,3 +165,48 @@ def test_persist_allowlist_entry_creates_missing_file(tmp_path: Path):
     persist_allowlist_entry("go vet", p)
     assert ["go", "vet"] in current_allowlist(p)
     assert ["pytest"] in current_allowlist(p)  # defaults seeded too
+
+
+def test_persist_respects_explicitly_empty_allowlist(tmp_path: Path):
+    """An explicitly empty allowlist (`allowlist = []`) is a deliberate
+    fail-closed posture: deny everything, make a human approve each command.
+    Approving ONE command must append exactly that command — not silently
+    seed all the defaults, which would reverse the user's security decision
+    without telling them."""
+    p = tmp_path / "config.toml"
+    p.write_text('[commands]\nallowlist = []\n')
+    persist_allowlist_entry("go vet", p)
+    assert current_allowlist(p) == [["go", "vet"]]
+
+
+def test_persist_seeds_defaults_when_commands_section_absent(tmp_path: Path):
+    """First-run behavior: a config with no [commands] section at all gets
+    the documented default allowlist plus the approved command."""
+    p = tmp_path / "config.toml"
+    p.write_text('[server]\nport = 9000\n')
+    persist_allowlist_entry("go vet", p)
+    allow = current_allowlist(p)
+    assert ["go", "vet"] in allow
+    assert ["pytest"] in allow  # defaults seeded on first creation
+    assert load_config(p).server_port == 9000  # rest of the file untouched
+
+
+def test_persist_seeds_defaults_when_allowlist_key_absent(tmp_path: Path):
+    """[commands] exists but has no allowlist key: the array is being
+    created for the first time, so the defaults are seeded (same first-run
+    rationale as a missing section)."""
+    p = tmp_path / "config.toml"
+    p.write_text('[commands]\ntimeout_seconds = 60\n')
+    persist_allowlist_entry("go vet", p)
+    allow = current_allowlist(p)
+    assert ["go", "vet"] in allow
+    assert ["pytest"] in allow
+    assert load_config(p).command_timeout_seconds == 60
+
+
+def test_persist_populated_allowlist_gains_only_the_new_entry(tmp_path: Path):
+    """A populated allowlist gains the approved command and nothing else."""
+    p = tmp_path / "config.toml"
+    p.write_text('[commands]\nallowlist = ["pytest"]\n')
+    persist_allowlist_entry("go vet", p)
+    assert current_allowlist(p) == [["pytest"], ["go", "vet"]]
