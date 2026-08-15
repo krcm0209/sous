@@ -153,11 +153,8 @@ that Qwen3 emits and the hermes JSON format used by other MLX models.
 
 ## Development
 
-```bash
-uv run pytest -m "not model"        # fast suite, no model needed (CI)
-uv run pytest -m model              # engine tests, downloads tiny models
-uv run python scripts/e2e_smoke.py  # full loop with a 0.6B model
-```
+Setup, the checks CI runs, and the pull-request process are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 Manual E2E with the real model: `sous serve`, register with `claude mcp add`,
 then ask Claude to delegate something trivial and watch `sous status`.
