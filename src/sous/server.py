@@ -103,11 +103,35 @@ class SousService:
         files = [f["path"] for f in (t.report or {}).get("files_changed", [])]
         if not files or not self._is_git_repo(t.project_root):
             return None
-        proc = subprocess.run(
-            ["git", "diff", "--", *files], cwd=t.project_root,
+        # `git diff` cannot show untracked files, and file CREATION is the
+        # single most common worker action — so split the reported paths into
+        # tracked (regular diff) and untracked (an add-style --no-index diff
+        # against /dev/null each). Strictly read-only: no `git add`, no index
+        # writes — this is a reporting path over the user's repository.
+        ls = subprocess.run(
+            ["git", "ls-files", "-z", "--", *files], cwd=t.project_root,
             capture_output=True, text=True, timeout=30,
         )
-        return proc.stdout[-30_000:]
+        tracked = set(ls.stdout.split("\0")) - {""}
+        parts: list[str] = []
+        if tracked_files := [f for f in files if f in tracked]:
+            proc = subprocess.run(
+                ["git", "diff", "--", *tracked_files], cwd=t.project_root,
+                capture_output=True, text=True, timeout=30,
+            )
+            parts.append(proc.stdout)
+        for f in files:
+            if f in tracked:
+                continue
+            # --no-index exits 1 when the files differ — for a newly created
+            # file that IS the expected outcome, not an error.
+            proc = subprocess.run(
+                ["git", "diff", "--no-index", "--", "/dev/null", f],
+                cwd=t.project_root, capture_output=True, text=True, timeout=30,
+            )
+            parts.append(proc.stdout)
+        combined = "".join(parts)
+        return combined[-30_000:] if combined else None
 
     @staticmethod
     def _is_git_repo(project_root: str) -> bool:

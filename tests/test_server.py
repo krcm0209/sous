@@ -176,6 +176,58 @@ def test_result_include_diff_from_git_worktree(svc, tmp_path: Path):
     assert "-one" in out["diff"] and "+two" in out["diff"]
 
 
+def _git_repo_with_commit(root: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    (root / "f.txt").write_text("one\n")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "init"], cwd=root, check=True)
+
+
+def test_result_include_diff_shows_created_untracked_file(svc):
+    """D1: `git diff -- <paths>` omits untracked files, and a worker CREATING
+    a file is the most common action — the diff must include the new file's
+    contents, or 'Claude always reviews the diff' silently fails for exactly
+    the case the review workflow exists to cover."""
+    service, store, root = svc
+    _git_repo_with_commit(root)
+    (root / "made.txt").write_text("brand new line\n")  # untracked
+    tid = service.delegate_task("t", "x", str(root))["task_id"]
+    store.claim_next()
+    store.finish(tid, "completed",
+                 {"summary": "s", "files_changed": [{"path": "made.txt"}]})
+    out = service.task_result(tid, include_diff=True)
+    assert out["diff"] is not None
+    assert "made.txt" in out["diff"]
+    assert "+brand new line" in out["diff"]
+
+
+def test_result_include_diff_shows_modified_and_created_together(svc):
+    service, store, root = svc
+    _git_repo_with_commit(root)
+    (root / "f.txt").write_text("two\n")               # modified, tracked
+    (root / "made.txt").write_text("brand new line\n")  # created, untracked
+    tid = service.delegate_task("t", "x", str(root))["task_id"]
+    store.claim_next()
+    store.finish(tid, "completed",
+                 {"summary": "s",
+                  "files_changed": [{"path": "f.txt"}, {"path": "made.txt"}]})
+    out = service.task_result(tid, include_diff=True)
+    assert "-one" in out["diff"] and "+two" in out["diff"]
+    assert "+brand new line" in out["diff"]
+
+
+def test_result_include_diff_non_repo_returns_none(svc):
+    service, store, root = svc  # root is a plain directory, no git repo
+    (root / "made.txt").write_text("brand new line\n")
+    tid = service.delegate_task("t", "x", str(root))["task_id"]
+    store.claim_next()
+    store.finish(tid, "completed",
+                 {"summary": "s", "files_changed": [{"path": "made.txt"}]})
+    out = service.task_result(tid, include_diff=True)
+    assert out["diff"] is None
+
+
 def test_cancel(svc):
     service, _, root = svc
     tid = service.delegate_task("t", "x", str(root))["task_id"]
