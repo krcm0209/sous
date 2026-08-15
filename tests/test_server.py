@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 from pathlib import Path
 
@@ -91,6 +92,32 @@ def test_result_include_diff_from_git(svc, tmp_path: Path):
     assert "-one" in out["diff"] and "+two" in out["diff"]
 
 
+def test_result_include_diff_from_git_worktree(svc, tmp_path: Path):
+    """A git *worktree* has a `.git` FILE (gitdir pointer), not a directory —
+    the diff must still be produced there (and in submodules / subdirectories
+    of a repo), which is why the repo check must be `git rev-parse
+    --is-inside-work-tree` rather than `.git`-is-a-directory."""
+    service, store, root = svc
+    main_repo = tmp_path / "main_repo"
+    main_repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=main_repo, check=True)
+    (main_repo / "f.txt").write_text("one\n")
+    subprocess.run(["git", "add", "."], cwd=main_repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "init"], cwd=main_repo, check=True)
+    worktree = tmp_path / "wt"
+    subprocess.run(["git", "worktree", "add", str(worktree)],
+                    cwd=main_repo, check=True)
+    assert not (worktree / ".git").is_dir()  # sanity: it's a file, not a dir
+    (worktree / "f.txt").write_text("two\n")
+    tid = service.delegate_task("t", "x", str(worktree))["task_id"]
+    store.claim_next()
+    store.finish(tid, "completed",
+                 {"summary": "s", "files_changed": [{"path": "f.txt"}]})
+    out = service.task_result(tid, include_diff=True)
+    assert "-one" in out["diff"] and "+two" in out["diff"]
+
+
 def test_cancel(svc):
     service, _, root = svc
     tid = service.delegate_task("t", "x", str(root))["task_id"]
@@ -131,4 +158,9 @@ def test_create_server_registers_six_tools(svc):
     service, store, root = svc
     from sous.server import create_server
     mcp = create_server(store, service.engines, service.config)
-    assert mcp is not None  # deep tool introspection exercised in e2e smoke
+    tools = asyncio.run(mcp.list_tools())
+    names = {t.name for t in tools}
+    assert names == {
+        "delegate_task", "task_status", "task_result",
+        "cancel_task", "respond_to_command_request", "server_status",
+    }

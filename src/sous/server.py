@@ -86,13 +86,25 @@ class SousService:
 
     def _diff(self, t: Task) -> str | None:
         files = [f["path"] for f in (t.report or {}).get("files_changed", [])]
-        if not files or not (Path(t.project_root) / ".git").is_dir():
+        if not files or not self._is_git_repo(t.project_root):
             return None
         proc = subprocess.run(
             ["git", "diff", "--", *files], cwd=t.project_root,
             capture_output=True, text=True, timeout=30,
         )
         return proc.stdout[-30_000:]
+
+    @staticmethod
+    def _is_git_repo(project_root: str) -> bool:
+        """Authoritative repo check: a `.git`-is-a-directory probe misses git
+        worktrees and submodules, where `.git` is a FILE pointing at the real
+        gitdir, and it also misses project_root being a subdirectory of a
+        repo. `git rev-parse --is-inside-work-tree` handles all three."""
+        check = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"], cwd=project_root,
+            capture_output=True, text=True, timeout=10,
+        )
+        return check.returncode == 0 and check.stdout.strip() == "true"
 
     def cancel_task(self, task_id: str) -> dict:
         if self.store.get(task_id) is None:
