@@ -15,8 +15,12 @@ class VLMEngine:
         return getattr(self._processor, "tokenizer", self._processor)
 
     def _prompt(self, messages: list[dict], tools: list[dict]) -> str:
+        # enable_thinking=False: same rationale as LMEngine. Confirmed inert
+        # (no-op) for templates such as Qwen2-VL's that don't define the
+        # variable — verified empirically, not assumed.
         return self._tokenizer.apply_chat_template(
             messages, tools=tools, add_generation_prompt=True, tokenize=False,
+            enable_thinking=False,
         )
 
     def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:

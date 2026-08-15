@@ -11,8 +11,13 @@ class LMEngine:
         self._model, self._tokenizer = load(model_id)
 
     def _prompt(self, messages: list[dict], tools: list[dict]) -> str:
+        # enable_thinking=False: sous delegates mechanical prep, not reasoning —
+        # a "thinking" model must not spend its turn budget on <think> chain-of-
+        # thought instead of emitting the tool call. Inert on templates that
+        # don't define the variable (e.g. plain non-thinking models).
         return self._tokenizer.apply_chat_template(
             messages, tools=tools, add_generation_prompt=True, tokenize=False,
+            enable_thinking=False,
         )
 
     def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:
