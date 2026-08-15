@@ -208,6 +208,18 @@ def test_changed_files_column_migrates_existing_db(tmp_path: Path):
     assert store.get(t.id).report["files_changed"] == [{"path": "x.py"}]
 
 
+def test_count_by_state_aggregates_all_rows(store: TaskStore):
+    """E2: queue depth must come from an aggregate over ALL rows, not a
+    LIMITed listing."""
+    for i in range(5):
+        _enqueue(store, f"t{i}")
+    store.claim_next()
+    counts = store.count_by_state()
+    assert counts[TaskState.QUEUED] == 4
+    assert counts[TaskState.RUNNING] == 1
+    assert counts.get(TaskState.DONE, 0) == 0
+
+
 def test_persistence_across_instances(tmp_path: Path):
     db = tmp_path / "tasks.db"
     t = _enqueue(TaskStore(db))

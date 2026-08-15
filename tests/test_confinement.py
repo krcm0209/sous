@@ -295,3 +295,24 @@ def test_output_truncated(ex: ToolExecutor):
     ex.write_file("big.txt", "line\n" * 20000)
     out = ex.read_file("big.txt", limit=20000)
     assert len(out) <= 16_000 + len("\n[truncated]") and out.endswith("[truncated]")
+
+def test_read_file_window_from_large_file_is_memory_bounded(ex: ToolExecutor):
+    """E1: read_file must stream. A small window from a large file must not
+    materialize the whole file — read_text().splitlines() spiked peak RSS
+    from 27 MB to 638 MB on a 143 MB file before the fix."""
+    import resource
+    import sys
+    big = ex.project_root / "big_stream.txt"
+    row = "y" * 90 + "\n"
+    with big.open("w") as f:
+        chunk = row * 1000  # ~91 KB — written in pieces, never held whole
+        for _ in range(440):  # ~40 MB, 440_000 lines total
+            f.write(chunk)
+    scale = 1 if sys.platform == "darwin" else 1024  # ru_maxrss: B on macOS, KB on Linux
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+    out = ex.read_file("big_stream.txt", offset=200_000, limit=5)
+    after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+    lines = out.splitlines()
+    assert lines == [f"{200_000 + i}\t" + "y" * 90 for i in range(1, 6)]
+    # Generous margin, but far below the ~40 MB the whole file would cost.
+    assert after - before < 20 * 1024 * 1024

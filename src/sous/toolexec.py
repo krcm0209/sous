@@ -200,9 +200,25 @@ class ToolExecutor:
 
     def read_file(self, path: str, offset: int = 0, limit: int = 2000) -> str:
         p = resolve_confined(self.project_root, path, for_write=False)
-        lines = p.read_text(errors="replace").splitlines()
-        window = lines[offset:offset + limit]
-        numbered = [f"{offset + i + 1}\t{line}" for i, line in enumerate(window)]
+        # Streamed on purpose: read_text().splitlines() materialized the
+        # ENTIRE file before the window applied (reading 5 lines of a 143 MB
+        # file spiked peak RSS from 27 MB to 638 MB — and this is the
+        # worker's most-used tool). Iterate line by line, skip to offset,
+        # collect at most limit lines, and stop early once the joined output
+        # is already past MAX_TOOL_OUTPUT — _truncate discards the rest.
+        numbered: list[str] = []
+        joined_len = -1  # each entry costs len(entry) + 1 joining "\n"
+        with p.open(errors="replace") as f:
+            for lineno, line in enumerate(f, 1):
+                if lineno <= offset:
+                    continue
+                if lineno > offset + limit:
+                    break
+                entry = f"{lineno}\t" + line.removesuffix("\n")
+                numbered.append(entry)
+                joined_len += len(entry) + 1
+                if joined_len > MAX_TOOL_OUTPUT:
+                    break
         return _truncate("\n".join(numbered) or "(empty file)")
 
     def _record_change(self, p: Path, before: bytes | None, after: bytes) -> None:

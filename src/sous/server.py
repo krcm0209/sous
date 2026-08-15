@@ -165,15 +165,14 @@ class SousService:
         return {"ok": ok}
 
     def server_status(self) -> dict:
-        recent = self.store.list_recent(limit=200)
+        counts = self.store.count_by_state()
         return {
             "model": self.engines.status(),
             "memory_gb": _mlx_memory_gb(),
             "queue": {
-                "queued": sum(t.state == TaskState.QUEUED for t in recent),
-                "running": sum(t.state in (TaskState.RUNNING,
-                                           TaskState.AWAITING_APPROVAL)
-                               for t in recent),
+                "queued": counts.get(TaskState.QUEUED, 0),
+                "running": counts.get(TaskState.RUNNING, 0)
+                           + counts.get(TaskState.AWAITING_APPROVAL, 0),
             },
             "config": {
                 "model_id": self.config.model_id,

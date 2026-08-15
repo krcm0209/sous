@@ -118,6 +118,15 @@ class TaskStore:
             row = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return _row_to_task(row) if row else None
 
+    def count_by_state(self) -> dict[str, int]:
+        """Aggregate task counts per state over ALL rows — queue depth must
+        never be derived from a LIMITed listing."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT state, COUNT(*) AS n FROM tasks GROUP BY state"
+            ).fetchall()
+        return {r["state"]: r["n"] for r in rows}
+
     def list_recent(self, limit: int = 20) -> list[Task]:
         with self._conn() as c:
             rows = c.execute(

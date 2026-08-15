@@ -298,6 +298,19 @@ def test_server_status(svc):
     assert ["pytest"] in s["config"]["allowlist"]
 
 
+def test_server_status_counts_past_200_tasks(svc):
+    """E2: queue depth came from list_recent(limit=200), so more than 200
+    active tasks under-reported — the count must cover every row."""
+    service, store, root = svc
+    for i in range(205):
+        store.enqueue(title=f"t{i}", instructions="x", project_root=str(root),
+                      context_files=[], verify_commands=[])
+    store.claim_next()
+    s = service.server_status()
+    assert s["queue"]["queued"] == 204
+    assert s["queue"]["running"] == 1
+
+
 def test_create_server_registers_six_tools(svc):
     service, store, root = svc
     from sous.server import create_server
