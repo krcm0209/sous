@@ -280,7 +280,12 @@ def test_approval_flow_denied(env):
     assert any("denied" in str(m.get("content", "")) for m in result_turn)
 
 
-def test_generation_stall_fails_task(env):
+def test_generation_timeout_at_wall_budget_is_budget_exhausted(env):
+    """C1: the generation timeout IS the remaining wall-clock budget, so a
+    timeout with the deadline passed means the budget ran out — per spec that
+    ends the task as done/budget-exhausted with a partial report, never
+    failed. (Previously test_generation_stall_fails_task, which asserted
+    FAILED/'stalled' for exactly this case.)"""
     root, cfg, store = env
     cfg = dataclasses.replace(cfg, max_minutes=0.005)  # 0.3 s wall budget
 
@@ -292,8 +297,47 @@ def test_generation_stall_fails_task(env):
     task = _start(store, root)
     run_task(task, store, StallingEngine([FINISH]), cfg)
     got = store.get(task.id)
+    assert got.state == TaskState.DONE
+    assert got.outcome == "budget-exhausted"
+    assert "files_changed" in got.report  # partial report still assembled
+    assert Path(got.report["transcript_path"]).exists()
+
+
+def test_genuine_stall_with_budget_remaining_fails(env, monkeypatch):
+    """C1 (the other side): a stall while wall-clock budget genuinely remains
+    is still a failure, not budget exhaustion."""
+    import sous.worker as worker_mod
+    root, cfg, store = env  # max_minutes=1: plenty of budget remains
+
+    def stall_immediately(engine, messages, max_tokens, timeout_seconds):
+        raise worker_mod.GenerationStalled("generation stalled (> 5s)")
+
+    monkeypatch.setattr(worker_mod, "_generate_with_timeout", stall_immediately)
+    task = _start(store, root)
+    run_task(task, store, FakeEngine([FINISH]), cfg)
+    got = store.get(task.id)
     assert got.state == TaskState.FAILED
     assert "stalled" in got.report["error"]
+    assert "files_changed" in got.report
+
+
+def test_context_over_cap_with_nothing_to_elide_fails_cleanly(env):
+    """C2: when no elidable tool_result remains and the count is still above
+    max_context_tokens, the task must fail with a clear reason naming the
+    measured count and the cap — never send an oversized prompt."""
+    root, cfg, store = env
+    cfg = dataclasses.replace(cfg, max_context_tokens=10)
+    task = _start(store, root)
+    engine = FakeEngine([FINISH])
+    run_task(task, store, engine, cfg)
+    got = store.get(task.id)
+    assert got.state == TaskState.FAILED
+    err = got.report["error"]
+    assert "context" in err.lower()
+    assert "10" in err  # the cap, named
+    assert engine.calls == []  # the oversized prompt was never sent
+    assert "files_changed" in got.report
+    assert Path(got.report["transcript_path"]).exists()
 
 
 def test_context_elision_replaces_old_tool_results(env):

@@ -108,15 +108,20 @@ def _execute(call: ToolCall, ex: ToolExecutor, config: SousConfig, approval) -> 
         return f"error: {e}"
 
 
-def _elide_if_needed(messages: list[dict], engine: Engine, config: SousConfig) -> None:
-    while engine.count_tokens(messages, WORKER_TOOLS) > config.max_context_tokens:
+def _elide_if_needed(messages: list[dict], engine: Engine, config: SousConfig) -> int:
+    """Elide old tool results until under the context cap. Returns the final
+    token count — the caller must check it against the cap: when nothing
+    elidable remains it can still be over, and an oversized prompt must never
+    be sent (engine error or memory exhaustion is what the cap prevents)."""
+    while (count := engine.count_tokens(messages, WORKER_TOOLS)) > config.max_context_tokens:
         for m in messages:
             if (m["role"] == "user" and m["content"].startswith("<tool_result")
                     and "[elided" not in m["content"]):
                 m["content"] = "<tool_result>[elided: re-read the file if needed]</tool_result>"
                 break
         else:
-            return  # nothing left to elide
+            return count  # nothing left to elide; still over the cap
+    return count
 
 
 class GenerationStalled(Exception):
@@ -193,13 +198,27 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
             transcript.log(event="cancelled")
             store.mark_cancelled(task.id, extra=_failure_extra(ex, transcript))
             return
-        _elide_if_needed(messages, engine, config)
+        token_count = _elide_if_needed(messages, engine, config)
+        if token_count > config.max_context_tokens:
+            reason = (f"context overflow: {token_count} tokens exceeds "
+                      f"max_context_tokens={config.max_context_tokens} with "
+                      f"nothing left to elide")
+            transcript.log(event="context_overflow", error=reason)
+            store.fail(task.id, reason, extra=_failure_extra(ex, transcript))
+            return
         remaining = max(0.1, deadline - time.monotonic())
         try:
             text = _generate_with_timeout(
                 engine, messages, config.max_tokens_per_generation, remaining,
             )
         except GenerationStalled as e:
+            if time.monotonic() >= deadline:
+                # The generation timeout IS the remaining wall-clock budget,
+                # so a timeout here means the budget ran out, not that the
+                # engine wedged. Per spec, hitting any budget ends the task
+                # as done/budget-exhausted with a partial report.
+                transcript.log(event="budget-exhausted", error=str(e))
+                break
             transcript.log(event="stalled", error=str(e))
             store.fail(task.id, str(e), extra=_failure_extra(ex, transcript))
             return
