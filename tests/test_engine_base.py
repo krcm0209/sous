@@ -9,8 +9,10 @@ from tests.fake_engine import FakeEngine
 def test_select_backend_vision_config():
     assert select_backend({"vision_config": {}, "model_type": "qwen3_vl"}) == "vlm"
 
+
 def test_select_backend_vl_model_type():
     assert select_backend({"model_type": "qwen2_5_vl"}) == "vlm"
+
 
 def test_select_backend_text_only():
     assert select_backend({"model_type": "qwen3_moe"}) == "lm"
@@ -30,7 +32,7 @@ def _manager(idle_minutes: int = 30) -> tuple[EngineManager, list]:
 
 def test_get_is_lazy_and_cached():
     mgr, created = _manager()
-    assert created == []          # nothing loaded yet
+    assert created == []  # nothing loaded yet
     e1 = mgr.get()
     e2 = mgr.get()
     assert e1 is e2 and len(created) == 1

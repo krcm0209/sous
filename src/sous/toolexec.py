@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
@@ -9,9 +10,9 @@ import shlex
 import signal
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from sous.config import current_allowlist
 
@@ -27,10 +28,11 @@ def command_allowed(argv: list[str], allowlist: list[list[str]]) -> bool:
 
     Skips falsy entries to prevent empty allowlist entries from matching all commands.
     """
-    return any(
-        len(argv) >= len(entry) and argv[: len(entry)] == entry
-        for entry in allowlist if entry
-    ) if argv else False
+    return (
+        any(len(argv) >= len(entry) and argv[: len(entry)] == entry for entry in allowlist if entry)
+        if argv
+        else False
+    )
 
 
 def scrubbed_env() -> dict[str, str]:
@@ -55,11 +57,12 @@ def _is_within(path: Path, ancestor: Path) -> bool:
     already-.resolve()d paths."""
     p = [part.lower() for part in path.parts]
     a = [part.lower() for part in ancestor.parts]
-    return len(p) >= len(a) and p[:len(a)] == a
+    return len(p) >= len(a) and p[: len(a)] == a
 
 
-def resolve_confined(project_root: Path, candidate: str, for_write: bool,
-                     *, protected: tuple[Path, ...] = ()) -> Path:
+def resolve_confined(
+    project_root: Path, candidate: str, for_write: bool, *, protected: tuple[Path, ...] = ()
+) -> Path:
     root = project_root.resolve()
     raw = Path(candidate)
     joined = raw if raw.is_absolute() else root / raw
@@ -79,7 +82,7 @@ def resolve_confined(project_root: Path, candidate: str, for_write: bool,
         lexical = Path(os.path.normpath(joined))
         lex_parts = lexical.parts
         if _is_within(lexical, root):
-            lex_parts = lex_parts[len(root.parts):]
+            lex_parts = lex_parts[len(root.parts) :]
         if any(part.lower() == ".git" for part in (*rel.parts, *lex_parts)):
             raise PathViolation("writes into .git/ are not allowed")
     if for_write and any(_is_within(resolved, shield) for shield in protected):
@@ -117,8 +120,7 @@ def _truncate(text: str) -> str:
 _CAP_HALF = MAX_TOOL_OUTPUT // 2
 
 
-def _read_combined_span(stdout_f, n_out: int, stderr_f, n_err: int,
-                        start: int, length: int) -> str:
+def _read_combined_span(stdout_f, n_out: int, stderr_f, n_err: int, start: int, length: int) -> str:
     """Read `length` bytes at offset `start` from the virtual concatenation
     stdout + b"\\n" + stderr, seeking within the spool files rather than
     loading them (they can be hundreds of MB). Decoded with errors="replace"
@@ -150,8 +152,7 @@ def _capped_command_output(stdout_f, stderr_f) -> str:
     if total <= MAX_TOOL_OUTPUT:
         return _read_combined_span(stdout_f, n_out, stderr_f, n_err, 0, total)
     head = _read_combined_span(stdout_f, n_out, stderr_f, n_err, 0, _CAP_HALF)
-    tail = _read_combined_span(stdout_f, n_out, stderr_f, n_err,
-                               total - _CAP_HALF, _CAP_HALF)
+    tail = _read_combined_span(stdout_f, n_out, stderr_f, n_err, total - _CAP_HALF, _CAP_HALF)
     return f"{head}\n[... {total - 2 * _CAP_HALF} bytes elided ...]\n{tail}"
 
 
@@ -167,29 +168,20 @@ def _kill_process_group(pgid: int, proc: subprocess.Popen) -> None:
     stdout/stderr go to temp files, not pipes, so no surviving descendant
     can hold a pipe write-end open and hang either wait() here: waitpid()
     blocks only on the direct child's exit, never on stream EOF."""
-    try:
+    with contextlib.suppress(ProcessLookupError):
         os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
+    with contextlib.suppress(subprocess.TimeoutExpired):
         # Grace period for SIGTERM handlers to run before the hard kill.
         proc.wait(timeout=_KILL_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        pass
-    try:
+    with contextlib.suppress(ProcessLookupError):
         os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    try:
+    with contextlib.suppress(subprocess.TimeoutExpired):
         # Reap the direct child so it doesn't linger as a zombie.
         proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
 
 
 class ToolExecutor:
-    def __init__(self, project_root: Path, config_path: Path,
-                 data_dir: Path | None = None):
+    def __init__(self, project_root: Path, config_path: Path, data_dir: Path | None = None):
         self.project_root = project_root.resolve()
         self.config_path = config_path
         # Default matches how SousConfig derives data_dir from config_path.
@@ -229,8 +221,7 @@ class ToolExecutor:
         self._changes[rel] = ChangedFile(rel, kind, original_sha, _sha(after))
 
     def write_file(self, path: str, content: str) -> str:
-        p = resolve_confined(self.project_root, path, for_write=True,
-                             protected=(self._data_dir,))
+        p = resolve_confined(self.project_root, path, for_write=True, protected=(self._data_dir,))
         before = p.read_bytes() if p.is_file() else None
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
@@ -238,8 +229,7 @@ class ToolExecutor:
         return f"wrote {len(content)} chars to {path}"
 
     def edit_file(self, path: str, old: str, new: str) -> str:
-        p = resolve_confined(self.project_root, path, for_write=True,
-                             protected=(self._data_dir,))
+        p = resolve_confined(self.project_root, path, for_write=True, protected=(self._data_dir,))
         text = p.read_text()
         n = text.count(old)
         if n != 1:
@@ -252,9 +242,7 @@ class ToolExecutor:
 
     def list_dir(self, path: str = ".") -> str:
         p = resolve_confined(self.project_root, path, for_write=False)
-        entries = sorted(
-            e.name + ("/" if e.is_dir() else "") for e in p.iterdir()
-        )
+        entries = sorted(e.name + ("/" if e.is_dir() else "") for e in p.iterdir())
         return _truncate("\n".join(entries) or "(empty dir)")
 
     def glob(self, pattern: str) -> str:
@@ -320,10 +308,8 @@ class ToolExecutor:
                                     stack.append(entry.path)
                             elif entry.is_file(follow_symlinks=False):
                                 st = entry.stat(follow_symlinks=False)
-                                rel = os.path.relpath(entry.path,
-                                                      self.project_root)
-                                snap[rel] = (st.st_mtime_ns, st.st_size,
-                                             st.st_ctime_ns)
+                                rel = os.path.relpath(entry.path, self.project_root)
+                                snap[rel] = (st.st_mtime_ns, st.st_size, st.st_ctime_ns)
                         except OSError:
                             continue
             except OSError:
@@ -347,15 +333,15 @@ class ToolExecutor:
             if prior is not None:
                 # already tracked: refresh the now-stale content hash, keep
                 # the original kind and before_sha
-                self._changes[rel] = ChangedFile(rel, prior.kind,
-                                                 prior.before_sha, _sha(content))
+                self._changes[rel] = ChangedFile(rel, prior.kind, prior.before_sha, _sha(content))
             else:
                 kind = "modified" if rel in before else "created"
                 # before_sha unknown: the pre-command snapshot is stat-only
                 self._changes[rel] = ChangedFile(rel, kind, None, _sha(content))
 
-    def run_command(self, command: str, approval: ApprovalHook | None = None,
-                    timeout: int = 120) -> str:
+    def run_command(
+        self, command: str, approval: ApprovalHook | None = None, timeout: int = 120
+    ) -> str:
         """Run a command with allowlist checking and optional approval hook.
 
         The command runs in its own session/process group (setsid), and on
@@ -381,9 +367,10 @@ class ToolExecutor:
             return f"command rejected: unparseable ({e})"
         if not argv:
             return "command rejected: empty"
-        if not command_allowed(argv, current_allowlist(self.config_path)):
-            if approval is None or not approval(command):
-                return f"command denied (not allowlisted): {command}"
+        if not command_allowed(argv, current_allowlist(self.config_path)) and (
+            approval is None or not approval(command)
+        ):
+            return f"command denied (not allowlisted): {command}"
         before_snap = self._tree_snapshot()
         # stdout/stderr are spooled to unlinked temp files, NOT pipes:
         # communicate() would buffer the ENTIRE output in RAM before the
@@ -400,8 +387,13 @@ class ToolExecutor:
                 # no controlling terminal for inherited TTY stdin to make
                 # sense.
                 proc = subprocess.Popen(
-                    argv, shell=False, cwd=self.project_root, env=scrubbed_env(),
-                    stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
+                    argv,
+                    shell=False,
+                    cwd=self.project_root,
+                    env=scrubbed_env(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=out_f,
+                    stderr=err_f,
                     start_new_session=True,
                 )
             except FileNotFoundError:

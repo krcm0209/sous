@@ -3,7 +3,6 @@ from pathlib import Path
 
 from sous.config import (
     DEFAULT_ALLOWLIST,
-    SousConfig,
     current_allowlist,
     load_config,
     persist_allowlist_entry,
@@ -29,7 +28,7 @@ def test_defaults_when_file_missing(tmp_path: Path):
 
 def test_partial_file_overrides_only_given_keys(tmp_path: Path):
     p = tmp_path / "config.toml"
-    p.write_text('[server]\nport = 9000\n')
+    p.write_text("[server]\nport = 9000\n")
     cfg = load_config(p)
     assert cfg.server_port == 9000
     assert cfg.max_turns == 40  # untouched default
@@ -37,7 +36,7 @@ def test_partial_file_overrides_only_given_keys(tmp_path: Path):
 
 def test_sampler_keys_overridable_from_file(tmp_path: Path):
     p = tmp_path / "config.toml"
-    p.write_text('[model]\ntemperature = 0.2\ntop_p = 0.9\ntop_k = 40\n')
+    p.write_text("[model]\ntemperature = 0.2\ntop_p = 0.9\ntop_k = 40\n")
     cfg = load_config(p)
     assert cfg.temperature == 0.2
     assert cfg.top_p == 0.9
@@ -46,7 +45,7 @@ def test_sampler_keys_overridable_from_file(tmp_path: Path):
 
 def test_unknown_keys_warn_not_crash(tmp_path: Path):
     p = tmp_path / "config.toml"
-    p.write_text('[server]\nport = 9000\nbogus = 1\n[wat]\nx = 2\n')
+    p.write_text("[server]\nport = 9000\nbogus = 1\n[wat]\nx = 2\n")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         cfg = load_config(p)
@@ -72,7 +71,7 @@ def test_malformed_toml_returns_defaults_and_warns(tmp_path: Path):
     """I2: a syntax error in the hand-edited config must not crash the daemon
     at boot (launchd KeepAlive would restart-loop it)."""
     p = tmp_path / "config.toml"
-    p.write_text('[server\nport = 9000\n')  # missing closing bracket
+    p.write_text("[server\nport = 9000\n")  # missing closing bracket
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         cfg = load_config(p)
@@ -122,7 +121,7 @@ def test_commands_not_a_table_current_allowlist_defaults(tmp_path: Path):
     """A2: [commands] with the wrong shape must not raise out of the hot
     allowlist read (which server_status/delegate_task/run_command all hit)."""
     p = tmp_path / "config.toml"
-    p.write_text('commands = 5\n')
+    p.write_text("commands = 5\n")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         allow = current_allowlist(p)
@@ -174,7 +173,7 @@ def test_persist_respects_explicitly_empty_allowlist(tmp_path: Path):
     seed all the defaults, which would reverse the user's security decision
     without telling them."""
     p = tmp_path / "config.toml"
-    p.write_text('[commands]\nallowlist = []\n')
+    p.write_text("[commands]\nallowlist = []\n")
     persist_allowlist_entry("go vet", p)
     assert current_allowlist(p) == [["go", "vet"]]
 
@@ -183,7 +182,7 @@ def test_persist_seeds_defaults_when_commands_section_absent(tmp_path: Path):
     """First-run behavior: a config with no [commands] section at all gets
     the documented default allowlist plus the approved command."""
     p = tmp_path / "config.toml"
-    p.write_text('[server]\nport = 9000\n')
+    p.write_text("[server]\nport = 9000\n")
     persist_allowlist_entry("go vet", p)
     allow = current_allowlist(p)
     assert ["go", "vet"] in allow
@@ -196,7 +195,7 @@ def test_persist_seeds_defaults_when_allowlist_key_absent(tmp_path: Path):
     created for the first time, so the defaults are seeded (same first-run
     rationale as a missing section)."""
     p = tmp_path / "config.toml"
-    p.write_text('[commands]\ntimeout_seconds = 60\n')
+    p.write_text("[commands]\ntimeout_seconds = 60\n")
     persist_allowlist_entry("go vet", p)
     allow = current_allowlist(p)
     assert ["go", "vet"] in allow

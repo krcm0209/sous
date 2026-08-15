@@ -28,8 +28,12 @@ def test_plist_escapes_xml_special_characters():
 def test_status_reports_not_running(tmp_path, capsys, monkeypatch):
     from sous import cli
     from sous.config import SousConfig
-    cfg = SousConfig(server_port=1, data_dir=tmp_path,  # port 1: never listening
-                     config_path=tmp_path / "c.toml")
+
+    cfg = SousConfig(
+        server_port=1,
+        data_dir=tmp_path,  # port 1: never listening
+        config_path=tmp_path / "c.toml",
+    )
     monkeypatch.setattr(cli, "load_config", lambda: cfg)
     cli.main(["status"])
     out = capsys.readouterr().out

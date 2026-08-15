@@ -3,8 +3,14 @@ import pytest
 from sous.protocol import WORKER_TOOLS, ParseError, ToolCall, parse_tool_calls
 
 EXPECTED_TOOLS = {
-    "read_file", "write_file", "edit_file", "list_dir",
-    "glob", "grep", "run_command", "finish",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_dir",
+    "glob",
+    "grep",
+    "run_command",
+    "finish",
 }
 
 
@@ -58,7 +64,10 @@ def test_missing_name_raises():
 
 def test_write_file_with_closing_tag_in_content():
     """write_file whose content contains the literal </tool_call> substring."""
-    text = '<tool_call>{"name": "write_file", "arguments": {"path": "a.txt", "content": "abc</tool_call>def"}}</tool_call>'
+    text = (
+        '<tool_call>{"name": "write_file", "arguments": '
+        '{"path": "a.txt", "content": "abc</tool_call>def"}}</tool_call>'
+    )
     [call] = parse_tool_calls(text)
     assert call.name == "write_file"
     assert call.arguments["content"] == "abc</tool_call>def"
@@ -67,7 +76,8 @@ def test_write_file_with_closing_tag_in_content():
 def test_two_calls_first_with_closing_tag_in_arguments():
     """Two adjacent calls where the first has </tool_call> in its arguments."""
     text = (
-        '<tool_call>{"name": "edit_file", "arguments": {"path": "x.py", "old": "foo</tool_call>", "new": "bar"}}</tool_call>'
+        '<tool_call>{"name": "edit_file", "arguments": '
+        '{"path": "x.py", "old": "foo</tool_call>", "new": "bar"}}</tool_call>'
         '<tool_call>{"name": "read_file", "arguments": {"path": "y.py"}}</tool_call>'
     )
     calls = parse_tool_calls(text)
@@ -79,7 +89,10 @@ def test_two_calls_first_with_closing_tag_in_arguments():
 
 def test_write_file_with_opening_tag_in_content():
     """write_file whose content contains the literal <tool_call> substring."""
-    text = '<tool_call>{"name": "write_file", "arguments": {"path": "a.txt", "content": "prefix <tool_call> suffix"}}</tool_call>'
+    text = (
+        '<tool_call>{"name": "write_file", "arguments": '
+        '{"path": "a.txt", "content": "prefix <tool_call> suffix"}}</tool_call>'
+    )
     [call] = parse_tool_calls(text)
     assert call.name == "write_file"
     assert call.arguments["content"] == "prefix <tool_call> suffix"
@@ -87,7 +100,10 @@ def test_write_file_with_opening_tag_in_content():
 
 def test_call_with_both_opening_and_closing_tags_in_content():
     """Call whose content contains both <tool_call> and </tool_call> substrings."""
-    text = '<tool_call>{"name": "write_file", "arguments": {"path": "test.txt", "content": "start <tool_call>data</tool_call> end"}}</tool_call>'
+    text = (
+        '<tool_call>{"name": "write_file", "arguments": '
+        '{"path": "test.txt", "content": "start <tool_call>data</tool_call> end"}}</tool_call>'
+    )
     [call] = parse_tool_calls(text)
     assert call.name == "write_file"
     assert call.arguments["content"] == "start <tool_call>data</tool_call> end"
@@ -96,7 +112,8 @@ def test_call_with_both_opening_and_closing_tags_in_content():
 def test_two_calls_first_with_opening_tag_in_arguments():
     """Two adjacent calls where the first has <tool_call> in its arguments."""
     text = (
-        '<tool_call>{"name": "edit_file", "arguments": {"path": "x.py", "old": "foo <tool_call> bar", "new": "baz"}}</tool_call>'
+        '<tool_call>{"name": "edit_file", "arguments": '
+        '{"path": "x.py", "old": "foo <tool_call> bar", "new": "baz"}}</tool_call>'
         '<tool_call>{"name": "read_file", "arguments": {"path": "y.py"}}</tool_call>'
     )
     calls = parse_tool_calls(text)
@@ -141,8 +158,7 @@ def test_xml_real_model_fixture_parses():
     lines intact, only the template's single wrapping newlines removed)."""
     calls = parse_tool_calls(QWEN_XML_REAL)
     assert calls == [
-        ToolCall("write_file", {"path": "/tmp/x/shapes.py",
-                                "content": QWEN_XML_REAL_CONTENT})
+        ToolCall("write_file", {"path": "/tmp/x/shapes.py", "content": QWEN_XML_REAL_CONTENT})
     ]
 
 
@@ -215,8 +231,7 @@ def test_mixed_json_and_xml_calls_both_parse():
         "<tool_call>\n<function=list_dir>\n</function>\n</tool_call>"
     )
     calls = parse_tool_calls(text)
-    assert calls == [ToolCall("read_file", {"path": "a.py"}),
-                     ToolCall("list_dir", {})]
+    assert calls == [ToolCall("read_file", {"path": "a.py"}), ToolCall("list_dir", {})]
 
 
 def test_xml_unknown_tool_raises():
