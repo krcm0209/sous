@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import shlex
+import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,6 +107,37 @@ def _truncate(text: str) -> str:
     if len(text) > MAX_TOOL_OUTPUT:
         return text[:MAX_TOOL_OUTPUT] + "\n[truncated]"
     return text
+
+
+_KILL_GRACE_SECONDS = 2.0
+
+
+def _kill_process_group(pgid: int, proc: subprocess.Popen) -> None:
+    """Kill a timed-out command's entire process group with escalation:
+    SIGTERM first (so well-behaved test runners can clean up), a short grace
+    period, then SIGKILL for whatever is left. Reaps the direct child.
+    ProcessLookupError means the group is already gone — not an error."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        # Grace period. communicate() also drains the pipes, which reach EOF
+        # only once every group member holding them has died.
+        proc.communicate(timeout=_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        # Reap the direct child. wait(), not communicate(): a descendant that
+        # escaped into its own session may still hold the stdout pipe open,
+        # and communicate() would block on it forever; waitpid() cannot.
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 class ToolExecutor:
@@ -254,6 +286,15 @@ class ToolExecutor:
                     timeout: int = 120) -> str:
         """Run a command with allowlist checking and optional approval hook.
 
+        The command runs in its own session/process group (setsid), and on
+        timeout the WHOLE group is killed — SIGTERM, a short grace, SIGKILL —
+        before changes are recorded, so descendants spawned by test runners
+        (pytest-xdist workers, npm's node, make's compilers) cannot keep
+        running and mutating files after the timeout and audit. Best-effort,
+        not a guarantee: a descendant that double-forks and calls setsid()
+        itself escapes into a new session the group kill cannot reach (not
+        closable without OS-level confinement macOS doesn't offer).
+
         Args:
             command: Command string to parse and execute
             approval: Optional approval hook to override allowlist check
@@ -273,16 +314,31 @@ class ToolExecutor:
                 return f"command denied (not allowlisted): {command}"
         before_snap = self._tree_snapshot()
         try:
-            proc = subprocess.run(
+            # start_new_session: the child becomes a session/process-group
+            # leader, so a timeout can kill its whole descendant tree, not
+            # just the direct child. stdin=DEVNULL: a non-interactive worker
+            # must never block on input, and a session leader has no
+            # controlling terminal for inherited TTY stdin to make sense.
+            proc = subprocess.Popen(
                 argv, shell=False, cwd=self.project_root, env=scrubbed_env(),
-                capture_output=True, text=True, timeout=timeout,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, start_new_session=True,
             )
+        except FileNotFoundError:
+            return f"command not found: {argv[0]}"
+        # Capture the group id while the child is certainly un-reaped (it may
+        # have exited, but stays a zombie until communicate()/wait() below).
+        pgid = os.getpgid(proc.pid)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
+            # Kill the whole group FIRST, then record: snapshotting while
+            # descendants are still alive would let them modify files after
+            # the audit.
+            _kill_process_group(pgid, proc)
             # A timed-out command may already have modified files.
             self._record_command_changes(before_snap)
             return f"command timed out after {timeout}s: {command}"
-        except FileNotFoundError:
-            return f"command not found: {argv[0]}"
         self._record_command_changes(before_snap)
-        out = f"exit code {proc.returncode}\n{proc.stdout}\n{proc.stderr}"
+        out = f"exit code {proc.returncode}\n{stdout}\n{stderr}"
         return _truncate(out)

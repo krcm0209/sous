@@ -104,6 +104,11 @@ still argmaxes to the same wrong output every time.
   still reach the network if the command itself does (e.g. `npm test`
   hitting a registry). Keep the allowlist narrow and review approval
   requests before saying yes.
+- Command timeouts kill the command's whole process group (SIGTERM, short
+  grace, SIGKILL) before file changes are audited — but a descendant that
+  double-forks and calls `setsid()` escapes into a new session and survives
+  the group kill. Closing that residual requires cgroup/OS-level confinement
+  that macOS does not offer.
 - Every worker turn is journaled to `~/.sous/tasks/<id>/transcript.jsonl`.
 - The MCP endpoint binds to 127.0.0.1 only.
 

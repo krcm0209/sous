@@ -1,4 +1,6 @@
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -142,6 +144,60 @@ def test_command_edit_refreshes_stale_hash_of_tracked_file(pyex: ToolExecutor):
     [after] = [c for c in pyex.changed_files() if c.path == "t.txt"]
     assert after.kind == "created"          # original kind survives
     assert after.after_sha != before.after_sha  # hash refreshed
+
+
+# --- timeout must kill the whole process group, not just the direct child ---
+
+@pytest.fixture()
+def shex(tmp_path: Path) -> ToolExecutor:
+    """Executor whose allowlist contains /bin/sh, the stand-in for allowlisted
+    test runners (pytest-xdist, npm test, make) that spawn descendants."""
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = tmp_path / "sous-home" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text('[commands]\nallowlist = ["/bin/sh"]\n')
+    return ToolExecutor(root, cfg)
+
+
+@pytest.mark.slow
+def test_timeout_kills_descendants_before_recording(shex: ToolExecutor):
+    """A descendant that would outlive the timeout must not be able to write
+    files after run_command has returned and recorded changes. Real processes
+    on purpose: the bug is OS process-tree behavior, unmockable."""
+    out = shex.run_command(
+        '/bin/sh -c "(sleep 3; echo pwned > late.txt) & sleep 10"', timeout=1)
+    assert "timed out" in out
+    # Sleep past when the orphaned descendant would have fired (t=3s from
+    # command start; we are at ~t=1s). If the group kill worked, nothing
+    # is left alive to write late.txt.
+    time.sleep(4)
+    assert not (shex.project_root / "late.txt").exists()
+    assert all(c.path != "late.txt" for c in shex.changed_files())
+
+
+@pytest.mark.slow
+def test_timeout_group_kill_leaves_no_survivors(shex: ToolExecutor):
+    """A descendant the group kill can reach must actually be dead after the
+    call returns (not merely orphaned and still running)."""
+    out = shex.run_command(
+        '/bin/sh -c "sleep 30 & echo $! > child.pid; sleep 10"', timeout=1)
+    assert "timed out" in out
+    pid = int((shex.project_root / "child.pid").read_text())
+    # The backgrounded sleep was in the child's process group; after the
+    # escalated group kill it must no longer exist. Allow a moment for
+    # launchd to reap the reparented orphan.
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail(f"descendant {pid} survived the process-group kill")
+    # child.pid was written before the timeout: the audit must still see it.
+    assert any(c.path == "child.pid" for c in shex.changed_files())
 
 
 def test_command_changes_in_git_dir_not_recorded(pyex: ToolExecutor):

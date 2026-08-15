@@ -31,4 +31,7 @@ sous = "sous.cli:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-markers = ["model: needs a real MLX model downloaded (manual/local only)"]
+markers = [
+    "model: needs a real MLX model downloaded (manual/local only)",
+    "slow: takes several seconds of real wall-clock (process-group kill tests)",
+]
