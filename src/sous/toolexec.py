@@ -18,17 +18,14 @@ def resolve_confined(project_root: Path, candidate: str, for_write: bool) -> Pat
     root = project_root.resolve()
     raw = Path(candidate)
     joined = raw if raw.is_absolute() else root / raw
-    # Resolve the deepest existing ancestor so symlinks can't smuggle us out,
-    # while still allowing writes to not-yet-existing files.
-    probe = joined
-    while not probe.exists() and probe != probe.parent:
-        probe = probe.parent
-    resolved_ancestor = probe.resolve()
-    resolved = resolved_ancestor / joined.relative_to(probe) if probe != joined else resolved_ancestor
+    # .resolve() collapses ".." AND resolves symlinks in existing
+    # components, for existing and non-existent paths alike (strict=False
+    # is the default). This is what closes the unresolved-tail hole.
+    resolved = joined.resolve()
     if not resolved.is_relative_to(root):
         raise PathViolation(f"path escapes project root: {candidate}")
     rel = resolved.relative_to(root)
-    if for_write and rel.parts and rel.parts[0] == ".git":
+    if for_write and any(part.lower() == ".git" for part in rel.parts):
         raise PathViolation("writes into .git/ are not allowed")
     return resolved
 

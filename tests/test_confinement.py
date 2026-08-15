@@ -60,6 +60,42 @@ def test_prefix_sibling_denied(root: Path, tmp_path: Path):
         resolve_confined(root, str(tmp_path / "projX" / "f.txt"), False)
 
 
+# --- adversarial tests: confirmed exploits ---
+
+def test_dotdot_in_unresolved_tail_denied(ex: ToolExecutor, tmp_path: Path):
+    """C1: x/../../pwned.txt escapes via unresolved tail."""
+    with pytest.raises(PathViolation):
+        ex.write_file("x/../../pwned.txt", "X")
+    # Verify no file was created outside root
+    assert not (tmp_path / "pwned.txt").exists()
+
+def test_dotdot_before_git_denied(root: Path):
+    """C2: q/../.git/hooks/pre-commit bypasses first-part check."""
+    with pytest.raises(PathViolation):
+        resolve_confined(root, "q/../.git/hooks/pre-commit", for_write=True)
+
+def test_git_case_insensitive_write_denied(root: Path):
+    """C3: .GIT (uppercase) bypasses exact string match on case-insensitive FS."""
+    with pytest.raises(PathViolation):
+        resolve_confined(root, ".GIT/hooks/evil", for_write=True)
+
+def test_nested_git_write_denied(root: Path):
+    """I4: sub/.git/hooks/x (nested at any depth) must be rejected."""
+    with pytest.raises(PathViolation):
+        resolve_confined(root, "sub/.git/hooks/x", for_write=True)
+
+def test_symlinked_parent_escape_denied(ex: ToolExecutor, tmp_path: Path):
+    """Symlinked parent dir pointing outside, with non-existent tail."""
+    os.symlink(tmp_path, ex.project_root / "out")
+    with pytest.raises(PathViolation):
+        ex.write_file("out/newfile.txt", "X")
+
+def test_git_read_still_allowed(root: Path):
+    """.git/config read is allowed (only writes are blocked)."""
+    result = resolve_confined(root, ".git/config", for_write=False)
+    assert result.exists()
+
+
 # --- file tools ---
 
 def test_read_file_line_numbers(ex: ToolExecutor):
