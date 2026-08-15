@@ -112,6 +112,23 @@ still argmaxes to the same wrong output every time.
 - Every worker turn is journaled to `~/.sous/tasks/<id>/transcript.jsonl`.
 - The MCP endpoint binds to 127.0.0.1 only.
 
+## Validation status
+
+Validated end to end against the default model
+(`mlx-community/Qwen3.8-27B-mxfp8`) on an M5 Pro / 64 GB:
+
+- **Worker path** — a delegated "add type hints and docstrings" task completed
+  in 57s over 3 turns (`done` / `completed`). The worker edited the file, chose
+  to run `pytest` to check itself, and reported accurately; an independent
+  re-run of the tests confirmed it.
+- **MCP surface** — driven by a real MCP client over streamable HTTP, the same
+  path Claude Code uses: all six tools registered with the expected names, and
+  a delegated task ran to `done` / `completed` in 42s with a correct diff and
+  verify output.
+
+Tool-call parsing accepts both the XML-ish `<function=…>/<parameter=…>` format
+that Qwen3 emits and the hermes JSON format used by other MLX models.
+
 ## Limitations
 
 - MLX generation cannot be aborted mid-stream. Generations are serialized by
@@ -119,6 +136,11 @@ still argmaxes to the same wrong output every time.
   flight), so a truly wedged generation delays subsequent tasks until the
   daemon is restarted. Running the worker in a separate process (process
   isolation) is the future fix.
+- `scripts/e2e_smoke.py` uses a 0.6B model so it stays cheap to run. That model
+  is too small to reliably emit a `finish` call, so the script usually ends
+  `failed` or `budget-exhausted` even when it writes the right file — it
+  exercises the plumbing, not model competence. The real-model runs above are
+  the meaningful end-to-end evidence.
 
 ## Development
 
