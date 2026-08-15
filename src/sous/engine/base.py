@@ -5,13 +5,18 @@ from __future__ import annotations
 import json
 import threading
 import time
-from typing import Callable, Protocol
+from collections.abc import Callable
+from typing import Protocol
 
 from sous.config import SousConfig
 
 
 class Engine(Protocol):
-    model_id: str
+    # Read-only: ManagedEngine exposes model_id as a property delegating to its
+    # inner engine. A plain `model_id: str` attribute would demand a settable
+    # one and exclude it from the protocol.
+    @property
+    def model_id(self) -> str: ...
 
     def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str: ...
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int: ...
@@ -34,13 +39,16 @@ def fetch_model_config(model_id: str) -> dict:
         return json.load(f)
 
 
-def _default_factory(model_id: str, temperature: float = 0.7,
-                     top_p: float = 0.8, top_k: int = 20) -> Engine:
+def _default_factory(
+    model_id: str, temperature: float = 0.7, top_p: float = 0.8, top_k: int = 20
+) -> Engine:
     backend = select_backend(fetch_model_config(model_id))
     if backend == "vlm":
         from sous.engine.vlm import VLMEngine
+
         return VLMEngine(model_id, temperature=temperature, top_p=top_p, top_k=top_k)
     from sous.engine.lm import LMEngine
+
     return LMEngine(model_id, temperature=temperature, top_p=top_p, top_k=top_k)
 
 
@@ -77,12 +85,14 @@ class ManagedEngine:
 
 
 class EngineManager:
-    def __init__(self, config: SousConfig,
-                 engine_factory: Callable[[str], Engine] | None = None):
+    def __init__(self, config: SousConfig, engine_factory: Callable[[str], Engine] | None = None):
         self._config = config
         self._factory = engine_factory or (
             lambda model_id: _default_factory(
-                model_id, config.temperature, config.top_p, config.top_k,
+                model_id,
+                config.temperature,
+                config.top_p,
+                config.top_k,
             )
         )
         self._lock = threading.Lock()

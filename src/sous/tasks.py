@@ -67,13 +67,18 @@ class Task:
 
 def _row_to_task(row: sqlite3.Row) -> Task:
     return Task(
-        id=row["id"], title=row["title"], instructions=row["instructions"],
+        id=row["id"],
+        title=row["title"],
+        instructions=row["instructions"],
         project_root=row["project_root"],
         context_files=json.loads(row["context_files"]),
         verify_commands=json.loads(row["verify_commands"]),
-        state=row["state"], outcome=row["outcome"],
-        created_at=row["created_at"], started_at=row["started_at"],
-        finished_at=row["finished_at"], last_activity=row["last_activity"],
+        state=row["state"],
+        outcome=row["outcome"],
+        created_at=row["created_at"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        last_activity=row["last_activity"],
         turns_used=row["turns_used"],
         report=json.loads(row["report"]) if row["report"] else None,
         pending_command=row["pending_command"],
@@ -99,19 +104,34 @@ class TaskStore:
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
-    def enqueue(self, title: str, instructions: str, project_root: str,
-                context_files: list[str], verify_commands: list[str]) -> Task:
+    def enqueue(
+        self,
+        title: str,
+        instructions: str,
+        project_root: str,
+        context_files: list[str],
+        verify_commands: list[str],
+    ) -> Task:
         task_id = uuid.uuid4().hex[:12]
         with self._conn() as c:
             c.execute(
                 "INSERT INTO tasks (id, title, instructions, project_root,"
                 " context_files, verify_commands, state, created_at)"
                 " VALUES (?,?,?,?,?,?,?,?)",
-                (task_id, title, instructions, project_root,
-                 json.dumps(context_files), json.dumps(verify_commands),
-                 TaskState.QUEUED, time.time()),
+                (
+                    task_id,
+                    title,
+                    instructions,
+                    project_root,
+                    json.dumps(context_files),
+                    json.dumps(verify_commands),
+                    TaskState.QUEUED,
+                    time.time(),
+                ),
             )
-        return self.get(task_id)
+        task = self.get(task_id)
+        assert task is not None  # just inserted in the transaction above
+        return task
 
     def get(self, task_id: str) -> Task | None:
         with self._conn() as c:
@@ -122,9 +142,7 @@ class TaskStore:
         """Aggregate task counts per state over ALL rows — queue depth must
         never be derived from a LIMITed listing."""
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT state, COUNT(*) AS n FROM tasks GROUP BY state"
-            ).fetchall()
+            rows = c.execute("SELECT state, COUNT(*) AS n FROM tasks GROUP BY state").fetchall()
         return {r["state"]: r["n"] for r in rows}
 
     def list_recent(self, limit: int = 20) -> list[Task]:
@@ -167,14 +185,12 @@ class TaskStore:
         cannot hide which files the task already touched (recover_interrupted
         reads this back into the failure report)."""
         with self._conn() as c:
-            c.execute("UPDATE tasks SET changed_files=? WHERE id=?",
-                      (json.dumps(files), task_id))
+            c.execute("UPDATE tasks SET changed_files=? WHERE id=?", (json.dumps(files), task_id))
 
     def request_approval(self, task_id: str, command: str) -> None:
         with self._conn() as c:
             c.execute(
-                "UPDATE tasks SET state=?, pending_command=?, approval_response=NULL"
-                " WHERE id=?",
+                "UPDATE tasks SET state=?, pending_command=?, approval_response=NULL WHERE id=?",
                 (TaskState.AWAITING_APPROVAL, command, task_id),
             )
 
@@ -187,21 +203,17 @@ class TaskStore:
             cur = c.execute(
                 "UPDATE tasks SET approval_response=? WHERE id=? AND state=?"
                 " AND approval_response IS NULL",
-                ("approved" if approve else "denied", task_id,
-                 TaskState.AWAITING_APPROVAL),
+                ("approved" if approve else "denied", task_id, TaskState.AWAITING_APPROVAL),
             )
             return cur.rowcount == 1
 
     def poll_approval(self, task_id: str) -> str | None:
         with self._conn() as c:
-            row = c.execute(
-                "SELECT approval_response FROM tasks WHERE id=?", (task_id,)
-            ).fetchone()
+            row = c.execute("SELECT approval_response FROM tasks WHERE id=?", (task_id,)).fetchone()
             if row is None or row["approval_response"] is None:
                 return None
             c.execute(
-                "UPDATE tasks SET state=?, pending_command=NULL,"
-                " approval_response=NULL WHERE id=?",
+                "UPDATE tasks SET state=?, pending_command=NULL, approval_response=NULL WHERE id=?",
                 (TaskState.RUNNING, task_id),
             )
             return row["approval_response"]
@@ -220,8 +232,7 @@ class TaskStore:
     def _end(self, task_id: str, state: str, outcome: str | None, report: dict) -> None:
         with self._conn() as c:
             c.execute(
-                "UPDATE tasks SET state=?, outcome=?, report=?, finished_at=?"
-                " WHERE id=?",
+                "UPDATE tasks SET state=?, outcome=?, report=?, finished_at=? WHERE id=?",
                 (state, outcome, json.dumps(report), time.time(), task_id),
             )
 
@@ -230,8 +241,7 @@ class TaskStore:
             # Try to cancel if queued (atomic transition with state guard)
             cur = c.execute(
                 "UPDATE tasks SET state=?, report=?, finished_at=? WHERE id=? AND state=?",
-                (TaskState.CANCELLED, json.dumps({}), time.time(), task_id,
-                 TaskState.QUEUED),
+                (TaskState.CANCELLED, json.dumps({}), time.time(), task_id, TaskState.QUEUED),
             )
             if cur.rowcount == 1:
                 return True
@@ -242,17 +252,14 @@ class TaskStore:
             # task flagged and cancel() returning True, contrary to the
             # finished-task contract (mirrors the atomic queued path above).
             cur = c.execute(
-                "UPDATE tasks SET cancel_requested=1"
-                " WHERE id=? AND state NOT IN (?,?,?)",
+                "UPDATE tasks SET cancel_requested=1 WHERE id=? AND state NOT IN (?,?,?)",
                 (task_id, *FINISHED_STATES),
             )
             return cur.rowcount == 1
 
     def is_cancel_requested(self, task_id: str) -> bool:
         with self._conn() as c:
-            row = c.execute(
-                "SELECT cancel_requested FROM tasks WHERE id=?", (task_id,)
-            ).fetchone()
+            row = c.execute("SELECT cancel_requested FROM tasks WHERE id=?", (task_id,)).fetchone()
         return bool(row and row["cancel_requested"])
 
     def recover_interrupted(self, data_dir: Path | None = None) -> int:
@@ -268,12 +275,14 @@ class TaskStore:
             for row in rows:
                 report: dict = {
                     "error": "interrupted by daemon restart",
-                    "files_changed": (json.loads(row["changed_files"])
-                                      if row["changed_files"] else []),
+                    "files_changed": (
+                        json.loads(row["changed_files"]) if row["changed_files"] else []
+                    ),
                 }
                 if data_dir is not None:
                     report["transcript_path"] = str(
-                        Path(data_dir) / "tasks" / row["id"] / "transcript.jsonl")
+                        Path(data_dir) / "tasks" / row["id"] / "transcript.jsonl"
+                    )
                 c.execute(
                     "UPDATE tasks SET state=?, report=?, finished_at=? WHERE id=?",
                     (TaskState.FAILED, json.dumps(report), time.time(), row["id"]),

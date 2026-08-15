@@ -39,34 +39,66 @@ def _tool(name: str, description: str, properties: dict, required: list[str]) ->
 
 
 WORKER_TOOLS: list[dict] = [
-    _tool("read_file", "Read a file (line-numbered). Use offset/limit for large files.",
-          {"path": {"type": "string"},
-           "offset": {"type": "integer", "description": "0-based start line"},
-           "limit": {"type": "integer", "description": "max lines"}},
-          ["path"]),
-    _tool("write_file", "Create or overwrite a file with the given content.",
-          {"path": {"type": "string"}, "content": {"type": "string"}},
-          ["path", "content"]),
-    _tool("edit_file", "Replace one exact, unique occurrence of `old` with `new`.",
-          {"path": {"type": "string"}, "old": {"type": "string"},
-           "new": {"type": "string"}},
-          ["path", "old", "new"]),
-    _tool("list_dir", "List one directory's entries.",
-          {"path": {"type": "string", "description": "default: project root"}}, []),
-    _tool("glob", "Find files by glob pattern, e.g. **/*.py",
-          {"pattern": {"type": "string"}}, ["pattern"]),
-    _tool("grep", "Regex-search file contents. Returns path:line:text hits.",
-          {"pattern": {"type": "string"},
-           "glob_pattern": {"type": "string", "description": "default **/*"}},
-          ["pattern"]),
-    _tool("run_command", "Run a verification command (tests/linter/formatter). "
-          "Only allowlisted commands run; others need human approval, which may "
-          "take a while or be denied — continue without it if denied.",
-          {"command": {"type": "string"}}, ["command"]),
-    _tool("finish", "Declare the task complete and report what you did.",
-          {"summary": {"type": "string", "description": "what was done and why"},
-           "concerns": {"type": "string", "description": "doubts, TODOs, risks"}},
-          ["summary"]),
+    _tool(
+        "read_file",
+        "Read a file (line-numbered). Use offset/limit for large files.",
+        {
+            "path": {"type": "string"},
+            "offset": {"type": "integer", "description": "0-based start line"},
+            "limit": {"type": "integer", "description": "max lines"},
+        },
+        ["path"],
+    ),
+    _tool(
+        "write_file",
+        "Create or overwrite a file with the given content.",
+        {"path": {"type": "string"}, "content": {"type": "string"}},
+        ["path", "content"],
+    ),
+    _tool(
+        "edit_file",
+        "Replace one exact, unique occurrence of `old` with `new`.",
+        {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}},
+        ["path", "old", "new"],
+    ),
+    _tool(
+        "list_dir",
+        "List one directory's entries.",
+        {"path": {"type": "string", "description": "default: project root"}},
+        [],
+    ),
+    _tool(
+        "glob",
+        "Find files by glob pattern, e.g. **/*.py",
+        {"pattern": {"type": "string"}},
+        ["pattern"],
+    ),
+    _tool(
+        "grep",
+        "Regex-search file contents. Returns path:line:text hits.",
+        {
+            "pattern": {"type": "string"},
+            "glob_pattern": {"type": "string", "description": "default **/*"},
+        },
+        ["pattern"],
+    ),
+    _tool(
+        "run_command",
+        "Run a verification command (tests/linter/formatter). "
+        "Only allowlisted commands run; others need human approval, which may "
+        "take a while or be denied — continue without it if denied.",
+        {"command": {"type": "string"}},
+        ["command"],
+    ),
+    _tool(
+        "finish",
+        "Declare the task complete and report what you did.",
+        {
+            "summary": {"type": "string", "description": "what was done and why"},
+            "concerns": {"type": "string", "description": "doubts, TODOs, risks"},
+        },
+        ["summary"],
+    ),
 ]
 
 TOOL_NAMES = {t["function"]["name"] for t in WORKER_TOOLS}
@@ -89,6 +121,17 @@ _WS_RE = re.compile(r"\s*")
 _DECODER = json.JSONDecoder()
 
 
+def _skip_ws(text: str, pos: int) -> int:
+    """Index of the first non-whitespace char at or after `pos`.
+
+    `\\s*` matches at every position (possibly zero-width), so the match can
+    never be None — the check is here to make that invariant checkable rather
+    than assumed."""
+    match = _WS_RE.match(text, pos)
+    assert match is not None
+    return match.end()
+
+
 class ParseError(Exception):
     pass
 
@@ -104,7 +147,7 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
     pos = 0
     while (match := _OPEN_RE.search(text, pos)) is not None:
         start = match.end()
-        first = text[start:start + 1]
+        first = text[start : start + 1]
         if first == "{":
             call, pos = _parse_json_call(text, start)
         elif first == "<":
@@ -112,7 +155,7 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
         else:
             raise ParseError(
                 "tool_call must contain a JSON object or a <function=...> "
-                f"block, got {text[start:start + 20]!r}"
+                f"block, got {text[start : start + 20]!r}"
             )
         calls.append(call)
     return calls
@@ -152,24 +195,22 @@ def _parse_xml_call(text: str, start: int) -> tuple[ToolCall, int]:
     arguments: dict = {}
     pos = fn.end()
     while True:
-        pos = _WS_RE.match(text, pos).end()
+        pos = _skip_ws(text, pos)
         param = _PARAM_RE.match(text, pos)
         if param is not None:
             key = param.group(1)
             close = text.find("</parameter>", param.end())
             if close == -1:
                 raise ParseError(f"unterminated <parameter={key}> block")
-            raw = _strip_wrapping_newlines(text[param.end():close])
+            raw = _strip_wrapping_newlines(text[param.end() : close])
             arguments[key] = _coerce(name, key, param_types.get(key, "string"), raw)
             pos = close + len("</parameter>")
         elif text.startswith("</function>", pos):
             pos += len("</function>")
             break
         else:
-            raise ParseError(
-                f"expected <parameter=KEY> or </function> in {name} tool_call"
-            )
-    after = _WS_RE.match(text, pos).end()
+            raise ParseError(f"expected <parameter=KEY> or </function> in {name} tool_call")
+    after = _skip_ws(text, pos)
     if text.startswith("</tool_call>", after):
         pos = after + len("</tool_call>")
     return ToolCall(name, arguments), pos
@@ -209,14 +250,10 @@ def _coerce(tool: str, key: str, typ: str, raw: str):
             return True
         if lowered == "false":
             return False
-        raise ParseError(
-            f"parameter {key!r} of {tool} must be a boolean, got {raw!r}"
-        )
+        raise ParseError(f"parameter {key!r} of {tool} must be a boolean, got {raw!r}")
     if typ == "number":
         try:
             return float(raw.strip())
         except ValueError:
-            raise ParseError(
-                f"parameter {key!r} of {tool} must be a number, got {raw!r}"
-            ) from None
+            raise ParseError(f"parameter {key!r} of {tool} must be a number, got {raw!r}") from None
     return raw

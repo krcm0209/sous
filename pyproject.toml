@@ -23,6 +23,8 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=1.4.0",
     "pyyaml>=6.0.3",
+    "ruff>=0.16.3",
+    "ty>=0.0.72",
 ]
 
 [project.scripts]
@@ -35,3 +37,24 @@ markers = [
     "model: needs a real MLX model downloaded (manual/local only)",
     "slow: takes several seconds of real wall-clock (process-group kill tests)",
 ]
+
+[tool.ruff]
+line-length = 100
+# target-version is inferred from project.requires-python
+# docs/ holds the design spec and implementation plan: point-in-time records of
+# what was decided, not live source. Ruff formats Python inside their fenced
+# code blocks, which would rewrite history for no benefit.
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+]
+
+[tool.ty.environment]
+python-version = "3.14"

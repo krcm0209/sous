@@ -4,8 +4,9 @@ from __future__ import annotations
 
 
 class VLMEngine:
-    def __init__(self, model_id: str, temperature: float = 0.7,
-                top_p: float = 0.8, top_k: int = 20):
+    def __init__(
+        self, model_id: str, temperature: float = 0.7, top_p: float = 0.8, top_k: int = 20
+    ):
         from mlx_vlm import load
         from mlx_vlm.sample_utils import make_sampler
 
@@ -13,26 +14,44 @@ class VLMEngine:
         self._model, self._processor = load(model_id)
         self._sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
 
+    def _loaded(self) -> tuple:
+        """The (model, processor) pair, or a clear error if already unloaded.
+        Same rationale as LMEngine._loaded."""
+        if self._model is None or self._processor is None:
+            raise RuntimeError(f"engine for {self.model_id} has been unloaded")
+        return self._model, self._processor
+
     @property
     def _tokenizer(self):
-        return getattr(self._processor, "tokenizer", self._processor)
+        # Via _loaded() so the _prompt/count_tokens paths raise the same named
+        # RuntimeError after unload() — reading _processor directly would hand
+        # back None and fail later with a bare AttributeError.
+        _, processor = self._loaded()
+        return getattr(processor, "tokenizer", processor)
 
     def _prompt(self, messages: list[dict], tools: list[dict]) -> str:
         # enable_thinking=False: same rationale as LMEngine. Confirmed inert
         # (no-op) for templates such as Qwen2-VL's that don't define the
         # variable — verified empirically, not assumed.
         return self._tokenizer.apply_chat_template(
-            messages, tools=tools, add_generation_prompt=True, tokenize=False,
+            messages,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=False,
             enable_thinking=False,
         )
 
     def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:
         from mlx_vlm import generate
 
+        model, processor = self._loaded()
         result = generate(
-            self._model, self._processor,
+            model,
+            processor,
             self._prompt(messages, tools),
-            max_tokens=max_tokens, sampler=self._sampler, verbose=False,
+            max_tokens=max_tokens,
+            sampler=self._sampler,
+            verbose=False,
         )
         # mlx-vlm returns GenerationResult in recent versions; older return str
         return result.text if hasattr(result, "text") else str(result)
@@ -43,7 +62,8 @@ class VLMEngine:
     def unload(self) -> None:
         import gc
 
-        import mlx.core as mx
+        # mlx.core is a compiled extension with no type stubs.
+        import mlx.core as mx  # ty: ignore[unresolved-import]
 
         self._model = None
         self._processor = None

@@ -104,8 +104,7 @@ def test_delegate_unparseable_verify_command_returns_error(svc):
     """C4: an unmatched quote in a client-supplied verify_command must come
     back as a structured error, not raise ValueError out of the service."""
     service, _, root = svc
-    out = service.delegate_task("t", "x", str(root),
-                                verify_commands=['echo "unclosed'])
+    out = service.delegate_task("t", "x", str(root), verify_commands=['echo "unclosed'])
     assert "error" in out and 'echo "unclosed' in out["error"]
 
 
@@ -139,13 +138,15 @@ def test_result_include_diff_from_git(svc, tmp_path: Path):
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     (root / "f.txt").write_text("one\n")
     subprocess.run(["git", "add", "."], cwd=root, check=True)
-    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                    "commit", "-qm", "init"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=root,
+        check=True,
+    )
     (root / "f.txt").write_text("two\n")
     tid = service.delegate_task("t", "x", str(root))["task_id"]
     store.claim_next()
-    store.finish(tid, "completed",
-                 {"summary": "s", "files_changed": [{"path": "f.txt"}]})
+    store.finish(tid, "completed", {"summary": "s", "files_changed": [{"path": "f.txt"}]})
     out = service.task_result(tid, include_diff=True)
     assert "-one" in out["diff"] and "+two" in out["diff"]
 
@@ -161,17 +162,18 @@ def test_result_include_diff_from_git_worktree(svc, tmp_path: Path):
     subprocess.run(["git", "init", "-q"], cwd=main_repo, check=True)
     (main_repo / "f.txt").write_text("one\n")
     subprocess.run(["git", "add", "."], cwd=main_repo, check=True)
-    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                    "commit", "-qm", "init"], cwd=main_repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=main_repo,
+        check=True,
+    )
     worktree = tmp_path / "wt"
-    subprocess.run(["git", "worktree", "add", str(worktree)],
-                    cwd=main_repo, check=True)
+    subprocess.run(["git", "worktree", "add", str(worktree)], cwd=main_repo, check=True)
     assert not (worktree / ".git").is_dir()  # sanity: it's a file, not a dir
     (worktree / "f.txt").write_text("two\n")
     tid = service.delegate_task("t", "x", str(worktree))["task_id"]
     store.claim_next()
-    store.finish(tid, "completed",
-                 {"summary": "s", "files_changed": [{"path": "f.txt"}]})
+    store.finish(tid, "completed", {"summary": "s", "files_changed": [{"path": "f.txt"}]})
     out = service.task_result(tid, include_diff=True)
     assert "-one" in out["diff"] and "+two" in out["diff"]
 
@@ -180,8 +182,11 @@ def _git_repo_with_commit(root: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     (root / "f.txt").write_text("one\n")
     subprocess.run(["git", "add", "."], cwd=root, check=True)
-    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                    "commit", "-qm", "init"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=root,
+        check=True,
+    )
 
 
 def test_result_include_diff_shows_created_untracked_file(svc):
@@ -194,8 +199,7 @@ def test_result_include_diff_shows_created_untracked_file(svc):
     (root / "made.txt").write_text("brand new line\n")  # untracked
     tid = service.delegate_task("t", "x", str(root))["task_id"]
     store.claim_next()
-    store.finish(tid, "completed",
-                 {"summary": "s", "files_changed": [{"path": "made.txt"}]})
+    store.finish(tid, "completed", {"summary": "s", "files_changed": [{"path": "made.txt"}]})
     out = service.task_result(tid, include_diff=True)
     assert out["diff"] is not None
     assert "made.txt" in out["diff"]
@@ -205,13 +209,15 @@ def test_result_include_diff_shows_created_untracked_file(svc):
 def test_result_include_diff_shows_modified_and_created_together(svc):
     service, store, root = svc
     _git_repo_with_commit(root)
-    (root / "f.txt").write_text("two\n")               # modified, tracked
+    (root / "f.txt").write_text("two\n")  # modified, tracked
     (root / "made.txt").write_text("brand new line\n")  # created, untracked
     tid = service.delegate_task("t", "x", str(root))["task_id"]
     store.claim_next()
-    store.finish(tid, "completed",
-                 {"summary": "s",
-                  "files_changed": [{"path": "f.txt"}, {"path": "made.txt"}]})
+    store.finish(
+        tid,
+        "completed",
+        {"summary": "s", "files_changed": [{"path": "f.txt"}, {"path": "made.txt"}]},
+    )
     out = service.task_result(tid, include_diff=True)
     assert "-one" in out["diff"] and "+two" in out["diff"]
     assert "+brand new line" in out["diff"]
@@ -222,8 +228,7 @@ def test_result_include_diff_non_repo_returns_none(svc):
     (root / "made.txt").write_text("brand new line\n")
     tid = service.delegate_task("t", "x", str(root))["task_id"]
     store.claim_next()
-    store.finish(tid, "completed",
-                 {"summary": "s", "files_changed": [{"path": "made.txt"}]})
+    store.finish(tid, "completed", {"summary": "s", "files_changed": [{"path": "made.txt"}]})
     out = service.task_result(tid, include_diff=True)
     assert out["diff"] is None
 
@@ -246,10 +251,10 @@ def test_respond_approves_and_persists(svc):
     tid = service.delegate_task("t", "x", str(root))["task_id"]
     store.claim_next()
     store.request_approval(tid, "go vet ./...")
-    out = service.respond_to_command_request(tid, approve=True,
-                                             persist_to_allowlist=True)
+    out = service.respond_to_command_request(tid, approve=True, persist_to_allowlist=True)
     assert out["ok"] is True
     from sous.config import current_allowlist
+
     assert ["go", "vet", "./..."] in current_allowlist(service.config.config_path)
     assert store.poll_approval(tid) == "approved"
 
@@ -262,13 +267,12 @@ def test_respond_race_does_not_persist_allowlist(svc, monkeypatch):
     store.claim_next()
     store.request_approval(tid, "go vet ./...")
     before = service.config.config_path.read_text()
-    monkeypatch.setattr(store, "respond_approval",
-                        lambda task_id, approve: False)
-    out = service.respond_to_command_request(tid, approve=True,
-                                             persist_to_allowlist=True)
+    monkeypatch.setattr(store, "respond_approval", lambda task_id, approve: False)
+    out = service.respond_to_command_request(tid, approve=True, persist_to_allowlist=True)
     assert out["ok"] is False
     assert service.config.config_path.read_text() == before
     from sous.config import current_allowlist
+
     assert ["go", "vet", "./..."] not in current_allowlist(service.config.config_path)
 
 
@@ -280,8 +284,7 @@ def test_second_respond_cannot_reverse_persisted_approval(svc):
     tid = service.delegate_task("t", "x", str(root))["task_id"]
     store.claim_next()
     store.request_approval(tid, "go vet ./...")
-    first = service.respond_to_command_request(tid, approve=True,
-                                               persist_to_allowlist=True)
+    first = service.respond_to_command_request(tid, approve=True, persist_to_allowlist=True)
     assert first["ok"] is True
     second = service.respond_to_command_request(tid, approve=False)
     assert second["ok"] is False  # first response already landed
@@ -303,8 +306,13 @@ def test_server_status_counts_past_200_tasks(svc):
     active tasks under-reported — the count must cover every row."""
     service, store, root = svc
     for i in range(205):
-        store.enqueue(title=f"t{i}", instructions="x", project_root=str(root),
-                      context_files=[], verify_commands=[])
+        store.enqueue(
+            title=f"t{i}",
+            instructions="x",
+            project_root=str(root),
+            context_files=[],
+            verify_commands=[],
+        )
     store.claim_next()
     s = service.server_status()
     assert s["queue"]["queued"] == 204
@@ -314,10 +322,15 @@ def test_server_status_counts_past_200_tasks(svc):
 def test_create_server_registers_six_tools(svc):
     service, store, root = svc
     from sous.server import create_server
+
     mcp = create_server(store, service.engines, service.config)
     tools = asyncio.run(mcp.list_tools())
     names = {t.name for t in tools}
     assert names == {
-        "delegate_task", "task_status", "task_result",
-        "cancel_task", "respond_to_command_request", "server_status",
+        "delegate_task",
+        "task_status",
+        "task_result",
+        "cancel_task",
+        "respond_to_command_request",
+        "server_status",
     }

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from sous.toolexec import ChangedFile, PathViolation, ToolExecutor, resolve_confined
+from sous.toolexec import PathViolation, ToolExecutor, resolve_confined
 
 
 @pytest.fixture()
@@ -28,34 +28,42 @@ def ex(root: Path, tmp_path: Path) -> ToolExecutor:
 
 # --- resolve_confined: the security core ---
 
+
 def test_relative_path_ok(root: Path):
     assert resolve_confined(root, "src/a.py", False) == root / "src" / "a.py"
+
 
 def test_dotdot_escape_denied(root: Path):
     with pytest.raises(PathViolation):
         resolve_confined(root, "../outside.txt", False)
 
+
 def test_absolute_outside_denied(root: Path, tmp_path: Path):
     with pytest.raises(PathViolation):
         resolve_confined(root, str(tmp_path / "outside.txt"), False)
 
+
 def test_absolute_inside_ok(root: Path):
     assert resolve_confined(root, str(root / "src/a.py"), False).name == "a.py"
+
 
 def test_symlink_escape_denied(root: Path, tmp_path: Path):
     os.symlink(tmp_path / "outside.txt", root / "link.txt")
     with pytest.raises(PathViolation):
         resolve_confined(root, "link.txt", False)
 
+
 def test_symlinked_dir_escape_denied(root: Path, tmp_path: Path):
     os.symlink(tmp_path, root / "updir")
     with pytest.raises(PathViolation):
         resolve_confined(root, "updir/outside.txt", False)
 
+
 def test_git_write_denied_but_read_ok(root: Path):
     with pytest.raises(PathViolation):
         resolve_confined(root, ".git/hooks/pre-commit", True)
     assert resolve_confined(root, ".git/config", False)
+
 
 def test_prefix_sibling_denied(root: Path, tmp_path: Path):
     (tmp_path / "projX").mkdir()
@@ -66,6 +74,7 @@ def test_prefix_sibling_denied(root: Path, tmp_path: Path):
 
 # --- adversarial tests: confirmed exploits ---
 
+
 def test_dotdot_in_unresolved_tail_denied(ex: ToolExecutor, tmp_path: Path):
     """C1: x/../../pwned.txt escapes via unresolved tail."""
     with pytest.raises(PathViolation):
@@ -73,26 +82,31 @@ def test_dotdot_in_unresolved_tail_denied(ex: ToolExecutor, tmp_path: Path):
     # Verify no file was created outside root
     assert not (tmp_path / "pwned.txt").exists()
 
+
 def test_dotdot_before_git_denied(root: Path):
     """C2: q/../.git/hooks/pre-commit bypasses first-part check."""
     with pytest.raises(PathViolation):
         resolve_confined(root, "q/../.git/hooks/pre-commit", for_write=True)
+
 
 def test_git_case_insensitive_write_denied(root: Path):
     """C3: .GIT (uppercase) bypasses exact string match on case-insensitive FS."""
     with pytest.raises(PathViolation):
         resolve_confined(root, ".GIT/hooks/evil", for_write=True)
 
+
 def test_nested_git_write_denied(root: Path):
     """I4: sub/.git/hooks/x (nested at any depth) must be rejected."""
     with pytest.raises(PathViolation):
         resolve_confined(root, "sub/.git/hooks/x", for_write=True)
+
 
 def test_symlinked_parent_escape_denied(ex: ToolExecutor, tmp_path: Path):
     """Symlinked parent dir pointing outside, with non-existent tail."""
     os.symlink(tmp_path, ex.project_root / "out")
     with pytest.raises(PathViolation):
         ex.write_file("out/newfile.txt", "X")
+
 
 def test_git_read_still_allowed(root: Path):
     """.git/config read is allowed (only writes are blocked)."""
@@ -135,6 +149,7 @@ def test_nested_git_symlink_write_denied(tmp_path: Path):
 
 # --- C1: the sous data dir is write-protected inside the sandbox ---
 
+
 @pytest.fixture()
 def home_ex(tmp_path: Path) -> ToolExecutor:
     """Executor whose project root CONTAINS the sous data dir (the $HOME
@@ -172,8 +187,9 @@ def test_data_dir_tasksdb_write_denied(home_ex: ToolExecutor):
 def test_data_dir_transcript_write_denied(home_ex: ToolExecutor):
     with pytest.raises(PathViolation):
         home_ex.write_file(".sous/tasks/x/transcript.jsonl", "[]")
-    assert (home_ex.project_root / ".sous" / "tasks" / "x"
-            / "transcript.jsonl").read_text() == '{"event":"tool"}\n'
+    assert (
+        home_ex.project_root / ".sous" / "tasks" / "x" / "transcript.jsonl"
+    ).read_text() == '{"event":"tool"}\n'
 
 
 def test_data_dir_edit_denied(home_ex: ToolExecutor):
@@ -191,7 +207,6 @@ def test_write_outside_data_dir_still_works(home_ex: ToolExecutor):
 
 
 def test_explicit_data_dir_overrides_default(root: Path, tmp_path: Path):
-    data = tmp_path / "elsewhere-data"
     (root / "sub").mkdir()
     ex = ToolExecutor(root, tmp_path / "config.toml", data_dir=root / "sub")
     with pytest.raises(PathViolation):
@@ -220,14 +235,14 @@ def test_data_dir_case_variant_write_denied(tmp_path: Path):
     real_cfg.write_text('[commands]\nallowlist = ["pytest"]\n')
     before = real_cfg.read_bytes()
     # project_root given with a case variant of the real "home" directory
-    ex = ToolExecutor(tmp_path / "HOME", home / ".sous" / "config.toml",
-                      data_dir=home / ".sous")
+    ex = ToolExecutor(tmp_path / "HOME", home / ".sous" / "config.toml", data_dir=home / ".sous")
     with pytest.raises(PathViolation):
         ex.write_file(".sous/config.toml", '[commands]\nallowlist = ["bash"]\n')
     assert real_cfg.read_bytes() == before  # real file byte-unchanged
 
 
 # --- I1: glob/grep must not read through escaping symlinks ---
+
 
 def test_grep_does_not_follow_escaping_symlink(ex: ToolExecutor, tmp_path: Path):
     (tmp_path / "secret.txt").write_text("TOPSECRET-MARKER")
@@ -253,48 +268,59 @@ def test_grep_skips_escaping_symlinked_dir(ex: ToolExecutor, tmp_path: Path):
 
 # --- file tools ---
 
+
 def test_read_file_line_numbers(ex: ToolExecutor):
     out = ex.read_file("src/a.py")
     assert "1\tx = 1" in out and "2\ty = 2" in out
 
+
 def test_read_offset_limit(ex: ToolExecutor):
     out = ex.read_file("src/a.py", offset=1, limit=1)
     assert "y = 2" in out and "x = 1" not in out
+
 
 def test_write_creates_and_tracks(ex: ToolExecutor):
     ex.write_file("src/new.py", "z = 3\n")
     changes = ex.changed_files()
     assert any(c.path == "src/new.py" and c.kind == "created" for c in changes)
 
+
 def test_write_modify_tracks_before_hash(ex: ToolExecutor):
     ex.write_file("src/a.py", "x = 9\n")
     [c] = [c for c in ex.changed_files() if c.path == "src/a.py"]
     assert c.kind == "modified" and c.before_sha and c.after_sha != c.before_sha
 
+
 def test_edit_exact_unique(ex: ToolExecutor):
     ex.edit_file("src/a.py", "x = 1", "x = 42")
     assert "x = 42" in (ex.project_root / "src/a.py").read_text()
+
 
 def test_edit_nonunique_rejected(ex: ToolExecutor):
     ex.write_file("src/dup.py", "a\na\n")
     out = ex.edit_file("src/dup.py", "a", "b")
     assert "2 matches" in out  # error text, not exception
 
+
 def test_edit_missing_rejected(ex: ToolExecutor):
     out = ex.edit_file("src/a.py", "nope", "x")
     assert "0 matches" in out
+
 
 def test_glob_and_grep(ex: ToolExecutor):
     assert "src/a.py" in ex.glob("**/*.py")
     assert "src/a.py:1" in ex.grep("x = 1")
 
+
 def test_grep_skips_git_dir(ex: ToolExecutor):
     assert ".git" not in ex.grep("core")
+
 
 def test_output_truncated(ex: ToolExecutor):
     ex.write_file("big.txt", "line\n" * 20000)
     out = ex.read_file("big.txt", limit=20000)
     assert len(out) <= 16_000 + len("\n[truncated]") and out.endswith("[truncated]")
+
 
 def test_read_file_window_from_large_file_is_memory_bounded(ex: ToolExecutor):
     """E1: read_file must stream. A small window from a large file must not
@@ -302,6 +328,7 @@ def test_read_file_window_from_large_file_is_memory_bounded(ex: ToolExecutor):
     from 27 MB to 638 MB on a 143 MB file before the fix."""
     import resource
     import sys
+
     big = ex.project_root / "big_stream.txt"
     row = "y" * 90 + "\n"
     with big.open("w") as f:

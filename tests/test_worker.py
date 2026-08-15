@@ -22,16 +22,21 @@ def env(tmp_path: Path):
     cfg = SousConfig(
         data_dir=tmp_path / "sous-data",
         config_path=tmp_path / "config.toml",
-        max_turns=10, max_minutes=1, approval_timeout_minutes=1,
+        max_turns=10,
+        max_minutes=1,
+        approval_timeout_minutes=1,
     )
     store = TaskStore(tmp_path / "tasks.db")
     return root, cfg, store
 
 
 def _start(store: TaskStore, root: Path, verify=(), context=()):
-    t = store.enqueue(
-        title="t", instructions="do the thing", project_root=str(root),
-        context_files=list(context), verify_commands=list(verify),
+    store.enqueue(
+        title="t",
+        instructions="do the thing",
+        project_root=str(root),
+        context_files=list(context),
+        verify_commands=list(verify),
     )
     return store.claim_next()
 
@@ -43,11 +48,12 @@ FINISH = CALL.format(name="finish", args='{"summary": "did it", "concerns": ""}'
 def test_happy_path_write_then_finish(env):
     root, cfg, store = env
     task = _start(store, root)
-    engine = FakeEngine([
-        CALL.format(name="write_file",
-                    args='{"path": "out.txt", "content": "hello"}'),
-        FINISH,
-    ])
+    engine = FakeEngine(
+        [
+            CALL.format(name="write_file", args='{"path": "out.txt", "content": "hello"}'),
+            FINISH,
+        ]
+    )
     run_task(task, store, engine, cfg)
     got = store.get(task.id)
     assert got.state == TaskState.DONE and got.outcome == "completed"
@@ -62,7 +68,7 @@ def test_transcript_is_jsonl(env):
     task = _start(store, root)
     run_task(task, store, FakeEngine([FINISH]), cfg)
     lines = Path(store.get(task.id).report["transcript_path"]).read_text().splitlines()
-    assert all(json.loads(l) for l in lines)
+    assert all(json.loads(line) for line in lines)
     assert len(lines) >= 2  # at least one generation + terminal event
 
 
@@ -88,7 +94,7 @@ def test_budget_exhaustion_by_turns(env):
 def test_three_consecutive_malformed_fails(env):
     root, cfg, store = env
     task = _start(store, root)
-    engine = FakeEngine(['<tool_call>{bad json}</tool_call>'] * 3)
+    engine = FakeEngine(["<tool_call>{bad json}</tool_call>"] * 3)
     run_task(task, store, engine, cfg)
     got = store.get(task.id)
     assert got.state == TaskState.FAILED
@@ -101,13 +107,14 @@ def test_file_written_then_model_confused_still_reports_files_changed(env):
     unreviewed file modification hidden behind a bare {"error": ...}."""
     root, cfg, store = env
     task = _start(store, root)
-    engine = FakeEngine([
-        CALL.format(name="write_file",
-                    args='{"path": "hello.txt", "content": "hello sous"}'),
-        "let me think about this some more with no tool call",
-        "still thinking, no tool call here either",
-        "and a third turn with no tool call at all",
-    ])
+    engine = FakeEngine(
+        [
+            CALL.format(name="write_file", args='{"path": "hello.txt", "content": "hello sous"}'),
+            "let me think about this some more with no tool call",
+            "still thinking, no tool call here either",
+            "and a third turn with no tool call at all",
+        ]
+    )
     run_task(task, store, engine, cfg)
     got = store.get(task.id)
     assert got.state == TaskState.FAILED
@@ -120,13 +127,15 @@ def test_file_written_then_model_confused_still_reports_files_changed(env):
 def test_malformed_then_recovery_resets_counter(env):
     root, cfg, store = env
     task = _start(store, root)
-    engine = FakeEngine([
-        '<tool_call>{bad}</tool_call>',
-        CALL.format(name="list_dir", args="{}"),
-        '<tool_call>{bad}</tool_call>',
-        '<tool_call>{bad}</tool_call>',
-        FINISH,
-    ])
+    engine = FakeEngine(
+        [
+            "<tool_call>{bad}</tool_call>",
+            CALL.format(name="list_dir", args="{}"),
+            "<tool_call>{bad}</tool_call>",
+            "<tool_call>{bad}</tool_call>",
+            FINISH,
+        ]
+    )
     run_task(task, store, engine, cfg)
     assert store.get(task.id).state == TaskState.DONE  # never hit 3 in a row
 
@@ -167,11 +176,12 @@ def test_cancel_after_write_still_reports_files_changed(env):
                 store.cancel(task.id)
             return out
 
-    engine = CancelAfterGen([
-        CALL.format(name="write_file",
-                    args='{"path": "hello.txt", "content": "hello sous"}'),
-        FINISH,
-    ])
+    engine = CancelAfterGen(
+        [
+            CALL.format(name="write_file", args='{"path": "hello.txt", "content": "hello sous"}'),
+            FINISH,
+        ]
+    )
     run_task(task, store, engine, cfg)
     got = store.get(task.id)
     assert got.state == TaskState.CANCELLED
@@ -197,11 +207,12 @@ def test_cancel_between_calls_in_same_turn_stops_before_finish(env):
         store.cancel(task_id)
 
     store.set_activity = cancel_on_activity
-    engine = FakeEngine([
-        CALL.format(name="write_file",
-                    args='{"path": "hello.txt", "content": "hello sous"}')
-        + FINISH,  # both calls in ONE response
-    ])
+    engine = FakeEngine(
+        [
+            CALL.format(name="write_file", args='{"path": "hello.txt", "content": "hello sous"}')
+            + FINISH,  # both calls in ONE response
+        ]
+    )
     run_task(task, store, engine, cfg)
     got = store.get(task.id)
     assert got.state == TaskState.CANCELLED
@@ -225,10 +236,11 @@ def test_restart_recovery_reports_files_changed_and_transcript(env):
                 raise KeyboardInterrupt  # simulates the daemon dying mid-task
             return super().generate(messages, tools, max_tokens)
 
-    engine = DyingEngine([
-        CALL.format(name="write_file",
-                    args='{"path": "hello.txt", "content": "hello sous"}'),
-    ])
+    engine = DyingEngine(
+        [
+            CALL.format(name="write_file", args='{"path": "hello.txt", "content": "hello sous"}'),
+        ]
+    )
     with pytest.raises(KeyboardInterrupt):
         run_task(task, store, engine, cfg)
     assert store.get(task.id).state == TaskState.RUNNING  # left mid-flight
@@ -238,7 +250,8 @@ def test_restart_recovery_reports_files_changed_and_transcript(env):
     assert "restart" in got.report["error"]
     assert got.report["files_changed"][0]["path"] == "hello.txt"
     assert got.report["transcript_path"] == str(
-        cfg.data_dir / "tasks" / task.id / "transcript.jsonl")
+        cfg.data_dir / "tasks" / task.id / "transcript.jsonl"
+    )
 
 
 def test_finish_without_summary_is_retriable_not_completion(env):
@@ -247,20 +260,23 @@ def test_finish_without_summary_is_retriable_not_completion(env):
     the model can retry, never a false 'completed' with an empty report."""
     root, cfg, store = env
     task = _start(store, root)
-    engine = FakeEngine([
-        CALL.format(name="finish", args='{"concerns": "none"}'),  # no summary
-        CALL.format(name="finish", args='{"summary": "   "}'),    # whitespace
-        FINISH,                                                    # proper retry
-    ])
+    engine = FakeEngine(
+        [
+            CALL.format(name="finish", args='{"concerns": "none"}'),  # no summary
+            CALL.format(name="finish", args='{"summary": "   "}'),  # whitespace
+            FINISH,  # proper retry
+        ]
+    )
     run_task(task, store, engine, cfg)
     got = store.get(task.id)
     assert got.state == TaskState.DONE and got.outcome == "completed"
     assert got.report["summary"] == "did it"  # from the proper finish only
     assert len(engine.calls) == 3  # both bad finishes were retried, not fatal
     for turn in (engine.calls[1], engine.calls[2]):
-        assert any("error" in str(m.get("content", "")).lower()
-                   and "summary" in str(m.get("content", ""))
-                   for m in turn)
+        assert any(
+            "error" in str(m.get("content", "")).lower() and "summary" in str(m.get("content", ""))
+            for m in turn
+        )
 
 
 def test_verify_commands_run_and_reported(env):
@@ -276,10 +292,12 @@ def test_verify_commands_run_and_reported(env):
 def test_path_violation_reported_not_fatal(env):
     root, cfg, store = env
     task = _start(store, root)
-    engine = FakeEngine([
-        CALL.format(name="read_file", args='{"path": "../../etc/passwd"}'),
-        FINISH,
-    ])
+    engine = FakeEngine(
+        [
+            CALL.format(name="read_file", args='{"path": "../../etc/passwd"}'),
+            FINISH,
+        ]
+    )
     run_task(task, store, engine, cfg)
     assert store.get(task.id).state == TaskState.DONE
     result_turn = engine.calls[1]
@@ -289,10 +307,12 @@ def test_path_violation_reported_not_fatal(env):
 def test_approval_flow_approved(env):
     root, cfg, store = env
     task = _start(store, root)
-    engine = FakeEngine([
-        CALL.format(name="run_command", args='{"command": "/bin/echo custom"}'),
-        FINISH,
-    ])
+    engine = FakeEngine(
+        [
+            CALL.format(name="run_command", args='{"command": "/bin/echo custom"}'),
+            FINISH,
+        ]
+    )
 
     def approver():
         deadline = time.monotonic() + 10
@@ -317,10 +337,12 @@ def test_approval_flow_approved(env):
 def test_approval_flow_denied(env):
     root, cfg, store = env
     task = _start(store, root)
-    engine = FakeEngine([
-        CALL.format(name="run_command", args='{"command": "/bin/echo custom"}'),
-        FINISH,
-    ])
+    engine = FakeEngine(
+        [
+            CALL.format(name="run_command", args='{"command": "/bin/echo custom"}'),
+            FINISH,
+        ]
+    )
 
     def denier():
         deadline = time.monotonic() + 10
@@ -365,6 +387,7 @@ def test_genuine_stall_with_budget_remaining_fails(env, monkeypatch):
     """C1 (the other side): a stall while wall-clock budget genuinely remains
     is still a failure, not budget exhaustion."""
     import sous.worker as worker_mod
+
     root, cfg, store = env  # max_minutes=1: plenty of budget remains
 
     def stall_immediately(engine, messages, max_tokens, timeout_seconds):
@@ -403,11 +426,13 @@ def test_context_elision_replaces_old_tool_results(env):
     (root / "big.txt").write_text("word " * 4000)
     cfg = dataclasses.replace(cfg, max_context_tokens=1500)
     task = _start(store, root)
-    engine = FakeEngine([
-        CALL.format(name="read_file", args='{"path": "big.txt"}'),
-        CALL.format(name="read_file", args='{"path": "hello.py"}'),
-        FINISH,
-    ])
+    engine = FakeEngine(
+        [
+            CALL.format(name="read_file", args='{"path": "big.txt"}'),
+            CALL.format(name="read_file", args='{"path": "hello.py"}'),
+            FINISH,
+        ]
+    )
     run_task(task, store, engine, cfg)
     assert store.get(task.id).state == TaskState.DONE
     final_turn = engine.calls[-1]
@@ -417,10 +442,12 @@ def test_context_elision_replaces_old_tool_results(env):
 def test_tool_error_from_bad_argument_value_does_not_crash_task(env):
     root, cfg, store = env
     task = _start(store, root)
-    engine = FakeEngine([
-        CALL.format(name="grep", args='{"pattern": "("}'),  # invalid regex
-        FINISH,
-    ])
+    engine = FakeEngine(
+        [
+            CALL.format(name="grep", args='{"pattern": "("}'),  # invalid regex
+            FINISH,
+        ]
+    )
     run_task(task, store, engine, cfg)
     got = store.get(task.id)
     assert got.state == TaskState.DONE and got.outcome == "completed"
@@ -465,6 +492,7 @@ def test_run_command_timeout_clamped_to_remaining_budget(env):
     timeout clamped to that remainder — and never a non-positive one."""
     from sous.protocol import ToolCall
     from sous.worker import _execute
+
     root, cfg, store = env
     cfg = dataclasses.replace(cfg, command_timeout_seconds=120)
 
@@ -493,6 +521,7 @@ def test_approval_wait_capped_by_task_deadline(env):
     the wall-clock budget runs out, not held for approval_timeout_minutes —
     and the deny must restore the running state like the timeout-deny does."""
     from sous.worker import _make_approval_hook
+
     root, cfg, store = env
     cfg = dataclasses.replace(cfg, approval_timeout_minutes=1)  # 60s on its own
     task = _start(store, root)

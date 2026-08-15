@@ -20,14 +20,17 @@ def launchd_plist(sous_executable: str, log_dir: Path) -> str:
     # plistlib handles XML escaping — a path containing & or < must still
     # produce a plist launchctl can parse (string formatting silently
     # produced invalid XML while install-launchd reported success).
-    return plistlib.dumps({
-        "Label": LABEL,
-        "ProgramArguments": [sous_executable, "serve"],
-        "RunAtLoad": True,
-        "KeepAlive": True,
-        "StandardOutPath": f"{log_dir}/daemon.log",
-        "StandardErrorPath": f"{log_dir}/daemon.err.log",
-    }, sort_keys=False).decode()
+    return plistlib.dumps(
+        {
+            "Label": LABEL,
+            "ProgramArguments": [sous_executable, "serve"],
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "StandardOutPath": f"{log_dir}/daemon.log",
+            "StandardErrorPath": f"{log_dir}/daemon.err.log",
+        },
+        sort_keys=False,
+    ).decode()
 
 
 def _cmd_status() -> None:
@@ -40,6 +43,7 @@ def _cmd_status() -> None:
         print("start it with: sous serve   (or: sous install-launchd)")
         return
     from sous.tasks import TaskStore
+
     store = TaskStore(config.data_dir / "tasks.db")
     for t in store.list_recent(limit=10):
         print(f"  {t.id}  {t.state:<18} {t.title}")
@@ -57,14 +61,13 @@ def _cmd_install_launchd() -> None:
     try:
         subprocess.run(cmd, check=True)
         print("daemon loaded; it will start at login and stay alive")
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except subprocess.CalledProcessError, FileNotFoundError:
         print("could not load automatically; run manually:")
         print("  " + " ".join(cmd))
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="sous",
-                                     description="local MLX sous-chef for Claude")
+    parser = argparse.ArgumentParser(prog="sous", description="local MLX sous-chef for Claude")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="run the daemon (MCP over HTTP on 127.0.0.1)")
     sub.add_parser("status", help="check the daemon and recent tasks")
@@ -72,6 +75,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.command == "serve":
         from sous.server import main as serve_main
+
         serve_main()
     elif args.command == "status":
         _cmd_status()

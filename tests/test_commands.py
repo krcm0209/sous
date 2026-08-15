@@ -49,7 +49,7 @@ def test_allowlisted_command_runs(ex: ToolExecutor):
 def test_shell_metacharacters_inert(ex: ToolExecutor, tmp_path: Path):
     out = ex.run_command("/bin/echo hi; touch pwned")
     assert "exit code 0" in out
-    assert "hi; touch pwned" in out            # echoed literally
+    assert "hi; touch pwned" in out  # echoed literally
     assert not (tmp_path / "proj" / "pwned").exists()
 
 
@@ -97,6 +97,7 @@ def test_empty_allowlist_entry_in_config(ex: ToolExecutor):
 
 # --- B3: command-induced file changes must be recorded ---
 
+
 @pytest.fixture()
 def pyex(tmp_path: Path) -> ToolExecutor:
     """Executor whose allowlist contains the current Python interpreter, the
@@ -113,8 +114,7 @@ def pyex(tmp_path: Path) -> ToolExecutor:
 
 
 def test_command_created_file_recorded(pyex: ToolExecutor):
-    out = pyex.run_command(
-        f"{sys.executable} -c \"open('gen.txt', 'w').write('made-by-command')\"")
+    out = pyex.run_command(f"{sys.executable} -c \"open('gen.txt', 'w').write('made-by-command')\"")
     assert "exit code 0" in out
     changes = {c.path: c for c in pyex.changed_files()}
     assert "gen.txt" in changes
@@ -126,7 +126,8 @@ def test_command_created_file_recorded(pyex: ToolExecutor):
 def test_command_modified_file_recorded(pyex: ToolExecutor):
     (pyex.project_root / "fmt.py").write_text("x=1\n")
     out = pyex.run_command(
-        f"{sys.executable} -c \"open('fmt.py', 'w').write('x = 1  # formatted')\"")
+        f"{sys.executable} -c \"open('fmt.py', 'w').write('x = 1  # formatted')\""
+    )
     assert "exit code 0" in out
     changes = {c.path: c for c in pyex.changed_files()}
     assert "fmt.py" in changes
@@ -140,14 +141,14 @@ def test_command_edit_refreshes_stale_hash_of_tracked_file(pyex: ToolExecutor):
     formatter's content hash, not the stale pre-command one."""
     pyex.write_file("t.txt", "one")
     [before] = pyex.changed_files()
-    pyex.run_command(
-        f"{sys.executable} -c \"open('t.txt', 'w').write('two-formatted')\"")
+    pyex.run_command(f"{sys.executable} -c \"open('t.txt', 'w').write('two-formatted')\"")
     [after] = [c for c in pyex.changed_files() if c.path == "t.txt"]
-    assert after.kind == "created"          # original kind survives
+    assert after.kind == "created"  # original kind survives
     assert after.after_sha != before.after_sha  # hash refreshed
 
 
 # --- forged stat metadata must not hide a modification from the audit ---
+
 
 def test_forged_mtime_and_size_rewrite_still_recorded(pyex: ToolExecutor):
     """Allowlisted test runners execute code the worker just wrote (e.g. a
@@ -166,8 +167,7 @@ def test_forged_mtime_and_size_rewrite_still_recorded(pyex: ToolExecutor):
     out = pyex.run_command(f"{sys.executable} forge.py")
     assert "exit code 0" in out
     changes = {c.path: c for c in pyex.changed_files()}
-    assert "secret.py" in changes, (
-        "equal-length rewrite with restored mtime evaded the audit")
+    assert "secret.py" in changes, "equal-length rewrite with restored mtime evaded the audit"
     assert changes["secret.py"].kind == "modified"
 
 
@@ -185,20 +185,20 @@ def test_snapshot_tuple_includes_ctime(pyex: ToolExecutor):
     os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
     forged = pyex._tree_snapshot()["s.txt"]
     assert forged[:2] == first[:2]  # the forgery really did fool mtime+size
-    assert forged != first          # ...but ctime still betrays it
+    assert forged != first  # ...but ctime still betrays it
 
 
 def test_unchanged_files_not_reported_after_command(pyex: ToolExecutor):
     """Merely reading a file (atime-only traffic) must not put it in the
     audit: over-reporting every untouched file would bury the real diff."""
     (pyex.project_root / "ro.txt").write_text("stable")
-    out = pyex.run_command(
-        f"{sys.executable} -c \"print(open('ro.txt').read())\"")
+    out = pyex.run_command(f"{sys.executable} -c \"print(open('ro.txt').read())\"")
     assert "exit code 0" in out
     assert pyex.changed_files() == []
 
 
 # --- timeout must kill the whole process group, not just the direct child ---
+
 
 @pytest.fixture()
 def shex(tmp_path: Path) -> ToolExecutor:
@@ -217,8 +217,7 @@ def test_timeout_kills_descendants_before_recording(shex: ToolExecutor):
     """A descendant that would outlive the timeout must not be able to write
     files after run_command has returned and recorded changes. Real processes
     on purpose: the bug is OS process-tree behavior, unmockable."""
-    out = shex.run_command(
-        '/bin/sh -c "(sleep 3; echo pwned > late.txt) & sleep 10"', timeout=1)
+    out = shex.run_command('/bin/sh -c "(sleep 3; echo pwned > late.txt) & sleep 10"', timeout=1)
     assert "timed out" in out
     # Sleep past when the orphaned descendant would have fired (t=3s from
     # command start; we are at ~t=1s). If the group kill worked, nothing
@@ -232,8 +231,7 @@ def test_timeout_kills_descendants_before_recording(shex: ToolExecutor):
 def test_timeout_group_kill_leaves_no_survivors(shex: ToolExecutor):
     """A descendant the group kill can reach must actually be dead after the
     call returns (not merely orphaned and still running)."""
-    out = shex.run_command(
-        '/bin/sh -c "sleep 30 & echo $! > child.pid; sleep 10"', timeout=1)
+    out = shex.run_command('/bin/sh -c "sleep 30 & echo $! > child.pid; sleep 10"', timeout=1)
     assert "timed out" in out
     pid = int((shex.project_root / "child.pid").read_text())
     # The backgrounded sleep was in the child's process group; after the
@@ -253,7 +251,8 @@ def test_timeout_group_kill_leaves_no_survivors(shex: ToolExecutor):
 
 
 def test_unexpected_exception_kills_group_and_reraises(
-        shex: ToolExecutor, monkeypatch: pytest.MonkeyPatch):
+    shex: ToolExecutor, monkeypatch: pytest.MonkeyPatch
+):
     """A non-timeout exception escaping wait() (KeyboardInterrupt /
     SystemExit during daemon shutdown) must kill the whole process group and
     re-raise — parity with subprocess.run's internal kill-on-any-exception.
@@ -294,12 +293,12 @@ def test_unexpected_exception_kills_group_and_reraises(
 
 def test_command_changes_in_git_dir_not_recorded(pyex: ToolExecutor):
     (pyex.project_root / ".git").mkdir()
-    pyex.run_command(
-        f"{sys.executable} -c \"open('.git/junk', 'w').write('x')\"")
+    pyex.run_command(f"{sys.executable} -c \"open('.git/junk', 'w').write('x')\"")
     assert all(".git" not in c.path for c in pyex.changed_files())
 
 
 # --- output capping: bounded memory, head+tail retention ---
+
 
 def _write_emit_script(root: Path, mb: int) -> None:
     """A script emitting a distinctive first line, `mb` MB of filler, and a
@@ -326,7 +325,7 @@ def test_huge_output_capped_without_buffering_in_memory(pyex: ToolExecutor):
     after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     assert "exit code 0" in out
     assert len(out) <= MAX_TOOL_OUTPUT + 100  # cap holds (+ marker slack)
-    assert "HEAD-MARKER-FIRST-LINE" in out    # the 50 MB really flowed
+    assert "HEAD-MARKER-FIRST-LINE" in out  # the 50 MB really flowed
     assert "TAIL-MARKER-LAST-LINE" in out
     # ru_maxrss is bytes on macOS (the product's target; KB on Linux, where
     # this margin is even more generous). Allow ample noise, but nothing
@@ -372,6 +371,7 @@ def test_small_output_unchanged_no_elision(pyex: ToolExecutor):
     stdout, then stderr, no elision marker."""
     out = pyex.run_command(
         f"{sys.executable} -c \"import sys; print('out-marker'); "
-        f"print('err-marker', file=sys.stderr)\"")
+        f"print('err-marker', file=sys.stderr)\""
+    )
     assert out == "exit code 0\nout-marker\n\nerr-marker\n"
     assert "elided" not in out
