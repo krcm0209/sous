@@ -24,10 +24,13 @@ _ENV_DENY_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD")
 
 
 def command_allowed(argv: list[str], allowlist: list[list[str]]) -> bool:
-    """Check if argv is allowlisted by leading-token equality."""
+    """Check if argv is allowlisted by leading-token equality.
+
+    Skips falsy entries to prevent empty allowlist entries from matching all commands.
+    """
     return any(
         len(argv) >= len(entry) and argv[: len(entry)] == entry
-        for entry in allowlist
+        for entry in allowlist if entry
     ) if argv else False
 
 

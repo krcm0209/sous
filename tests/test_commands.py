@@ -74,3 +74,18 @@ def test_timeout(ex: ToolExecutor):
     ex.config_path.write_text('[commands]\nallowlist = ["/bin/sleep"]\n')
     out = ex.run_command("/bin/sleep 5", timeout=1)
     assert "timed out" in out
+
+
+def test_empty_allowlist_entry_does_not_match(ex: ToolExecutor):
+    """Empty allowlist entry must not match any command (prevent allow-all gate)."""
+    assert not command_allowed(["rm", "-rf", "/"], [[], ["npm", "test"]])
+
+
+def test_empty_allowlist_entry_in_config(ex: ToolExecutor):
+    """End-to-end: empty entry in config cannot bypass security gate."""
+    ex.config_path.write_text('[commands]\nallowlist = ["", "/bin/echo"]\n')
+    # Empty entry should not allow /usr/bin/true
+    assert ex.run_command("/usr/bin/true").startswith("command denied")
+    # But /bin/echo should still be allowed (non-empty entry)
+    out = ex.run_command("/bin/echo hi")
+    assert "exit code 0" in out
