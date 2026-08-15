@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import plistlib
 import shutil
 import socket
 import subprocess
@@ -14,28 +15,19 @@ from sous.config import load_config
 
 LABEL = "com.sous.daemon"
 
-_PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
- "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{exe}</string>
-        <string>serve</string>
-    </array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>{log_dir}/daemon.log</string>
-    <key>StandardErrorPath</key><string>{log_dir}/daemon.err.log</string>
-</dict>
-</plist>
-"""
-
 
 def launchd_plist(sous_executable: str, log_dir: Path) -> str:
-    return _PLIST_TEMPLATE.format(label=LABEL, exe=sous_executable, log_dir=log_dir)
+    # plistlib handles XML escaping — a path containing & or < must still
+    # produce a plist launchctl can parse (string formatting silently
+    # produced invalid XML while install-launchd reported success).
+    return plistlib.dumps({
+        "Label": LABEL,
+        "ProgramArguments": [sous_executable, "serve"],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": f"{log_dir}/daemon.log",
+        "StandardErrorPath": f"{log_dir}/daemon.err.log",
+    }, sort_keys=False).decode()
 
 
 def _cmd_status() -> None:

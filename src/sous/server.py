@@ -46,10 +46,20 @@ class SousService:
                              f"could rewrite sous's own allowlist, task db, "
                              f"and audit transcripts"}
         allowlist = current_allowlist(self.config.config_path)
-        bad = [c for c in (verify_commands or [])
-               if not command_allowed(shlex.split(c), allowlist)]
+        bad = []
+        for c in (verify_commands or []):
+            try:
+                argv = shlex.split(c)
+            except ValueError:
+                # Client-supplied string with e.g. an unmatched quote — a
+                # structured error, never a ValueError out of the service.
+                bad.append(c)
+                continue
+            if not command_allowed(argv, allowlist):
+                bad.append(c)
         if bad:
-            return {"error": "verify_commands not allowlisted: " + ", ".join(bad)}
+            return {"error": "verify_commands not allowlisted (or unparseable): "
+                             + ", ".join(bad)}
         task = self.store.enqueue(
             title=title, instructions=instructions, project_root=str(root),
             context_files=context_files or [], verify_commands=verify_commands or [],

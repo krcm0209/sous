@@ -100,6 +100,15 @@ def test_delegate_accepts_allowlisted_verify(svc):
     assert "task_id" in out
 
 
+def test_delegate_unparseable_verify_command_returns_error(svc):
+    """C4: an unmatched quote in a client-supplied verify_command must come
+    back as a structured error, not raise ValueError out of the service."""
+    service, _, root = svc
+    out = service.delegate_task("t", "x", str(root),
+                                verify_commands=['echo "unclosed'])
+    assert "error" in out and 'echo "unclosed' in out["error"]
+
+
 def test_status_single_and_all(svc):
     service, store, root = svc
     a = service.delegate_task("a", "x", str(root))["task_id"]

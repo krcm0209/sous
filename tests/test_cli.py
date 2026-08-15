@@ -15,6 +15,16 @@ def test_plist_is_valid_and_correct():
     assert data["StandardErrorPath"] == "/Users/x/.sous/daemon.err.log"
 
 
+def test_plist_escapes_xml_special_characters():
+    """C5: a valid macOS path containing & or < must yield a plist that
+    launchctl can actually parse — not silently-invalid XML."""
+    xml = launchd_plist("/opt/a&b/sous", Path("/Users/x/My & <Special> Docs/.sous"))
+    data = plistlib.loads(xml.encode())
+    assert data["ProgramArguments"] == ["/opt/a&b/sous", "serve"]
+    assert data["StandardOutPath"] == "/Users/x/My & <Special> Docs/.sous/daemon.log"
+    assert data["StandardErrorPath"] == "/Users/x/My & <Special> Docs/.sous/daemon.err.log"
+
+
 def test_status_reports_not_running(tmp_path, capsys, monkeypatch):
     from sous import cli
     from sous.config import SousConfig
