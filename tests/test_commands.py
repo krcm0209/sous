@@ -200,6 +200,46 @@ def test_timeout_group_kill_leaves_no_survivors(shex: ToolExecutor):
     assert any(c.path == "child.pid" for c in shex.changed_files())
 
 
+def test_unexpected_exception_kills_group_and_reraises(
+        shex: ToolExecutor, monkeypatch: pytest.MonkeyPatch):
+    """A non-timeout exception escaping communicate() (KeyboardInterrupt /
+    SystemExit during daemon shutdown) must kill the whole process group and
+    re-raise — parity with subprocess.run's internal kill-on-any-exception.
+    The exception is injected on the FIRST communicate() call only, so the
+    group-kill helper's own grace-period communicate() still works."""
+    import sous.toolexec as toolexec
+
+    captured: dict = {}
+    real_popen = toolexec.subprocess.Popen
+
+    class ExplodingPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured["proc"] = self
+            self._exploded = False
+
+        def communicate(self, *args, **kwargs):
+            if not self._exploded:
+                self._exploded = True
+                raise KeyboardInterrupt
+            return super().communicate(*args, **kwargs)
+
+    monkeypatch.setattr(toolexec.subprocess, "Popen", ExplodingPopen)
+    with pytest.raises(KeyboardInterrupt):
+        shex.run_command('/bin/sh -c "sleep 30 & sleep 30"', timeout=5)
+    proc = captured["proc"]
+    # (b) the child's whole process group must be gone afterwards
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("process group survived the exception backstop")
+
+
 def test_command_changes_in_git_dir_not_recorded(pyex: ToolExecutor):
     (pyex.project_root / ".git").mkdir()
     pyex.run_command(

@@ -339,6 +339,15 @@ class ToolExecutor:
             # A timed-out command may already have modified files.
             self._record_command_changes(before_snap)
             return f"command timed out after {timeout}s: {command}"
+        except BaseException:  # noqa: BLE001 — deliberate: KeyboardInterrupt/
+            # SystemExit during daemon shutdown must not orphan a running
+            # process group that keeps writing files. Kill the group, then
+            # let the exception propagate (subprocess.run had the same
+            # kill-on-any-exception backstop for the direct child). No
+            # change recording here: the exception is propagating, no
+            # report is being assembled.
+            _kill_process_group(pgid, proc)
+            raise
         self._record_command_changes(before_snap)
         out = f"exit code {proc.returncode}\n{stdout}\n{stderr}"
         return _truncate(out)
