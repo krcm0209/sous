@@ -34,20 +34,25 @@ def fetch_model_config(model_id: str) -> dict:
         return json.load(f)
 
 
-def _default_factory(model_id: str) -> Engine:
+def _default_factory(model_id: str, temperature: float = 0.7,
+                     top_p: float = 0.8, top_k: int = 20) -> Engine:
     backend = select_backend(fetch_model_config(model_id))
     if backend == "vlm":
         from sous.engine.vlm import VLMEngine
-        return VLMEngine(model_id)
+        return VLMEngine(model_id, temperature=temperature, top_p=top_p, top_k=top_k)
     from sous.engine.lm import LMEngine
-    return LMEngine(model_id)
+    return LMEngine(model_id, temperature=temperature, top_p=top_p, top_k=top_k)
 
 
 class EngineManager:
     def __init__(self, config: SousConfig,
                  engine_factory: Callable[[str], Engine] | None = None):
         self._config = config
-        self._factory = engine_factory or _default_factory
+        self._factory = engine_factory or (
+            lambda model_id: _default_factory(
+                model_id, config.temperature, config.top_p, config.top_k,
+            )
+        )
         self._lock = threading.Lock()
         self._engine: Engine | None = None
         self._last_used: float | None = None

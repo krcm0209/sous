@@ -16,6 +16,9 @@ def test_defaults_when_file_missing(tmp_path: Path):
     assert cfg.model_id == "mlx-community/Qwen3.8-27B-mxfp8"
     assert cfg.idle_unload_minutes == 30
     assert cfg.max_context_tokens == 32768
+    assert cfg.temperature == 0.7
+    assert cfg.top_p == 0.8
+    assert cfg.top_k == 20
     assert cfg.max_turns == 40
     assert cfg.max_minutes == 15
     assert cfg.max_tokens_per_generation == 4096
@@ -30,6 +33,15 @@ def test_partial_file_overrides_only_given_keys(tmp_path: Path):
     cfg = load_config(p)
     assert cfg.server_port == 9000
     assert cfg.max_turns == 40  # untouched default
+
+
+def test_sampler_keys_overridable_from_file(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text('[model]\ntemperature = 0.2\ntop_p = 0.9\ntop_k = 40\n')
+    cfg = load_config(p)
+    assert cfg.temperature == 0.2
+    assert cfg.top_p == 0.9
+    assert cfg.top_k == 40
 
 
 def test_unknown_keys_warn_not_crash(tmp_path: Path):

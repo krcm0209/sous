@@ -4,11 +4,14 @@ from __future__ import annotations
 
 
 class VLMEngine:
-    def __init__(self, model_id: str):
+    def __init__(self, model_id: str, temperature: float = 0.7,
+                top_p: float = 0.8, top_k: int = 20):
         from mlx_vlm import load
+        from mlx_vlm.sample_utils import make_sampler
 
         self.model_id = model_id
         self._model, self._processor = load(model_id)
+        self._sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
 
     @property
     def _tokenizer(self):
@@ -29,7 +32,7 @@ class VLMEngine:
         result = generate(
             self._model, self._processor,
             self._prompt(messages, tools),
-            max_tokens=max_tokens, verbose=False,
+            max_tokens=max_tokens, sampler=self._sampler, verbose=False,
         )
         # mlx-vlm returns GenerationResult in recent versions; older return str
         return result.text if hasattr(result, "text") else str(result)

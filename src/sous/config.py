@@ -20,7 +20,8 @@ DEFAULT_ALLOWLIST: list[str] = [
 
 _KNOWN = {
     "server": {"port"},
-    "model": {"id", "idle_unload_minutes", "max_context_tokens"},
+    "model": {"id", "idle_unload_minutes", "max_context_tokens",
+              "temperature", "top_p", "top_k"},
     "budgets": {"max_turns", "max_minutes", "max_tokens_per_generation"},
     "commands": {"allowlist", "timeout_seconds", "approval_timeout_minutes"},
     "tasks": {"retention"},
@@ -33,6 +34,13 @@ class SousConfig:
     model_id: str = "mlx-community/Qwen3.8-27B-mxfp8"
     idle_unload_minutes: int = 30
     max_context_tokens: int = 32768
+    # Qwen's documented non-thinking-mode sampling settings — greedy (temp=0)
+    # decoding cannot escape a bad completion once one happens (a nudge can't
+    # change an argmax pick over a near-identical prompt), so some stochastic
+    # sampling is required for the worker to have any chance of recovering.
+    temperature: float = 0.7
+    top_p: float = 0.8
+    top_k: int = 20
     max_turns: int = 40
     max_minutes: int = 15
     max_tokens_per_generation: int = 4096
@@ -77,6 +85,9 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         model_id=model.get("id", "mlx-community/Qwen3.8-27B-mxfp8"),
         idle_unload_minutes=model.get("idle_unload_minutes", 30),
         max_context_tokens=model.get("max_context_tokens", 32768),
+        temperature=model.get("temperature", 0.7),
+        top_p=model.get("top_p", 0.8),
+        top_k=model.get("top_k", 20),
         max_turns=budgets.get("max_turns", 40),
         max_minutes=budgets.get("max_minutes", 15),
         max_tokens_per_generation=budgets.get("max_tokens_per_generation", 4096),

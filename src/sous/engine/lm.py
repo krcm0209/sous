@@ -4,11 +4,14 @@ from __future__ import annotations
 
 
 class LMEngine:
-    def __init__(self, model_id: str):
+    def __init__(self, model_id: str, temperature: float = 0.7,
+                top_p: float = 0.8, top_k: int = 20):
         from mlx_lm import load
+        from mlx_lm.sample_utils import make_sampler
 
         self.model_id = model_id
         self._model, self._tokenizer = load(model_id)
+        self._sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
 
     def _prompt(self, messages: list[dict], tools: list[dict]) -> str:
         # enable_thinking=False: sous delegates mechanical prep, not reasoning —
@@ -26,7 +29,7 @@ class LMEngine:
         return generate(
             self._model, self._tokenizer,
             prompt=self._prompt(messages, tools),
-            max_tokens=max_tokens, verbose=False,
+            max_tokens=max_tokens, sampler=self._sampler, verbose=False,
         )
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:

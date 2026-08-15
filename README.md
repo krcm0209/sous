@@ -49,6 +49,9 @@ port = 8383
 id = "mlx-community/Qwen3.8-27B-mxfp8"
 idle_unload_minutes = 30
 max_context_tokens = 32768
+temperature = 0.7
+top_p = 0.8
+top_k = 20
 
 [budgets]
 max_turns = 40
@@ -69,6 +72,12 @@ retention = 200
 Every value is optional; the allowlist is re-read on every command execution,
 so edits apply instantly. Swap `[model].id` for any MLX text or vision model
 (e.g. the `-8bit`/`-4bit` conversions, or a fast MoE coder via mlx-lm).
+
+`temperature`/`top_p`/`top_k` control the worker's sampler (Qwen's own
+documented non-thinking-mode defaults). Greedy decoding (temperature 0)
+sounds safer but isn't: it gives the model no way to escape a bad
+completion once it happens, since a near-identical prompt plus a nudge
+still argmaxes to the same wrong output every time.
 
 ## Security model
 
