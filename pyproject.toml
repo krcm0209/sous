@@ -1,0 +1,33 @@
+[project]
+name = "sous"
+version = "0.1.0"
+description = "macOS MCP daemon for delegating coding tasks to local MLX model"
+authors = [
+    { name = "Kyle Krcmaric", email = "kyle.krcmaric@ozmo.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "huggingface-hub",
+    "mcp>=2.0,<3",
+    "mlx-lm>=0.31",
+    "mlx-vlm>=0.6.13",
+    "tomlkit>=0.13",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=1.4.0",
+]
+
+[project.scripts]
+sous = "sous.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["model: needs a real MLX model downloaded (manual/local only)"]
