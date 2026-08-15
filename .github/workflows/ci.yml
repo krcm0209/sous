@@ -18,7 +18,12 @@ concurrency:
 env:
   # Fail loudly if uv.lock and pyproject.toml have drifted, rather than
   # silently re-resolving to versions nobody tested.
-  UV_FROZEN: "1"
+  #
+  # UV_LOCKED, not UV_FROZEN: --frozen means "use the lockfile as-is without
+  # checking it", which downgrades `uv lock --check` to a validity-only check
+  # and lets real drift pass with exit 0. --locked asserts the lockfile is
+  # up to date and fails otherwise, for both `uv lock --check` and `uv sync`.
+  UV_LOCKED: "1"
 
 # setup-uv is pinned to an exact release: it stopped publishing floating major
 # tags after v7, so `@v10` does not resolve. Dependabot keeps it current.

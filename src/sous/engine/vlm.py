@@ -23,7 +23,11 @@ class VLMEngine:
 
     @property
     def _tokenizer(self):
-        return getattr(self._processor, "tokenizer", self._processor)
+        # Via _loaded() so the _prompt/count_tokens paths raise the same named
+        # RuntimeError after unload() — reading _processor directly would hand
+        # back None and fail later with a bare AttributeError.
+        _, processor = self._loaded()
+        return getattr(processor, "tokenizer", processor)
 
     def _prompt(self, messages: list[dict], tools: list[dict]) -> str:
         # enable_thinking=False: same rationale as LMEngine. Confirmed inert

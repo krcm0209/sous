@@ -99,7 +99,7 @@ def _execute(
                 # run past the task deadline — but never pass a non-positive
                 # timeout.
                 remaining = deadline - time.monotonic()
-                timeout = max(1, int(min(config.command_timeout_seconds, remaining)))
+                timeout = max(1, min(config.command_timeout_seconds, remaining))
                 return ex.run_command(a["command"], approval=approval, timeout=timeout)
             case _:
                 return f"error: unhandled tool {call.name}"
@@ -335,10 +335,7 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
         if remaining <= 0:
             return "skipped: task wall-clock budget exhausted"
         try:
-            # max(1, ...) for the same reason as _execute: a sub-second sliver
-            # of remaining budget must not truncate to a zero-second timeout.
-            timeout = max(1, int(min(config.command_timeout_seconds, remaining)))
-            return ex.run_command(cmd, timeout=timeout)
+            return ex.run_command(cmd, timeout=min(config.command_timeout_seconds, remaining))
         except Exception as e:
             # run_command already turns most failures (timeout, missing
             # binary, denied) into strings, but not all of them (e.g. a

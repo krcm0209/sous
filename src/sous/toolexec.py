@@ -340,7 +340,7 @@ class ToolExecutor:
                 self._changes[rel] = ChangedFile(rel, kind, None, _sha(content))
 
     def run_command(
-        self, command: str, approval: ApprovalHook | None = None, timeout: int = 120
+        self, command: str, approval: ApprovalHook | None = None, timeout: float = 120
     ) -> str:
         """Run a command with allowlist checking and optional approval hook.
 
@@ -356,7 +356,8 @@ class ToolExecutor:
         Args:
             command: Command string to parse and execute
             approval: Optional approval hook to override allowlist check
-            timeout: Timeout in seconds (default 120)
+            timeout: Timeout in seconds (default 120). Fractional values are
+                honoured — callers clamp it to the remaining task budget.
 
         Returns:
             Command output: "exit code N\n<stdout>\n<stderr>" or error message
