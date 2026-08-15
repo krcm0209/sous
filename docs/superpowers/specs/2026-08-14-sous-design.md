@@ -27,7 +27,7 @@
 | Worker capabilities | **Files + safe commands** — file tools plus allowlisted verify commands (tests, linters, formatters), with an approval escalation flow |
 | Delegation style | **Async task queue** — `delegate_task` returns an ID immediately; Claude polls and collects |
 | Model hosting | **Embedded** — the daemon loads the model in-process via MLX |
-| Default model | **`mlx-community/Qwen3.8-27B-8bit`** (~29.5 GB). Configurable. True FP8 checkpoints (e.g. `Qwen/Qwen3.8-27B-FP8`) are CUDA-only; MLX's FP8-family equivalent is `mxfp8`, which mlx-community has not yet published for 3.8. The 8-bit pick is quality/size-equivalent; moving to `-mxfp8` later is an optional one-line config change. |
+| Default model | **`mlx-community/Qwen3.8-27B-mxfp8`** (28.7 GB, converted from the official `Qwen/Qwen3.8-27B` with mlx-vlm). Configurable. True FP8 checkpoints (e.g. `Qwen/Qwen3.8-27B-FP8`) are CUDA-only; `mxfp8` is MLX's FP8-family equivalent — the closest official-provenance realization of "FP8 as MLX". `-8bit` and `-4bit` conversions are drop-in config alternatives. |
 | Topology | **Single shared daemon**, MCP over streamable HTTP on 127.0.0.1 |
 | MCP SDK | Official `modelcontextprotocol/python-sdk` **v2** — high-level `MCPServer` API (`mcp.server.mcpserver`), protocol revision 2026-07-28 |
 
@@ -103,7 +103,7 @@ Then: **generate → parse tool calls → execute → append results → repeat.
 
 **Worker's tools:** `read_file`, `write_file`, `edit_file` (exact-match replace), `list_dir`, `glob`, `grep`, `run_command` (allowlist only), and `finish(report)` — the explicit "I'm done" tool whose argument becomes the task report.
 
-**Budgets** (all config, defaults shown): max 40 turns, 15 min wall-clock, 4,096 tokens per generation, and a **32k-token context cap** — the model's native window is 262k, but KV cache at that length would blow past 64 GB RAM next to 29.5 GB of weights. Near the cap, oldest tool results are elided with a placeholder note. Hitting any budget ends the task as `done (budget-exhausted)` with a partial report — never a hang.
+**Budgets** (all config, defaults shown): max 40 turns, 15 min wall-clock, 4,096 tokens per generation, and a **32k-token context cap** — the model's native window is 262k, but KV cache at that length would blow past 64 GB RAM next to 28.7 GB of weights. Near the cap, oldest tool results are elided with a placeholder note. Hitting any budget ends the task as `done (budget-exhausted)` with a partial report — never a hang.
 
 ## Safety & confinement
 
@@ -121,7 +121,7 @@ Then: **generate → parse tool calls → execute → append results → repeat.
 port = 8383                     # streamable HTTP, 127.0.0.1 only
 
 [model]
-id = "mlx-community/Qwen3.8-27B-8bit"
+id = "mlx-community/Qwen3.8-27B-mxfp8"
 idle_unload_minutes = 30
 max_context_tokens = 32768
 
@@ -193,6 +193,5 @@ sous/
 
 ## Future work (explicitly out of v1)
 
-- Switch default to `mlx-community/Qwen3.8-27B-mxfp8` when published.
 - Vision-input tasks (screenshot-driven UI work) via the already-multimodal default model.
 - Multiple concurrent workers if a smaller/faster model makes batching worthwhile.
