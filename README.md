@@ -107,6 +107,14 @@ still argmaxes to the same wrong output every time.
 - Every worker turn is journaled to `~/.sous/tasks/<id>/transcript.jsonl`.
 - The MCP endpoint binds to 127.0.0.1 only.
 
+## Limitations
+
+- MLX generation cannot be aborted mid-stream. Generations are serialized by
+  a per-engine lock (and the engine is never idle-unloaded while one is in
+  flight), so a truly wedged generation delays subsequent tasks until the
+  daemon is restarted. Running the worker in a separate process (process
+  isolation) is the future fix.
+
 ## Development
 
 ```bash

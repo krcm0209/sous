@@ -1,3 +1,4 @@
+import threading
 import time
 
 from sous.config import SousConfig
@@ -57,3 +58,62 @@ def test_status_when_never_loaded():
     mgr, _ = _manager()
     s = mgr.status()
     assert s["loaded"] is False and s["model_id"]
+
+
+class _BlockingEngine(FakeEngine):
+    def __init__(self):
+        super().__init__([])
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.in_flight = 0
+        self.overlap = False
+
+    def generate(self, messages, tools, max_tokens):
+        self.in_flight += 1
+        if self.in_flight > 1:
+            self.overlap = True
+        self.entered.set()
+        self.release.wait(5)
+        self.in_flight -= 1
+        return "ok"
+
+
+def test_generations_never_overlap_on_one_engine():
+    """C3: on a stall the daemon thread is abandoned while still using the
+    engine; the next task must WAIT rather than start a second concurrent
+    generation on the same MLX model instance."""
+    inner = _BlockingEngine()
+    cfg = SousConfig(idle_unload_minutes=30)
+    mgr = EngineManager(cfg, engine_factory=lambda mid: inner)
+    engine = mgr.get()
+    t1 = threading.Thread(target=engine.generate, args=([], [], 8), daemon=True)
+    t1.start()
+    assert inner.entered.wait(5)
+    t2 = threading.Thread(target=engine.generate, args=([], [], 8), daemon=True)
+    t2.start()
+    time.sleep(0.2)
+    assert inner.in_flight == 1  # the second generation is waiting, not running
+    inner.release.set()
+    t1.join(5)
+    t2.join(5)
+    assert not inner.overlap
+
+
+def test_unload_refused_while_generation_in_flight():
+    """C3: idle-unload racing an abandoned generation would free the model
+    weights under it — unload_if_idle must refuse (False) while a generation
+    is in flight, then proceed normally once it finishes."""
+    inner = _BlockingEngine()
+    cfg = SousConfig(idle_unload_minutes=0)
+    mgr = EngineManager(cfg, engine_factory=lambda mid: inner)
+    engine = mgr.get()
+    t = threading.Thread(target=engine.generate, args=([], [], 8), daemon=True)
+    t.start()
+    assert inner.entered.wait(5)
+    time.sleep(0.01)  # let the 0-minute idle threshold elapse
+    assert mgr.unload_if_idle() is False
+    assert inner.unloaded is False
+    inner.release.set()
+    t.join(5)
+    time.sleep(0.01)
+    assert mgr.unload_if_idle() is True  # generation done → unload proceeds
