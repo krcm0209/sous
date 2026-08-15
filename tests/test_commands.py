@@ -1,12 +1,21 @@
 import os
 import resource
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
 
-from sous.toolexec import MAX_TOOL_OUTPUT, ToolExecutor, command_allowed, scrubbed_env
+import sous.toolexec as toolexec
+from sous.toolexec import (
+    MAX_TOOL_OUTPUT,
+    ToolExecutor,
+    _kill_process_group,
+    command_allowed,
+    scrubbed_env,
+)
 
 
 def test_allowlist_token_matching():
@@ -375,3 +384,59 @@ def test_small_output_unchanged_no_elision(pyex: ToolExecutor):
     )
     assert out == "exit code 0\nout-marker\n\nerr-marker\n"
     assert "elided" not in out
+
+
+def test_group_kill_survives_eperm_from_killpg(shex: ToolExecutor, monkeypatch):
+    """macOS returns EPERM, not ESRCH, from killpg when no member of the group
+    can be signalled — the state the group reaches once its remaining members
+    are un-reaped zombies. That is "nothing left to kill", not a failure, and
+    it must not escape run_command.
+
+    Observed as an intermittent CI failure: the group emptied to zombies
+    between the SIGTERM and the SIGKILL, and only ProcessLookupError was
+    suppressed."""
+    real_killpg = os.killpg
+
+    def eperm_on_hard_kill(pgid: int, sig: int):
+        if sig == signal.SIGKILL:
+            raise PermissionError(1, "Operation not permitted")
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(toolexec.os, "killpg", eperm_on_hard_kill)
+    out = shex.run_command('/bin/sh -c "sleep 10"', timeout=1)
+    assert "timed out" in out
+
+
+def test_hard_kill_precedes_reaping_the_group_leader(monkeypatch):
+    """start_new_session makes the child its own group leader, so the pgid IS
+    its pid. Reaping it releases that pid, after which the pgid may be
+    recycled and a later SIGKILL could land on an unrelated group. The
+    escalation must happen while the leader is still un-reaped."""
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", "sleep 30"],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pgid = os.getpgid(proc.pid)
+    reaped_when_sent: dict[int, bool] = {}
+    real_killpg = os.killpg
+
+    def spy(pg: int, sig: int):
+        reaped_when_sent.setdefault(sig, proc.returncode is not None)
+        return real_killpg(pg, sig)
+
+    monkeypatch.setattr(toolexec.os, "killpg", spy)
+    try:
+        _kill_process_group(pgid, proc)
+    finally:
+        if proc.returncode is None:  # pragma: no cover - only on failure paths
+            proc.kill()
+            proc.wait()
+
+    assert signal.SIGKILL in reaped_when_sent, "expected a SIGKILL escalation"
+    assert reaped_when_sent[signal.SIGKILL] is False, (
+        "the group leader was already reaped when SIGKILL was sent, so its pid "
+        "— and therefore the process-group id — could have been recycled"
+    )

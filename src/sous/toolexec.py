@@ -10,6 +10,7 @@ import shlex
 import signal
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -157,23 +158,51 @@ def _capped_command_output(stdout_f, stderr_f) -> str:
 
 
 _KILL_GRACE_SECONDS = 2.0
+_KILL_POLL_SECONDS = 0.02
+
+# ESRCH and EPERM both mean "nothing in this group can be signalled" — see
+# _kill_process_group for why EPERM is not a failure here.
+_ALREADY_DEAD = (ProcessLookupError, PermissionError)
+
+
+def _await_exit_without_reaping(pid: int, timeout: float) -> None:
+    """Wait up to `timeout` for `pid` to exit, deliberately leaving it
+    un-reaped so its pid stays allocated."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None:
+                return
+        except ChildProcessError:
+            return  # already reaped; nothing left to wait for
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(_KILL_POLL_SECONDS)
 
 
 def _kill_process_group(pgid: int, proc: subprocess.Popen) -> None:
     """Kill a timed-out command's entire process group with escalation:
     SIGTERM first (so well-behaved test runners can clean up), a short grace
-    period, then SIGKILL for whatever is left. Reaps the direct child.
-    ProcessLookupError means the group is already gone — not an error.
+    period, then SIGKILL for whatever is left. Reaps the direct child last.
+
+    start_new_session makes the child its own group leader, so the pgid IS
+    its pid. It is therefore left un-reaped until after the SIGKILL: reaping
+    it during the grace period would release that pid and let the group id be
+    recycled, aiming the escalation at an unrelated group.
+
+    ESRCH and EPERM both mean the group has nothing left to kill. macOS
+    returns EPERM rather than ESRCH once the group's remaining members are
+    un-reaped zombies; while any member is still signalable the call succeeds
+    and kills it, so suppressing EPERM cannot mask a survivor.
 
     stdout/stderr go to temp files, not pipes, so no surviving descendant
-    can hold a pipe write-end open and hang either wait() here: waitpid()
+    can hold a pipe write-end open and hang the wait() here: waitpid()
     blocks only on the direct child's exit, never on stream EOF."""
-    with contextlib.suppress(ProcessLookupError):
+    with contextlib.suppress(*_ALREADY_DEAD):
         os.killpg(pgid, signal.SIGTERM)
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        # Grace period for SIGTERM handlers to run before the hard kill.
-        proc.wait(timeout=_KILL_GRACE_SECONDS)
-    with contextlib.suppress(ProcessLookupError):
+    # Grace period for SIGTERM handlers, without reaping the group leader.
+    _await_exit_without_reaping(proc.pid, _KILL_GRACE_SECONDS)
+    with contextlib.suppress(*_ALREADY_DEAD):
         os.killpg(pgid, signal.SIGKILL)
     with contextlib.suppress(subprocess.TimeoutExpired):
         # Reap the direct child so it doesn't linger as a zombie.
