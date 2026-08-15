@@ -33,20 +33,27 @@ def main() -> None:
         proj = base / "proj"
         proj.mkdir()
         cfg = SousConfig(
-            model_id=TINY, data_dir=base / "data",
-            config_path=base / "config.toml", max_turns=8, max_minutes=5,
+            model_id=TINY,
+            data_dir=base / "data",
+            config_path=base / "config.toml",
+            max_turns=8,
+            max_minutes=5,
         )
         store = TaskStore(base / "tasks.db")
         task = store.enqueue(
             title="smoke",
-            instructions=("Create a file named hello.txt containing exactly "
-                          "this one line: hello sous"),
-            project_root=str(proj), context_files=[], verify_commands=[],
+            instructions=(
+                "Create a file named hello.txt containing exactly this one line: hello sous"
+            ),
+            project_root=str(proj),
+            context_files=[],
+            verify_commands=[],
         )
         stop = threading.Event()
         threading.Thread(
             target=run_worker_loop,
-            args=(store, EngineManager(cfg), cfg, stop), daemon=True,
+            args=(store, EngineManager(cfg), cfg, stop),
+            daemon=True,
         ).start()
         while store.get(task.id).state not in FINISHED_STATES:
             t = store.get(task.id)

@@ -40,9 +40,7 @@ NUDGE = "You must call a tool to make progress. Call finish when done."
 
 
 def build_system_prompt(project_root: Path) -> str:
-    entries = sorted(
-        e.name + ("/" if e.is_dir() else "") for e in project_root.iterdir()
-    )[:50]
+    entries = sorted(e.name + ("/" if e.is_dir() else "") for e in project_root.iterdir())[:50]
     return SYSTEM_TEMPLATE.format(root=project_root, listing="\n".join(entries))
 
 
@@ -56,15 +54,14 @@ class _Transcript:
             f.write(json.dumps(event) + "\n")
 
 
-def _make_approval_hook(task: Task, store: TaskStore, config: SousConfig,
-                        deadline: float):
+def _make_approval_hook(task: Task, store: TaskStore, config: SousConfig, deadline: float):
     """`deadline` is the task's wall-clock deadline (time.monotonic() terms):
     the approval wait ends at the earlier of the approval timeout and the
     task deadline — max_minutes bounds the whole task, approvals included."""
+
     def hook(command: str) -> bool:
         store.request_approval(task.id, command)
-        wait_until = min(time.monotonic() + config.approval_timeout_minutes * 60,
-                         deadline)
+        wait_until = min(time.monotonic() + config.approval_timeout_minutes * 60, deadline)
         while time.monotonic() < wait_until:
             if store.is_cancel_requested(task.id):
                 return False
@@ -73,13 +70,15 @@ def _make_approval_hook(task: Task, store: TaskStore, config: SousConfig,
                 return response == "approved"
             time.sleep(0.05)
         store.respond_approval(task.id, approve=False)  # timeout/budget → deny
-        store.poll_approval(task.id)                    # restore running state
+        store.poll_approval(task.id)  # restore running state
         return False
+
     return hook
 
 
-def _execute(call: ToolCall, ex: ToolExecutor, config: SousConfig, approval,
-             deadline: float) -> str:
+def _execute(
+    call: ToolCall, ex: ToolExecutor, config: SousConfig, approval, deadline: float
+) -> str:
     try:
         a = call.arguments
         match call.name:
@@ -101,8 +100,7 @@ def _execute(call: ToolCall, ex: ToolExecutor, config: SousConfig, approval,
                 # timeout.
                 remaining = deadline - time.monotonic()
                 timeout = max(1, min(config.command_timeout_seconds, remaining))
-                return ex.run_command(a["command"], approval=approval,
-                                      timeout=timeout)
+                return ex.run_command(a["command"], approval=approval, timeout=timeout)
             case _:
                 return f"error: unhandled tool {call.name}"
     except PathViolation as e:
@@ -126,8 +124,11 @@ def _elide_if_needed(messages: list[dict], engine: Engine, config: SousConfig) -
     be sent (engine error or memory exhaustion is what the cap prevents)."""
     while (count := engine.count_tokens(messages, WORKER_TOOLS)) > config.max_context_tokens:
         for m in messages:
-            if (m["role"] == "user" and m["content"].startswith("<tool_result")
-                    and "[elided" not in m["content"]):
+            if (
+                m["role"] == "user"
+                and m["content"].startswith("<tool_result")
+                and "[elided" not in m["content"]
+            ):
                 m["content"] = "<tool_result>[elided: re-read the file if needed]</tool_result>"
                 break
         else:
@@ -139,8 +140,9 @@ class GenerationStalled(Exception):
     pass
 
 
-def _generate_with_timeout(engine: Engine, messages: list[dict], max_tokens: int,
-                           timeout_seconds: float) -> str:
+def _generate_with_timeout(
+    engine: Engine, messages: list[dict], max_tokens: int, timeout_seconds: float
+) -> str:
     """Run a (synchronous, uninterruptible) MLX generation with a deadline.
 
     MLX generation can't be aborted mid-stream. The generation runs on a
@@ -161,9 +163,7 @@ def _generate_with_timeout(engine: Engine, messages: list[dict], max_tokens: int
     try:
         kind, value = result_q.get(timeout=timeout_seconds)
     except queue.Empty:
-        raise GenerationStalled(
-            f"generation stalled (> {round(timeout_seconds, 1)}s)"
-        ) from None
+        raise GenerationStalled(f"generation stalled (> {round(timeout_seconds, 1)}s)") from None
     if kind == "err":
         raise value
     return value
@@ -176,6 +176,14 @@ def _failure_extra(ex: ToolExecutor, transcript: _Transcript) -> dict:
     return {
         "files_changed": [vars(c) for c in ex.changed_files()],
         "transcript_path": str(transcript.path),
+    }
+
+
+def _tool_result_message(name: str, result: str) -> dict:
+    """The user-role turn that feeds a tool's result back to the model."""
+    return {
+        "role": "user",
+        "content": f'<tool_result name="{name}">\n{result}\n</tool_result>',
     }
 
 
@@ -193,8 +201,7 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
             content = ex.read_file(cf)
         except (PathViolation, OSError) as e:
             content = f"error: {e}"
-        messages.append({"role": "user",
-                         "content": f"Contents of {cf}:\n{content}"})
+        messages.append({"role": "user", "content": f"Contents of {cf}:\n{content}"})
 
     started = time.monotonic()
     # The one wall-clock authority for the whole task: the generation loop,
@@ -214,16 +221,21 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
             return
         token_count = _elide_if_needed(messages, engine, config)
         if token_count > config.max_context_tokens:
-            reason = (f"context overflow: {token_count} tokens exceeds "
-                      f"max_context_tokens={config.max_context_tokens} with "
-                      f"nothing left to elide")
+            reason = (
+                f"context overflow: {token_count} tokens exceeds "
+                f"max_context_tokens={config.max_context_tokens} with "
+                f"nothing left to elide"
+            )
             transcript.log(event="context_overflow", error=reason)
             store.fail(task.id, reason, extra=_failure_extra(ex, transcript))
             return
         remaining = max(0.1, deadline - time.monotonic())
         try:
             text = _generate_with_timeout(
-                engine, messages, config.max_tokens_per_generation, remaining,
+                engine,
+                messages,
+                config.max_tokens_per_generation,
+                remaining,
             )
         except GenerationStalled as e:
             if time.monotonic() >= deadline:
@@ -253,17 +265,22 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
             malformed += 1
             transcript.log(event="malformed", error=str(e))
             if malformed >= MAX_CONSECUTIVE_MALFORMED:
-                store.fail(task.id, "model-confused: 3 consecutive malformed tool calls",
-                          extra=_failure_extra(ex, transcript))
+                store.fail(
+                    task.id,
+                    "model-confused: 3 consecutive malformed tool calls",
+                    extra=_failure_extra(ex, transcript),
+                )
                 return
-            messages.append({"role": "user",
-                             "content": FORMAT_REMINDER.format(error=e)})
+            messages.append({"role": "user", "content": FORMAT_REMINDER.format(error=e)})
             continue
         if not calls:
             malformed += 1
             if malformed >= MAX_CONSECUTIVE_MALFORMED:
-                store.fail(task.id, "model-confused: 3 consecutive turns without a tool call",
-                          extra=_failure_extra(ex, transcript))
+                store.fail(
+                    task.id,
+                    "model-confused: 3 consecutive turns without a tool call",
+                    extra=_failure_extra(ex, transcript),
+                )
                 return
             messages.append({"role": "user", "content": NUDGE})
             continue
@@ -287,10 +304,10 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
                     # empty report. Same recoverable tool-error shape as every
                     # other tool; the turn budget bounds retries.
                     result = "error: finish requires a non-empty summary"
-                    transcript.log(event="tool", name=call.name,
-                                   arguments=call.arguments, result=result)
-                    messages.append({"role": "user",
-                                     "content": f'<tool_result name="{call.name}">\n{result}\n</tool_result>'})
+                    transcript.log(
+                        event="tool", name=call.name, arguments=call.arguments, result=result
+                    )
+                    messages.append(_tool_result_message(call.name, result))
                     continue
                 summary = str(raw_summary)
                 concerns = str(call.arguments.get("concerns", ""))
@@ -302,12 +319,11 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
             store.set_activity(task.id, f"{call.name}: {str(arg_hint)[:80]}", turns)
             # Persist the changed-file list as we go: if the daemon dies here,
             # recover_interrupted can still report what was already touched.
-            store.update_changed_files(task.id,
-                                       [vars(c) for c in ex.changed_files()])
-            transcript.log(event="tool", name=call.name,
-                           arguments=call.arguments, result=result[:2000])
-            messages.append({"role": "user",
-                             "content": f'<tool_result name="{call.name}">\n{result}\n</tool_result>'})
+            store.update_changed_files(task.id, [vars(c) for c in ex.changed_files()])
+            transcript.log(
+                event="tool", name=call.name, arguments=call.arguments, result=result[:2000]
+            )
+            messages.append(_tool_result_message(call.name, result))
         if finished:
             break
 
@@ -319,8 +335,7 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
         if remaining <= 0:
             return "skipped: task wall-clock budget exhausted"
         try:
-            return ex.run_command(
-                cmd, timeout=min(config.command_timeout_seconds, remaining))
+            return ex.run_command(cmd, timeout=min(config.command_timeout_seconds, remaining))
         except Exception as e:
             # run_command already turns most failures (timeout, missing
             # binary, denied) into strings, but not all of them (e.g. a
@@ -342,8 +357,13 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
     store.finish(task.id, outcome, report)
 
 
-def run_worker_loop(store: TaskStore, engines: EngineManager, config: SousConfig,
-                    stop: threading.Event, poll_interval: float = 0.5) -> None:
+def run_worker_loop(
+    store: TaskStore,
+    engines: EngineManager,
+    config: SousConfig,
+    stop: threading.Event,
+    poll_interval: float = 0.5,
+) -> None:
     while not stop.is_set():
         try:
             task = store.claim_next()

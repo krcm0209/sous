@@ -13,8 +13,11 @@ def store(tmp_path: Path) -> TaskStore:
 
 def _enqueue(store: TaskStore, title: str = "t") -> Task:
     return store.enqueue(
-        title=title, instructions="do it", project_root="/tmp/p",
-        context_files=["a.py"], verify_commands=["pytest"],
+        title=title,
+        instructions="do it",
+        project_root="/tmp/p",
+        context_files=["a.py"],
+        verify_commands=["pytest"],
     )
 
 
@@ -132,8 +135,9 @@ def test_fail_without_extra_stores_only_error(store: TaskStore):
 def test_fail_with_extra_merges_keys_into_report(store: TaskStore):
     t = _enqueue(store)
     store.claim_next()
-    store.fail(t.id, "boom", extra={"files_changed": [{"path": "a.py"}],
-                                    "transcript_path": "/tmp/x.jsonl"})
+    store.fail(
+        t.id, "boom", extra={"files_changed": [{"path": "a.py"}], "transcript_path": "/tmp/x.jsonl"}
+    )
     got = store.get(t.id)
     assert got.state == TaskState.FAILED
     assert got.report == {
@@ -153,21 +157,23 @@ def test_recover_interrupted(store: TaskStore):
     assert "restart" in got.report["error"]
 
 
-def test_recover_interrupted_includes_persisted_changed_files(store: TaskStore,
-                                                              tmp_path: Path):
+def test_recover_interrupted_includes_persisted_changed_files(store: TaskStore, tmp_path: Path):
     """B2: recovery must surface the changed_files the worker persisted while
     running, plus the deterministic transcript path."""
     t = _enqueue(store)
     store.claim_next()
-    store.update_changed_files(t.id, [{"path": "a.py", "kind": "modified",
-                                       "before_sha": "aa", "after_sha": "bb"}])
+    store.update_changed_files(
+        t.id, [{"path": "a.py", "kind": "modified", "before_sha": "aa", "after_sha": "bb"}]
+    )
     assert store.recover_interrupted(tmp_path / "data") == 1
     got = store.get(t.id)
     assert got.state == TaskState.FAILED
-    assert got.report["files_changed"] == [{"path": "a.py", "kind": "modified",
-                                            "before_sha": "aa", "after_sha": "bb"}]
+    assert got.report["files_changed"] == [
+        {"path": "a.py", "kind": "modified", "before_sha": "aa", "after_sha": "bb"}
+    ]
     assert got.report["transcript_path"] == str(
-        tmp_path / "data" / "tasks" / t.id / "transcript.jsonl")
+        tmp_path / "data" / "tasks" / t.id / "transcript.jsonl"
+    )
 
 
 _PRE_MIGRATION_SCHEMA = """

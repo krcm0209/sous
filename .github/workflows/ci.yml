@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer push to the same branch/PR makes the in-flight run obsolete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Fail loudly if uv.lock and pyproject.toml have drifted, rather than
+  # silently re-resolving to versions nobody tested.
+  #
+  # UV_LOCKED, not UV_FROZEN: --frozen means "use the lockfile as-is without
+  # checking it", which downgrades `uv lock --check` to a validity-only check
+  # and lets real drift pass with exit 0. --locked asserts the lockfile is
+  # up to date and fails otherwise, for both `uv lock --check` and `uv sync`.
+  UV_LOCKED: "1"
+
+# setup-uv is pinned to an exact release: it stopped publishing floating major
+# tags after v7, so `@v10` does not resolve. Dependabot keeps it current.
+jobs:
+  lint:
+    name: Lint & lockfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: uv.lock is in sync with pyproject.toml
+        run: uv lock --check
+
+      # Linting needs only the pure-Python dev group. Skipping the project
+      # install keeps mlx (and therefore macOS) out of this job entirely.
+      - name: Install dev tooling
+        run: uv sync --only-group dev --no-install-project
+
+      - name: ruff check
+        run: uv run --no-sync ruff check --output-format=github .
+
+      - name: ruff format
+        run: uv run --no-sync ruff format --check .
+
+  test:
+    name: Tests
+    # Apple silicon: mlx-metal is sys_platform == 'darwin' gated, and this is
+    # the only platform sous actually targets.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install project and dev dependencies
+        run: uv sync
+
+      # The `model` marker needs a multi-GB MLX model download — local only.
+      # `slow` tests (process-group kills) do run here.
+      - name: pytest
+        run: uv run --no-sync pytest -m "not model"
+
+  typecheck:
+    name: Type check
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      # ty needs the real dependency types resolved, so this job installs
+      # the full environment rather than the dev group alone.
+      - name: Install project and dev dependencies
+        run: uv sync
+
+      - name: ty
+        run: uv run --no-sync ty check src
+
+  build:
+    name: Build sdist + wheel
+    runs-on: macos-15
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, test, typecheck]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: uv build
+        run: uv build
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error

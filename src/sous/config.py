@@ -14,14 +14,23 @@ DEFAULT_CONFIG_PATH = Path.home() / ".sous" / "config.toml"
 DEFAULT_DATA_DIR = Path.home() / ".sous"
 
 DEFAULT_ALLOWLIST: list[str] = [
-    "pytest", "python -m pytest", "npm test", "npx eslint", "npx prettier",
-    "ruff", "black", "mypy", "go test", "cargo test", "cargo check", "make test",
+    "pytest",
+    "python -m pytest",
+    "npm test",
+    "npx eslint",
+    "npx prettier",
+    "ruff",
+    "black",
+    "mypy",
+    "go test",
+    "cargo test",
+    "cargo check",
+    "make test",
 ]
 
 _KNOWN = {
     "server": {"port"},
-    "model": {"id", "idle_unload_minutes", "max_context_tokens",
-              "temperature", "top_p", "top_k"},
+    "model": {"id", "idle_unload_minutes", "max_context_tokens", "temperature", "top_p", "top_k"},
     "budgets": {"max_turns", "max_minutes", "max_tokens_per_generation"},
     "commands": {"allowlist", "timeout_seconds", "approval_timeout_minutes"},
     "tasks": {"retention"},
@@ -61,8 +70,7 @@ def _read_toml(path: Path) -> dict:
             # A typo in the hand-edited config must not crash the daemon at
             # boot (launchd KeepAlive would restart-loop it) — warn and run
             # on defaults, matching the unknown-key stance.
-            warnings.warn(f"sous config: cannot parse {path} ({e}); using defaults",
-                          stacklevel=3)
+            warnings.warn(f"sous config: cannot parse {path} ({e}); using defaults", stacklevel=3)
             return {}
 
 
@@ -74,9 +82,7 @@ def _warn_unknown(raw: dict) -> None:
         if isinstance(values, dict):
             for key in values:
                 if key not in _KNOWN[section]:
-                    warnings.warn(
-                        f"sous config: unknown key {key!r} in [{section}]", stacklevel=3
-                    )
+                    warnings.warn(f"sous config: unknown key {key!r} in [{section}]", stacklevel=3)
 
 
 def _section(raw: dict, name: str) -> dict:
@@ -85,9 +91,11 @@ def _section(raw: dict, name: str) -> dict:
     section and fall back to defaults for it."""
     value = raw.get(name, {})
     if not isinstance(value, dict):
-        warnings.warn(f"sous config: [{name}] is not a table "
-                      f"(got {type(value).__name__}); using defaults for it",
-                      stacklevel=4)
+        warnings.warn(
+            f"sous config: [{name}] is not a table "
+            f"(got {type(value).__name__}); using defaults for it",
+            stacklevel=4,
+        )
         return {}
     return value
 
@@ -127,32 +135,33 @@ def current_allowlist(config_path: Path) -> list[list[str]]:
     if not isinstance(entries, list):
         # This escapes into delegate_task/server_status/run_command — a wrong
         # shape must degrade to defaults, never raise out of the service API.
-        warnings.warn(f"sous config: [commands].allowlist is not a list "
-                      f"(got {type(entries).__name__}); using defaults",
-                      stacklevel=2)
+        warnings.warn(
+            f"sous config: [commands].allowlist is not a list "
+            f"(got {type(entries).__name__}); using defaults",
+            stacklevel=2,
+        )
         entries = DEFAULT_ALLOWLIST
     parsed: list[list[str]] = []
     for entry in entries:
         if not isinstance(entry, str):
-            warnings.warn(f"sous config: skipping non-string allowlist entry "
-                          f"{entry!r}", stacklevel=2)
+            warnings.warn(
+                f"sous config: skipping non-string allowlist entry {entry!r}", stacklevel=2
+            )
             continue
         try:
             parsed.append(shlex.split(entry))
         except ValueError as e:
             # One unparseable entry (e.g. an unbalanced quote) must not
             # disable delegation — skip it, keep the valid ones.
-            warnings.warn(f"sous config: skipping unparseable allowlist entry "
-                          f"{entry!r} ({e})", stacklevel=2)
+            warnings.warn(
+                f"sous config: skipping unparseable allowlist entry {entry!r} ({e})", stacklevel=2
+            )
     return parsed
 
 
 def persist_allowlist_entry(command: str, config_path: Path) -> None:
     """Append one command to the allowlist, preserving file formatting."""
-    if config_path.is_file():
-        doc = tomlkit.parse(config_path.read_text())
-    else:
-        doc = tomlkit.document()
+    doc = tomlkit.parse(config_path.read_text()) if config_path.is_file() else tomlkit.document()
     commands = doc.setdefault("commands", tomlkit.table())
     # Seed the defaults ONLY when the key is absent — i.e. the array is being
     # created for the first time (new file, or a section that never had an
