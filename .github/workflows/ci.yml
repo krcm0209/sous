@@ -20,13 +20,15 @@ env:
   # silently re-resolving to versions nobody tested.
   UV_FROZEN: "1"
 
+# setup-uv is pinned to an exact release: it stopped publishing floating major
+# tags after v7, so `@v10` does not resolve. Dependabot keeps it current.
 jobs:
   lint:
     name: Lint & lockfile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
 
@@ -51,7 +53,7 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
 
@@ -68,7 +70,7 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
 
@@ -87,7 +89,7 @@ jobs:
     needs: [lint, test, typecheck]
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
 
