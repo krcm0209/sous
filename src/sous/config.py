@@ -55,7 +55,15 @@ def _read_toml(path: Path) -> dict:
     if not path.is_file():
         return {}
     with path.open("rb") as f:
-        return tomllib.load(f)
+        try:
+            return tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            # A typo in the hand-edited config must not crash the daemon at
+            # boot (launchd KeepAlive would restart-loop it) — warn and run
+            # on defaults, matching the unknown-key stance.
+            warnings.warn(f"sous config: cannot parse {path} ({e}); using defaults",
+                          stacklevel=3)
+            return {}
 
 
 def _warn_unknown(raw: dict) -> None:
@@ -103,7 +111,16 @@ def current_allowlist(config_path: Path) -> list[list[str]]:
     """Hot path: re-read the allowlist on every command execution."""
     raw = _read_toml(config_path)
     entries = raw.get("commands", {}).get("allowlist", DEFAULT_ALLOWLIST)
-    return [shlex.split(e) for e in entries]
+    parsed: list[list[str]] = []
+    for entry in entries:
+        try:
+            parsed.append(shlex.split(entry))
+        except ValueError as e:
+            # One unparseable entry (e.g. an unbalanced quote) must not
+            # disable delegation — skip it, keep the valid ones.
+            warnings.warn(f"sous config: skipping unparseable allowlist entry "
+                          f"{entry!r} ({e})", stacklevel=2)
+    return parsed
 
 
 def persist_allowlist_entry(command: str, config_path: Path) -> None:

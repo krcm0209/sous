@@ -68,6 +68,40 @@ def test_current_allowlist_defaults_when_missing(tmp_path: Path):
     ]
 
 
+def test_malformed_toml_returns_defaults_and_warns(tmp_path: Path):
+    """I2: a syntax error in the hand-edited config must not crash the daemon
+    at boot (launchd KeepAlive would restart-loop it)."""
+    p = tmp_path / "config.toml"
+    p.write_text('[server\nport = 9000\n')  # missing closing bracket
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(p)
+    assert cfg.server_port == 8383  # defaults, not a raise
+    assert any("config" in str(w.message).lower() for w in caught)
+
+
+def test_malformed_toml_allowlist_falls_back_to_defaults(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text('[commands\nallowlist = ["pytest"]\n')
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        allow = current_allowlist(p)
+    assert ["pytest"] in allow  # defaults still allow delegation
+    assert any("config" in str(w.message).lower() for w in caught)
+
+
+def test_unparseable_allowlist_entry_skipped_with_warning(tmp_path: Path):
+    """I2: one unbalanced quote must not disable delegation entirely."""
+    p = tmp_path / "config.toml"
+    p.write_text('[commands]\nallowlist = ["pytest", "don\'t", "ruff"]\n')
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        allow = current_allowlist(p)
+    assert ["pytest"] in allow and ["ruff"] in allow  # valid entries survive
+    assert len(allow) == 2
+    assert any("allowlist" in str(w.message).lower() for w in caught)
+
+
 def test_persist_allowlist_entry_appends_and_preserves(tmp_path: Path):
     p = tmp_path / "config.toml"
     p.write_text('# my comment\n[commands]\nallowlist = ["pytest"]\n')
