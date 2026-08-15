@@ -21,10 +21,33 @@ def _enqueue(store: TaskStore, title: str = "t") -> Task:
     )
 
 
+# get()/claim_next() return Task | None, and report is dict | None, because
+# production callers genuinely handle absence. Tests that go straight to an
+# attribute are asserting the row exists; these say so once, and fail with
+# that message instead of an AttributeError on None.
+
+
+def _get(store: TaskStore, task_id: str) -> Task:
+    task = store.get(task_id)
+    assert task is not None, f"expected task {task_id} to exist"
+    return task
+
+
+def _claim(store: TaskStore) -> Task:
+    task = store.claim_next()
+    assert task is not None, "expected a queued task to claim"
+    return task
+
+
+def _report(store: TaskStore, task_id: str) -> dict:
+    report = _get(store, task_id).report
+    assert report is not None, f"expected task {task_id} to have a report"
+    return report
+
+
 def test_enqueue_and_get_roundtrip(store: TaskStore):
     t = _enqueue(store)
-    got = store.get(t.id)
-    assert got is not None
+    got = _get(store, t.id)
     assert got.state == TaskState.QUEUED
     assert got.instructions == "do it"
     assert got.context_files == ["a.py"]
@@ -33,10 +56,10 @@ def test_enqueue_and_get_roundtrip(store: TaskStore):
 
 def test_claim_next_is_fifo_and_marks_running(store: TaskStore):
     t1, t2 = _enqueue(store, "one"), _enqueue(store, "two")
-    c = store.claim_next()
+    c = _claim(store)
     assert c.id == t1.id and c.state == TaskState.RUNNING
-    assert store.get(t1.id).started_at is not None
-    assert store.claim_next().id == t2.id
+    assert _get(store, t1.id).started_at is not None
+    assert _claim(store).id == t2.id
     assert store.claim_next() is None
 
 
@@ -52,7 +75,7 @@ def test_finish_stores_report(store: TaskStore):
     t = _enqueue(store)
     store.claim_next()
     store.finish(t.id, "completed", {"summary": "did the thing"})
-    got = store.get(t.id)
+    got = _get(store, t.id)
     assert got.state == TaskState.DONE
     assert got.outcome == "completed"
     assert got.report == {"summary": "did the thing"}
@@ -63,12 +86,12 @@ def test_approval_flow(store: TaskStore):
     t = _enqueue(store)
     store.claim_next()
     store.request_approval(t.id, "go vet ./...")
-    assert store.get(t.id).state == TaskState.AWAITING_APPROVAL
-    assert store.get(t.id).pending_command == "go vet ./..."
+    assert _get(store, t.id).state == TaskState.AWAITING_APPROVAL
+    assert _get(store, t.id).pending_command == "go vet ./..."
     assert store.poll_approval(t.id) is None  # still pending
     assert store.respond_approval(t.id, approve=True) is True
     assert store.poll_approval(t.id) == "approved"
-    got = store.get(t.id)
+    got = _get(store, t.id)
     assert got.state == TaskState.RUNNING and got.pending_command is None
 
 
@@ -91,17 +114,17 @@ def test_second_approval_response_does_not_overwrite_first(store: TaskStore):
 def test_cancel_queued_is_immediate(store: TaskStore):
     t = _enqueue(store)
     assert store.cancel(t.id) is True
-    assert store.get(t.id).state == TaskState.CANCELLED
+    assert _get(store, t.id).state == TaskState.CANCELLED
 
 
 def test_cancel_running_sets_flag(store: TaskStore):
     t = _enqueue(store)
     store.claim_next()
     assert store.cancel(t.id) is True
-    assert store.get(t.id).state == TaskState.RUNNING
+    assert _get(store, t.id).state == TaskState.RUNNING
     assert store.is_cancel_requested(t.id) is True
     store.mark_cancelled(t.id)
-    assert store.get(t.id).state == TaskState.CANCELLED
+    assert _get(store, t.id).state == TaskState.CANCELLED
 
 
 def test_cancel_finished_returns_false(store: TaskStore):
@@ -120,14 +143,14 @@ def test_cancel_finished_does_not_set_flag(store: TaskStore):
     store.finish(t.id, "completed", {})
     assert store.cancel(t.id) is False
     assert store.is_cancel_requested(t.id) is False
-    assert store.get(t.id).state == TaskState.DONE
+    assert _get(store, t.id).state == TaskState.DONE
 
 
 def test_fail_without_extra_stores_only_error(store: TaskStore):
     t = _enqueue(store)
     store.claim_next()
     store.fail(t.id, "boom")
-    got = store.get(t.id)
+    got = _get(store, t.id)
     assert got.state == TaskState.FAILED
     assert got.report == {"error": "boom"}
 
@@ -138,7 +161,7 @@ def test_fail_with_extra_merges_keys_into_report(store: TaskStore):
     store.fail(
         t.id, "boom", extra={"files_changed": [{"path": "a.py"}], "transcript_path": "/tmp/x.jsonl"}
     )
-    got = store.get(t.id)
+    got = _get(store, t.id)
     assert got.state == TaskState.FAILED
     assert got.report == {
         "error": "boom",
@@ -152,9 +175,9 @@ def test_recover_interrupted(store: TaskStore):
     store.claim_next()
     n = store.recover_interrupted()
     assert n == 1
-    got = store.get(t.id)
+    got = _get(store, t.id)
     assert got.state == TaskState.FAILED
-    assert "restart" in got.report["error"]
+    assert "restart" in _report(store, t.id)["error"]
 
 
 def test_recover_interrupted_includes_persisted_changed_files(store: TaskStore, tmp_path: Path):
@@ -166,14 +189,13 @@ def test_recover_interrupted_includes_persisted_changed_files(store: TaskStore, 
         t.id, [{"path": "a.py", "kind": "modified", "before_sha": "aa", "after_sha": "bb"}]
     )
     assert store.recover_interrupted(tmp_path / "data") == 1
-    got = store.get(t.id)
+    got = _get(store, t.id)
     assert got.state == TaskState.FAILED
-    assert got.report["files_changed"] == [
+    report = _report(store, t.id)
+    assert report["files_changed"] == [
         {"path": "a.py", "kind": "modified", "before_sha": "aa", "after_sha": "bb"}
     ]
-    assert got.report["transcript_path"] == str(
-        tmp_path / "data" / "tasks" / t.id / "transcript.jsonl"
-    )
+    assert report["transcript_path"] == str(tmp_path / "data" / "tasks" / t.id / "transcript.jsonl")
 
 
 _PRE_MIGRATION_SCHEMA = """
@@ -211,7 +233,7 @@ def test_changed_files_column_migrates_existing_db(tmp_path: Path):
     store.claim_next()
     store.update_changed_files(t.id, [{"path": "x.py"}])
     assert store.recover_interrupted(tmp_path) == 1
-    assert store.get(t.id).report["files_changed"] == [{"path": "x.py"}]
+    assert _report(store, t.id)["files_changed"] == [{"path": "x.py"}]
 
 
 def test_count_by_state_aggregates_all_rows(store: TaskStore):
@@ -229,7 +251,7 @@ def test_count_by_state_aggregates_all_rows(store: TaskStore):
 def test_persistence_across_instances(tmp_path: Path):
     db = tmp_path / "tasks.db"
     t = _enqueue(TaskStore(db))
-    assert TaskStore(db).get(t.id).title == "t"
+    assert _get(TaskStore(db), t.id).title == "t"
 
 
 def test_prune_keeps_recent(store: TaskStore):
@@ -253,7 +275,7 @@ def test_cancel_running_cannot_clobber_state(store: TaskStore):
     store.claim_next()  # Now running
     # Cancel the running task - should set flag, not transition state
     assert store.cancel(t.id) is True
-    got = store.get(t.id)
+    got = _get(store, t.id)
     assert got.state == TaskState.RUNNING  # Still running, not cancelled
     assert got.cancel_requested is True  # Flag is set
     assert got.finished_at is None  # Not finished
