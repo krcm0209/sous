@@ -108,6 +108,18 @@ def test_cancel_finished_returns_false(store: TaskStore):
     assert store.cancel(t.id) is False
 
 
+def test_cancel_finished_does_not_set_flag(store: TaskStore):
+    """B2: the active-task cancel path must be one atomic guarded UPDATE — a
+    worker finishing between a read and a blind write would otherwise leave a
+    terminal task flagged with cancel() lying True."""
+    t = _enqueue(store)
+    store.claim_next()
+    store.finish(t.id, "completed", {})
+    assert store.cancel(t.id) is False
+    assert store.is_cancel_requested(t.id) is False
+    assert store.get(t.id).state == TaskState.DONE
+
+
 def test_fail_without_extra_stores_only_error(store: TaskStore):
     t = _enqueue(store)
     store.claim_next()

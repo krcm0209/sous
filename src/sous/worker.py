@@ -271,6 +271,14 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
 
         finished = False
         for call in calls:
+            # Cancellation is honored at EVERY tool boundary: a response can
+            # carry several calls, and a cancel that lands while one executes
+            # must stop the rest — including a trailing finish, which would
+            # otherwise turn a cancelled task into done.
+            if store.is_cancel_requested(task.id):
+                transcript.log(event="cancelled")
+                store.mark_cancelled(task.id, extra=_failure_extra(ex, transcript))
+                return
             if call.name == "finish":
                 summary = str(call.arguments.get("summary", ""))
                 concerns = str(call.arguments.get("concerns", ""))

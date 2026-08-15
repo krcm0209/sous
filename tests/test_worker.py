@@ -159,7 +159,12 @@ def test_cancel_after_write_still_reports_files_changed(env):
     class CancelAfterGen(FakeEngine):
         def generate(self, messages, tools, max_tokens):
             out = super().generate(messages, tools, max_tokens)
-            store.cancel(task.id)  # flag lands after this turn's write runs
+            if not self.script:
+                # Flag lands after the final generation, i.e. after turn 1's
+                # write already ran. (Cancelling right after turn 1's generate
+                # would now — correctly — stop the task BEFORE the write:
+                # cancellation is checked at every tool boundary.)
+                store.cancel(task.id)
             return out
 
     engine = CancelAfterGen([
@@ -170,6 +175,37 @@ def test_cancel_after_write_still_reports_files_changed(env):
     run_task(task, store, engine, cfg)
     got = store.get(task.id)
     assert got.state == TaskState.CANCELLED
+    assert (root / "hello.txt").read_text() == "hello sous"
+    assert got.report["files_changed"][0]["path"] == "hello.txt"
+    assert Path(got.report["transcript_path"]).exists()
+
+
+def test_cancel_between_calls_in_same_turn_stops_before_finish(env):
+    """B1: cancellation is honored at EVERY tool boundary, not once per model
+    turn — a single response carrying [write_file, finish] with cancel landing
+    while write_file executes must end cancelled, never done, and the report
+    must still name the written file."""
+    root, cfg, store = env
+    task = _start(store, root)
+
+    # Cancel lands right after the first tool executes (set_activity runs
+    # after each _execute), i.e. between write_file and finish.
+    orig_set_activity = store.set_activity
+
+    def cancel_on_activity(task_id, text, turns_used):
+        orig_set_activity(task_id, text, turns_used)
+        store.cancel(task_id)
+
+    store.set_activity = cancel_on_activity
+    engine = FakeEngine([
+        CALL.format(name="write_file",
+                    args='{"path": "hello.txt", "content": "hello sous"}')
+        + FINISH,  # both calls in ONE response
+    ])
+    run_task(task, store, engine, cfg)
+    got = store.get(task.id)
+    assert got.state == TaskState.CANCELLED
+    assert got.outcome != "completed"
     assert (root / "hello.txt").read_text() == "hello sous"
     assert got.report["files_changed"][0]["path"] == "hello.txt"
     assert Path(got.report["transcript_path"]).exists()

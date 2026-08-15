@@ -227,15 +227,17 @@ class TaskStore:
             if cur.rowcount == 1:
                 return True
 
-            # If not queued, check if it's still active and set cancel_requested
-            row = c.execute(
-                "SELECT state FROM tasks WHERE id=?", (task_id,)
-            ).fetchone()
-            if row is None or row["state"] in FINISHED_STATES:
-                return False
-            # Must be running or awaiting_approval
-            c.execute("UPDATE tasks SET cancel_requested=1 WHERE id=?", (task_id,))
-        return True
+            # Not queued: flag the task for cancellation only while it is
+            # still active, as ONE guarded UPDATE. A SELECT-then-blind-UPDATE
+            # would let a worker finishing between the two leave a terminal
+            # task flagged and cancel() returning True, contrary to the
+            # finished-task contract (mirrors the atomic queued path above).
+            cur = c.execute(
+                "UPDATE tasks SET cancel_requested=1"
+                " WHERE id=? AND state NOT IN (?,?,?)",
+                (task_id, *FINISHED_STATES),
+            )
+            return cur.rowcount == 1
 
     def is_cancel_requested(self, task_id: str) -> bool:
         with self._conn() as c:
