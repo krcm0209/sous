@@ -32,8 +32,8 @@ Top-level entries:
 """
 
 FORMAT_REMINDER = (
-    "Your tool call was malformed ({error}). Emit exactly:\n"
-    '<tool_call>{{"name": "<tool>", "arguments": {{...}}}}</tool_call>'
+    "Your tool call could not be parsed ({error}). Re-emit it using exactly "
+    "the tool-call format specified in your instructions."
 )
 
 NUDGE = "You must call a tool to make progress. Call finish when done."

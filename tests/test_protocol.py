@@ -104,3 +104,153 @@ def test_two_calls_first_with_opening_tag_in_arguments():
     assert calls[0].name == "edit_file"
     assert calls[0].arguments["old"] == "foo <tool_call> bar"
     assert calls[1].name == "read_file"
+
+
+# --- XML-ish function/parameter format (Qwen3 chat_template.jinja) ---
+
+# Verbatim text emitted by Qwen3.8-27B in a real validation run.
+QWEN_XML_REAL = '''<tool_call>
+<function=write_file>
+<parameter=path>
+/tmp/x/shapes.py
+</parameter>
+<parameter=content>
+import math
+
+
+def area_circle(r: float) -> float:
+    """Return the area of a circle with radius r."""
+    return math.pi * r * r
+</parameter>
+</function>
+</tool_call>'''
+
+QWEN_XML_REAL_CONTENT = (
+    "import math\n"
+    "\n"
+    "\n"
+    "def area_circle(r: float) -> float:\n"
+    '    """Return the area of a circle with radius r."""\n'
+    "    return math.pi * r * r"
+)
+
+
+def test_xml_real_model_fixture_parses():
+    """The exact text the real model emitted must parse to one ToolCall,
+    with the multi-line content preserved byte-for-byte (internal blank
+    lines intact, only the template's single wrapping newlines removed)."""
+    calls = parse_tool_calls(QWEN_XML_REAL)
+    assert calls == [
+        ToolCall("write_file", {"path": "/tmp/x/shapes.py",
+                                "content": QWEN_XML_REAL_CONTENT})
+    ]
+
+
+def test_xml_trailing_blank_line_in_content_preserved():
+    """A trailing newline inside content must survive: only the template's
+    one wrapping newline is stripped, never .strip()/.rstrip()."""
+    text = (
+        "<tool_call>\n"
+        "<function=write_file>\n"
+        "<parameter=path>\n"
+        "a.txt\n"
+        "</parameter>\n"
+        "<parameter=content>\n"
+        "line1\n"
+        "line2\n"
+        "\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    [call] = parse_tool_calls(text)
+    assert call.arguments["content"] == "line1\nline2\n"
+
+
+def test_xml_integer_parameter_coerced_to_int():
+    text = (
+        "<tool_call>\n"
+        "<function=read_file>\n"
+        "<parameter=path>\na.py\n</parameter>\n"
+        "<parameter=offset>\n5\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    [call] = parse_tool_calls(text)
+    assert call.arguments["offset"] == 5
+    assert isinstance(call.arguments["offset"], int)
+    assert not isinstance(call.arguments["offset"], bool)
+
+
+def test_xml_uncoercible_integer_raises():
+    text = (
+        "<tool_call>\n"
+        "<function=read_file>\n"
+        "<parameter=path>\na.py\n</parameter>\n"
+        "<parameter=offset>\nnot-a-number\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    with pytest.raises(ParseError):
+        parse_tool_calls(text)
+
+
+def test_xml_two_adjacent_calls_in_order():
+    text = (
+        "<tool_call>\n<function=glob>\n"
+        "<parameter=pattern>\n**/*.py\n</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "<tool_call>\n<function=list_dir>\n"
+        "</function>\n</tool_call>"
+    )
+    calls = parse_tool_calls(text)
+    assert [c.name for c in calls] == ["glob", "list_dir"]
+    assert calls[0].arguments == {"pattern": "**/*.py"}
+    assert calls[1].arguments == {}
+
+
+def test_mixed_json_and_xml_calls_both_parse():
+    text = (
+        '<tool_call>{"name": "read_file", "arguments": {"path": "a.py"}}</tool_call>\n'
+        "<tool_call>\n<function=list_dir>\n</function>\n</tool_call>"
+    )
+    calls = parse_tool_calls(text)
+    assert calls == [ToolCall("read_file", {"path": "a.py"}),
+                     ToolCall("list_dir", {})]
+
+
+def test_xml_unknown_tool_raises():
+    with pytest.raises(ParseError):
+        parse_tool_calls("<tool_call>\n<function=rm_rf>\n</function>\n</tool_call>")
+
+
+def test_xml_prose_before_call_ignored():
+    """The template permits reasoning text before the tool call."""
+    text = "I will write the shapes module now.\n\n" + QWEN_XML_REAL
+    [call] = parse_tool_calls(text)
+    assert call.name == "write_file"
+    assert call.arguments["content"] == QWEN_XML_REAL_CONTENT
+
+
+def test_xml_embedded_tool_call_tags_in_value_not_rescanned():
+    """Cursor advance: tag text inside an argument value must not be
+    re-scanned as a new call (same guarantee as the JSON path)."""
+    text = (
+        "<tool_call>\n<function=write_file>\n"
+        "<parameter=path>\na.txt\n</parameter>\n"
+        "<parameter=content>\nstart <tool_call>data</tool_call> end\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    [call] = parse_tool_calls(text)
+    assert call.arguments["content"] == "start <tool_call>data</tool_call> end"
+
+
+def test_xml_unterminated_parameter_raises():
+    text = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n"
+    with pytest.raises(ParseError):
+        parse_tool_calls(text)
+
+
+def test_tool_call_with_unrecognized_payload_raises():
+    with pytest.raises(ParseError):
+        parse_tool_calls("<tool_call>garbage</tool_call>")
