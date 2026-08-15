@@ -8,6 +8,7 @@ import re
 import shlex
 import signal
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -109,6 +110,51 @@ def _truncate(text: str) -> str:
     return text
 
 
+# Command output keeps the HEAD and the TAIL of the combined stdout+stderr,
+# half the budget each: for a verify command the verdict — "3 failed", the
+# traceback, the summary line — is at the END, which the head-only _truncate
+# (still right for the file tools) would hide.
+_CAP_HALF = MAX_TOOL_OUTPUT // 2
+
+
+def _read_combined_span(stdout_f, n_out: int, stderr_f, n_err: int,
+                        start: int, length: int) -> str:
+    """Read `length` bytes at offset `start` from the virtual concatenation
+    stdout + b"\\n" + stderr, seeking within the spool files rather than
+    loading them (they can be hundreds of MB). Decoded with errors="replace"
+    so binary-ish output — or a multi-byte sequence split at a cut point —
+    cannot raise."""
+    end = start + length
+    chunks: list[bytes] = []
+    if start < n_out:
+        stdout_f.seek(start)
+        chunks.append(stdout_f.read(min(end, n_out) - start))
+    if start <= n_out < end:
+        chunks.append(b"\n")  # the separator the return shape puts between streams
+    err_lo = max(start - n_out - 1, 0)
+    err_hi = min(end - n_out - 1, n_err)
+    if err_hi > err_lo:
+        stderr_f.seek(err_lo)
+        chunks.append(stderr_f.read(err_hi - err_lo))
+    return b"".join(chunks).decode(errors="replace")
+
+
+def _capped_command_output(stdout_f, stderr_f) -> str:
+    """Bounded read-back of a command's spooled stdout+stderr: the whole
+    thing when it fits in MAX_TOOL_OUTPUT, otherwise the head and the tail
+    with an elision marker between them. Never holds more than
+    ~MAX_TOOL_OUTPUT bytes in memory no matter how much the command wrote."""
+    n_out = os.fstat(stdout_f.fileno()).st_size
+    n_err = os.fstat(stderr_f.fileno()).st_size
+    total = n_out + 1 + n_err  # the "\n" joining the two streams
+    if total <= MAX_TOOL_OUTPUT:
+        return _read_combined_span(stdout_f, n_out, stderr_f, n_err, 0, total)
+    head = _read_combined_span(stdout_f, n_out, stderr_f, n_err, 0, _CAP_HALF)
+    tail = _read_combined_span(stdout_f, n_out, stderr_f, n_err,
+                               total - _CAP_HALF, _CAP_HALF)
+    return f"{head}\n[... {total - 2 * _CAP_HALF} bytes elided ...]\n{tail}"
+
+
 _KILL_GRACE_SECONDS = 2.0
 
 
@@ -116,15 +162,18 @@ def _kill_process_group(pgid: int, proc: subprocess.Popen) -> None:
     """Kill a timed-out command's entire process group with escalation:
     SIGTERM first (so well-behaved test runners can clean up), a short grace
     period, then SIGKILL for whatever is left. Reaps the direct child.
-    ProcessLookupError means the group is already gone — not an error."""
+    ProcessLookupError means the group is already gone — not an error.
+
+    stdout/stderr go to temp files, not pipes, so no surviving descendant
+    can hold a pipe write-end open and hang either wait() here: waitpid()
+    blocks only on the direct child's exit, never on stream EOF."""
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         pass
     try:
-        # Grace period. communicate() also drains the pipes, which reach EOF
-        # only once every group member holding them has died.
-        proc.communicate(timeout=_KILL_GRACE_SECONDS)
+        # Grace period for SIGTERM handlers to run before the hard kill.
+        proc.wait(timeout=_KILL_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
         pass
     try:
@@ -132,9 +181,7 @@ def _kill_process_group(pgid: int, proc: subprocess.Popen) -> None:
     except ProcessLookupError:
         pass
     try:
-        # Reap the direct child. wait(), not communicate(): a descendant that
-        # escaped into its own session may still hold the stdout pipe open,
-        # and communicate() would block on it forever; waitpid() cannot.
+        # Reap the direct child so it doesn't linger as a zombie.
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass
@@ -313,41 +360,49 @@ class ToolExecutor:
             if approval is None or not approval(command):
                 return f"command denied (not allowlisted): {command}"
         before_snap = self._tree_snapshot()
-        try:
-            # start_new_session: the child becomes a session/process-group
-            # leader, so a timeout can kill its whole descendant tree, not
-            # just the direct child. stdin=DEVNULL: a non-interactive worker
-            # must never block on input, and a session leader has no
-            # controlling terminal for inherited TTY stdin to make sense.
-            proc = subprocess.Popen(
-                argv, shell=False, cwd=self.project_root, env=scrubbed_env(),
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, start_new_session=True,
-            )
-        except FileNotFoundError:
-            return f"command not found: {argv[0]}"
-        # Capture the group id while the child is certainly un-reaped (it may
-        # have exited, but stays a zombie until communicate()/wait() below).
-        pgid = os.getpgid(proc.pid)
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Kill the whole group FIRST, then record: snapshotting while
-            # descendants are still alive would let them modify files after
-            # the audit.
-            _kill_process_group(pgid, proc)
-            # A timed-out command may already have modified files.
+        # stdout/stderr are spooled to unlinked temp files, NOT pipes:
+        # communicate() would buffer the ENTIRE output in RAM before the
+        # 16 KB cap could apply (a ~300 MB-noisy test run drove peak RSS
+        # past 1 GB on a machine sharing 64 GB with a ~28.7 GB resident
+        # model). Files also make the reap unhangable: no descendant can
+        # keep a pipe write-end open, because there is no pipe.
+        with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+            try:
+                # start_new_session: the child becomes a session/process-group
+                # leader, so a timeout can kill its whole descendant tree, not
+                # just the direct child. stdin=DEVNULL: a non-interactive
+                # worker must never block on input, and a session leader has
+                # no controlling terminal for inherited TTY stdin to make
+                # sense.
+                proc = subprocess.Popen(
+                    argv, shell=False, cwd=self.project_root, env=scrubbed_env(),
+                    stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
+                    start_new_session=True,
+                )
+            except FileNotFoundError:
+                return f"command not found: {argv[0]}"
+            # Capture the group id while the child is certainly un-reaped (it
+            # may have exited, but stays a zombie until wait() below).
+            pgid = os.getpgid(proc.pid)
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Kill the whole group FIRST, then record: snapshotting while
+                # descendants are still alive would let them modify files
+                # after the audit.
+                _kill_process_group(pgid, proc)
+                # A timed-out command may already have modified files.
+                self._record_command_changes(before_snap)
+                return f"command timed out after {timeout}s: {command}"
+            except BaseException:  # noqa: BLE001 — deliberate: KeyboardInterrupt/
+                # SystemExit during daemon shutdown must not orphan a running
+                # process group that keeps writing files. Kill the group, then
+                # let the exception propagate (subprocess.run had the same
+                # kill-on-any-exception backstop for the direct child). No
+                # change recording here: the exception is propagating, no
+                # report is being assembled.
+                _kill_process_group(pgid, proc)
+                raise
             self._record_command_changes(before_snap)
-            return f"command timed out after {timeout}s: {command}"
-        except BaseException:  # noqa: BLE001 — deliberate: KeyboardInterrupt/
-            # SystemExit during daemon shutdown must not orphan a running
-            # process group that keeps writing files. Kill the group, then
-            # let the exception propagate (subprocess.run had the same
-            # kill-on-any-exception backstop for the direct child). No
-            # change recording here: the exception is propagating, no
-            # report is being assembled.
-            _kill_process_group(pgid, proc)
-            raise
-        self._record_command_changes(before_snap)
-        out = f"exit code {proc.returncode}\n{stdout}\n{stderr}"
-        return _truncate(out)
+            body = _capped_command_output(out_f, err_f)
+            return f"exit code {proc.returncode}\n{body}"

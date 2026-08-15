@@ -1,11 +1,12 @@
 import os
+import resource
 import sys
 import time
 from pathlib import Path
 
 import pytest
 
-from sous.toolexec import ToolExecutor, command_allowed, scrubbed_env
+from sous.toolexec import MAX_TOOL_OUTPUT, ToolExecutor, command_allowed, scrubbed_env
 
 
 def test_allowlist_token_matching():
@@ -202,11 +203,11 @@ def test_timeout_group_kill_leaves_no_survivors(shex: ToolExecutor):
 
 def test_unexpected_exception_kills_group_and_reraises(
         shex: ToolExecutor, monkeypatch: pytest.MonkeyPatch):
-    """A non-timeout exception escaping communicate() (KeyboardInterrupt /
+    """A non-timeout exception escaping wait() (KeyboardInterrupt /
     SystemExit during daemon shutdown) must kill the whole process group and
     re-raise — parity with subprocess.run's internal kill-on-any-exception.
-    The exception is injected on the FIRST communicate() call only, so the
-    group-kill helper's own grace-period communicate() still works."""
+    The exception is injected on the FIRST wait() call only, so the
+    group-kill helper's own grace-period and reap waits still work."""
     import sous.toolexec as toolexec
 
     captured: dict = {}
@@ -218,11 +219,11 @@ def test_unexpected_exception_kills_group_and_reraises(
             captured["proc"] = self
             self._exploded = False
 
-        def communicate(self, *args, **kwargs):
+        def wait(self, *args, **kwargs):
             if not self._exploded:
                 self._exploded = True
                 raise KeyboardInterrupt
-            return super().communicate(*args, **kwargs)
+            return super().wait(*args, **kwargs)
 
     monkeypatch.setattr(toolexec.subprocess, "Popen", ExplodingPopen)
     with pytest.raises(KeyboardInterrupt):
@@ -245,3 +246,81 @@ def test_command_changes_in_git_dir_not_recorded(pyex: ToolExecutor):
     pyex.run_command(
         f"{sys.executable} -c \"open('.git/junk', 'w').write('x')\"")
     assert all(".git" not in c.path for c in pyex.changed_files())
+
+
+# --- output capping: bounded memory, head+tail retention ---
+
+def _write_emit_script(root: Path, mb: int) -> None:
+    """A script emitting a distinctive first line, `mb` MB of filler, and a
+    distinctive last line — the shape of a noisy test run whose verdict is
+    at the END."""
+    (root / "emit.py").write_text(
+        "import sys\n"
+        "sys.stdout.write('HEAD-MARKER-FIRST-LINE\\n')\n"
+        "chunk = 'x' * 65536\n"
+        f"for _ in range({mb} * 16):\n"
+        "    sys.stdout.write(chunk)\n"
+        "sys.stdout.write('\\nTAIL-MARKER-LAST-LINE\\n')\n"
+    )
+
+
+def test_huge_output_capped_without_buffering_in_memory(pyex: ToolExecutor):
+    """The 16 KB cap must be enforced without ever holding the command's
+    full output in RAM: the daemon shares 64 GB with a ~28.7 GB resident
+    model, and running noisy test suites is the worker's primary job.
+    ~50 MB of output must not grow peak RSS by anything near 50 MB."""
+    _write_emit_script(pyex.project_root, 50)
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    out = pyex.run_command(f"{sys.executable} emit.py")
+    after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    assert "exit code 0" in out
+    assert len(out) <= MAX_TOOL_OUTPUT + 100  # cap holds (+ marker slack)
+    assert "HEAD-MARKER-FIRST-LINE" in out    # the 50 MB really flowed
+    assert "TAIL-MARKER-LAST-LINE" in out
+    # ru_maxrss is bytes on macOS (the product's target; KB on Linux, where
+    # this margin is even more generous). Allow ample noise, but nothing
+    # near the ~50 MB the command printed.
+    growth = after - before
+    assert growth < 100 * 1024 * 1024, f"peak RSS grew {growth} bytes"
+
+
+def test_capped_output_retains_head_and_tail(pyex: ToolExecutor):
+    """For a verify command the verdict (`3 failed`, a traceback, a summary
+    line) is at the END — head-only truncation hides exactly what the
+    worker needs. Both the beginning and the end must survive the cap,
+    with an elision marker between them."""
+    _write_emit_script(pyex.project_root, 1)
+    out = pyex.run_command(f"{sys.executable} emit.py")
+    assert "exit code 0" in out
+    assert "HEAD-MARKER-FIRST-LINE" in out
+    assert "TAIL-MARKER-LAST-LINE" in out
+    assert "elided" in out
+    assert len(out) <= MAX_TOOL_OUTPUT + 100
+
+
+def test_capped_output_retains_stderr_tail(pyex: ToolExecutor):
+    """When the noise is on stderr (compilers, linters), the tail of stderr
+    is the verdict and must survive the cap."""
+    (pyex.project_root / "emit_err.py").write_text(
+        "import sys\n"
+        "sys.stdout.write('OUT-HEAD\\n')\n"
+        "chunk = 'e' * 65536\n"
+        "for _ in range(16):\n"
+        "    sys.stderr.write(chunk)\n"
+        "sys.stderr.write('\\nERR-TAIL-VERDICT\\n')\n"
+    )
+    out = pyex.run_command(f"{sys.executable} emit_err.py")
+    assert "exit code 0" in out
+    assert "OUT-HEAD" in out
+    assert "ERR-TAIL-VERDICT" in out
+    assert len(out) <= MAX_TOOL_OUTPUT + 100
+
+
+def test_small_output_unchanged_no_elision(pyex: ToolExecutor):
+    """Small outputs keep the exact existing contract: exit-code line, then
+    stdout, then stderr, no elision marker."""
+    out = pyex.run_command(
+        f"{sys.executable} -c \"import sys; print('out-marker'); "
+        f"print('err-marker', file=sys.stderr)\"")
+    assert out == "exit code 0\nout-marker\n\nerr-marker\n"
+    assert "elided" not in out
