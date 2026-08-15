@@ -230,3 +230,47 @@ def test_context_elision_replaces_old_tool_results(env):
     assert store.get(task.id).state == TaskState.DONE
     final_turn = engine.calls[-1]
     assert any("[elided" in str(m.get("content", "")) for m in final_turn)
+
+
+def test_tool_error_from_bad_argument_value_does_not_crash_task(env):
+    root, cfg, store = env
+    task = _start(store, root)
+    engine = FakeEngine([
+        CALL.format(name="grep", args='{"pattern": "("}'),  # invalid regex
+        FINISH,
+    ])
+    run_task(task, store, engine, cfg)
+    got = store.get(task.id)
+    assert got.state == TaskState.DONE and got.outcome == "completed"
+    result_turn = engine.calls[1]
+    assert any("error" in str(m.get("content", "")).lower() for m in result_turn)
+
+
+def test_verify_command_that_raises_is_reported_not_fatal(env):
+    root, cfg, store = env
+    script = root / "verify.sh"
+    script.write_text("#!/bin/sh\necho nope\n")
+    script.chmod(0o644)  # no execute bit -> subprocess.run raises PermissionError
+    cfg.config_path.write_text(f'[commands]\nallowlist = ["{script}"]\n')
+    task = _start(store, root, verify=[str(script)])
+    run_task(task, store, FakeEngine([FINISH]), cfg)
+    got = store.get(task.id)
+    assert got.state == TaskState.DONE
+    [v] = got.report["verify"]
+    assert v["command"] == str(script)
+    assert "error" in v["output"].lower() or "permission" in v["output"].lower()
+
+
+def test_engine_exception_fails_task_cleanly(env):
+    root, cfg, store = env
+    task = _start(store, root)
+
+    class ExplodingEngine(FakeEngine):
+        def generate(self, messages, tools, max_tokens):
+            raise ValueError("boom")
+
+    run_task(task, store, ExplodingEngine([FINISH]), cfg)
+    got = store.get(task.id)
+    assert got.state == TaskState.FAILED
+    assert "engine error" in got.report["error"]
+    assert "boom" in got.report["error"]

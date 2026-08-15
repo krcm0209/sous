@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 from pathlib import Path
@@ -98,6 +99,12 @@ def _execute(call: ToolCall, ex: ToolExecutor, config: SousConfig, approval) -> 
         return f"error: missing required argument {e}"
     except OSError as e:
         return f"error: {e}"
+    except Exception as e:
+        # A small local model routinely emits a bad argument VALUE (an
+        # unparseable regex, a wrong-typed offset, an absolute glob
+        # pattern, ...). That must come back as a tool result the model
+        # can recover from, never crash the whole task.
+        return f"error: {e}"
 
 
 def _elide_if_needed(messages: list[dict], engine: Engine, config: SousConfig) -> None:
@@ -119,22 +126,30 @@ def _generate_with_timeout(engine: Engine, messages: list[dict], max_tokens: int
                            timeout_seconds: float) -> str:
     """Run a (synchronous, uninterruptible) MLX generation with a deadline.
 
-    MLX generation can't be aborted mid-stream; on timeout the thread is
-    abandoned to finish in the background and its result discarded — the task
-    fails cleanly instead of wedging the queue forever.
+    MLX generation can't be aborted mid-stream. The generation runs on a
+    daemon thread so a truly wedged model can never block interpreter (or
+    daemon-shutdown) exit — only the queue hand-off is waited on, with a
+    bounded timeout. On timeout the thread is abandoned to finish (or hang)
+    in the background; its eventual result or exception is simply dropped.
     """
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+    result_q: queue.Queue = queue.Queue(maxsize=1)
 
-    pool = ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(engine.generate, messages, WORKER_TOOLS, max_tokens)
+    def _run() -> None:
+        try:
+            result_q.put(("ok", engine.generate(messages, WORKER_TOOLS, max_tokens)))
+        except BaseException as e:  # noqa: BLE001 — relayed to the caller
+            result_q.put(("err", e))
+
+    threading.Thread(target=_run, daemon=True).start()
     try:
-        return future.result(timeout=timeout_seconds)
-    except FutureTimeout:
+        kind, value = result_q.get(timeout=timeout_seconds)
+    except queue.Empty:
         raise GenerationStalled(
             f"generation stalled (> {round(timeout_seconds, 1)}s)"
         ) from None
-    finally:
-        pool.shutdown(wait=False)  # never join: a stuck thread is abandoned
+    if kind == "err":
+        raise value
+    return value
 
 
 def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -> None:
@@ -176,6 +191,13 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
         except GenerationStalled as e:
             transcript.log(event="stalled", error=str(e))
             store.fail(task.id, str(e))
+            return
+        except Exception as e:
+            # The engine raised something other than a stall (a real
+            # generation failure). Fail the task cleanly rather than let it
+            # escape run_task's "never raises" contract.
+            transcript.log(event="engine_error", error=str(e))
+            store.fail(task.id, f"engine error: {e}")
             return
         turns += 1
         transcript.log(event="generation", turn=turns, text=text)
@@ -219,11 +241,18 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
         if finished:
             break
 
-    verify = [
-        {"command": cmd,
-         "output": ex.run_command(cmd, timeout=config.command_timeout_seconds)}
-        for cmd in task.verify_commands
-    ]
+    def _run_verify(cmd: str) -> str:
+        try:
+            return ex.run_command(cmd, timeout=config.command_timeout_seconds)
+        except Exception as e:
+            # run_command already turns most failures (timeout, missing
+            # binary, denied) into strings, but not all of them (e.g. a
+            # verify script without the execute bit raises PermissionError).
+            # Budget exhaustion is not a failure — the report must still
+            # assemble and the task must still reach `done`.
+            return f"error: {e}"
+
+    verify = [{"command": cmd, "output": _run_verify(cmd)} for cmd in task.verify_commands]
     report = {
         "summary": summary,
         "concerns": concerns,
