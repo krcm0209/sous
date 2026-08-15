@@ -3,11 +3,40 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import shlex
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
+
+from sous.config import current_allowlist
 
 MAX_TOOL_OUTPUT = 16_000
+
+# --- command execution (Task 4) ---
+
+ApprovalHook = Callable[[str], bool]
+
+_ENV_PASS = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR")
+_ENV_DENY_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD")
+
+
+def command_allowed(argv: list[str], allowlist: list[list[str]]) -> bool:
+    """Check if argv is allowlisted by leading-token equality."""
+    return any(
+        len(argv) >= len(entry) and argv[: len(entry)] == entry
+        for entry in allowlist
+    ) if argv else False
+
+
+def scrubbed_env() -> dict[str, str]:
+    """Return environment with only safe vars; scrub secret-related ones."""
+    return {
+        k: v for k, v in os.environ.items()
+        if k in _ENV_PASS and not any(k.endswith(suffix) for suffix in _ENV_DENY_SUFFIXES)
+    }
 
 
 class PathViolation(Exception):
@@ -123,3 +152,38 @@ class ToolExecutor:
 
     def changed_files(self) -> list[ChangedFile]:
         return list(self._changes.values())
+
+    # -- command execution --
+
+    def run_command(self, command: str, approval: ApprovalHook | None = None,
+                    timeout: int = 120) -> str:
+        """Run a command with allowlist checking and optional approval hook.
+
+        Args:
+            command: Command string to parse and execute
+            approval: Optional approval hook to override allowlist check
+            timeout: Timeout in seconds (default 120)
+
+        Returns:
+            Command output: "exit code N\n<stdout>\n<stderr>" or error message
+        """
+        try:
+            argv = shlex.split(command)
+        except ValueError as e:
+            return f"command rejected: unparseable ({e})"
+        if not argv:
+            return "command rejected: empty"
+        if not command_allowed(argv, current_allowlist(self.config_path)):
+            if approval is None or not approval(command):
+                return f"command denied (not allowlisted): {command}"
+        try:
+            proc = subprocess.run(
+                argv, shell=False, cwd=self.project_root, env=scrubbed_env(),
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return f"command timed out after {timeout}s: {command}"
+        except FileNotFoundError:
+            return f"command not found: {argv[0]}"
+        out = f"exit code {proc.returncode}\n{proc.stdout}\n{proc.stderr}"
+        return _truncate(out)
