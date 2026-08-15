@@ -105,5 +105,9 @@ single green run proves very little.
 
 ## Questions
 
-Open an issue. For anything security-sensitive, please say so in the title so
-it gets looked at first.
+Open an issue.
+
+For anything security-sensitive, please don't — use GitHub's private
+vulnerability reporting instead (**Security** tab → **Report a vulnerability**),
+so a live weakness isn't described in public while it is unfixed. See
+[SECURITY.md](SECURITY.md).
