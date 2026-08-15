@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     report TEXT,
     pending_command TEXT,
     approval_response TEXT,
-    cancel_requested INTEGER NOT NULL DEFAULT 0
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    changed_files TEXT
 );
 """
 
@@ -86,6 +87,11 @@ class TaskStore:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            # CREATE TABLE IF NOT EXISTS won't add new columns to an existing
+            # database — migrate changed_files in for pre-existing DBs.
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(tasks)")}
+            if "changed_files" not in cols:
+                c.execute("ALTER TABLE tasks ADD COLUMN changed_files TEXT")
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -147,6 +153,14 @@ class TaskStore:
                 (text, turns_used, task_id),
             )
 
+    def update_changed_files(self, task_id: str, files: list[dict]) -> None:
+        """Persist the changed-file list as the worker goes, so a daemon crash
+        cannot hide which files the task already touched (recover_interrupted
+        reads this back into the failure report)."""
+        with self._conn() as c:
+            c.execute("UPDATE tasks SET changed_files=? WHERE id=?",
+                      (json.dumps(files), task_id))
+
     def request_approval(self, task_id: str, command: str) -> None:
         with self._conn() as c:
             c.execute(
@@ -189,8 +203,10 @@ class TaskStore:
     def fail(self, task_id: str, reason: str, extra: dict | None = None) -> None:
         self._end(task_id, TaskState.FAILED, None, {"error": reason, **(extra or {})})
 
-    def mark_cancelled(self, task_id: str) -> None:
-        self._end(task_id, TaskState.CANCELLED, None, {})
+    def mark_cancelled(self, task_id: str, extra: dict | None = None) -> None:
+        # Same optional extra merge as fail(): a task cancelled after editing
+        # files must still report files_changed and the transcript path.
+        self._end(task_id, TaskState.CANCELLED, None, dict(extra or {}))
 
     def _end(self, task_id: str, state: str, outcome: str | None, report: dict) -> None:
         with self._conn() as c:
@@ -228,16 +244,30 @@ class TaskStore:
             ).fetchone()
         return bool(row and row["cancel_requested"])
 
-    def recover_interrupted(self) -> int:
+    def recover_interrupted(self, data_dir: Path | None = None) -> int:
+        """Fail tasks left running/awaiting_approval by a daemon crash. The
+        report carries the changed_files the worker persisted while running
+        and the deterministic transcript path — a restart must never hide
+        which files the worker already touched."""
         with self._conn() as c:
-            cur = c.execute(
-                "UPDATE tasks SET state=?, report=?, finished_at=?"
-                " WHERE state IN (?, ?)",
-                (TaskState.FAILED,
-                 json.dumps({"error": "interrupted by daemon restart"}),
-                 time.time(), TaskState.RUNNING, TaskState.AWAITING_APPROVAL),
-            )
-            return cur.rowcount
+            rows = c.execute(
+                "SELECT id, changed_files FROM tasks WHERE state IN (?, ?)",
+                (TaskState.RUNNING, TaskState.AWAITING_APPROVAL),
+            ).fetchall()
+            for row in rows:
+                report: dict = {
+                    "error": "interrupted by daemon restart",
+                    "files_changed": (json.loads(row["changed_files"])
+                                      if row["changed_files"] else []),
+                }
+                if data_dir is not None:
+                    report["transcript_path"] = str(
+                        Path(data_dir) / "tasks" / row["id"] / "transcript.jsonl")
+                c.execute(
+                    "UPDATE tasks SET state=?, report=?, finished_at=? WHERE id=?",
+                    (TaskState.FAILED, json.dumps(report), time.time(), row["id"]),
+                )
+            return len(rows)
 
     def prune(self, retention: int) -> int:
         with self._conn() as c:

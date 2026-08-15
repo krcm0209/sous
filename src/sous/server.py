@@ -214,7 +214,7 @@ def main() -> None:
     config = load_config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
     store = TaskStore(config.data_dir / "tasks.db")
-    interrupted = store.recover_interrupted()
+    interrupted = store.recover_interrupted(config.data_dir)
     if interrupted:
         print(f"sous: marked {interrupted} interrupted task(s) as failed")
     engines = EngineManager(config)

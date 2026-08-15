@@ -149,6 +149,62 @@ def test_cancel_mid_loop(env):
     assert store.get(task.id).state == TaskState.CANCELLED
 
 
+def test_cancel_after_write_still_reports_files_changed(env):
+    """B1: a task cancelled after editing files must report files_changed and
+    the transcript path exactly like the failed path does — cancel is the one
+    terminal state that was still hiding what the worker touched."""
+    root, cfg, store = env
+    task = _start(store, root)
+
+    class CancelAfterGen(FakeEngine):
+        def generate(self, messages, tools, max_tokens):
+            out = super().generate(messages, tools, max_tokens)
+            store.cancel(task.id)  # flag lands after this turn's write runs
+            return out
+
+    engine = CancelAfterGen([
+        CALL.format(name="write_file",
+                    args='{"path": "hello.txt", "content": "hello sous"}'),
+        FINISH,
+    ])
+    run_task(task, store, engine, cfg)
+    got = store.get(task.id)
+    assert got.state == TaskState.CANCELLED
+    assert (root / "hello.txt").read_text() == "hello sous"
+    assert got.report["files_changed"][0]["path"] == "hello.txt"
+    assert Path(got.report["transcript_path"]).exists()
+
+
+def test_restart_recovery_reports_files_changed_and_transcript(env):
+    """B2: files the worker already wrote must be visible after a daemon
+    restart — the worker persists changed_files as it goes, and
+    recover_interrupted folds them (plus the deterministic transcript path)
+    into the failure report."""
+    root, cfg, store = env
+    task = _start(store, root)
+
+    class DyingEngine(FakeEngine):
+        def generate(self, messages, tools, max_tokens):
+            if not self.script:
+                raise KeyboardInterrupt  # simulates the daemon dying mid-task
+            return super().generate(messages, tools, max_tokens)
+
+    engine = DyingEngine([
+        CALL.format(name="write_file",
+                    args='{"path": "hello.txt", "content": "hello sous"}'),
+    ])
+    with pytest.raises(KeyboardInterrupt):
+        run_task(task, store, engine, cfg)
+    assert store.get(task.id).state == TaskState.RUNNING  # left mid-flight
+    assert store.recover_interrupted(cfg.data_dir) == 1
+    got = store.get(task.id)
+    assert got.state == TaskState.FAILED
+    assert "restart" in got.report["error"]
+    assert got.report["files_changed"][0]["path"] == "hello.txt"
+    assert got.report["transcript_path"] == str(
+        cfg.data_dir / "tasks" / task.id / "transcript.jsonl")
+
+
 def test_verify_commands_run_and_reported(env):
     root, cfg, store = env
     cfg.config_path.write_text('[commands]\nallowlist = ["/bin/echo"]\n')

@@ -191,7 +191,7 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
     while turns < config.max_turns and time.monotonic() < deadline:
         if store.is_cancel_requested(task.id):
             transcript.log(event="cancelled")
-            store.mark_cancelled(task.id)
+            store.mark_cancelled(task.id, extra=_failure_extra(ex, transcript))
             return
         _elide_if_needed(messages, engine, config)
         remaining = max(0.1, deadline - time.monotonic())
@@ -247,6 +247,10 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
             result = _execute(call, ex, config, approval)
             arg_hint = next(iter(call.arguments.values()), "")
             store.set_activity(task.id, f"{call.name}: {str(arg_hint)[:80]}", turns)
+            # Persist the changed-file list as we go: if the daemon dies here,
+            # recover_interrupted can still report what was already touched.
+            store.update_changed_files(task.id,
+                                       [vars(c) for c in ex.changed_files()])
             transcript.log(event="tool", name=call.name,
                            arguments=call.arguments, result=result[:2000])
             messages.append({"role": "user",

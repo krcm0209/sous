@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -138,6 +139,61 @@ def test_recover_interrupted(store: TaskStore):
     got = store.get(t.id)
     assert got.state == TaskState.FAILED
     assert "restart" in got.report["error"]
+
+
+def test_recover_interrupted_includes_persisted_changed_files(store: TaskStore,
+                                                              tmp_path: Path):
+    """B2: recovery must surface the changed_files the worker persisted while
+    running, plus the deterministic transcript path."""
+    t = _enqueue(store)
+    store.claim_next()
+    store.update_changed_files(t.id, [{"path": "a.py", "kind": "modified",
+                                       "before_sha": "aa", "after_sha": "bb"}])
+    assert store.recover_interrupted(tmp_path / "data") == 1
+    got = store.get(t.id)
+    assert got.state == TaskState.FAILED
+    assert got.report["files_changed"] == [{"path": "a.py", "kind": "modified",
+                                            "before_sha": "aa", "after_sha": "bb"}]
+    assert got.report["transcript_path"] == str(
+        tmp_path / "data" / "tasks" / t.id / "transcript.jsonl")
+
+
+_PRE_MIGRATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    instructions TEXT NOT NULL,
+    project_root TEXT NOT NULL,
+    context_files TEXT NOT NULL,
+    verify_commands TEXT NOT NULL,
+    state TEXT NOT NULL,
+    outcome TEXT,
+    created_at REAL NOT NULL,
+    started_at REAL,
+    finished_at REAL,
+    last_activity TEXT NOT NULL DEFAULT '',
+    turns_used INTEGER NOT NULL DEFAULT 0,
+    report TEXT,
+    pending_command TEXT,
+    approval_response TEXT,
+    cancel_requested INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+
+def test_changed_files_column_migrates_existing_db(tmp_path: Path):
+    """B2: CREATE TABLE IF NOT EXISTS won't add changed_files to an existing
+    database — TaskStore.__init__ must ALTER TABLE it in."""
+    db = tmp_path / "tasks.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(_PRE_MIGRATION_SCHEMA)
+    conn.close()
+    store = TaskStore(db)  # must migrate, not raise
+    t = _enqueue(store)
+    store.claim_next()
+    store.update_changed_files(t.id, [{"path": "x.py"}])
+    assert store.recover_interrupted(tmp_path) == 1
+    assert store.get(t.id).report["files_changed"] == [{"path": "x.py"}]
 
 
 def test_persistence_across_instances(tmp_path: Path):

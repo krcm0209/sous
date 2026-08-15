@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 import pytest
@@ -89,3 +90,62 @@ def test_empty_allowlist_entry_in_config(ex: ToolExecutor):
     # But /bin/echo should still be allowed (non-empty entry)
     out = ex.run_command("/bin/echo hi")
     assert "exit code 0" in out
+
+
+# --- B3: command-induced file changes must be recorded ---
+
+@pytest.fixture()
+def pyex(tmp_path: Path) -> ToolExecutor:
+    """Executor whose allowlist contains the current Python interpreter, the
+    stand-in for the default-allowlisted formatters (black, prettier, ruff)
+    whose whole job is modifying files."""
+    root = tmp_path / "proj"
+    root.mkdir()
+    # config in its own dir: data_dir defaults to config_path.parent and is
+    # write-protected, so it must not be an ancestor of the project root.
+    cfg = tmp_path / "sous-home" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text(f'[commands]\nallowlist = ["{sys.executable}"]\n')
+    return ToolExecutor(root, cfg)
+
+
+def test_command_created_file_recorded(pyex: ToolExecutor):
+    out = pyex.run_command(
+        f"{sys.executable} -c \"open('gen.txt', 'w').write('made-by-command')\"")
+    assert "exit code 0" in out
+    changes = {c.path: c for c in pyex.changed_files()}
+    assert "gen.txt" in changes
+    assert changes["gen.txt"].kind == "created"
+    assert changes["gen.txt"].before_sha is None
+    assert changes["gen.txt"].after_sha
+
+
+def test_command_modified_file_recorded(pyex: ToolExecutor):
+    (pyex.project_root / "fmt.py").write_text("x=1\n")
+    out = pyex.run_command(
+        f"{sys.executable} -c \"open('fmt.py', 'w').write('x = 1  # formatted')\"")
+    assert "exit code 0" in out
+    changes = {c.path: c for c in pyex.changed_files()}
+    assert "fmt.py" in changes
+    assert changes["fmt.py"].kind == "modified"
+    # the pre-command snapshot is stat-only: prior content hash is unknown
+    assert changes["fmt.py"].before_sha is None
+
+
+def test_command_edit_refreshes_stale_hash_of_tracked_file(pyex: ToolExecutor):
+    """A file the worker wrote and a formatter then rewrote must carry the
+    formatter's content hash, not the stale pre-command one."""
+    pyex.write_file("t.txt", "one")
+    [before] = pyex.changed_files()
+    pyex.run_command(
+        f"{sys.executable} -c \"open('t.txt', 'w').write('two-formatted')\"")
+    [after] = [c for c in pyex.changed_files() if c.path == "t.txt"]
+    assert after.kind == "created"          # original kind survives
+    assert after.after_sha != before.after_sha  # hash refreshed
+
+
+def test_command_changes_in_git_dir_not_recorded(pyex: ToolExecutor):
+    (pyex.project_root / ".git").mkdir()
+    pyex.run_command(
+        f"{sys.executable} -c \"open('.git/junk', 'w').write('x')\"")
+    assert all(".git" not in c.path for c in pyex.changed_files())

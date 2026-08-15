@@ -196,6 +196,60 @@ class ToolExecutor:
 
     # -- command execution --
 
+    def _tree_snapshot(self) -> dict[str, tuple[int, int]]:
+        """Cheap stat-based snapshot of the project tree: rel path ->
+        (mtime_ns, size). Skips .git (case-folded) and never follows symlinks
+        — a symlink's target may live outside the root, and its content must
+        be neither read nor reported. Stat-only on purpose: this runs before
+        AND after every command, so no hashing here."""
+        snap: dict[str, tuple[int, int]] = {}
+        stack: list[str] = [str(self.project_root)]
+        while stack:
+            d = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_symlink():
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                if entry.name.lower() != ".git":
+                                    stack.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                st = entry.stat(follow_symlinks=False)
+                                rel = os.path.relpath(entry.path,
+                                                      self.project_root)
+                                snap[rel] = (st.st_mtime_ns, st.st_size)
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        return snap
+
+    def _record_command_changes(self, before: dict[str, tuple[int, int]]) -> None:
+        """Record files a command created or modified (the default allowlist
+        ships formatters — black, npx prettier, ruff — whose whole job is
+        editing files). Content is read only for files whose stat changed.
+        Deletions cannot be expressed by the ChangedFile shape (after_sha is
+        required) and are not recorded."""
+        for rel, sig in self._tree_snapshot().items():
+            if before.get(rel) == sig:
+                continue
+            try:
+                content = (self.project_root / rel).read_bytes()
+            except OSError:
+                continue  # vanished between snapshot and read
+            prior = self._changes.get(rel)
+            if prior is not None:
+                # already tracked: refresh the now-stale content hash, keep
+                # the original kind and before_sha
+                self._changes[rel] = ChangedFile(rel, prior.kind,
+                                                 prior.before_sha, _sha(content))
+            else:
+                kind = "modified" if rel in before else "created"
+                # before_sha unknown: the pre-command snapshot is stat-only
+                self._changes[rel] = ChangedFile(rel, kind, None, _sha(content))
+
     def run_command(self, command: str, approval: ApprovalHook | None = None,
                     timeout: int = 120) -> str:
         """Run a command with allowlist checking and optional approval hook.
@@ -217,14 +271,18 @@ class ToolExecutor:
         if not command_allowed(argv, current_allowlist(self.config_path)):
             if approval is None or not approval(command):
                 return f"command denied (not allowlisted): {command}"
+        before_snap = self._tree_snapshot()
         try:
             proc = subprocess.run(
                 argv, shell=False, cwd=self.project_root, env=scrubbed_env(),
                 capture_output=True, text=True, timeout=timeout,
             )
         except subprocess.TimeoutExpired:
+            # A timed-out command may already have modified files.
+            self._record_command_changes(before_snap)
             return f"command timed out after {timeout}s: {command}"
         except FileNotFoundError:
             return f"command not found: {argv[0]}"
+        self._record_command_changes(before_snap)
         out = f"exit code {proc.returncode}\n{proc.stdout}\n{proc.stderr}"
         return _truncate(out)
