@@ -71,9 +71,10 @@ class ToolCall:
 
 def parse_tool_calls(text: str) -> list[ToolCall]:
     calls: list[ToolCall] = []
-    for match in _OPEN_RE.finditer(text):
+    pos = 0
+    while (match := _OPEN_RE.search(text, pos)) is not None:
         try:
-            payload, _end = _DECODER.raw_decode(text, match.end())
+            payload, end = _DECODER.raw_decode(text, match.end())
         except json.JSONDecodeError as e:
             raise ParseError(f"invalid JSON in tool_call: {e}") from e
         if not isinstance(payload, dict):
@@ -85,4 +86,5 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
         if not isinstance(arguments, dict):
             raise ParseError("tool_call arguments must be a JSON object")
         calls.append(ToolCall(name, arguments))
+        pos = end
     return calls

@@ -75,3 +75,32 @@ def test_two_calls_first_with_closing_tag_in_arguments():
     assert calls[0].name == "edit_file"
     assert calls[0].arguments["old"] == "foo</tool_call>"
     assert calls[1].name == "read_file"
+
+
+def test_write_file_with_opening_tag_in_content():
+    """write_file whose content contains the literal <tool_call> substring."""
+    text = '<tool_call>{"name": "write_file", "arguments": {"path": "a.txt", "content": "prefix <tool_call> suffix"}}</tool_call>'
+    [call] = parse_tool_calls(text)
+    assert call.name == "write_file"
+    assert call.arguments["content"] == "prefix <tool_call> suffix"
+
+
+def test_call_with_both_opening_and_closing_tags_in_content():
+    """Call whose content contains both <tool_call> and </tool_call> substrings."""
+    text = '<tool_call>{"name": "write_file", "arguments": {"path": "test.txt", "content": "start <tool_call>data</tool_call> end"}}</tool_call>'
+    [call] = parse_tool_calls(text)
+    assert call.name == "write_file"
+    assert call.arguments["content"] == "start <tool_call>data</tool_call> end"
+
+
+def test_two_calls_first_with_opening_tag_in_arguments():
+    """Two adjacent calls where the first has <tool_call> in its arguments."""
+    text = (
+        '<tool_call>{"name": "edit_file", "arguments": {"path": "x.py", "old": "foo <tool_call> bar", "new": "baz"}}</tool_call>'
+        '<tool_call>{"name": "read_file", "arguments": {"path": "y.py"}}</tool_call>'
+    )
+    calls = parse_tool_calls(text)
+    assert len(calls) == 2
+    assert calls[0].name == "edit_file"
+    assert calls[0].arguments["old"] == "foo <tool_call> bar"
+    assert calls[1].name == "read_file"
