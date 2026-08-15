@@ -211,6 +211,22 @@ def test_respond_race_does_not_persist_allowlist(svc, monkeypatch):
     assert ["go", "vet", "./..."] not in current_allowlist(service.config.config_path)
 
 
+def test_second_respond_cannot_reverse_persisted_approval(svc):
+    """A3 (service boundary): approve-with-persist writes the allowlist entry;
+    a later deny must NOT win the approval state, or the command would be left
+    permanently allowlisted while reported as denied."""
+    service, store, root = svc
+    tid = service.delegate_task("t", "x", str(root))["task_id"]
+    store.claim_next()
+    store.request_approval(tid, "go vet ./...")
+    first = service.respond_to_command_request(tid, approve=True,
+                                               persist_to_allowlist=True)
+    assert first["ok"] is True
+    second = service.respond_to_command_request(tid, approve=False)
+    assert second["ok"] is False  # first response already landed
+    assert store.poll_approval(tid) == "approved"
+
+
 def test_server_status(svc):
     service, _, root = svc
     service.delegate_task("t", "x", str(root))

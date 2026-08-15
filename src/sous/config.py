@@ -79,15 +79,28 @@ def _warn_unknown(raw: dict) -> None:
                     )
 
 
+def _section(raw: dict, name: str) -> dict:
+    """A valid-TOML config with the wrong SHAPE (`server = 1`) must not crash
+    the daemon at boot any more than a syntax error would — warn naming the
+    section and fall back to defaults for it."""
+    value = raw.get(name, {})
+    if not isinstance(value, dict):
+        warnings.warn(f"sous config: [{name}] is not a table "
+                      f"(got {type(value).__name__}); using defaults for it",
+                      stacklevel=4)
+        return {}
+    return value
+
+
 def load_config(config_path: Path | None = None) -> SousConfig:
     path = config_path or DEFAULT_CONFIG_PATH
     raw = _read_toml(path)
     _warn_unknown(raw)
-    server = raw.get("server", {})
-    model = raw.get("model", {})
-    budgets = raw.get("budgets", {})
-    commands = raw.get("commands", {})
-    tasks = raw.get("tasks", {})
+    server = _section(raw, "server")
+    model = _section(raw, "model")
+    budgets = _section(raw, "budgets")
+    commands = _section(raw, "commands")
+    tasks = _section(raw, "tasks")
     return SousConfig(
         server_port=server.get("port", 8383),
         model_id=model.get("id", "mlx-community/Qwen3.8-27B-mxfp8"),
@@ -110,9 +123,20 @@ def load_config(config_path: Path | None = None) -> SousConfig:
 def current_allowlist(config_path: Path) -> list[list[str]]:
     """Hot path: re-read the allowlist on every command execution."""
     raw = _read_toml(config_path)
-    entries = raw.get("commands", {}).get("allowlist", DEFAULT_ALLOWLIST)
+    entries = _section(raw, "commands").get("allowlist", DEFAULT_ALLOWLIST)
+    if not isinstance(entries, list):
+        # This escapes into delegate_task/server_status/run_command — a wrong
+        # shape must degrade to defaults, never raise out of the service API.
+        warnings.warn(f"sous config: [commands].allowlist is not a list "
+                      f"(got {type(entries).__name__}); using defaults",
+                      stacklevel=2)
+        entries = DEFAULT_ALLOWLIST
     parsed: list[list[str]] = []
     for entry in entries:
+        if not isinstance(entry, str):
+            warnings.warn(f"sous config: skipping non-string allowlist entry "
+                          f"{entry!r}", stacklevel=2)
+            continue
         try:
             parsed.append(shlex.split(entry))
         except ValueError as e:

@@ -73,6 +73,17 @@ def test_respond_approval_when_not_awaiting_returns_false(store: TaskStore):
     assert store.respond_approval(t.id, approve=True) is False
 
 
+def test_second_approval_response_does_not_overwrite_first(store: TaskStore):
+    """A3: only the first response wins — a retried/duplicate response must
+    not reverse it (deny-after-approve or approve-after-deny)."""
+    t = _enqueue(store)
+    store.claim_next()
+    store.request_approval(t.id, "go vet ./...")
+    assert store.respond_approval(t.id, approve=False) is True
+    assert store.respond_approval(t.id, approve=True) is False  # loser
+    assert store.poll_approval(t.id) == "denied"  # first response stands
+
+
 def test_cancel_queued_is_immediate(store: TaskStore):
     t = _enqueue(store)
     assert store.cancel(t.id) is True

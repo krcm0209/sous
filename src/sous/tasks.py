@@ -157,8 +157,13 @@ class TaskStore:
 
     def respond_approval(self, task_id: str, approve: bool) -> bool:
         with self._conn() as c:
+            # approval_response IS NULL makes the first response atomic and
+            # final: a retried/duplicate response returns False instead of
+            # reversing the first (which could leave a command persisted to
+            # the allowlist by an approve, then reported as denied).
             cur = c.execute(
-                "UPDATE tasks SET approval_response=? WHERE id=? AND state=?",
+                "UPDATE tasks SET approval_response=? WHERE id=? AND state=?"
+                " AND approval_response IS NULL",
                 ("approved" if approve else "denied", task_id,
                  TaskState.AWAITING_APPROVAL),
             )

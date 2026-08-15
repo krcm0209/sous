@@ -68,8 +68,18 @@ def resolve_confined(project_root: Path, candidate: str, for_write: bool,
     if not resolved.is_relative_to(root):
         raise PathViolation(f"path escapes project root: {candidate}")
     rel = resolved.relative_to(root)
-    if for_write and any(part.lower() == ".git" for part in rel.parts):
-        raise PathViolation("writes into .git/ are not allowed")
+    if for_write:
+        # Check for a .git component on BOTH the resolved path and the
+        # lexical path (".."/"." collapsed, symlinks NOT followed). If .git
+        # is itself a symlink to a directory inside the project, resolution
+        # strips the ".git" name entirely — only the lexical path still
+        # shows it. Case-folded, any depth, either route → denied.
+        lexical = Path(os.path.normpath(joined))
+        lex_parts = lexical.parts
+        if _is_within(lexical, root):
+            lex_parts = lex_parts[len(root.parts):]
+        if any(part.lower() == ".git" for part in (*rel.parts, *lex_parts)):
+            raise PathViolation("writes into .git/ are not allowed")
     if for_write and any(_is_within(resolved, shield) for shield in protected):
         # The sous control directory (config.toml with the command allowlist,
         # tasks.db, transcripts) must never be writable from inside the

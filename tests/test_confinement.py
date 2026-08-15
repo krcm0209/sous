@@ -100,6 +100,39 @@ def test_git_read_still_allowed(root: Path):
     assert result.exists()
 
 
+def test_git_symlink_write_denied(tmp_path: Path):
+    """A1 (bypass #3): `.git` as a symlink to a directory inside the project.
+    Resolution strips the `.git` name (resolved path is realgit/...), so a
+    resolved-only guard lets the write land in the real git dir. The lexical
+    path still names `.git` and must be checked too."""
+    proj = tmp_path / "proj-gitlink"
+    (proj / "realgit").mkdir(parents=True)
+    os.symlink(proj / "realgit", proj / ".git")
+    ex = ToolExecutor(proj, tmp_path / "sous-home" / "config.toml")
+    with pytest.raises(PathViolation):
+        ex.write_file(".git/hooks/pre-commit", "INJECTED")
+    assert not (proj / "realgit" / "hooks" / "pre-commit").exists()
+
+
+def test_git_symlink_case_variant_write_denied(tmp_path: Path):
+    """A1 + C3 combined: a case variant of the `.git` symlink must be denied
+    too (case-folded lexical check)."""
+    proj = tmp_path / "proj-gitlink-case"
+    (proj / "realgit").mkdir(parents=True)
+    os.symlink(proj / "realgit", proj / ".git")
+    with pytest.raises(PathViolation):
+        resolve_confined(proj, ".GIT/hooks/evil", for_write=True)
+
+
+def test_nested_git_symlink_write_denied(tmp_path: Path):
+    """A1 at depth: sub/.git as a symlink is denied like top-level .git."""
+    proj = tmp_path / "proj-gitlink-nested"
+    (proj / "sub" / "realgit").mkdir(parents=True)
+    os.symlink(proj / "sub" / "realgit", proj / "sub" / ".git")
+    with pytest.raises(PathViolation):
+        resolve_confined(proj, "sub/.git/hooks/x", for_write=True)
+
+
 # --- C1: the sous data dir is write-protected inside the sandbox ---
 
 @pytest.fixture()
