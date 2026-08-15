@@ -82,13 +82,24 @@ still argmaxes to the same wrong output every time.
 ## Security model
 
 - Workers are confined to the `project_root` of their task (symlink-resolved;
-  `.git/` writes denied).
+  `.git/` writes denied). The sous control directory (`~/.sous/` — config,
+  allowlist, task db, transcripts) is never writable from inside the sandbox,
+  and a `project_root` that contains it is rejected outright.
 - No shell: commands run as argv (never through a shell), with an
   environment scrubbed down to `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`,
   `TMPDIR` (anything else, including `*_TOKEN`/`*_KEY`/`*_SECRET`/`*_PASSWORD`
   vars, is stripped). Only allowlisted commands run without approval.
 - Non-allowlisted commands pause the task for explicit human approval
   (auto-deny after `approval_timeout_minutes`).
+- Path confinement bounds the worker's *edits*, not what an allowlisted
+  command can do. Allowlisting a command that executes repo-resident code —
+  any test runner (`pytest`, `npm test`, `make test`, ...) — is equivalent
+  to granting arbitrary local code execution over code the worker just
+  wrote: the worker can write a `conftest.py` or test file that does
+  anything the command's process can (network egress, reading any
+  user-readable file), and the allowlisted verify run executes it without
+  approval. Calibrate the allowlist accordingly, and review diffs before
+  trusting verify output.
 - There is no network sandbox: an allowlisted or human-approved command can
   still reach the network if the command itself does (e.g. `npm test`
   hitting a registry). Keep the allowlist narrow and review approval

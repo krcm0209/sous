@@ -36,6 +36,9 @@ prep: volume and repetition. **Its output is a draft, never a merge.**
   `pending_command`. Relay it to the human verbatim and ask approve once /
   add to allowlist / deny. Answer with `respond_to_command_request`.
   Unanswered requests auto-deny after a timeout, so relay promptly.
+  Note: allowlisting any command that executes repo-resident code (test
+  runners especially) grants the worker arbitrary local execution via files
+  it writes — prefer approve-once unless the human clearly wants it standing.
 - Don't edit files the running task is touching (`last_activity` shows where
   it is working).
 
