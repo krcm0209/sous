@@ -152,6 +152,16 @@ def _generate_with_timeout(engine: Engine, messages: list[dict], max_tokens: int
     return value
 
 
+def _failure_extra(ex: ToolExecutor, transcript: _Transcript) -> dict:
+    """Attached to every terminal store.fail() in run_task so a failed task
+    still tells Claude what changed on disk and where to audit — silent,
+    unreviewed file modifications are the worst failure shape here."""
+    return {
+        "files_changed": [vars(c) for c in ex.changed_files()],
+        "transcript_path": str(transcript.path),
+    }
+
+
 def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -> None:
     root = Path(task.project_root)
     ex = ToolExecutor(root, config.config_path)
@@ -190,14 +200,14 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
             )
         except GenerationStalled as e:
             transcript.log(event="stalled", error=str(e))
-            store.fail(task.id, str(e))
+            store.fail(task.id, str(e), extra=_failure_extra(ex, transcript))
             return
         except Exception as e:
             # The engine raised something other than a stall (a real
             # generation failure). Fail the task cleanly rather than let it
             # escape run_task's "never raises" contract.
             transcript.log(event="engine_error", error=str(e))
-            store.fail(task.id, f"engine error: {e}")
+            store.fail(task.id, f"engine error: {e}", extra=_failure_extra(ex, transcript))
             return
         turns += 1
         transcript.log(event="generation", turn=turns, text=text)
@@ -209,7 +219,8 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
             malformed += 1
             transcript.log(event="malformed", error=str(e))
             if malformed >= MAX_CONSECUTIVE_MALFORMED:
-                store.fail(task.id, "model-confused: 3 consecutive malformed tool calls")
+                store.fail(task.id, "model-confused: 3 consecutive malformed tool calls",
+                          extra=_failure_extra(ex, transcript))
                 return
             messages.append({"role": "user",
                              "content": FORMAT_REMINDER.format(error=e)})
@@ -217,7 +228,8 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
         if not calls:
             malformed += 1
             if malformed >= MAX_CONSECUTIVE_MALFORMED:
-                store.fail(task.id, "model-confused: 3 consecutive turns without a tool call")
+                store.fail(task.id, "model-confused: 3 consecutive turns without a tool call",
+                          extra=_failure_extra(ex, transcript))
                 return
             messages.append({"role": "user", "content": NUDGE})
             continue

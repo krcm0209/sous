@@ -96,6 +96,29 @@ def test_cancel_finished_returns_false(store: TaskStore):
     assert store.cancel(t.id) is False
 
 
+def test_fail_without_extra_stores_only_error(store: TaskStore):
+    t = _enqueue(store)
+    store.claim_next()
+    store.fail(t.id, "boom")
+    got = store.get(t.id)
+    assert got.state == TaskState.FAILED
+    assert got.report == {"error": "boom"}
+
+
+def test_fail_with_extra_merges_keys_into_report(store: TaskStore):
+    t = _enqueue(store)
+    store.claim_next()
+    store.fail(t.id, "boom", extra={"files_changed": [{"path": "a.py"}],
+                                    "transcript_path": "/tmp/x.jsonl"})
+    got = store.get(t.id)
+    assert got.state == TaskState.FAILED
+    assert got.report == {
+        "error": "boom",
+        "files_changed": [{"path": "a.py"}],
+        "transcript_path": "/tmp/x.jsonl",
+    }
+
+
 def test_recover_interrupted(store: TaskStore):
     t = _enqueue(store)
     store.claim_next()

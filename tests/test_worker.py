@@ -93,6 +93,28 @@ def test_three_consecutive_malformed_fails(env):
     assert "model-confused" in got.report["error"]
 
 
+def test_file_written_then_model_confused_still_reports_files_changed(env):
+    """A task that writes a file and then goes model-confused must still
+    tell Claude what changed and where to audit — never a silent,
+    unreviewed file modification hidden behind a bare {"error": ...}."""
+    root, cfg, store = env
+    task = _start(store, root)
+    engine = FakeEngine([
+        CALL.format(name="write_file",
+                    args='{"path": "hello.txt", "content": "hello sous"}'),
+        "let me think about this some more with no tool call",
+        "still thinking, no tool call here either",
+        "and a third turn with no tool call at all",
+    ])
+    run_task(task, store, engine, cfg)
+    got = store.get(task.id)
+    assert got.state == TaskState.FAILED
+    assert "model-confused" in got.report["error"]
+    assert (root / "hello.txt").read_text() == "hello sous"
+    assert got.report["files_changed"][0]["path"] == "hello.txt"
+    assert Path(got.report["transcript_path"]).exists()
+
+
 def test_malformed_then_recovery_resets_counter(env):
     root, cfg, store = env
     task = _start(store, root)

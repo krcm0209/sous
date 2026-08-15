@@ -181,8 +181,8 @@ class TaskStore:
     def finish(self, task_id: str, outcome: str, report: dict) -> None:
         self._end(task_id, TaskState.DONE, outcome, report)
 
-    def fail(self, task_id: str, reason: str) -> None:
-        self._end(task_id, TaskState.FAILED, None, {"error": reason})
+    def fail(self, task_id: str, reason: str, extra: dict | None = None) -> None:
+        self._end(task_id, TaskState.FAILED, None, {"error": reason, **(extra or {})})
 
     def mark_cancelled(self, task_id: str) -> None:
         self._end(task_id, TaskState.CANCELLED, None, {})

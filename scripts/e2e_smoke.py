@@ -1,8 +1,17 @@
 """End-to-end smoke test with a tiny real model (no MCP, no Claude needed).
 
 Run:  uv run python scripts/e2e_smoke.py
-Downloads ~350 MB on first run. Expected: task reaches state=done and
-hello.txt exists with the right content.
+Downloads ~350 MB on first run. Exercises the real multi-turn agent loop
+(generate -> parse -> execute -> append) against the smallest available
+Qwen3 model. hello.txt is usually written correctly on the first or second
+turn (check "content:" below) — but this 0.6B model is unreliable at then
+emitting a well-formed `finish` tool call, so the task can still end
+`failed` (model-confused) or `done`/`budget-exhausted` even when the file
+is right. Judge success from the printed report and hello.txt content, not
+just the final state; the transcript_path in the report has full turn-by-
+turn detail if something looks wrong. Sous's default model
+(mlx-community/Qwen3.8-27B-mxfp8) is far larger and far more reliable at
+closing out the loop than this tiny one.
 """
 
 import tempfile
