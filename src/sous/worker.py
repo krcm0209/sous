@@ -56,24 +56,30 @@ class _Transcript:
             f.write(json.dumps(event) + "\n")
 
 
-def _make_approval_hook(task: Task, store: TaskStore, config: SousConfig):
+def _make_approval_hook(task: Task, store: TaskStore, config: SousConfig,
+                        deadline: float):
+    """`deadline` is the task's wall-clock deadline (time.monotonic() terms):
+    the approval wait ends at the earlier of the approval timeout and the
+    task deadline — max_minutes bounds the whole task, approvals included."""
     def hook(command: str) -> bool:
         store.request_approval(task.id, command)
-        deadline = time.monotonic() + config.approval_timeout_minutes * 60
-        while time.monotonic() < deadline:
+        wait_until = min(time.monotonic() + config.approval_timeout_minutes * 60,
+                         deadline)
+        while time.monotonic() < wait_until:
             if store.is_cancel_requested(task.id):
                 return False
             response = store.poll_approval(task.id)
             if response is not None:
                 return response == "approved"
             time.sleep(0.05)
-        store.respond_approval(task.id, approve=False)  # timeout → deny
+        store.respond_approval(task.id, approve=False)  # timeout/budget → deny
         store.poll_approval(task.id)                    # restore running state
         return False
     return hook
 
 
-def _execute(call: ToolCall, ex: ToolExecutor, config: SousConfig, approval) -> str:
+def _execute(call: ToolCall, ex: ToolExecutor, config: SousConfig, approval,
+             deadline: float) -> str:
     try:
         a = call.arguments
         match call.name:
@@ -90,8 +96,13 @@ def _execute(call: ToolCall, ex: ToolExecutor, config: SousConfig, approval) -> 
             case "grep":
                 return ex.grep(a["pattern"], a.get("glob_pattern", "**/*"))
             case "run_command":
+                # Clamp to the remaining task budget so one command cannot
+                # run past the task deadline — but never pass a non-positive
+                # timeout.
+                remaining = deadline - time.monotonic()
+                timeout = max(1, min(config.command_timeout_seconds, remaining))
                 return ex.run_command(a["command"], approval=approval,
-                                      timeout=config.command_timeout_seconds)
+                                      timeout=timeout)
             case _:
                 return f"error: unhandled tool {call.name}"
     except PathViolation as e:
@@ -172,7 +183,6 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
     root = Path(task.project_root)
     ex = ToolExecutor(root, config.config_path, data_dir=config.data_dir)
     transcript = _Transcript(config.data_dir / "tasks" / task.id / "transcript.jsonl")
-    approval = _make_approval_hook(task, store, config)
 
     messages: list[dict] = [
         {"role": "system", "content": build_system_prompt(root)},
@@ -187,12 +197,16 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
                          "content": f"Contents of {cf}:\n{content}"})
 
     started = time.monotonic()
+    # The one wall-clock authority for the whole task: the generation loop,
+    # the approval wait, run_command timeouts, and the verify loop are all
+    # bounded by this same deadline.
+    deadline = started + config.max_minutes * 60
+    approval = _make_approval_hook(task, store, config, deadline)
     turns = 0
     malformed = 0
     summary, concerns = "", ""
     outcome = "budget-exhausted"
 
-    deadline = started + config.max_minutes * 60
     while turns < config.max_turns and time.monotonic() < deadline:
         if store.is_cancel_requested(task.id):
             transcript.log(event="cancelled")
@@ -263,7 +277,7 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
                 outcome = "completed"
                 finished = True
                 break
-            result = _execute(call, ex, config, approval)
+            result = _execute(call, ex, config, approval, deadline)
             arg_hint = next(iter(call.arguments.values()), "")
             store.set_activity(task.id, f"{call.name}: {str(arg_hint)[:80]}", turns)
             # Persist the changed-file list as we go: if the daemon dies here,
@@ -278,8 +292,15 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
             break
 
     def _run_verify(cmd: str) -> str:
+        # max_minutes bounds verify commands too: past the deadline each
+        # remaining command is recorded as skipped — visible in the report,
+        # never a silent multi-minute overshoot.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "skipped: task wall-clock budget exhausted"
         try:
-            return ex.run_command(cmd, timeout=config.command_timeout_seconds)
+            return ex.run_command(
+                cmd, timeout=min(config.command_timeout_seconds, remaining))
         except Exception as e:
             # run_command already turns most failures (timeout, missing
             # binary, denied) into strings, but not all of them (e.g. a

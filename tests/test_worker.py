@@ -385,6 +385,68 @@ def test_verify_command_that_raises_is_reported_not_fatal(env):
     assert "error" in v["output"].lower() or "permission" in v["output"].lower()
 
 
+def test_verify_commands_skipped_when_budget_exhausted(env):
+    """A3: verify commands must not run past the task's wall-clock budget —
+    each gets a visible 'skipped' entry in the report instead of silently
+    overshooting max_minutes by a fresh command timeout apiece."""
+    root, cfg, store = env
+    cfg = dataclasses.replace(cfg, max_minutes=0)  # deadline already passed
+    cfg.config_path.write_text('[commands]\nallowlist = ["/usr/bin/touch"]\n')
+    task = _start(store, root, verify=["/usr/bin/touch verify-ran.txt"])
+    run_task(task, store, FakeEngine([]), cfg)  # engine never consulted
+    got = store.get(task.id)
+    assert got.state == TaskState.DONE and got.outcome == "budget-exhausted"
+    [v] = got.report["verify"]  # the skip keeps the {command, output} shape
+    assert v["command"] == "/usr/bin/touch verify-ran.txt"
+    assert "skipped" in v["output"] and "budget" in v["output"]
+    assert not (root / "verify-ran.txt").exists()  # it truly did not run
+
+
+def test_run_command_timeout_clamped_to_remaining_budget(env):
+    """A2: a run_command issued with seconds of task budget left must get a
+    timeout clamped to that remainder — and never a non-positive one."""
+    from sous.protocol import ToolCall
+    from sous.worker import _execute
+    root, cfg, store = env
+    cfg = dataclasses.replace(cfg, command_timeout_seconds=120)
+
+    class RecordingEx:
+        def __init__(self):
+            self.timeout = None
+
+        def run_command(self, command, approval=None, timeout=None):
+            self.timeout = timeout
+            return "exit code 0\nok"
+
+    call = ToolCall(name="run_command", arguments={"command": "/bin/echo hi"})
+    almost_out = RecordingEx()
+    _execute(call, almost_out, cfg, None, deadline=time.monotonic() + 2)
+    assert almost_out.timeout is not None
+    assert 0 < almost_out.timeout <= 2  # clamped well below the 120s default
+
+    exhausted = RecordingEx()
+    _execute(call, exhausted, cfg, None, deadline=time.monotonic() - 5)
+    assert exhausted.timeout is not None
+    assert exhausted.timeout > 0  # never a non-positive timeout
+
+
+def test_approval_wait_capped_by_task_deadline(env):
+    """A1: an approval requested near the task deadline must be denied when
+    the wall-clock budget runs out, not held for approval_timeout_minutes —
+    and the deny must restore the running state like the timeout-deny does."""
+    from sous.worker import _make_approval_hook
+    root, cfg, store = env
+    cfg = dataclasses.replace(cfg, approval_timeout_minutes=1)  # 60s on its own
+    task = _start(store, root)
+    hook = _make_approval_hook(task, store, cfg, time.monotonic() + 0.3)
+    t0 = time.monotonic()
+    assert hook("/bin/echo custom") is False
+    assert time.monotonic() - t0 < 5  # denied at the ~0.3s budget, not 60s
+    got = store.get(task.id)
+    assert got.state == TaskState.RUNNING  # running state restored
+    assert got.pending_command is None
+
+
 def test_worker_loop_survives_bookkeeping_exception(env, capsys):
     """M1: a transient failure in claim_next (outside the per-task try) must
     not kill the worker thread — the loop should log and keep polling."""
