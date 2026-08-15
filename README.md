@@ -5,10 +5,20 @@ tasks from Claude Code / Claude Desktop to a local MLX model on your Mac.
 Claude designs the menu; sous does the prep — in a sandboxed, auditable,
 autonomous tool loop. You (and Claude) review everything it cooks.
 
+## Why
+
+Heavy Claude Code use runs into plan usage limits, and most of what consumes
+them is generated output. sous exists to stretch that budget: the mechanical,
+volume-heavy output comes from a local model at zero marginal cost, while
+Claude spends its much cheaper input-side attention writing instructions and
+reviewing the resulting diff. Claude stays the head chef, and the same plan
+carries further into the week.
+
 ## Requirements
 
 - Apple silicon Mac (tested on M-series with 64 GB; the default model needs
-  ~30 GB free unified memory)
+  ~30 GB free unified memory — for 32 GB and 16 GB machines, see
+  [Smaller machines](#smaller-machines))
 - Python 3.14 (standard build) via [uv](https://docs.astral.sh/uv/)
 - Claude Code or Claude Desktop with a Pro/Max plan
 
@@ -78,6 +88,32 @@ documented non-thinking-mode defaults). Greedy decoding (temperature 0)
 sounds safer but isn't: it gives the model no way to escape a bad
 completion once it happens, since a near-identical prompt plus a nudge
 still argmaxes to the same wrong output every time.
+
+## Smaller machines
+
+The default model wants a 64 GB machine. Both alternatives below share the
+default's `qwen3_5` architecture, so they load through the exact same mlx-vlm
+path — edit `[model].id` in `~/.sous/config.toml` and the next delegation
+downloads and uses them.
+
+| Unified memory | `[model].id` | Weights |
+|---|---|---|
+| 64 GB (default) | `mlx-community/Qwen3.8-27B-mxfp8` | ~28.7 GB |
+| 32 GB | `mlx-community/Qwen3.8-27B-mxfp4` | ~15.2 GB |
+| 16 GB | `mlx-community/Qwen3.5-9B-MLX-4bit` | ~6 GB |
+
+The 32 GB pick is the same Qwen3.8-27B checkpoint at mxfp4 — same model at
+half the footprint for a modest quality cost. The 16 GB pick drops to the 9B
+tier because an 8-bit 9B (~11 GB) would crowd the ≈10.7 GB Metal working-set
+limit of a 16 GB machine once the KV cache lands on top of the weights; on
+16 GB, also consider `[model].max_context_tokens = 16384` if you see memory
+pressure. (`mlx-community/Qwen3.5-9B-mxfp8`/`-mxfp4` look like the obvious
+picks, but as of 2026-08 they are empty placeholder repos with no weights.)
+
+Neither alternative has been validated end to end the way the default has
+(see [Validation status](#validation-status)). Smaller workers fail more
+tasks and make reviewing the diff matter more — but a reviewed draft from a
+small local model still costs your plan nothing.
 
 ## Security model
 

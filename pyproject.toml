@@ -1,7 +1,7 @@
 [project]
 name = "sous"
 version = "0.1.0"
-description = "The sous-chef for Claude's kitchen: an MCP daemon that delegates mechanical, volume-heavy coding tasks to a sandboxed local MLX worker on Apple silicon"
+description = "The sous-chef for Claude's kitchen: an MCP daemon that delegates mechanical, volume-heavy coding tasks to a sandboxed local MLX worker on Apple silicon, so heavy Claude Code use stretches further on the same plan"
 authors = [
     { name = "krcm0209", email = "17315774+krcm0209@users.noreply.github.com" }
 ]
