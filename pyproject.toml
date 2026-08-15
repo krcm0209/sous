@@ -1,9 +1,9 @@
 [project]
 name = "sous"
 version = "0.1.0"
-description = "macOS MCP daemon for delegating coding tasks to local MLX model"
+description = "The sous-chef for Claude's kitchen: an MCP daemon that delegates mechanical, volume-heavy coding tasks to a sandboxed local MLX worker on Apple silicon"
 authors = [
-    { name = "Kyle Krcmaric", email = "kyle.krcmaric@ozmo.com" }
+    { name = "krcm0209", email = "17315774+krcm0209@users.noreply.github.com" }
 ]
 requires-python = ">=3.14"
 dependencies = [
