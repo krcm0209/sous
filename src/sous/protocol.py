@@ -55,7 +55,8 @@ WORKER_TOOLS: list[dict] = [
 
 TOOL_NAMES = {t["function"]["name"] for t in WORKER_TOOLS}
 
-_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_OPEN_RE = re.compile(r"<tool_call>\s*")
+_DECODER = json.JSONDecoder()
 
 
 class ParseError(Exception):
@@ -70,9 +71,9 @@ class ToolCall:
 
 def parse_tool_calls(text: str) -> list[ToolCall]:
     calls: list[ToolCall] = []
-    for block in _CALL_RE.findall(text):
+    for match in _OPEN_RE.finditer(text):
         try:
-            payload = json.loads(block.strip())
+            payload, _end = _DECODER.raw_decode(text, match.end())
         except json.JSONDecodeError as e:
             raise ParseError(f"invalid JSON in tool_call: {e}") from e
         if not isinstance(payload, dict):
