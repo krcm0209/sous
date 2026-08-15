@@ -1,0 +1,7 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/krcm0209/sous/security/advisories/new
+    about: >-
+      Sandbox escapes, allowlist bypasses, environment leaks and similar go
+      through private disclosure — please do not open a public issue for them.
