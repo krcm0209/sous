@@ -2,7 +2,7 @@
 
 *2026-08-14. Approved through collaborative brainstorming; supersedes the working draft.*
 
-**sous** is the sous-chef for Claude's kitchen: a macOS MCP application that lets Claude Code / Claude Desktop (on a Pro/Max plan) delegate lower-priority, mechanical, or volume-heavy coding tasks to a locally hosted MLX model running on Apple silicon — so the Anthropic-hosted models keep their role as the primary reasoning agents. The directory is `local-mlx-mcp`; the package, CLI, and MCP server name are all `sous`. (If published to PyPI and `sous` is taken, the fallback package name is `sous-mcp`.)
+**sous** is the sous-chef for Claude's kitchen: a macOS MCP application that lets Claude Code / Claude Desktop (on a Pro/Max plan) delegate lower-priority, mechanical, or volume-heavy coding tasks to a locally hosted MLX model running on Apple silicon — so the Anthropic-hosted models keep their role as the primary reasoning agents. The directory, package, CLI, and MCP server name are all `sous`. (If published to PyPI and `sous` is taken, the fallback package name is `sous-mcp`.)
 
 ## Goals
 
@@ -176,7 +176,7 @@ A Claude Code skill, `skills/delegating-to-local/SKILL.md`, that teaches Claude:
 ## Repo layout
 
 ```
-local-mlx-mcp/
+sous/
 ├── pyproject.toml            # uv-managed, Python 3.14 (mlx ships cp314 arm64 wheels; MCP SDK v2 supports 3.10–3.14; standard build, not free-threaded 3.14t)
 ├── src/sous/
 │   ├── cli.py                # serve / status / install-launchd
