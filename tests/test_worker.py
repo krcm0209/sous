@@ -241,6 +241,28 @@ def test_restart_recovery_reports_files_changed_and_transcript(env):
         cfg.data_dir / "tasks" / task.id / "transcript.jsonl")
 
 
+def test_finish_without_summary_is_retriable_not_completion(env):
+    """C1: summary is declared required in WORKER_TOOLS — a finish missing it
+    (or carrying only whitespace) must come back as a recoverable tool error
+    the model can retry, never a false 'completed' with an empty report."""
+    root, cfg, store = env
+    task = _start(store, root)
+    engine = FakeEngine([
+        CALL.format(name="finish", args='{"concerns": "none"}'),  # no summary
+        CALL.format(name="finish", args='{"summary": "   "}'),    # whitespace
+        FINISH,                                                    # proper retry
+    ])
+    run_task(task, store, engine, cfg)
+    got = store.get(task.id)
+    assert got.state == TaskState.DONE and got.outcome == "completed"
+    assert got.report["summary"] == "did it"  # from the proper finish only
+    assert len(engine.calls) == 3  # both bad finishes were retried, not fatal
+    for turn in (engine.calls[1], engine.calls[2]):
+        assert any("error" in str(m.get("content", "")).lower()
+                   and "summary" in str(m.get("content", ""))
+                   for m in turn)
+
+
 def test_verify_commands_run_and_reported(env):
     root, cfg, store = env
     cfg.config_path.write_text('[commands]\nallowlist = ["/bin/echo"]\n')

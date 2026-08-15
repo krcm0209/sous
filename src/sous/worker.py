@@ -280,7 +280,19 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
                 store.mark_cancelled(task.id, extra=_failure_extra(ex, transcript))
                 return
             if call.name == "finish":
-                summary = str(call.arguments.get("summary", ""))
+                raw_summary = call.arguments.get("summary")
+                if raw_summary is None or not str(raw_summary).strip():
+                    # summary is required by the finish schema: a finish
+                    # without one must not become a false completion with an
+                    # empty report. Same recoverable tool-error shape as every
+                    # other tool; the turn budget bounds retries.
+                    result = "error: finish requires a non-empty summary"
+                    transcript.log(event="tool", name=call.name,
+                                   arguments=call.arguments, result=result)
+                    messages.append({"role": "user",
+                                     "content": f'<tool_result name="{call.name}">\n{result}\n</tool_result>'})
+                    continue
+                summary = str(raw_summary)
                 concerns = str(call.arguments.get("concerns", ""))
                 outcome = "completed"
                 finished = True
