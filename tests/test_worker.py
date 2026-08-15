@@ -4,6 +4,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -491,11 +492,15 @@ def test_run_command_timeout_clamped_to_remaining_budget(env):
     """A2: a run_command issued with seconds of task budget left must get a
     timeout clamped to that remainder — and never a non-positive one."""
     from sous.protocol import ToolCall
+    from sous.toolexec import ToolExecutor
     from sous.worker import _execute
 
     root, cfg, store = env
     cfg = dataclasses.replace(cfg, command_timeout_seconds=120)
 
+    # Deliberately partial: this test drives only the run_command branch, so
+    # the double implements only that. cast, not a Protocol — it does not
+    # implement the rest of the surface _execute can dispatch to.
     class RecordingEx:
         def __init__(self):
             self.timeout = None
@@ -506,12 +511,12 @@ def test_run_command_timeout_clamped_to_remaining_budget(env):
 
     call = ToolCall(name="run_command", arguments={"command": "/bin/echo hi"})
     almost_out = RecordingEx()
-    _execute(call, almost_out, cfg, None, deadline=time.monotonic() + 2)
+    _execute(call, cast(ToolExecutor, almost_out), cfg, None, deadline=time.monotonic() + 2)
     assert almost_out.timeout is not None
     assert 0 < almost_out.timeout <= 2  # clamped well below the 120s default
 
     exhausted = RecordingEx()
-    _execute(call, exhausted, cfg, None, deadline=time.monotonic() - 5)
+    _execute(call, cast(ToolExecutor, exhausted), cfg, None, deadline=time.monotonic() - 5)
     assert exhausted.timeout is not None
     assert exhausted.timeout > 0  # never a non-positive timeout
 
@@ -541,6 +546,8 @@ def test_worker_loop_survives_bookkeeping_exception(env, capsys):
     stop = threading.Event()
     calls = {"n": 0}
 
+    # Partial double for the same reason as RecordingEx: the loop never gets
+    # past claim_next here, so that is all it implements.
     class FlakyStore:
         def claim_next(self):
             calls["n"] += 1
@@ -550,7 +557,7 @@ def test_worker_loop_survives_bookkeeping_exception(env, capsys):
             return None
 
     engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
-    run_worker_loop(FlakyStore(), engines, cfg, stop, poll_interval=0.01)
+    run_worker_loop(cast(TaskStore, FlakyStore()), engines, cfg, stop, poll_interval=0.01)
     assert calls["n"] >= 2  # survived the first failure and polled again
 
 
