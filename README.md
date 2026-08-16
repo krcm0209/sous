@@ -14,6 +14,31 @@ Claude spends its much cheaper input-side attention writing instructions and
 reviewing the resulting diff. Claude stays the head chef, and the same plan
 carries further into the week.
 
+This is a hybrid local + cloud arrangement, deliberately not an
+all-or-nothing switch to a local model: pointing Claude Code itself at a
+local endpoint trades away the frontier reasoning you are paying for, while
+sous offloads only the small, mechanical work your Apple silicon Mac can
+handle on its own.
+
+## How sous compares
+
+Other ways to put local models next to Claude Code make a different trade:
+
+- **Full-local replacements** point Claude Code (or a fork of it) at a local
+  endpoint — every task drops to local-model quality, including the ones you
+  wanted a frontier model for.
+- **Routers/proxies** swap models per request, but the work still runs
+  synchronously inside your session, and nothing sandboxes what the local
+  model does to your files.
+- **Subagent/skill delegates** hand tasks to a local model without a
+  persistent queue, path confinement, command allowlisting, or an audit
+  trail.
+
+sous is the hybrid: Claude keeps the reasoning, and an asynchronous queue
+hands the mechanical work to a local worker that is sandboxed, budgeted,
+approval-gated, and journaled — with the diff always reviewed before it
+counts.
+
 ## Requirements
 
 - Apple silicon Mac (tested on M-series with 64 GB; the default model needs
