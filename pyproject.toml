@@ -60,6 +60,9 @@ dev = [
 
 [project.scripts]
 sous = "sous.cli:main"
+# `uvx sous-mcp` resolves the script matching the distribution name, which is
+# how MCP clients launch registry packages — same CLI, second name.
+sous-mcp = "sous.cli:main"
 
 [project.urls]
 Repository = "https://github.com/krcm0209/sous"

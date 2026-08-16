@@ -14,6 +14,13 @@
       "registryBaseUrl": "https://pypi.org",
       "identifier": "sous-mcp",
       "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "serve"
+        }
+      ],
       "transport": {
         "type": "streamable-http",
         "url": "http://127.0.0.1:8383/mcp"

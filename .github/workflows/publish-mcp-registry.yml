@@ -19,19 +19,33 @@ jobs:
       - uses: actions/checkout@v7
 
       # The registry verifies ownership by reading the mcp-name marker out
-      # of the PyPI package's rendered README, so the referenced version
-      # must already be live on PyPI — fail fast here instead of publishing
-      # a listing that points at nothing.
-      - name: Check server.json version is live on PyPI
+      # of the PyPI package's rendered README, so the exact version the
+      # entry references must already be live on PyPI — fail fast here
+      # instead of publishing a listing that points at nothing. The
+      # version-specific endpoint 404s for unpublished versions, which is
+      # the check; PyPI's latest-version field would wrongly reject a valid
+      # older release.
+      - name: Check server.json versions agree and are live on PyPI
         run: |
-          pypi=$(curl -sf https://pypi.org/pypi/sous-mcp/json | jq -r .info.version)
-          declared=$(jq -r .version server.json)
-          echo "PyPI: $pypi / server.json: $declared"
-          test "$pypi" = "$declared"
+          declared=$(jq -r '.version' server.json)
+          pkgver=$(jq -r '.packages[0].version' server.json)
+          echo "server.json version: $declared / package version: $pkgver"
+          test "$declared" = "$pkgver"
+          curl -sf "https://pypi.org/pypi/sous-mcp/${pkgver}/json" > /dev/null \
+            || { echo "sous-mcp ${pkgver} is not live on PyPI"; exit 1; }
 
-      - name: Install mcp-publisher
+      # Pinned and checksum-verified: this job can mint registry-publishing
+      # OIDC credentials, so it must never execute a mutable `latest`
+      # binary. Bump the pin deliberately; checksums come from the
+      # registry_<version>_checksums.txt asset on the same release.
+      - name: Install mcp-publisher (pinned, checksum-verified)
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+          MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
         run: |
-          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+          curl -sfLO "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher_linux_amd64.tar.gz" | sha256sum -c -
+          tar xzf mcp-publisher_linux_amd64.tar.gz mcp-publisher
 
       - name: Authenticate to the MCP Registry (GitHub OIDC)
         run: ./mcp-publisher login github-oidc
