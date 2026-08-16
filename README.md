@@ -110,10 +110,13 @@ limit of a 16 GB machine once the KV cache lands on top of the weights; on
 pressure. (`mlx-community/Qwen3.5-9B-mxfp8`/`-mxfp4` look like the obvious
 picks, but as of 2026-08 they are empty placeholder repos with no weights.)
 
-Neither alternative has been validated end to end the way the default has
-(see [Validation status](#validation-status)). Smaller workers fail more
-tasks and make reviewing the diff matter more — but a reviewed draft from a
-small local model still costs your plan nothing.
+Both alternatives passed the same worker-path validation as the default
+(see [Validation status](#validation-status)), run on the 64 GB test
+machine — which validates the models and quants through sous's whole stack,
+not the memory fit on physical 32 GB / 16 GB hardware (that remains
+arithmetic: weights plus KV-cache headroom). Smaller workers still fail more
+tasks in general and make reviewing the diff matter more — but a reviewed
+draft from a small local model costs your plan nothing.
 
 ## Security model
 
@@ -170,6 +173,12 @@ Validated end to end against the default model
   path Claude Code uses: all six tools registered with the expected names, and
   a delegated task ran to `done` / `completed` in 42s with a correct diff and
   verify output.
+- **Smaller-machine models** — both [Smaller machines](#smaller-machines)
+  picks passed the same worker-path check on the same machine (delegated
+  type-hints task, worker self-verified with `pytest`, independent re-run
+  confirmed, accurate report): `Qwen3.8-27B-mxfp4` in 35s over 4 turns —
+  confirming mlx-vlm loads mxfp4-mode quants — and `Qwen3.5-9B-MLX-4bit` in
+  25s over 8 turns.
 
 Tool-call parsing accepts both the XML-ish `<function=…>/<parameter=…>` format
 that Qwen3 emits and the hermes JSON format used by other MLX models.
