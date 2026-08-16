@@ -5,10 +5,45 @@ tasks from Claude Code / Claude Desktop to a local MLX model on your Mac.
 Claude designs the menu; sous does the prep — in a sandboxed, auditable,
 autonomous tool loop. You (and Claude) review everything it cooks.
 
+## Why
+
+Heavy Claude Code use runs into plan usage limits, and most of what consumes
+them is generated output. sous exists to stretch that budget: the mechanical,
+volume-heavy output comes from a local model at zero marginal cost, while
+Claude spends its much cheaper input-side attention writing instructions and
+reviewing the resulting diff. Claude stays the head chef, and the same plan
+carries further into the week.
+
+This is a hybrid local + cloud arrangement, deliberately not an
+all-or-nothing switch to a local model: pointing Claude Code itself at a
+local endpoint trades away the frontier reasoning you are paying for, while
+sous offloads only the small, mechanical work your Apple silicon Mac can
+handle on its own.
+
+## How sous compares
+
+Other ways to put local models next to Claude Code make a different trade:
+
+- **Full-local replacements** point Claude Code (or a fork of it) at a local
+  endpoint — every task drops to local-model quality, including the ones you
+  wanted a frontier model for.
+- **Routers/proxies** swap models per request, but the work still runs
+  synchronously inside your session, and nothing sandboxes what the local
+  model does to your files.
+- **Subagent/skill delegates** hand tasks to a local model without a
+  persistent queue, path confinement, command allowlisting, or an audit
+  trail.
+
+sous is the hybrid: Claude keeps the reasoning, and an asynchronous queue
+hands the mechanical work to a local worker that is sandboxed, budgeted,
+approval-gated, and journaled — with the diff always reviewed before it
+counts.
+
 ## Requirements
 
 - Apple silicon Mac (tested on M-series with 64 GB; the default model needs
-  ~30 GB free unified memory)
+  ~30 GB free unified memory — for 32 GB and 16 GB machines, see
+  [Smaller machines](#smaller-machines))
 - Python 3.14 (standard build) via [uv](https://docs.astral.sh/uv/)
 - Claude Code or Claude Desktop with a Pro/Max plan
 
@@ -79,6 +114,35 @@ sounds safer but isn't: it gives the model no way to escape a bad
 completion once it happens, since a near-identical prompt plus a nudge
 still argmaxes to the same wrong output every time.
 
+## Smaller machines
+
+The default model wants a 64 GB machine. Both alternatives below share the
+default's `qwen3_5` architecture, so they load through the exact same mlx-vlm
+path — edit `[model].id` in `~/.sous/config.toml` and the next delegation
+downloads and uses them.
+
+| Unified memory | `[model].id` | Weights |
+|---|---|---|
+| 64 GB (default) | `mlx-community/Qwen3.8-27B-mxfp8` | ~28.7 GB |
+| 32 GB | `mlx-community/Qwen3.8-27B-mxfp4` | ~15.2 GB |
+| 16 GB | `mlx-community/Qwen3.5-9B-MLX-4bit` | ~6 GB |
+
+The 32 GB pick is the same Qwen3.8-27B checkpoint at mxfp4 — same model at
+half the footprint for a modest quality cost. The 16 GB pick drops to the 9B
+tier because an 8-bit 9B (~11 GB) would crowd the ≈10.7 GB Metal working-set
+limit of a 16 GB machine once the KV cache lands on top of the weights; on
+16 GB, also consider `[model].max_context_tokens = 16384` if you see memory
+pressure. (`mlx-community/Qwen3.5-9B-mxfp8`/`-mxfp4` look like the obvious
+picks, but as of 2026-08 they are empty placeholder repos with no weights.)
+
+Both alternatives passed the same worker-path validation as the default
+(see [Validation status](#validation-status)), run on the 64 GB test
+machine — which validates the models and quants through sous's whole stack,
+not the memory fit on physical 32 GB / 16 GB hardware (that remains
+arithmetic: weights plus KV-cache headroom). Smaller workers still fail more
+tasks in general and make reviewing the diff matter more — but a reviewed
+draft from a small local model costs your plan nothing.
+
 ## Security model
 
 - Workers are confined to the `project_root` of their task (symlink-resolved;
@@ -134,6 +198,12 @@ Validated end to end against the default model
   path Claude Code uses: all six tools registered with the expected names, and
   a delegated task ran to `done` / `completed` in 42s with a correct diff and
   verify output.
+- **Smaller-machine models** — both [Smaller machines](#smaller-machines)
+  picks passed the same worker-path check on the same machine (delegated
+  type-hints task, worker self-verified with `pytest`, independent re-run
+  confirmed, accurate report): `Qwen3.8-27B-mxfp4` in 35s over 4 turns —
+  confirming mlx-vlm loads mxfp4-mode quants — and `Qwen3.5-9B-MLX-4bit` in
+  25s over 8 turns.
 
 Tool-call parsing accepts both the XML-ish `<function=…>/<parameter=…>` format
 that Qwen3 emits and the hermes JSON format used by other MLX models.

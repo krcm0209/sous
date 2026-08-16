@@ -1,13 +1,15 @@
 ---
 name: delegating-to-local
-description: Use when coding work is mechanical, repetitive, volume-heavy, and low-risk (boilerplate, test scaffolding, bulk renames/migrations, docstrings, lint-fix sweeps, fixtures) - delegates it to the local sous MLX worker via MCP so you stay focused on reasoning, architecture, and review
+description: Use when coding work is mechanical, repetitive, volume-heavy, and low-risk (boilerplate, test scaffolding, bulk renames/migrations, docstrings, lint-fix sweeps, fixtures) - delegates it to the local sous MLX worker via MCP so you stay focused on reasoning, architecture, and review, and the volume output costs none of the user's Claude plan
 ---
 
 # Delegating to the local sous worker
 
 sous runs a local MLX model that executes self-contained coding tasks in a
 sandboxed tool loop. You are the head chef: design, decide, review. sous is
-prep: volume and repetition. **Its output is a draft, never a merge.**
+prep: volume and repetition. Every line the worker generates is output the
+user's plan didn't pay for, so prefer delegating work that qualifies.
+**Its output is a draft, never a merge.**
 
 ## When to delegate
 
