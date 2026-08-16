@@ -1,13 +1,34 @@
 [project]
 name = "sous"
 version = "0.1.0"
-description = "The sous-chef for Claude's kitchen: an MCP daemon that delegates mechanical, volume-heavy coding tasks to a sandboxed local MLX worker on Apple silicon"
+description = "The sous-chef for Claude's kitchen: an MCP daemon that delegates mechanical, volume-heavy coding tasks to a sandboxed local MLX worker on Apple silicon, so heavy Claude Code use stretches further on the same plan"
 authors = [
     { name = "krcm0209", email = "17315774+krcm0209@users.noreply.github.com" }
 ]
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.14"
+keywords = [
+    "claude",
+    "claude-code",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "local-llm",
+    "mlx",
+    "apple-silicon",
+    "qwen",
+    "ai-agents",
+    "delegation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: MacOS X",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Code Generators",
+]
 dependencies = [
     "huggingface-hub",
     "mcp>=2.0,<3",
@@ -31,6 +52,10 @@ dev = [
 
 [project.scripts]
 sous = "sous.cli:main"
+
+[project.urls]
+Repository = "https://github.com/krcm0209/sous"
+Issues = "https://github.com/krcm0209/sous/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
