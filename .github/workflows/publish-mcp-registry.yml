@@ -1,0 +1,40 @@
+name: Publish to MCP Registry
+
+# Deliberately manual (workflow_dispatch, never a tag trigger): listing in
+# the official registry syndicates to Smithery, PulseMCP, and friends —
+# i.e. it turns discovery ON. Run it from the Actions tab when the project
+# is ready for that.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write # GitHub OIDC proves the io.github.krcm0209/* namespace
+  contents: read
+
+jobs:
+  publish:
+    name: Publish server.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The registry verifies ownership by reading the mcp-name marker out
+      # of the PyPI package's rendered README, so the referenced version
+      # must already be live on PyPI — fail fast here instead of publishing
+      # a listing that points at nothing.
+      - name: Check server.json version is live on PyPI
+        run: |
+          pypi=$(curl -sf https://pypi.org/pypi/sous-mcp/json | jq -r .info.version)
+          declared=$(jq -r .version server.json)
+          echo "PyPI: $pypi / server.json: $declared"
+          test "$pypi" = "$declared"
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to the MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish
