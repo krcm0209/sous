@@ -1310,7 +1310,7 @@ wheels = [
 ]
 
 [[package]]
-name = "sous"
+name = "sous-mcp"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

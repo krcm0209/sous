@@ -1,5 +1,7 @@
 # sous
 
+<!-- mcp-name: io.github.krcm0209/sous -->
+
 The sous-chef for Claude's kitchen: delegate mechanical, volume-heavy coding
 tasks from Claude Code / Claude Desktop to a local MLX model on your Mac.
 Claude designs the menu; sous does the prep — in a sandboxed, auditable,
@@ -50,10 +52,14 @@ counts.
 ## Install
 
 ```bash
-uv tool install .          # from a checkout; PyPI/brew distribution planned
+uv tool install sous-mcp   # PyPI package name; the CLI it installs is `sous`
 sous install-launchd       # start at login, keep alive (recommended)
 claude mcp add --transport http sous http://127.0.0.1:8383/mcp
 ```
+
+From a checkout, `uv tool install .` works instead of the PyPI package.
+(The bare `sous` name on PyPI is an unrelated, abandoned placeholder — the
+package you want is `sous-mcp`.)
 
 Optionally install the delegation skill so Claude knows when and how to use it:
 

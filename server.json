@@ -1,0 +1,30 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.krcm0209/sous",
+  "title": "sous",
+  "description": "Delegate mechanical coding tasks from Claude Code to a sandboxed local MLX worker on Apple silicon",
+  "repository": {
+    "url": "https://github.com/krcm0209/sous",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "sous-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "serve"
+        }
+      ],
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://127.0.0.1:8383/mcp"
+      }
+    }
+  ]
+}
