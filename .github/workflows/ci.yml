@@ -98,6 +98,25 @@ jobs:
         with:
           enable-cache: true
 
+      # Fail here, not at the PyPI upload. A tag whose version does not match
+      # the package builds fine and is only rejected by PyPI as a duplicate —
+      # after the tag exists and is awkward to take back. server.json carries
+      # the version twice and is the easiest of the three to forget.
+      - name: tag matches the packaged version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          srv=$(python3 -c "import json;print(json.load(open('server.json'))['version'])")
+          srv_pkg=$(python3 -c "import json;print(json.load(open('server.json'))['packages'][0]['version'])")
+          echo "tag=$tag pyproject=$pkg server.json=$srv server.json/packages=$srv_pkg"
+          for found in "$pkg" "$srv" "$srv_pkg"; do
+            if [ "$tag" != "$found" ]; then
+              echo "::error::tag $GITHUB_REF_NAME disagrees with a declared version ($found)"
+              exit 1
+            fi
+          done
+
       - name: uv build
         run: uv build
 
