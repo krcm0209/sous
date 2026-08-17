@@ -327,15 +327,48 @@ def test_uninstall_does_not_advise_stop_for_a_daemon_it_just_unloaded(
         daemon.kill()
 
 
-def test_uninstall_still_advises_stop_for_a_daemon_launchd_never_owned(
+def test_uninstall_still_advises_stop_when_a_daemon_outlives_the_unload(
     tmp_path, capsys, monkeypatch
 ):
-    """The wait must not swallow the case the advice exists for: a daemon that
-    outlives the uninstall because nothing was supervising it."""
+    """The wait must not swallow the case the advice exists for.
+
+    Goes through the successful-unload branch on purpose: that is the one the
+    wait was added to, so a regression suppressing the advice whenever bootout
+    succeeds has to fail here. The grace is shortened rather than waited out,
+    and the elapsed time is asserted so the timeout path is genuinely taken
+    instead of the daemon merely looking absent.
+    """
     from sous import cli
 
     port = _free_cli_port()
     daemon = _fake_daemon(tmp_path, port)  # nothing kills this one
+    plist = tmp_path / "com.sous.daemon.plist"
+    plist.write_text("<plist/>")
+
+    try:
+        monkeypatch.setattr(cli, "load_config", lambda: _cfg(tmp_path, port))
+        monkeypatch.setattr(cli, "_plist_path", lambda: plist)
+        monkeypatch.setattr(cli, "_bootout", lambda label: 0)  # unload succeeded
+        monkeypatch.setattr(cli, "_UNLOAD_GRACE_SECONDS", 0.5)
+        started = time.monotonic()
+        cli.main(["uninstall-launchd"])
+        elapsed = time.monotonic() - started
+
+        out = capsys.readouterr().out
+        assert "unloaded the launchd agent" in out
+        assert "sous stop" in out, "suppressed the advice for a daemon that survived"
+        assert elapsed >= 0.5, f"returned in {elapsed:.2f}s — the wait never ran"
+    finally:
+        daemon.kill()
+
+
+def test_uninstall_advises_stop_when_there_was_nothing_to_unload(tmp_path, capsys, monkeypatch):
+    """No unload happened, so nothing was going to terminate the daemon and the
+    advice applies immediately — the branch the wait must not reach."""
+    from sous import cli
+
+    port = _free_cli_port()
+    daemon = _fake_daemon(tmp_path, port)
     plist = tmp_path / "com.sous.daemon.plist"
     plist.write_text("<plist/>")
 
