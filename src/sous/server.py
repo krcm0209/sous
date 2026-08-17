@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import shlex
 import subprocess
@@ -286,9 +287,14 @@ def _acquire_singleton_lock(data_dir: Path) -> IO[bytes]:
     handle = lock_path.open("ab")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as e:
         handle.close()
-        raise SystemExit(f"sous: another daemon already holds {lock_path}") from None
+        if e.errno in (errno.EAGAIN, errno.EACCES):  # EWOULDBLOCK is EAGAIN
+            raise SystemExit(f"sous: another daemon already holds {lock_path}") from None
+        # ENOLCK, or a filesystem that cannot flock: a real startup failure.
+        # Calling it contention would send the operator hunting for a second
+        # daemon that does not exist.
+        raise
     return handle
 
 

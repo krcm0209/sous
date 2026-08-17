@@ -406,3 +406,27 @@ def test_lock_excludes_a_separate_process(tmp_path: Path):
     # holder released -> the next process gets it
     freed = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
     assert "ACQUIRED" in freed.stdout, freed.stderr
+
+
+def test_non_contention_lock_failure_is_not_reported_as_another_daemon(tmp_path: Path, monkeypatch):
+    """ENOLCK, or a filesystem without flock support, is a real startup failure.
+
+    Contention is EAGAIN (EWOULDBLOCK). Translating every OSError into "another
+    daemon already holds ..." would send the operator hunting for a process that
+    does not exist, hiding the actual cause.
+    """
+    import errno
+    import fcntl
+
+    from sous.server import _acquire_singleton_lock
+
+    data = tmp_path / "data"
+    data.mkdir()
+
+    def no_locks_available(fd, op):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(fcntl, "flock", no_locks_available)
+    with pytest.raises(OSError) as exc:
+        _acquire_singleton_lock(data)
+    assert exc.value.errno == errno.ENOLCK
