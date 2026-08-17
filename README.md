@@ -88,6 +88,22 @@ cp -r skills/delegating-to-local ~/.claude/skills/
 
 First delegation downloads the model (~28.7 GB for the default) — one time.
 
+### Managing the daemon
+
+```bash
+sous status             # is it up, and what has it been doing
+sous stop               # stop it (see below)
+sous uninstall-launchd  # stop it starting at login, and remove the agent
+```
+
+`sous stop` deliberately refuses when launchd is managing the daemon, because
+`KeepAlive` would restart it a second later and the command would look like it
+did nothing. It tells you which command you actually want. Stopping is for
+daemons nothing is supervising — including one `sous mcp` started for you.
+
+Stopping the daemon also ends any running `sous mcp` bridges; their clients
+reconnect and start a fresh one on the next call.
+
 ## What Claude gets
 
 | Tool | Purpose |
