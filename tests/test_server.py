@@ -445,3 +445,32 @@ def test_lock_file_records_the_holder_pid(tmp_path: Path):
         assert (data / "daemon.lock").read_text().strip() == str(os.getpid())
     finally:
         holder.close()
+
+
+def test_main_installs_the_shutdown_handler_before_serving(tmp_path: Path, monkeypatch):
+    """The handler is useless if main() never installs it.
+
+    Everything else about shutdown is covered in tests/test_commands.py; this
+    pins the one-line link between them, which no other test would catch.
+    """
+    import sous.server as server
+
+    data = tmp_path / "data"
+    data.mkdir()
+    installed = []
+    with socket.socket() as occupied:  # make mcp.run() fail fast instead of serving
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+        cfg = SousConfig(
+            data_dir=data,
+            config_path=tmp_path / "config.toml",
+            server_port=occupied.getsockname()[1],
+        )
+        cfg.config_path.write_text("")
+        monkeypatch.setattr(server, "load_config", lambda: cfg)
+        monkeypatch.setattr(
+            server, "_install_shutdown_handler", lambda stop: installed.append(stop)
+        )
+        with pytest.raises(SystemExit):
+            server.main()
+    assert installed, "main() served without installing the shutdown handler"

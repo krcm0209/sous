@@ -1,8 +1,10 @@
 import os
 import resource
+import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -460,3 +462,95 @@ def test_fast_command_that_exits_before_pgid_capture(ex: ToolExecutor, monkeypat
 
     out = ex.run_command("/bin/echo hello")
     assert "exit code 0" in out and "hello" in out
+
+
+# --- shutdown must not orphan a running command ------------------------------
+
+
+def test_terminate_active_commands_kills_an_in_flight_child(tmp_path: Path):
+    """A command running when the daemon stops must not outlive it.
+
+    run_command puts its child in a new session, so the child survives its
+    parent and keeps writing files unless the group is killed explicitly.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[commands]\nallowlist = ["{sys.executable}"]\n')
+    ex = ToolExecutor(root, cfg)
+
+    marker = tmp_path / "ticks.txt"
+    marker.touch()
+    script = (
+        f"import time\nwhile True:\n    open({str(marker)!r},'a').write('t')\n    time.sleep(0.1)"
+    )
+    done = threading.Event()
+
+    def run():
+        ex.run_command(f"{sys.executable} -c {shlex.quote(script)}", timeout=60)
+        done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    for _ in range(100):  # wait until the child is actually writing
+        if marker.stat().st_size > 0:
+            break
+        time.sleep(0.1)
+    assert marker.stat().st_size > 0, "child never started"
+
+    killed = toolexec.terminate_active_commands()
+    assert killed == 1
+    assert done.wait(timeout=15), "run_command never returned after the kill"
+
+    before = marker.stat().st_size
+    time.sleep(1.0)
+    assert marker.stat().st_size == before, "child survived and kept writing"
+
+
+def test_sigterm_to_the_daemon_kills_a_running_command(tmp_path: Path):
+    """End to end, in a real process taking a real SIGTERM.
+
+    Default SIGTERM handling terminates the daemon outright — main()'s finally
+    never runs — so without an installed handler the sandboxed child is
+    orphaned and goes on mutating the project after the daemon is gone.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[commands]\nallowlist = ["{sys.executable}"]\n')
+    marker = tmp_path / "ticks.txt"
+    marker.touch()
+
+    child = (
+        f"import time\nwhile True:\n    open({str(marker)!r},'a').write('t')\n    time.sleep(0.1)"
+    )
+    command = f"{sys.executable} -c {shlex.quote(child)}"
+    daemon_src = (
+        "import threading, time\n"
+        "from pathlib import Path\n"
+        "from sous.server import _install_shutdown_handler\n"
+        "from sous.toolexec import ToolExecutor\n"
+        f"ex = ToolExecutor(Path({str(root)!r}), Path({str(cfg)!r}))\n"
+        "_install_shutdown_handler(threading.Event())\n"
+        f"run = lambda: ex.run_command({command!r}, timeout=120)\n"
+        "threading.Thread(target=run, daemon=True).start()\n"
+        "time.sleep(120)\n"
+    )
+    daemon = subprocess.Popen([sys.executable, "-c", daemon_src])
+    try:
+        for _ in range(150):
+            if marker.stat().st_size > 0:
+                break
+            time.sleep(0.1)
+        assert marker.stat().st_size > 0, "command never started in the daemon"
+
+        daemon.send_signal(signal.SIGTERM)
+        daemon.wait(timeout=20)
+
+        time.sleep(0.5)
+        before = marker.stat().st_size
+        time.sleep(1.5)
+        assert marker.stat().st_size == before, (
+            "sandboxed child outlived the daemon and kept writing to the project"
+        )
+    finally:
+        daemon.kill()

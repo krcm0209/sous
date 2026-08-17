@@ -10,6 +10,7 @@ import shlex
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -178,6 +179,39 @@ def _await_exit_without_reaping(pid: int, timeout: float) -> None:
         if time.monotonic() >= deadline:
             return
         time.sleep(_KILL_POLL_SECONDS)
+
+
+# Process groups of commands running right now. start_new_session puts each
+# child in its own session, so it outlives the daemon and keeps writing to the
+# user's project unless the group is killed on the way out. Registered here
+# rather than plumbed through the worker: the groups are created in this file
+# and the kill escalation already lives here, so the boundary stays in one
+# place. The worker runs one task at a time today; a set costs nothing and
+# does not assume that.
+_active_groups: set[int] = set()
+_active_groups_lock = threading.Lock()
+
+
+def terminate_active_commands() -> int:
+    """Kill every command group still running, returning how many there were.
+
+    Same escalation as a timeout — SIGTERM, a grace period, then SIGKILL — but
+    deliberately without reaping: the worker thread still owns each Popen and
+    reaping the group leader here would free its pid and let the id be recycled
+    onto an unrelated group before the SIGKILL lands.
+    """
+    with _active_groups_lock:
+        groups = list(_active_groups)
+    if not groups:
+        return 0
+    for pgid in groups:
+        with contextlib.suppress(*_ALREADY_DEAD):
+            os.killpg(pgid, signal.SIGTERM)
+    time.sleep(_KILL_GRACE_SECONDS)
+    for pgid in groups:
+        with contextlib.suppress(*_ALREADY_DEAD):
+            os.killpg(pgid, signal.SIGKILL)
+    return len(groups)
 
 
 def _kill_process_group(pgid: int, proc: subprocess.Popen) -> None:
@@ -436,25 +470,33 @@ class ToolExecutor:
             # child un-reaped until the wait() below; see _kill_process_group
             # for why it must stay that way through the kill escalation.
             pgid = proc.pid
+            with _active_groups_lock:
+                _active_groups.add(pgid)
             try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                # Kill the whole group FIRST, then record: snapshotting while
-                # descendants are still alive would let them modify files
-                # after the audit.
-                _kill_process_group(pgid, proc)
-                # A timed-out command may already have modified files.
+                try:
+                    proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    # Kill the whole group FIRST, then record: snapshotting while
+                    # descendants are still alive would let them modify files
+                    # after the audit.
+                    _kill_process_group(pgid, proc)
+                    # A timed-out command may already have modified files.
+                    self._record_command_changes(before_snap)
+                    return f"command timed out after {timeout}s: {command}"
+                except BaseException:  # noqa: BLE001 — deliberate: KeyboardInterrupt/
+                    # SystemExit during daemon shutdown must not orphan a running
+                    # process group that keeps writing files. Kill the group, then
+                    # let the exception propagate (subprocess.run had the same
+                    # kill-on-any-exception backstop for the direct child). No
+                    # change recording here: the exception is propagating, no
+                    # report is being assembled.
+                    _kill_process_group(pgid, proc)
+                    raise
                 self._record_command_changes(before_snap)
-                return f"command timed out after {timeout}s: {command}"
-            except BaseException:  # noqa: BLE001 — deliberate: KeyboardInterrupt/
-                # SystemExit during daemon shutdown must not orphan a running
-                # process group that keeps writing files. Kill the group, then
-                # let the exception propagate (subprocess.run had the same
-                # kill-on-any-exception backstop for the direct child). No
-                # change recording here: the exception is propagating, no
-                # report is being assembled.
-                _kill_process_group(pgid, proc)
-                raise
-            self._record_command_changes(before_snap)
-            body = _capped_command_output(out_f, err_f)
-            return f"exit code {proc.returncode}\n{body}"
+                body = _capped_command_output(out_f, err_f)
+                return f"exit code {proc.returncode}\n{body}"
+            finally:
+                # Every exit path, or shutdown would keep signalling a pgid that
+                # has been reaped and possibly recycled onto something else.
+                with _active_groups_lock:
+                    _active_groups.discard(pgid)
