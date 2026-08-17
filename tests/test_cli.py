@@ -1,6 +1,8 @@
 import plistlib
 from pathlib import Path
 
+import pytest
+
 from sous.cli import LABEL, launchd_plist
 
 
@@ -38,3 +40,22 @@ def test_status_reports_not_running(tmp_path, capsys, monkeypatch):
     cli.main(["status"])
     out = capsys.readouterr().out
     assert "not running" in out
+
+
+def test_mcp_subcommand_dispatches_to_the_proxy(monkeypatch):
+    """`sous mcp` must reach the proxy and propagate its exit code, so a failed
+    cold start surfaces to the launching client instead of exiting 0."""
+    import sous.proxy
+    from sous.cli import main
+
+    called = {}
+
+    def fake_run():
+        called["ran"] = True
+        return 1
+
+    monkeypatch.setattr(sous.proxy, "run", fake_run)
+    with pytest.raises(SystemExit) as exc:
+        main(["mcp"])
+    assert called.get("ran") is True
+    assert exc.value.code == 1

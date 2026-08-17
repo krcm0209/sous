@@ -1,4 +1,5 @@
 import asyncio
+import os
 import socket
 import subprocess
 import sys
@@ -430,3 +431,17 @@ def test_non_contention_lock_failure_is_not_reported_as_another_daemon(tmp_path:
     with pytest.raises(OSError) as exc:
         _acquire_singleton_lock(data)
     assert exc.value.errno == errno.ENOLCK
+
+
+def test_lock_file_records_the_holder_pid(tmp_path: Path):
+    """The lock file names its holder, so a client can tell a restarted daemon
+    from the one it connected to — a port check alone cannot."""
+    from sous.server import _acquire_singleton_lock
+
+    data = tmp_path / "data"
+    data.mkdir()
+    holder = _acquire_singleton_lock(data)
+    try:
+        assert (data / "daemon.lock").read_text().strip() == str(os.getpid())
+    finally:
+        holder.close()

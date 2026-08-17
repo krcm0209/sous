@@ -71,12 +71,19 @@ def main(argv: list[str] | None = None) -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="run the daemon (MCP over HTTP on 127.0.0.1)")
     sub.add_parser("status", help="check the daemon and recent tasks")
+    sub.add_parser("mcp", help="bridge stdio to the daemon (for stdio-only MCP clients)")
     sub.add_parser("install-launchd", help="install start-at-login LaunchAgent")
     args = parser.parse_args(argv)
     if args.command == "serve":
         from sous.server import main as serve_main
 
         serve_main()
+    elif args.command == "mcp":
+        # Attribute lookup, not `from ... import run`: the exit code has to
+        # reach the launching client, and this stays patchable for tests.
+        import sous.proxy
+
+        raise SystemExit(sous.proxy.run())
     elif args.command == "status":
         _cmd_status()
     elif args.command == "install-launchd":
