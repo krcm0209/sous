@@ -210,6 +210,18 @@ def _register_group(pgid: int) -> bool:
         return True
 
 
+def _unregister_group(pgid: int) -> None:
+    """Release a group id. Idempotent, and safe to call from any exit path.
+
+    Call this the moment the leader is reaped, not when the command finishes:
+    a reaped pid belongs to the OS again, and everything after the reap — the
+    project-tree audit, the output read-back — is time in which a shutdown
+    could signal whatever inherited the number.
+    """
+    with _active_groups_lock:
+        _active_groups.discard(pgid)
+
+
 def terminate_active_commands() -> int:
     """Kill every command group still running, returning how many there were.
 
@@ -513,6 +525,7 @@ class ToolExecutor:
                     # descendants are still alive would let them modify files
                     # after the audit.
                     _kill_process_group(pgid, proc)
+                    _unregister_group(pgid)  # reaped in there; the id is not ours
                     # A timed-out command may already have modified files.
                     self._record_command_changes(before_snap)
                     return f"command timed out after {timeout}s: {command}"
@@ -524,12 +537,17 @@ class ToolExecutor:
                     # change recording here: the exception is propagating, no
                     # report is being assembled.
                     _kill_process_group(pgid, proc)
+                    _unregister_group(pgid)
                     raise
+                # wait() reaped the leader, so release the id before the audit
+                # and the output read-back: both can take a while on a large
+                # project, and holding a recycled id across them means shutdown
+                # would SIGKILL whatever inherited it.
+                _unregister_group(pgid)
                 self._record_command_changes(before_snap)
                 body = _capped_command_output(out_f, err_f)
                 return f"exit code {proc.returncode}\n{body}"
             finally:
-                # Every exit path, or shutdown would keep signalling a pgid that
-                # has been reaped and possibly recycled onto something else.
-                with _active_groups_lock:
-                    _active_groups.discard(pgid)
+                # Backstop for any path above that returns or raises before
+                # reaching its own release. discard() makes this idempotent.
+                _unregister_group(pgid)

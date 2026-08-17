@@ -615,10 +615,13 @@ def test_terminate_does_not_linger_between_snapshot_and_kill(tmp_path: Path):
     script = (
         f"import time\nwhile True:\n    open({str(marker)!r},'a').write('t')\n    time.sleep(0.1)"
     )
-    threading.Thread(
-        target=lambda: ex.run_command(f"{sys.executable} -c {shlex.quote(script)}", timeout=60),
-        daemon=True,
-    ).start()
+    done = threading.Event()
+
+    def run():
+        ex.run_command(f"{sys.executable} -c {shlex.quote(script)}", timeout=60)
+        done.set()
+
+    threading.Thread(target=run, daemon=True).start()
     for _ in range(100):
         if marker.stat().st_size > 0:
             break
@@ -631,3 +634,36 @@ def test_terminate_does_not_linger_between_snapshot_and_kill(tmp_path: Path):
     assert elapsed < toolexec._KILL_GRACE_SECONDS, (
         f"terminate slept {elapsed:.2f}s between snapshot and kill"
     )
+    # Wait for run_command to unwind before leaving: it releases the group id on
+    # the way out, and a half-finished command would leak a live entry in the
+    # module-level registry into whatever test runs next.
+    assert done.wait(timeout=15), "run_command never returned after the kill"
+
+
+def test_group_is_unregistered_before_the_audit_runs(tmp_path: Path, monkeypatch):
+    """Drop the pgid the moment it is reaped, not after auditing.
+
+    proc.wait() reaps the leader, so from that instant the number belongs to
+    the OS again. _record_command_changes walks the whole project tree and the
+    output read-back follows it — leaving the id registered across both means a
+    shutdown in that window SIGKILLs whatever inherited it.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[commands]\nallowlist = ["/bin/echo"]\n')
+    ex = ToolExecutor(root, cfg)
+
+    seen: dict[str, set[int]] = {}
+    real = ToolExecutor._record_command_changes
+
+    def spy(self, before_snap):
+        with toolexec._active_groups_lock:
+            seen["registered"] = set(toolexec._active_groups)
+        return real(self, before_snap)
+
+    monkeypatch.setattr(ToolExecutor, "_record_command_changes", spy)
+    out = ex.run_command("/bin/echo hi")
+
+    assert "exit code 0" in out
+    assert seen["registered"] == set(), "reaped pgid was still registered during the audit"
