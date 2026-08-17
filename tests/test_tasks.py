@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from pathlib import Path
 
@@ -279,3 +280,35 @@ def test_cancel_running_cannot_clobber_state(store: TaskStore):
     assert got.state == TaskState.RUNNING  # Still running, not cancelled
     assert got.cancel_requested is True  # Flag is set
     assert got.finished_at is None  # Not finished
+
+
+def _open_fd_count() -> int:
+    """Descriptors held by this process. /dev/fd works on macOS and Linux."""
+    return len(os.listdir("/dev/fd"))
+
+
+def test_repeated_operations_do_not_leak_file_descriptors(store: TaskStore):
+    """Every TaskStore method opens its own connection; each must close it.
+
+    `with sqlite3.connect(...)` only commits the transaction, it does not
+    close. Leaking two descriptors (db + WAL) per call crash-loops the daemon
+    under launchd's 256-descriptor soft limit after ~128 operations.
+    """
+    _enqueue(store, "warmup")  # let one-time schema/WAL setup settle
+    baseline = _open_fd_count()
+
+    for i in range(50):
+        task = _enqueue(store, f"t{i}")
+        store.get(task.id)
+
+    assert _open_fd_count() <= baseline + 2
+
+
+def test_failed_statement_rolls_back(store: TaskStore):
+    """_conn must keep commit-on-success / rollback-on-error while closing."""
+    task = _enqueue(store, "keep")
+    with pytest.raises(sqlite3.IntegrityError), store._conn() as c:
+        c.execute("UPDATE tasks SET title = 'clobbered'")
+        c.execute("INSERT INTO tasks (id) VALUES (?)", (task.id,))  # dup PK
+
+    assert _get(store, task.id).title == "keep"
