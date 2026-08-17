@@ -2,6 +2,7 @@ import plistlib
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -292,3 +293,57 @@ def test_uninstall_boots_out_even_when_the_plist_is_gone(tmp_path, capsys, monke
     monkeypatch.setattr(cli, "_bootout", lambda label: (booted.append(label), 0)[1])
     cli.main(["uninstall-launchd"])
     assert booted == [cli.LABEL], "did not attempt bootout without a plist"
+
+
+def test_uninstall_does_not_advise_stop_for_a_daemon_it_just_unloaded(
+    tmp_path, capsys, monkeypatch
+):
+    """bootout terminates the job, so an immediate port check races its exit.
+
+    Advising `sous stop` then names a daemon that is already going away, and
+    running it reports "not running" — which reads as though the advice was
+    wrong rather than merely early.
+    """
+    from sous import cli
+
+    port = _free_cli_port()
+    daemon = _fake_daemon(tmp_path, port)
+    plist = tmp_path / "com.sous.daemon.plist"
+    plist.write_text("<plist/>")
+
+    def bootout_then_it_dies(label):
+        threading.Timer(0.8, daemon.kill).start()  # launchd tears it down shortly after
+        return 0
+
+    try:
+        monkeypatch.setattr(cli, "load_config", lambda: _cfg(tmp_path, port))
+        monkeypatch.setattr(cli, "_plist_path", lambda: plist)
+        monkeypatch.setattr(cli, "_bootout", bootout_then_it_dies)
+        cli.main(["uninstall-launchd"])
+        out = capsys.readouterr().out
+        assert "unloaded the launchd agent" in out
+        assert "sous stop" not in out, "advised stopping a daemon that was already exiting"
+    finally:
+        daemon.kill()
+
+
+def test_uninstall_still_advises_stop_for_a_daemon_launchd_never_owned(
+    tmp_path, capsys, monkeypatch
+):
+    """The wait must not swallow the case the advice exists for: a daemon that
+    outlives the uninstall because nothing was supervising it."""
+    from sous import cli
+
+    port = _free_cli_port()
+    daemon = _fake_daemon(tmp_path, port)  # nothing kills this one
+    plist = tmp_path / "com.sous.daemon.plist"
+    plist.write_text("<plist/>")
+
+    try:
+        monkeypatch.setattr(cli, "load_config", lambda: _cfg(tmp_path, port))
+        monkeypatch.setattr(cli, "_plist_path", lambda: plist)
+        monkeypatch.setattr(cli, "_bootout", lambda label: cli._BOOTOUT_NOT_LOADED)
+        cli.main(["uninstall-launchd"])
+        assert "sous stop" in capsys.readouterr().out
+    finally:
+        daemon.kill()

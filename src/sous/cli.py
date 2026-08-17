@@ -64,6 +64,19 @@ def _port_open(port: int) -> bool:
         return False
 
 
+_UNLOAD_GRACE_SECONDS = 5.0
+
+
+def _await_port_closed(port: int, seconds: float) -> bool:
+    """Wait up to `seconds` for the port to stop accepting."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not _port_open(port):
+            return True
+        time.sleep(0.2)
+    return not _port_open(port)
+
+
 def _launchd_loaded(label: str) -> bool:
     """Whether launchd is currently managing the daemon.
 
@@ -206,6 +219,14 @@ def _cmd_uninstall_launchd() -> None:
         return
 
     config = load_config()
+    if code == 0:
+        # bootout terminates the job it just unloaded, so checking the port
+        # straight away races that teardown: the daemon is still accepting for
+        # a moment, and advising `sous stop` sends the user after a process
+        # that is already exiting — they run it and are told "not running",
+        # which reads as bad advice rather than early advice. Only a daemon
+        # that outlives the unload was never launchd's to begin with.
+        _await_port_closed(config.server_port, _UNLOAD_GRACE_SECONDS)
     if _port_open(config.server_port):
         print("the running daemon is now unmanaged; stop it with: sous stop")
 
