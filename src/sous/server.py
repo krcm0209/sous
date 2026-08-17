@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import shlex
 import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import IO
 
 from mcp.server import MCPServer
 
@@ -270,9 +273,39 @@ def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) 
     return mcp
 
 
+def _acquire_singleton_lock(data_dir: Path) -> IO[bytes]:
+    """Take the daemon's exclusive lock, or exit if another daemon holds it.
+
+    flock rather than a pidfile: the kernel releases it when the holder dies,
+    including SIGKILL and the crashes launchd restarts from, so a stale lock
+    can never wedge the daemon out of ever starting again.
+
+    The returned handle must stay open for the process's lifetime — closing it
+    (or letting it be collected) drops the lock.
+    """
+    lock_path = data_dir / "daemon.lock"
+    handle = lock_path.open("ab")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        handle.close()
+        if e.errno in (errno.EAGAIN, errno.EACCES):  # EWOULDBLOCK is EAGAIN
+            raise SystemExit(f"sous: another daemon already holds {lock_path}") from None
+        # ENOLCK, or a filesystem that cannot flock: a real startup failure.
+        # Calling it contention would send the operator hunting for a second
+        # daemon that does not exist.
+        raise
+    return handle
+
+
 def main() -> None:
     config = load_config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
+    # Before ANY queue access: recover_interrupted() below would fail a running
+    # daemon's in-flight task, and the worker would load a second copy of the
+    # model. The port bind at the end of this function is far too late to be
+    # the guard. `_lock` is unused by design — it must stay open to hold it.
+    _lock = _acquire_singleton_lock(config.data_dir)
     store = TaskStore(config.data_dir / "tasks.db")
     interrupted = store.recover_interrupted(config.data_dir)
     if interrupted:
