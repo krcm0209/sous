@@ -1,6 +1,7 @@
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -15,6 +16,15 @@ def _free_port() -> int:
 
 def _daemon_command(data: Path, port: int) -> list[str]:
     return [sys.executable, "-m", "tests.daemon_stub", str(data), str(port)]
+
+
+def _readline(stream, seconds: float) -> bytes:
+    """Read one line, giving up after `seconds` instead of blocking forever."""
+    result: list[bytes] = []
+    reader = threading.Thread(target=lambda: result.append(stream.readline()), daemon=True)
+    reader.start()
+    reader.join(seconds)
+    return result[0] if result else b""
 
 
 def _wait_for_port(port: int, seconds: float = 20.0) -> bool:
@@ -163,6 +173,134 @@ def test_proxy_forwards_tool_calls_over_stdio(tmp_path: Path):
     try:
         names = anyio.run(drive)
         assert "server_status" in names and "delegate_task" in names
+    finally:
+        daemon.kill()
+        subprocess.run(["pkill", "-f", f"daemon_stub {data} {port}"], check=False)
+
+
+@pytest.mark.slow
+def test_proxy_exits_when_the_daemon_dies(tmp_path: Path):
+    """A dead daemon must end the bridge, not leave it waiting on stdin.
+
+    Both SDK transports own background task groups. With the bridge's own task
+    group innermost, its __aexit__ absorbs the cancellation before those
+    transports unwind, and stdio_server() goes on waiting for stdin forever —
+    the client sees a live server with a dead backend behind it.
+    """
+    port = _free_port()
+    data = tmp_path / "data"
+    daemon = subprocess.Popen(
+        _daemon_command(data, port),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    assert _wait_for_port(port, 25.0), "daemon never came up"
+
+    proxy_src = (
+        "from pathlib import Path;"
+        "from sous.config import SousConfig;"
+        "from sous.proxy import run;"
+        f"run(SousConfig(data_dir=Path({str(data)!r}), "
+        f"config_path=Path({str(data / 'config.toml')!r}), server_port={port}))"
+    )
+    proxy = subprocess.Popen(
+        [sys.executable, "-c", proxy_src],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        # A real session first. An idle proxy has no live daemon stream to
+        # notice a death on — the HTTP client only opens its SSE stream once
+        # `initialized` arrives — so skipping the handshake would test nothing.
+        assert proxy.stdin is not None and proxy.stdout is not None
+        proxy.stdin.write(
+            b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":'
+            b'"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}\n'
+        )
+        proxy.stdin.flush()
+        assert _readline(proxy.stdout, 20.0), "no initialize response through the bridge"
+        proxy.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+        proxy.stdin.flush()
+        time.sleep(2.0)
+        assert proxy.poll() is None, "proxy died before the daemon did"
+
+        daemon.kill()
+        daemon.wait()
+
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline and proxy.poll() is None:
+            time.sleep(0.3)
+        assert proxy.poll() is not None, "proxy still running after the daemon died"
+    finally:
+        proxy.kill()
+        daemon.kill()
+        subprocess.run(["pkill", "-f", f"daemon_stub {data} {port}"], check=False)
+
+
+class _StdioTransport:
+    """Adapts the stdio client to the Client transport protocol."""
+
+    def __init__(self, params):
+        self._params = params
+        self._cm = None
+
+    async def __aenter__(self):
+        from mcp.client.stdio import stdio_client
+
+        self._cm = stdio_client(self._params)
+        return await self._cm.__aenter__()
+
+    async def __aexit__(self, *exc):
+        assert self._cm is not None
+        return await self._cm.__aexit__(*exc)
+
+
+@pytest.mark.slow
+def test_modern_protocol_client_works_through_the_bridge(tmp_path: Path):
+    """A `mode='auto'` client (which probes `server/discover`) must still work.
+
+    stdio carries no HTTP headers, so the bridge has no `Mcp-Method`/`Mcp-Name`
+    metadata to forward and the daemon sees the session as legacy — the SDK's
+    documented fallback. Tools must still resolve and call. The bridge does not
+    synthesize those headers: the daemon's validation ladder checks them only
+    when present, so omitting them is skipped whereas a wrong guess would be a
+    HEADER_MISMATCH rejection.
+    """
+    import anyio
+    from mcp import StdioServerParameters
+    from mcp.client import Client
+
+    port = _free_port()
+    data = tmp_path / "data"
+    daemon = subprocess.Popen(
+        _daemon_command(data, port),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    assert _wait_for_port(port, 25.0), "daemon never came up"
+
+    proxy_src = (
+        "from pathlib import Path;"
+        "from sous.config import SousConfig;"
+        "from sous.proxy import run;"
+        f"run(SousConfig(data_dir=Path({str(data)!r}), "
+        f"config_path=Path({str(data / 'config.toml')!r}), server_port={port}))"
+    )
+
+    async def drive():
+        params = StdioServerParameters(command=sys.executable, args=["-c", proxy_src])
+        async with Client(_StdioTransport(params), mode="auto") as client:
+            listed = await client.list_tools()
+            result = await client.call_tool("server_status", {})
+            return [t.name for t in listed.tools], result
+
+    try:
+        names, result = anyio.run(drive)
+        assert "server_status" in names and "delegate_task" in names
+        assert result is not None
     finally:
         daemon.kill()
         subprocess.run(["pkill", "-f", f"daemon_stub {data} {port}"], check=False)

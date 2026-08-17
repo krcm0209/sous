@@ -8,10 +8,19 @@ state of its own. N clients share one daemon.
 
 It is deliberately a message pump, not a semantic proxy: payloads are passed
 through untouched, so tools and notifications need no support here.
+
+That costs one thing, knowingly. stdio carries no HTTP headers, so there is no
+`Mcp-Method`/`Mcp-Name`/protocol-version metadata to forward and the daemon
+treats the session as legacy — the SDK's documented fallback, which a
+`mode='auto'` client takes without complaint. The bridge does not synthesize
+those headers: the daemon validates them only when present, so omitting them
+skips that rung entirely while a wrong guess would be a HEADER_MISMATCH
+rejection. Passing through less is the safe direction here.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import subprocess
@@ -20,6 +29,7 @@ import time
 
 import anyio
 from anyio.abc import TaskGroup
+from anyio.to_thread import run_sync
 from mcp import stdio_server
 from mcp.client.streamable_http import streamable_http_client
 
@@ -27,6 +37,7 @@ from sous.config import SousConfig, load_config
 
 DEFAULT_WAIT_SECONDS = 20.0
 _POLL_SECONDS = 0.2
+_LIVENESS_POLL_SECONDS = 1.0
 
 
 def _port_open(port: int, timeout: float = 0.5) -> bool:
@@ -77,7 +88,33 @@ async def _pump(source, dest, task_group: TaskGroup) -> None:
     task_group.cancel_scope.cancel()
 
 
-async def _bridge(url: str) -> None:
+async def _watch_daemon(port: int) -> None:
+    """End the bridge when the daemon goes away.
+
+    Two things make this necessary, and neither is obvious:
+
+    A dead daemon does not close the client's SSE read stream — it yields
+    nothing, raises nothing, and never ends — so the pumps alone wait forever
+    while the client keeps talking to a bridge with nothing behind it. The
+    daemon is on loopback, so the port is an unambiguous liveness signal.
+    _port_open blocks, hence the worker thread.
+
+    Cancelling the task group is then not enough to exit: stdio_server() is
+    blocked reading stdin, which the client still holds open, and that read
+    stalls the transports' __aexit__ indefinitely. So end the process outright.
+    A bridge holds no state and buffers nothing, and dying is precisely the
+    signal the client needs — EOF on stdout is how it learns the server is
+    gone. Client-initiated shutdown still unwinds normally: stdin reaches EOF,
+    the pump ends, and the task group closes on its own.
+    """
+    while await run_sync(_port_open, port):
+        await anyio.sleep(_LIVENESS_POLL_SECONDS)
+    print(f"sous: daemon on 127.0.0.1:{port} went away; closing the bridge", file=sys.stderr)
+    sys.stderr.flush()
+    os._exit(1)
+
+
+async def _bridge(url: str, port: int) -> None:
     async with (
         stdio_server() as (client_read, client_write),
         streamable_http_client(url) as (daemon_read, daemon_write),
@@ -85,6 +122,7 @@ async def _bridge(url: str) -> None:
     ):
         tg.start_soon(_pump, client_read, daemon_write, tg)
         tg.start_soon(_pump, daemon_read, client_write, tg)
+        tg.start_soon(_watch_daemon, port)
 
 
 def run(config: SousConfig | None = None, start_command: list[str] | None = None) -> int:
@@ -95,5 +133,5 @@ def run(config: SousConfig | None = None, start_command: list[str] | None = None
         print(f"sous: no daemon on 127.0.0.1:{config.server_port}", file=sys.stderr)
         print("start it with: sous serve   (or: sous install-launchd)", file=sys.stderr)
         return 1
-    anyio.run(_bridge, f"http://127.0.0.1:{config.server_port}/mcp")
+    anyio.run(_bridge, f"http://127.0.0.1:{config.server_port}/mcp", config.server_port)
     return 0
