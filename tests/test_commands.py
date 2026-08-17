@@ -1,8 +1,10 @@
 import os
 import resource
+import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -16,6 +18,17 @@ from sous.toolexec import (
     command_allowed,
     scrubbed_env,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_shutdown_latch(monkeypatch):
+    """terminate_active_commands() latches shutdown for the whole module.
+
+    Without this, any test that calls it silently turns every later
+    run_command in the session into "aborted: the daemon is shutting down" —
+    a failure that would look like a bug in the command under test.
+    """
+    monkeypatch.setattr(toolexec, "_registration_closed", False)
 
 
 def test_allowlist_token_matching():
@@ -460,3 +473,197 @@ def test_fast_command_that_exits_before_pgid_capture(ex: ToolExecutor, monkeypat
 
     out = ex.run_command("/bin/echo hello")
     assert "exit code 0" in out and "hello" in out
+
+
+# --- shutdown must not orphan a running command ------------------------------
+
+
+def test_terminate_active_commands_kills_an_in_flight_child(tmp_path: Path):
+    """A command running when the daemon stops must not outlive it.
+
+    run_command puts its child in a new session, so the child survives its
+    parent and keeps writing files unless the group is killed explicitly.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[commands]\nallowlist = ["{sys.executable}"]\n')
+    ex = ToolExecutor(root, cfg)
+
+    marker = tmp_path / "ticks.txt"
+    marker.touch()
+    script = (
+        f"import time\nwhile True:\n    open({str(marker)!r},'a').write('t')\n    time.sleep(0.1)"
+    )
+    done = threading.Event()
+
+    def run():
+        ex.run_command(f"{sys.executable} -c {shlex.quote(script)}", timeout=60)
+        done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    for _ in range(100):  # wait until the child is actually writing
+        if marker.stat().st_size > 0:
+            break
+        time.sleep(0.1)
+    assert marker.stat().st_size > 0, "child never started"
+
+    killed = toolexec.terminate_active_commands()
+    assert killed == 1
+    assert done.wait(timeout=15), "run_command never returned after the kill"
+
+    before = marker.stat().st_size
+    time.sleep(1.0)
+    assert marker.stat().st_size == before, "child survived and kept writing"
+
+
+def test_sigterm_to_the_daemon_kills_a_running_command(tmp_path: Path):
+    """End to end, in a real process taking a real SIGTERM.
+
+    Default SIGTERM handling terminates the daemon outright — main()'s finally
+    never runs — so without an installed handler the sandboxed child is
+    orphaned and goes on mutating the project after the daemon is gone.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[commands]\nallowlist = ["{sys.executable}"]\n')
+    marker = tmp_path / "ticks.txt"
+    marker.touch()
+
+    child = (
+        f"import time\nwhile True:\n    open({str(marker)!r},'a').write('t')\n    time.sleep(0.1)"
+    )
+    command = f"{sys.executable} -c {shlex.quote(child)}"
+    daemon_src = (
+        "import threading, time\n"
+        "from pathlib import Path\n"
+        "from sous.server import _install_shutdown_handler\n"
+        "from sous.toolexec import ToolExecutor\n"
+        f"ex = ToolExecutor(Path({str(root)!r}), Path({str(cfg)!r}))\n"
+        "_install_shutdown_handler(threading.Event())\n"
+        f"run = lambda: ex.run_command({command!r}, timeout=120)\n"
+        "threading.Thread(target=run, daemon=True).start()\n"
+        "time.sleep(120)\n"
+    )
+    daemon = subprocess.Popen([sys.executable, "-c", daemon_src])
+    try:
+        for _ in range(150):
+            if marker.stat().st_size > 0:
+                break
+            time.sleep(0.1)
+        assert marker.stat().st_size > 0, "command never started in the daemon"
+
+        daemon.send_signal(signal.SIGTERM)
+        daemon.wait(timeout=20)
+
+        time.sleep(0.5)
+        before = marker.stat().st_size
+        time.sleep(1.5)
+        assert marker.stat().st_size == before, (
+            "sandboxed child outlived the daemon and kept writing to the project"
+        )
+    finally:
+        daemon.kill()
+
+
+def test_command_started_during_shutdown_does_not_slip_through(tmp_path: Path):
+    """Shutdown must close registration, not just snapshot it.
+
+    stop.set() does not interrupt the task in flight: after its command is
+    killed, the agent loop can issue another one. A snapshot taken before that
+    never sees the new group, and the process exits leaving it orphaned —
+    exactly the leak this file is meant to prevent.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[commands]\nallowlist = ["{sys.executable}"]\n')
+    ex = ToolExecutor(root, cfg)
+
+    assert toolexec.terminate_active_commands() == 0  # nothing running; latches shutdown
+
+    marker = tmp_path / "late.txt"
+    marker.touch()
+    script = (
+        f"import time\nwhile True:\n    open({str(marker)!r},'a').write('t')\n    time.sleep(0.1)"
+    )
+    out = ex.run_command(f"{sys.executable} -c {shlex.quote(script)}", timeout=30)
+
+    assert "shutting down" in out, f"late command ran to completion: {out!r}"
+    before = marker.stat().st_size
+    time.sleep(1.0)
+    assert marker.stat().st_size == before, "late command's child survived shutdown"
+
+
+def test_terminate_does_not_linger_between_snapshot_and_kill(tmp_path: Path):
+    """No grace sleep on the shutdown path.
+
+    The worker is blocked in proc.wait() and reaps the group leader as soon as
+    it dies, so a delay between signalling and SIGKILL is a window where the
+    pgid can be recycled onto an unrelated group. The daemon exits immediately
+    afterwards, so nothing would observe a graceful teardown anyway.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[commands]\nallowlist = ["{sys.executable}"]\n')
+    ex = ToolExecutor(root, cfg)
+
+    marker = tmp_path / "ticks.txt"
+    marker.touch()
+    script = (
+        f"import time\nwhile True:\n    open({str(marker)!r},'a').write('t')\n    time.sleep(0.1)"
+    )
+    done = threading.Event()
+
+    def run():
+        ex.run_command(f"{sys.executable} -c {shlex.quote(script)}", timeout=60)
+        done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    for _ in range(100):
+        if marker.stat().st_size > 0:
+            break
+        time.sleep(0.1)
+    assert marker.stat().st_size > 0, "child never started"
+
+    started = time.monotonic()
+    assert toolexec.terminate_active_commands() == 1
+    elapsed = time.monotonic() - started
+    assert elapsed < toolexec._KILL_GRACE_SECONDS, (
+        f"terminate slept {elapsed:.2f}s between snapshot and kill"
+    )
+    # Wait for run_command to unwind before leaving: it releases the group id on
+    # the way out, and a half-finished command would leak a live entry in the
+    # module-level registry into whatever test runs next.
+    assert done.wait(timeout=15), "run_command never returned after the kill"
+
+
+def test_group_is_unregistered_before_the_audit_runs(tmp_path: Path, monkeypatch):
+    """Drop the pgid the moment it is reaped, not after auditing.
+
+    proc.wait() reaps the leader, so from that instant the number belongs to
+    the OS again. _record_command_changes walks the whole project tree and the
+    output read-back follows it — leaving the id registered across both means a
+    shutdown in that window SIGKILLs whatever inherited it.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[commands]\nallowlist = ["/bin/echo"]\n')
+    ex = ToolExecutor(root, cfg)
+
+    seen: dict[str, set[int]] = {}
+    real = ToolExecutor._record_command_changes
+
+    def spy(self, before_snap):
+        with toolexec._active_groups_lock:
+            seen["registered"] = set(toolexec._active_groups)
+        return real(self, before_snap)
+
+    monkeypatch.setattr(ToolExecutor, "_record_command_changes", spy)
+    out = ex.run_command("/bin/echo hi")
+
+    assert "exit code 0" in out
+    assert seen["registered"] == set(), "reaped pgid was still registered during the audit"
