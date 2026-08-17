@@ -10,6 +10,7 @@ import shlex
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -178,6 +179,80 @@ def _await_exit_without_reaping(pid: int, timeout: float) -> None:
         if time.monotonic() >= deadline:
             return
         time.sleep(_KILL_POLL_SECONDS)
+
+
+# Process groups of commands running right now. start_new_session puts each
+# child in its own session, so it outlives the daemon and keeps writing to the
+# user's project unless the group is killed on the way out. Registered here
+# rather than plumbed through the worker: the groups are created in this file
+# and the kill escalation already lives here, so the boundary stays in one
+# place. The worker runs one task at a time today; a set costs nothing and
+# does not assume that.
+_active_groups: set[int] = set()
+_active_groups_lock = threading.Lock()
+# Latched by terminate_active_commands(). A daemon that has begun shutting down
+# never runs another command, so this is deliberately one-way.
+_registration_closed = False
+
+
+def _register_group(pgid: int) -> bool:
+    """Claim a group, or report that shutdown has already closed registration.
+
+    The flag and the set are read and written under one acquisition, so a
+    command either lands in the snapshot terminate_active_commands() takes or
+    is told to kill itself. There is no gap between the two for it to fall
+    through, which is what a plain snapshot got wrong.
+    """
+    with _active_groups_lock:
+        if _registration_closed:
+            return False
+        _active_groups.add(pgid)
+        return True
+
+
+def _unregister_group(pgid: int) -> None:
+    """Release a group id. Idempotent, and safe to call from any exit path.
+
+    Call this the moment the leader is reaped, not when the command finishes:
+    a reaped pid belongs to the OS again, and everything after the reap — the
+    project-tree audit, the output read-back — is time in which a shutdown
+    could signal whatever inherited the number.
+    """
+    with _active_groups_lock:
+        _active_groups.discard(pgid)
+
+
+def terminate_active_commands() -> int:
+    """Kill every command group still running, returning how many there were.
+
+    SIGKILL immediately, with no grace period, unlike the timeout path. Two
+    reasons, and the second is the important one:
+
+    The daemon exits as soon as this returns, so nothing would observe a
+    well-behaved teardown — the grace period buys a timed-out test runner a
+    tidy exit, but buys a dying daemon nothing.
+
+    More importantly, waiting here is unsafe in a way it is not on the timeout
+    path. There, _kill_process_group is called by the worker thread itself, so
+    it can hold the group leader un-reaped across the escalation. Here the
+    worker is concurrently blocked in proc.wait() and reaps the leader the
+    moment it dies — so any delay between signalling and SIGKILL is a window
+    where the pgid is free to be recycled onto an unrelated group. Signalling
+    once, immediately, keeps that window as small as this design allows.
+
+    Registration is closed first so a task mid-flight cannot start another
+    command behind the snapshot: stop.set() does not interrupt run_task, and
+    its agent loop is free to issue another run_command as soon as the current
+    one dies.
+    """
+    global _registration_closed
+    with _active_groups_lock:
+        _registration_closed = True
+        groups = list(_active_groups)
+    for pgid in groups:
+        with contextlib.suppress(*_ALREADY_DEAD):
+            os.killpg(pgid, signal.SIGKILL)
+    return len(groups)
 
 
 def _kill_process_group(pgid: int, proc: subprocess.Popen) -> None:
@@ -436,25 +511,43 @@ class ToolExecutor:
             # child un-reaped until the wait() below; see _kill_process_group
             # for why it must stay that way through the kill escalation.
             pgid = proc.pid
+            if not _register_group(pgid):
+                # Shutdown began between Popen and here. Kill what we just
+                # started rather than let it outlive the daemon: the snapshot
+                # was taken before this group existed, so nothing else will.
+                _kill_process_group(pgid, proc)
+                return "command aborted: the daemon is shutting down"
             try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                # Kill the whole group FIRST, then record: snapshotting while
-                # descendants are still alive would let them modify files
-                # after the audit.
-                _kill_process_group(pgid, proc)
-                # A timed-out command may already have modified files.
+                try:
+                    proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    # Kill the whole group FIRST, then record: snapshotting while
+                    # descendants are still alive would let them modify files
+                    # after the audit.
+                    _kill_process_group(pgid, proc)
+                    _unregister_group(pgid)  # reaped in there; the id is not ours
+                    # A timed-out command may already have modified files.
+                    self._record_command_changes(before_snap)
+                    return f"command timed out after {timeout}s: {command}"
+                except BaseException:  # noqa: BLE001 — deliberate: KeyboardInterrupt/
+                    # SystemExit during daemon shutdown must not orphan a running
+                    # process group that keeps writing files. Kill the group, then
+                    # let the exception propagate (subprocess.run had the same
+                    # kill-on-any-exception backstop for the direct child). No
+                    # change recording here: the exception is propagating, no
+                    # report is being assembled.
+                    _kill_process_group(pgid, proc)
+                    _unregister_group(pgid)
+                    raise
+                # wait() reaped the leader, so release the id before the audit
+                # and the output read-back: both can take a while on a large
+                # project, and holding a recycled id across them means shutdown
+                # would SIGKILL whatever inherited it.
+                _unregister_group(pgid)
                 self._record_command_changes(before_snap)
-                return f"command timed out after {timeout}s: {command}"
-            except BaseException:  # noqa: BLE001 — deliberate: KeyboardInterrupt/
-                # SystemExit during daemon shutdown must not orphan a running
-                # process group that keeps writing files. Kill the group, then
-                # let the exception propagate (subprocess.run had the same
-                # kill-on-any-exception backstop for the direct child). No
-                # change recording here: the exception is propagating, no
-                # report is being assembled.
-                _kill_process_group(pgid, proc)
-                raise
-            self._record_command_changes(before_snap)
-            body = _capped_command_output(out_f, err_f)
-            return f"exit code {proc.returncode}\n{body}"
+                body = _capped_command_output(out_f, err_f)
+                return f"exit code {proc.returncode}\n{body}"
+            finally:
+                # Backstop for any path above that returns or raises before
+                # reaching its own release. discard() makes this idempotent.
+                _unregister_group(pgid)

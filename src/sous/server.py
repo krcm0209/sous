@@ -6,7 +6,9 @@ import errno
 import fcntl
 import os
 import shlex
+import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -17,7 +19,7 @@ from mcp.server import MCPServer
 from sous.config import SousConfig, current_allowlist, load_config, persist_allowlist_entry
 from sous.engine.base import EngineManager
 from sous.tasks import FINISHED_STATES, Task, TaskState, TaskStore
-from sous.toolexec import _is_within, command_allowed
+from sous.toolexec import _is_within, command_allowed, terminate_active_commands
 from sous.worker import run_worker_loop
 
 
@@ -308,6 +310,33 @@ def _acquire_singleton_lock(data_dir: Path) -> IO[bytes]:
     return handle
 
 
+def _install_shutdown_handler(stop: threading.Event) -> None:
+    """Kill in-flight commands on SIGTERM/SIGINT before the process goes away.
+
+    Default handling terminates the daemon outright — measured: exit -15 with
+    main()'s finally never reached — so cleanup in a finally would be dead
+    code. Meanwhile a command's child is in its own session (start_new_session
+    in toolexec), so it survives the daemon and goes on writing to the user's
+    project. launchd restarts and `sous stop` both send SIGTERM, so this is the
+    ordinary path out, not an edge case.
+
+    The worker thread is deliberately not joined: a task can run for minutes,
+    and killing the command groups is what protects the user's files. The task
+    itself is reported failed by recover_interrupted() on the next start.
+    """
+
+    def handle(signum, frame) -> None:  # noqa: ARG001 — signal handler signature
+        stop.set()
+        killed = terminate_active_commands()
+        if killed:
+            print(f"sous: killed {killed} running command group(s)", file=sys.stderr)
+        sys.stderr.flush()
+        os._exit(0)
+
+    for received in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(received, handle)
+
+
 def main() -> None:
     config = load_config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
@@ -322,6 +351,7 @@ def main() -> None:
         print(f"sous: marked {interrupted} interrupted task(s) as failed")
     engines = EngineManager(config)
     stop = threading.Event()
+    _install_shutdown_handler(stop)
     worker = threading.Thread(
         target=run_worker_loop,
         args=(store, engines, config, stop),
