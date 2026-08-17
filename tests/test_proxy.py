@@ -304,3 +304,72 @@ def test_modern_protocol_client_works_through_the_bridge(tmp_path: Path):
     finally:
         daemon.kill()
         subprocess.run(["pkill", "-f", f"daemon_stub {data} {port}"], check=False)
+
+
+@pytest.mark.slow
+def test_proxy_exits_when_the_daemon_restarts(tmp_path: Path):
+    """A restarted daemon leaves the bridge alive but useless — it must exit.
+
+    launchd's KeepAlive puts a new daemon on the same port within a second, so
+    a liveness check never sees it go down; meanwhile every old session is gone
+    and each call comes back "Session not found" forever. The client cannot
+    recover, because a bridge that stays alive is never restarted. Identity, not
+    liveness, is the signal — hence the pid in daemon.lock.
+    """
+    port = _free_port()
+    data = tmp_path / "data"
+    first = subprocess.Popen(
+        _daemon_command(data, port),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    assert _wait_for_port(port, 25.0), "daemon never came up"
+
+    proxy_src = (
+        "from pathlib import Path;"
+        "from sous.config import SousConfig;"
+        "from sous.proxy import run;"
+        f"run(SousConfig(data_dir=Path({str(data)!r}), "
+        f"config_path=Path({str(data / 'config.toml')!r}), server_port={port}))"
+    )
+    proxy = subprocess.Popen(
+        [sys.executable, "-c", proxy_src],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    second = None
+    try:
+        assert proxy.stdin is not None and proxy.stdout is not None
+        proxy.stdin.write(
+            b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":'
+            b'"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}\n'
+        )
+        proxy.stdin.flush()
+        assert _readline(proxy.stdout, 20.0), "no initialize response through the bridge"
+        proxy.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+        proxy.stdin.flush()
+        time.sleep(2.0)
+        assert proxy.poll() is None, "proxy died before the restart"
+
+        first.kill()
+        first.wait()
+        second = subprocess.Popen(
+            _daemon_command(data, port),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        assert _wait_for_port(port, 25.0), "replacement daemon never came up"
+
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline and proxy.poll() is None:
+            time.sleep(0.3)
+        assert proxy.poll() is not None, "bridge survived a daemon restart as a dead session"
+    finally:
+        proxy.kill()
+        first.kill()
+        if second:
+            second.kill()
+        subprocess.run(["pkill", "-f", f"daemon_stub {data} {port}"], check=False)

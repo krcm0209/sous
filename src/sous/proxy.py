@@ -26,6 +26,7 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import anyio
 from anyio.abc import TaskGroup
@@ -88,16 +89,31 @@ async def _pump(source, dest, task_group: TaskGroup) -> None:
     task_group.cancel_scope.cancel()
 
 
-async def _watch_daemon(port: int) -> None:
-    """End the bridge when the daemon goes away.
+def _daemon_identity(data_dir: Path) -> str:
+    """Which daemon holds the lock. Empty when unknown."""
+    try:
+        return (data_dir / "daemon.lock").read_text().strip()
+    except OSError:
+        return ""
 
-    Two things make this necessary, and neither is obvious:
+
+async def _watch_daemon(port: int, data_dir: Path) -> None:
+    """End the bridge when the daemon goes away OR is replaced.
+
+    Three things make this necessary, and none is obvious:
 
     A dead daemon does not close the client's SSE read stream — it yields
     nothing, raises nothing, and never ends — so the pumps alone wait forever
     while the client keeps talking to a bridge with nothing behind it. The
     daemon is on loopback, so the port is an unambiguous liveness signal.
     _port_open blocks, hence the worker thread.
+
+    Liveness alone is not enough either. launchd's KeepAlive puts a replacement
+    on the same port within a second, so the port may never be seen shut; but
+    every session from the old process is gone and each call returns "Session
+    not found" forever. A bridge that stays up is never restarted by the
+    client, so it must notice the swap — hence identity, read from the pid the
+    daemon records in its lock file.
 
     Cancelling the task group is then not enough to exit: stdio_server() is
     blocked reading stdin, which the client still holds open, and that read
@@ -107,14 +123,21 @@ async def _watch_daemon(port: int) -> None:
     gone. Client-initiated shutdown still unwinds normally: stdin reaches EOF,
     the pump ends, and the task group closes on its own.
     """
-    while await run_sync(_port_open, port):
+    connected_to = await run_sync(_daemon_identity, data_dir)
+    while True:
         await anyio.sleep(_LIVENESS_POLL_SECONDS)
-    print(f"sous: daemon on 127.0.0.1:{port} went away; closing the bridge", file=sys.stderr)
+        if not await run_sync(_port_open, port):
+            reason = "went away"
+            break
+        if await run_sync(_daemon_identity, data_dir) != connected_to:
+            reason = "was replaced"
+            break
+    print(f"sous: daemon on 127.0.0.1:{port} {reason}; closing the bridge", file=sys.stderr)
     sys.stderr.flush()
     os._exit(1)
 
 
-async def _bridge(url: str, port: int) -> None:
+async def _bridge(url: str, port: int, data_dir: Path) -> None:
     async with (
         stdio_server() as (client_read, client_write),
         streamable_http_client(url) as (daemon_read, daemon_write),
@@ -122,7 +145,7 @@ async def _bridge(url: str, port: int) -> None:
     ):
         tg.start_soon(_pump, client_read, daemon_write, tg)
         tg.start_soon(_pump, daemon_read, client_write, tg)
-        tg.start_soon(_watch_daemon, port)
+        tg.start_soon(_watch_daemon, port, data_dir)
 
 
 def run(config: SousConfig | None = None, start_command: list[str] | None = None) -> int:
@@ -133,5 +156,7 @@ def run(config: SousConfig | None = None, start_command: list[str] | None = None
         print(f"sous: no daemon on 127.0.0.1:{config.server_port}", file=sys.stderr)
         print("start it with: sous serve   (or: sous install-launchd)", file=sys.stderr)
         return 1
-    anyio.run(_bridge, f"http://127.0.0.1:{config.server_port}/mcp", config.server_port)
+    anyio.run(
+        _bridge, f"http://127.0.0.1:{config.server_port}/mcp", config.server_port, config.data_dir
+    )
     return 0
