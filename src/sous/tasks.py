@@ -106,9 +106,12 @@ class TaskStore:
         # descriptor open. Returning the bare connection leaked db + WAL per
         # call, crash-looping the daemon at launchd's 256-descriptor soft limit.
         conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
         try:
+            # Setup belongs inside the try: the WAL pragma takes a lock and can
+            # raise SQLITE_BUSY under contention, which would otherwise escape
+            # the finally and leak the descriptor we just opened.
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
             with conn:
                 yield conn
         finally:

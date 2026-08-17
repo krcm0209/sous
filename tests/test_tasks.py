@@ -312,3 +312,36 @@ def test_failed_statement_rolls_back(store: TaskStore):
         c.execute("INSERT INTO tasks (id) VALUES (?)", (task.id,))  # dup PK
 
     assert _get(store, task.id).title == "keep"
+
+
+class _WalPragmaFails(sqlite3.Connection):
+    """A connection whose WAL pragma fails, as SQLITE_BUSY does under contention."""
+
+    def execute(self, sql: str, *args):
+        if "journal_mode" in sql:
+            raise sqlite3.OperationalError("database is locked")
+        return super().execute(sql, *args)
+
+
+def test_connection_closed_when_setup_fails(store: TaskStore, monkeypatch: pytest.MonkeyPatch):
+    """Post-connect() setup must sit inside the try, or a raising PRAGMA leaks.
+
+    `_conn` opens the descriptor before the try block; anything that raises
+    between connect() and try: escapes the finally and leaks exactly the way
+    the bare-connection version did.
+    """
+    _enqueue(store, "warmup")
+    baseline = _open_fd_count()
+
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(
+        sqlite3,
+        "connect",
+        lambda *a, **kw: real_connect(*a, **kw, factory=_WalPragmaFails),
+    )
+
+    for _ in range(50):
+        with pytest.raises(sqlite3.OperationalError), store._conn():
+            pass  # pragma: no cover — _conn raises on __enter__
+
+    assert _open_fd_count() <= baseline + 2
