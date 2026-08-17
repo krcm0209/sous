@@ -1,5 +1,7 @@
 import asyncio
+import socket
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -334,3 +336,97 @@ def test_create_server_registers_six_tools(svc):
         "respond_to_command_request",
         "server_status",
     }
+
+
+# --- only one daemon may run: a second would fail the first's in-flight task
+# --- via recover_interrupted() and load a second copy of the model.
+
+
+def test_second_daemon_exits_without_touching_the_queue(tmp_path: Path, monkeypatch):
+    """The lock must be taken before ANY queue access.
+
+    server.main() opens the TaskStore and calls recover_interrupted() — which
+    marks the first daemon's RUNNING task failed — then starts a worker that
+    can load a second model. All of that happens before mcp.run() binds the
+    port, so the bind is far too late to be the guard. If the lock is acquired
+    first, tasks.db is never even created.
+    """
+    from sous.server import _acquire_singleton_lock
+    from sous.server import main as serve_main
+
+    data = tmp_path / "data"
+    data.mkdir()
+
+    # Hold the port for the whole test: without the lock, main() would reach
+    # mcp.run() and serve forever instead of failing, hanging the suite. An
+    # occupied port makes the unlocked path terminate so the assertion below
+    # is what distinguishes pass from fail.
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+        cfg = SousConfig(
+            data_dir=data,
+            config_path=tmp_path / "config.toml",
+            server_port=occupied.getsockname()[1],
+        )
+        cfg.config_path.write_text("")
+
+        holder = _acquire_singleton_lock(data)  # stand-in for the live daemon
+        try:
+            monkeypatch.setattr("sous.server.load_config", lambda: cfg)
+            with pytest.raises(SystemExit):
+                serve_main()
+            assert not (data / "tasks.db").exists(), "second daemon opened the shared queue"
+        finally:
+            holder.close()
+
+
+def test_lock_excludes_a_separate_process(tmp_path: Path):
+    """flock, not a pidfile: the kernel drops it when the holder dies, so a
+    SIGKILLed daemon can never wedge the next start out of the lock."""
+    from sous.server import _acquire_singleton_lock
+
+    data = tmp_path / "data"
+    data.mkdir()
+
+    probe = (
+        "import sys; from pathlib import Path;"
+        "from sous.server import _acquire_singleton_lock;"
+        f"_acquire_singleton_lock(Path({str(data)!r}));"
+        "print('ACQUIRED')"
+    )
+    holder = _acquire_singleton_lock(data)
+    try:
+        blocked = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+        assert blocked.returncode != 0, "second process acquired a held lock"
+        assert "ACQUIRED" not in blocked.stdout
+    finally:
+        holder.close()
+
+    # holder released -> the next process gets it
+    freed = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert "ACQUIRED" in freed.stdout, freed.stderr
+
+
+def test_non_contention_lock_failure_is_not_reported_as_another_daemon(tmp_path: Path, monkeypatch):
+    """ENOLCK, or a filesystem without flock support, is a real startup failure.
+
+    Contention is EAGAIN (EWOULDBLOCK). Translating every OSError into "another
+    daemon already holds ..." would send the operator hunting for a process that
+    does not exist, hiding the actual cause.
+    """
+    import errno
+    import fcntl
+
+    from sous.server import _acquire_singleton_lock
+
+    data = tmp_path / "data"
+    data.mkdir()
+
+    def no_locks_available(fd, op):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(fcntl, "flock", no_locks_available)
+    with pytest.raises(OSError) as exc:
+        _acquire_singleton_lock(data)
+    assert exc.value.errno == errno.ENOLCK
