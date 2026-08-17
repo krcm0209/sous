@@ -428,9 +428,14 @@ class ToolExecutor:
                 )
             except FileNotFoundError:
                 return f"command not found: {argv[0]}"
-            # Capture the group id while the child is certainly un-reaped (it
-            # may have exited, but stays a zombie until wait() below).
-            pgid = os.getpgid(proc.pid)
+            # start_new_session made the child its own group leader, so the
+            # pgid IS its pid — no syscall needed to learn it. os.getpgid()
+            # here was worse than redundant: macOS returns ESRCH for a zombie
+            # (Linux does not), so any command exiting before this line raised
+            # ProcessLookupError. The pid stays valid because Popen leaves the
+            # child un-reaped until the wait() below; see _kill_process_group
+            # for why it must stay that way through the kill escalation.
+            pgid = proc.pid
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:

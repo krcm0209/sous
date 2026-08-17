@@ -440,3 +440,23 @@ def test_hard_kill_precedes_reaping_the_group_leader(monkeypatch):
         "the group leader was already reaped when SIGKILL was sent, so its pid "
         "— and therefore the process-group id — could have been recycled"
     )
+
+
+def test_fast_command_that_exits_before_pgid_capture(ex: ToolExecutor, monkeypatch):
+    """A child that exits before the parent captures its group id must not fail.
+
+    macOS getpgid() returns ESRCH for a zombie, unlike Linux, so reading the
+    pgid off an already-exited child raises ProcessLookupError. Sleeping right
+    after Popen forces the ordering that a fast command hits by chance.
+    """
+    real_popen = subprocess.Popen
+
+    def popen_then_let_child_exit(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        time.sleep(0.3)  # child exits and becomes an un-reaped zombie
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", popen_then_let_child_exit)
+
+    out = ex.run_command("/bin/echo hello")
+    assert "exit code 0" in out and "hello" in out
