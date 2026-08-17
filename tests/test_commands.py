@@ -20,6 +20,17 @@ from sous.toolexec import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _reset_shutdown_latch(monkeypatch):
+    """terminate_active_commands() latches shutdown for the whole module.
+
+    Without this, any test that calls it silently turns every later
+    run_command in the session into "aborted: the daemon is shutting down" —
+    a failure that would look like a bug in the command under test.
+    """
+    monkeypatch.setattr(toolexec, "_registration_closed", False)
+
+
 def test_allowlist_token_matching():
     allow = [["npm", "test"], ["pytest"]]
     assert command_allowed(["npm", "test"], allow)
@@ -554,3 +565,69 @@ def test_sigterm_to_the_daemon_kills_a_running_command(tmp_path: Path):
         )
     finally:
         daemon.kill()
+
+
+def test_command_started_during_shutdown_does_not_slip_through(tmp_path: Path):
+    """Shutdown must close registration, not just snapshot it.
+
+    stop.set() does not interrupt the task in flight: after its command is
+    killed, the agent loop can issue another one. A snapshot taken before that
+    never sees the new group, and the process exits leaving it orphaned —
+    exactly the leak this file is meant to prevent.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[commands]\nallowlist = ["{sys.executable}"]\n')
+    ex = ToolExecutor(root, cfg)
+
+    assert toolexec.terminate_active_commands() == 0  # nothing running; latches shutdown
+
+    marker = tmp_path / "late.txt"
+    marker.touch()
+    script = (
+        f"import time\nwhile True:\n    open({str(marker)!r},'a').write('t')\n    time.sleep(0.1)"
+    )
+    out = ex.run_command(f"{sys.executable} -c {shlex.quote(script)}", timeout=30)
+
+    assert "shutting down" in out, f"late command ran to completion: {out!r}"
+    before = marker.stat().st_size
+    time.sleep(1.0)
+    assert marker.stat().st_size == before, "late command's child survived shutdown"
+
+
+def test_terminate_does_not_linger_between_snapshot_and_kill(tmp_path: Path):
+    """No grace sleep on the shutdown path.
+
+    The worker is blocked in proc.wait() and reaps the group leader as soon as
+    it dies, so a delay between signalling and SIGKILL is a window where the
+    pgid can be recycled onto an unrelated group. The daemon exits immediately
+    afterwards, so nothing would observe a graceful teardown anyway.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[commands]\nallowlist = ["{sys.executable}"]\n')
+    ex = ToolExecutor(root, cfg)
+
+    marker = tmp_path / "ticks.txt"
+    marker.touch()
+    script = (
+        f"import time\nwhile True:\n    open({str(marker)!r},'a').write('t')\n    time.sleep(0.1)"
+    )
+    threading.Thread(
+        target=lambda: ex.run_command(f"{sys.executable} -c {shlex.quote(script)}", timeout=60),
+        daemon=True,
+    ).start()
+    for _ in range(100):
+        if marker.stat().st_size > 0:
+            break
+        time.sleep(0.1)
+    assert marker.stat().st_size > 0, "child never started"
+
+    started = time.monotonic()
+    assert toolexec.terminate_active_commands() == 1
+    elapsed = time.monotonic() - started
+    assert elapsed < toolexec._KILL_GRACE_SECONDS, (
+        f"terminate slept {elapsed:.2f}s between snapshot and kill"
+    )

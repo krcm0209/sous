@@ -190,24 +190,53 @@ def _await_exit_without_reaping(pid: int, timeout: float) -> None:
 # does not assume that.
 _active_groups: set[int] = set()
 _active_groups_lock = threading.Lock()
+# Latched by terminate_active_commands(). A daemon that has begun shutting down
+# never runs another command, so this is deliberately one-way.
+_registration_closed = False
+
+
+def _register_group(pgid: int) -> bool:
+    """Claim a group, or report that shutdown has already closed registration.
+
+    The flag and the set are read and written under one acquisition, so a
+    command either lands in the snapshot terminate_active_commands() takes or
+    is told to kill itself. There is no gap between the two for it to fall
+    through, which is what a plain snapshot got wrong.
+    """
+    with _active_groups_lock:
+        if _registration_closed:
+            return False
+        _active_groups.add(pgid)
+        return True
 
 
 def terminate_active_commands() -> int:
     """Kill every command group still running, returning how many there were.
 
-    Same escalation as a timeout — SIGTERM, a grace period, then SIGKILL — but
-    deliberately without reaping: the worker thread still owns each Popen and
-    reaping the group leader here would free its pid and let the id be recycled
-    onto an unrelated group before the SIGKILL lands.
+    SIGKILL immediately, with no grace period, unlike the timeout path. Two
+    reasons, and the second is the important one:
+
+    The daemon exits as soon as this returns, so nothing would observe a
+    well-behaved teardown — the grace period buys a timed-out test runner a
+    tidy exit, but buys a dying daemon nothing.
+
+    More importantly, waiting here is unsafe in a way it is not on the timeout
+    path. There, _kill_process_group is called by the worker thread itself, so
+    it can hold the group leader un-reaped across the escalation. Here the
+    worker is concurrently blocked in proc.wait() and reaps the leader the
+    moment it dies — so any delay between signalling and SIGKILL is a window
+    where the pgid is free to be recycled onto an unrelated group. Signalling
+    once, immediately, keeps that window as small as this design allows.
+
+    Registration is closed first so a task mid-flight cannot start another
+    command behind the snapshot: stop.set() does not interrupt run_task, and
+    its agent loop is free to issue another run_command as soon as the current
+    one dies.
     """
+    global _registration_closed
     with _active_groups_lock:
+        _registration_closed = True
         groups = list(_active_groups)
-    if not groups:
-        return 0
-    for pgid in groups:
-        with contextlib.suppress(*_ALREADY_DEAD):
-            os.killpg(pgid, signal.SIGTERM)
-    time.sleep(_KILL_GRACE_SECONDS)
     for pgid in groups:
         with contextlib.suppress(*_ALREADY_DEAD):
             os.killpg(pgid, signal.SIGKILL)
@@ -470,8 +499,12 @@ class ToolExecutor:
             # child un-reaped until the wait() below; see _kill_process_group
             # for why it must stay that way through the kill escalation.
             pgid = proc.pid
-            with _active_groups_lock:
-                _active_groups.add(pgid)
+            if not _register_group(pgid):
+                # Shutdown began between Popen and here. Kill what we just
+                # started rather than let it outlive the daemon: the snapshot
+                # was taken before this group existed, so nothing else will.
+                _kill_process_group(pgid, proc)
+                return "command aborted: the daemon is shutting down"
             try:
                 try:
                     proc.wait(timeout=timeout)
