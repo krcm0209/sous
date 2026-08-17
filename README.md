@@ -61,6 +61,25 @@ From a checkout, `uv tool install .` works instead of the PyPI package.
 (The bare `sous` name on PyPI is an unrelated, abandoned placeholder — the
 package you want is `sous-mcp`.)
 
+### Claude Desktop
+
+`claude_desktop_config.json` launches MCP servers as stdio subprocesses, so it
+cannot take the HTTP URL above. Use `sous mcp`, which bridges stdio to the
+daemon:
+
+```json
+{
+  "mcpServers": {
+    "sous": { "command": "sous", "args": ["mcp"] }
+  }
+}
+```
+
+`sous mcp` holds no state and loads no model — it forwards messages to the one
+daemon. Open several clients and they share it, so the model is resident once
+no matter how many are connected. If no daemon is running it starts one, which
+is what makes this work without `sous install-launchd`.
+
 Optionally install the delegation skill so Claude knows when and how to use it:
 
 ```bash
