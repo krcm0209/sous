@@ -671,3 +671,21 @@ def test_generation_thread_releases_mlx_state_before_exit(env, monkeypatch):
     assert len(released_in) == 2, "one release per generation turn"
     here = threading.get_ident()
     assert all(t != here for t in released_in), "must run in the generation thread"
+
+
+def test_worker_loop_releases_mlx_state_on_exit(env, monkeypatch):
+    """The worker-loop thread touches mlx (model load, idle unload). On the
+    rare non-signal shutdown path it exits while the process is still tearing
+    down, and per ml-explore/mlx#4327 an exiting thread with mlx state
+    segfaults — so the loop must release on the way out. (The ordinary SIGTERM
+    path os._exits and never runs thread teardown at all.)"""
+    import sous.worker as worker
+
+    released = []
+    monkeypatch.setattr(worker, "release_mlx_thread_state", lambda: released.append(True))
+    root, cfg, store = env
+    engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
+    stop = threading.Event()
+    stop.set()  # loop exits immediately; the release must still happen
+    run_worker_loop(store, engines, cfg, stop)
+    assert released == [True]

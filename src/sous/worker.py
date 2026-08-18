@@ -399,6 +399,26 @@ def run_worker_loop(
     stop: threading.Event,
     poll_interval: float = 0.5,
 ) -> None:
+    try:
+        _worker_loop(store, engines, config, stop, poll_interval)
+    finally:
+        # This thread touches mlx (model load, idle unload). The ordinary
+        # shutdown is SIGTERM -> os._exit, which never runs thread teardown —
+        # but on the non-signal path (mcp.run returning) the loop exits while
+        # the process is still tearing down, and an exiting thread holding
+        # mlx state segfaults it (ml-explore/mlx#4327). Deliberately NOT
+        # paired with a join in main(): a task can run for minutes, and the
+        # shutdown handler documents why the worker is never joined.
+        release_mlx_thread_state()
+
+
+def _worker_loop(
+    store: TaskStore,
+    engines: EngineManager,
+    config: SousConfig,
+    stop: threading.Event,
+    poll_interval: float,
+) -> None:
     while not stop.is_set():
         try:
             task = store.claim_next()
