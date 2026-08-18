@@ -339,6 +339,35 @@ def test_create_server_registers_six_tools(svc):
     }
 
 
+def test_create_server_sets_discovery_instructions(svc):
+    """Server-level instructions are the one part of the MCP surface clients
+    put in front of the model unconditionally — tool descriptions can be
+    deferred out of context, leaving only names. Discovery therefore lives or
+    dies on instructions being present, naming the delegate tool, and fitting
+    under Claude Code's 2KB truncation limit (an overlong block silently loses
+    its own ending)."""
+    service, store, root = svc
+    from sous.server import create_server
+
+    mcp = create_server(store, service.engines, service.config)
+    assert mcp.instructions
+    assert "delegate_task" in mcp.instructions
+    assert len(mcp.instructions.encode()) < 2048
+
+
+def test_delegate_tool_description_carries_the_motive(svc):
+    """The description lists what QUALIFIES for delegation; it must also say
+    why delegation beats doing the work inline (which the model always can) —
+    the plan-economics rationale is the tie-breaker at tool-selection time."""
+    service, store, root = svc
+    from sous.server import create_server
+
+    mcp = create_server(store, service.engines, service.config)
+    tools = asyncio.run(mcp.list_tools())
+    delegate = next(t for t in tools if t.name == "delegate_task")
+    assert "plan" in (delegate.description or "").lower()
+
+
 # --- only one daemon may run: a second would fail the first's in-flight task
 # --- via recover_interrupted() and load a second copy of the model.
 

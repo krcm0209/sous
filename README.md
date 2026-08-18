@@ -80,7 +80,11 @@ daemon. Open several clients and they share it, so the model is resident once
 no matter how many are connected. If no daemon is running it starts one, which
 is what makes this work without `sous install-launchd`.
 
-Optionally install the delegation skill so Claude knows when and how to use it:
+Discovery needs no extra setup: the daemon publishes MCP server instructions
+that clients put in front of Claude, saying when to delegate and why.
+Optionally install the delegation skill as a supplement — a fuller playbook
+(mirroring delegations into Claude's task list, approval etiquette,
+restarting a downed daemon):
 
 ```bash
 cp -r skills/delegating-to-local ~/.claude/skills/
