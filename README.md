@@ -201,6 +201,10 @@ draft from a small local model costs your plan nothing.
   environment scrubbed down to `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`,
   `TMPDIR` (anything else, including `*_TOKEN`/`*_KEY`/`*_SECRET`/`*_PASSWORD`
   vars, is stripped). Only allowlisted commands run without approval.
+  `PATH` itself is adopted from your login shell once at daemon startup, so
+  allowlisted commands resolve exactly as they do in your terminal no matter
+  how the daemon was launched (launchd starts agents with the bare system
+  `PATH`, which would otherwise turn every `uv run ...` into an approval).
 - Non-allowlisted commands pause the task for explicit human approval
   (auto-deny after `approval_timeout_minutes`).
 - Path confinement bounds the worker's *edits*, not what an allowlisted

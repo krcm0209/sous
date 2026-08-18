@@ -28,17 +28,14 @@ def test_plist_is_valid_and_correct():
     assert data["StandardErrorPath"] == "/Users/x/.sous/daemon.err.log"
 
 
-def test_plist_puts_the_executables_dir_on_path():
-    """launchd starts agents with the bare system PATH, and worker commands
-    inherit it (the sandbox passes PATH through) — so without help, neither
-    `uv` nor any user-installed tool resolves, and every verify command
-    round-trips through a human approval. The executable's own directory is
-    where uv-tool shims (sous itself, uv) live."""
+def test_plist_sets_no_environment_variables():
+    """PATH is deliberately NOT baked into the plist: the daemon adopts the
+    user's login-shell PATH at startup (server._login_shell_path), which stays
+    current and works however the daemon was launched. An install-time PATH
+    snapshot here would be a second, staler mechanism that shadows it."""
     xml = launchd_plist("/Users/x/.local/bin/sous", Path("/Users/x/.sous"))
     data = plistlib.loads(xml.encode())
-    path = data["EnvironmentVariables"]["PATH"]
-    assert path.startswith("/Users/x/.local/bin:")
-    assert "/usr/bin" in path.split(":") and "/bin" in path.split(":")
+    assert "EnvironmentVariables" not in data
 
 
 def test_plist_escapes_xml_special_characters():
@@ -533,42 +530,3 @@ def test_wait_timeout_zero_is_an_immediate_probe(tmp_path, capsys, monkeypatch):
     store.finish(done.id, "completed", {"summary": "s"})
     cli.main(["wait", done.id, "--timeout", "0"])
     assert "done" in capsys.readouterr().out
-
-
-def test_plist_includes_extra_tool_dirs_deduped():
-    """uv does not necessarily live next to the sous shim (Homebrew's uv is in
-    /opt/homebrew/bin while the shim sits in ~/.local/bin) — the plist must
-    accept extra tool dirs, and not duplicate ones it already has."""
-    xml = launchd_plist(
-        "/Users/x/.local/bin/sous",
-        Path("/Users/x/.sous"),
-        tool_dirs=["/opt/homebrew/bin", "/Users/x/.local/bin"],
-    )
-    data = plistlib.loads(xml.encode())
-    parts = data["EnvironmentVariables"]["PATH"].split(":")
-    assert parts[0] == "/Users/x/.local/bin"
-    assert "/opt/homebrew/bin" in parts
-    assert parts.count("/Users/x/.local/bin") == 1
-
-
-def test_install_launchd_puts_the_uv_dir_on_path(tmp_path, capsys, monkeypatch):
-    """install-launchd must capture where uv actually is at install time, not
-    assume it shares a directory with the sous shim."""
-    import shutil as real_shutil
-
-    from sous import cli
-
-    plist = tmp_path / "com.sous.daemon.plist"
-    monkeypatch.setattr(cli, "load_config", lambda: _cfg(tmp_path, 1))
-    monkeypatch.setattr(cli, "_plist_path", lambda: plist)
-    which = {"sous": "/Users/x/.local/bin/sous", "uv": "/opt/homebrew/bin/uv"}
-    monkeypatch.setattr(real_shutil, "which", lambda name: which.get(name))
-    ran = []
-    monkeypatch.setattr(
-        subprocess, "run", lambda *a, **k: ran.append(a) or subprocess.CompletedProcess(a, 0)
-    )
-    cli.main(["install-launchd"])
-    data = plistlib.loads(plist.read_bytes())
-    parts = data["EnvironmentVariables"]["PATH"].split(":")
-    assert parts[0] == "/Users/x/.local/bin"
-    assert "/opt/homebrew/bin" in parts
