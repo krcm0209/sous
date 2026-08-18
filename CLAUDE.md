@@ -24,6 +24,11 @@ Claude Code use stretches further — evaluate features against that goal.
 - mlx / mlx_lm / mlx_vlm imports are deliberately function-local (absent on
   non-macOS; the lint CI job runs on ubuntu; tests use fake engines). Don't
   hoist them to module level.
+- Any thread that touches mlx MUST call
+  `engine.base.release_mlx_thread_state()` before it exits — mlx >= 0.32.1
+  (ml-explore/mlx#4327) segfaults the whole daemon in the exiting thread's
+  TLS teardown otherwise. CI cannot catch this (model tests are local-only);
+  after dependency changes, verify with one real delegated task.
 - e2e_smoke.py often ends `failed` or `budget-exhausted` even when it worked —
   the 0.6B model can't reliably emit `finish`. Judge by hello.txt content.
 - Budget exhaustion is `done` with outcome `budget-exhausted`, never `failed`.

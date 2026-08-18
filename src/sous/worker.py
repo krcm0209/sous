@@ -11,7 +11,7 @@ from pathlib import Path
 
 from sous.config import SousConfig
 from sous.context import ContextDecision, decide_context
-from sous.engine.base import Engine, EngineManager
+from sous.engine.base import Engine, EngineManager, release_mlx_thread_state
 from sous.protocol import WORKER_TOOLS, ParseError, ToolCall, parse_tool_calls
 from sous.tasks import Task, TaskStore
 from sous.toolexec import PathViolation, ToolExecutor
@@ -159,6 +159,12 @@ def _generate_with_timeout(
             result_q.put(("ok", engine.generate(messages, WORKER_TOOLS, max_tokens)))
         except BaseException as e:  # noqa: BLE001 — relayed to the caller
             result_q.put(("err", e))
+        finally:
+            # This thread dies after one generation, and an exiting thread
+            # that touched mlx without releasing its streams segfaults the
+            # whole daemon (ml-explore/mlx#4327). After the queue put, so the
+            # waiting caller is never delayed by cleanup.
+            release_mlx_thread_state()
 
     threading.Thread(target=_run, daemon=True).start()
     try:
@@ -392,6 +398,26 @@ def run_worker_loop(
     config: SousConfig,
     stop: threading.Event,
     poll_interval: float = 0.5,
+) -> None:
+    try:
+        _worker_loop(store, engines, config, stop, poll_interval)
+    finally:
+        # This thread touches mlx (model load, idle unload). The ordinary
+        # shutdown is SIGTERM -> os._exit, which never runs thread teardown —
+        # but on the non-signal path (mcp.run returning) the loop exits while
+        # the process is still tearing down, and an exiting thread holding
+        # mlx state segfaults it (ml-explore/mlx#4327). Deliberately NOT
+        # paired with a join in main(): a task can run for minutes, and the
+        # shutdown handler documents why the worker is never joined.
+        release_mlx_thread_state()
+
+
+def _worker_loop(
+    store: TaskStore,
+    engines: EngineManager,
+    config: SousConfig,
+    stop: threading.Event,
+    poll_interval: float,
 ) -> None:
     while not stop.is_set():
         try:

@@ -645,3 +645,47 @@ def test_prompt_leaving_no_output_room_is_overflow(env):
     assert got.state == TaskState.FAILED
     assert "no room" in got.report["error"]
     assert starved.max_tokens_seen == []  # never reached the engine
+
+
+def test_generation_thread_releases_mlx_state_before_exit(env, monkeypatch):
+    """mlx >= 0.32.1 requires mx.clear_streams() at the end of every thread
+    that touched mlx (ml-explore/mlx#4327): without it, the exiting generation
+    thread's TLS teardown segfaults the WHOLE daemon mid-task. The release must
+    happen once per generation, in the generation thread itself."""
+    import sous.worker as worker
+
+    released_in = []
+    monkeypatch.setattr(
+        worker, "release_mlx_thread_state", lambda: released_in.append(threading.get_ident())
+    )
+    root, cfg, store = env
+    task = _start(store, root)
+    engine = FakeEngine(
+        [
+            CALL.format(name="write_file", args='{"path": "out.txt", "content": "x"}'),
+            FINISH,
+        ]
+    )
+    run_task(task, store, engine, cfg)
+    assert store.get(task.id).state == TaskState.DONE
+    assert len(released_in) == 2, "one release per generation turn"
+    here = threading.get_ident()
+    assert all(t != here for t in released_in), "must run in the generation thread"
+
+
+def test_worker_loop_releases_mlx_state_on_exit(env, monkeypatch):
+    """The worker-loop thread touches mlx (model load, idle unload). On the
+    rare non-signal shutdown path it exits while the process is still tearing
+    down, and per ml-explore/mlx#4327 an exiting thread with mlx state
+    segfaults — so the loop must release on the way out. (The ordinary SIGTERM
+    path os._exits and never runs thread teardown at all.)"""
+    import sous.worker as worker
+
+    released = []
+    monkeypatch.setattr(worker, "release_mlx_thread_state", lambda: released.append(True))
+    root, cfg, store = env
+    engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
+    stop = threading.Event()
+    stop.set()  # loop exits immediately; the release must still happen
+    run_worker_loop(store, engines, cfg, stop)
+    assert released == [True]
