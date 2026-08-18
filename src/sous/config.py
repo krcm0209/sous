@@ -44,6 +44,7 @@ _KNOWN = {
     "model": {"id", "idle_unload_minutes", "max_context_tokens", "temperature", "top_p", "top_k"},
     "budgets": {"max_turns", "max_minutes", "max_tokens_per_generation"},
     "commands": {"allowlist", "timeout_seconds", "approval_timeout_minutes"},
+    "context": {"mode", "fraction", "min_tokens"},
     "tasks": {"retention"},
 }
 
@@ -67,6 +68,12 @@ class SousConfig:
     command_timeout_seconds: int = 120
     approval_timeout_minutes: int = 10
     task_retention: int = 200
+    # "fixed": serve max_context_tokens as-is. "auto": size the window per
+    # task from live memory headroom (see sous.context), using `fraction` of
+    # it and never dropping below `min_tokens`.
+    context_mode: str = "fixed"
+    context_fraction: float = 0.8
+    context_min_tokens: int = 8192
     data_dir: Path = DEFAULT_DATA_DIR
     config_path: Path = DEFAULT_CONFIG_PATH
 
@@ -119,6 +126,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
     model = _section(raw, "model")
     budgets = _section(raw, "budgets")
     commands = _section(raw, "commands")
+    context = _section(raw, "context")
     tasks = _section(raw, "tasks")
     return SousConfig(
         server_port=server.get("port", 8383),
@@ -134,6 +142,9 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         command_timeout_seconds=commands.get("timeout_seconds", 120),
         approval_timeout_minutes=commands.get("approval_timeout_minutes", 10),
         task_retention=tasks.get("retention", 200),
+        context_mode=context.get("mode", "fixed"),
+        context_fraction=context.get("fraction", 0.8),
+        context_min_tokens=context.get("min_tokens", 8192),
         data_dir=(path.parent if path.parent != Path(".") else DEFAULT_DATA_DIR),
         config_path=path,
     )

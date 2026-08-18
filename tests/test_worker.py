@@ -574,3 +574,32 @@ def test_engine_exception_fails_task_cleanly(env):
     assert got.state == TaskState.FAILED
     assert "engine error" in got.report["error"]
     assert "boom" in got.report["error"]
+
+
+def test_run_task_honors_context_decision_over_config(env):
+    """The per-task ContextDecision, not the static config value, must govern
+    the window: ten tokens cannot fit even the system prompt, so the task must
+    fail on context overflow despite config allowing 32768."""
+    from sous.context import ContextDecision
+
+    root, cfg, store = env
+    task = _start(store, root)
+    run_task(task, store, FakeEngine([FINISH]), cfg, context=ContextDecision(10, "test"))
+    got = store.get(task.id)
+    assert got.state == TaskState.FAILED
+    assert "context" in got.report["error"].lower()
+
+
+def test_report_records_the_context_window_used(env):
+    """Verifiability by construction: every report says what window the task
+    actually ran with and why, so auto sizing can be audited after the fact."""
+    from sous.context import ContextDecision
+
+    root, cfg, store = env
+    task = _start(store, root)
+    run_task(
+        task, store, FakeEngine([FINISH]), cfg, context=ContextDecision(5000, "auto: test-run")
+    )
+    got = store.get(task.id)
+    assert got.report["budget"]["context_tokens"] == 5000
+    assert got.report["budget"]["context_reason"] == "auto: test-run"

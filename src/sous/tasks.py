@@ -90,6 +90,9 @@ def _row_to_task(row: sqlite3.Row) -> Task:
 
 class TaskStore:
     def __init__(self, db_path: Path):
+        """Open (or create) the task database at db_path, creating its
+        parent directory and migrating pre-existing DBs to the current
+        schema."""
         self.db_path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as c:
@@ -125,6 +128,7 @@ class TaskStore:
         context_files: list[str],
         verify_commands: list[str],
     ) -> Task:
+        """Insert a new task in the queued state and return it."""
         task_id = uuid.uuid4().hex[:12]
         with self._conn() as c:
             c.execute(
@@ -147,6 +151,7 @@ class TaskStore:
         return task
 
     def get(self, task_id: str) -> Task | None:
+        """Return the task with the given id, or None if it does not exist."""
         with self._conn() as c:
             row = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return _row_to_task(row) if row else None
@@ -159,6 +164,7 @@ class TaskStore:
         return {r["state"]: r["n"] for r in rows}
 
     def list_recent(self, limit: int = 20) -> list[Task]:
+        """Return up to limit tasks in any state, newest first."""
         with self._conn() as c:
             rows = c.execute(
                 "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)
@@ -166,6 +172,8 @@ class TaskStore:
         return [_row_to_task(r) for r in rows]
 
     def queue_position(self, task_id: str) -> int | None:
+        """Return the task's 1-based position among queued tasks, or None if
+        it is not queued."""
         with self._conn() as c:
             rows = c.execute(
                 "SELECT id FROM tasks WHERE state=? ORDER BY created_at",
@@ -175,6 +183,8 @@ class TaskStore:
         return waiting.index(task_id) + 1 if task_id in waiting else None
 
     def claim_next(self) -> Task | None:
+        """Atomically mark the oldest queued task running (stamping
+        started_at) and return it, or None if the queue is empty."""
         with self._conn() as c:
             row = c.execute(
                 "UPDATE tasks SET state=?, started_at=? WHERE id = ("
@@ -187,6 +197,7 @@ class TaskStore:
         return self.get(row["id"])
 
     def set_activity(self, task_id: str, text: str, turns_used: int) -> None:
+        """Record the task's latest activity text and turn count."""
         with self._conn() as c:
             c.execute(
                 "UPDATE tasks SET last_activity=?, turns_used=? WHERE id=?",
@@ -201,6 +212,8 @@ class TaskStore:
             c.execute("UPDATE tasks SET changed_files=? WHERE id=?", (json.dumps(files), task_id))
 
     def request_approval(self, task_id: str, command: str) -> None:
+        """Move the task to awaiting_approval, storing the command that
+        needs a human decision."""
         with self._conn() as c:
             c.execute(
                 "UPDATE tasks SET state=?, pending_command=?, approval_response=NULL WHERE id=?",
@@ -208,6 +221,9 @@ class TaskStore:
             )
 
     def respond_approval(self, task_id: str, approve: bool) -> bool:
+        """Record the first approval decision for an awaiting task. Return True
+        only for the decision that took effect; a duplicate or late response
+        (task not awaiting, or already answered) returns False."""
         with self._conn() as c:
             # approval_response IS NULL makes the first response atomic and
             # final: a retried/duplicate response returns False instead of
@@ -221,6 +237,9 @@ class TaskStore:
             return cur.rowcount == 1
 
     def poll_approval(self, task_id: str) -> str | None:
+        """Return "approved" or "denied" once a decision is recorded,
+        atomically clearing the pending command and resuming the task;
+        return None while no decision is recorded yet."""
         with self._conn() as c:
             row = c.execute("SELECT approval_response FROM tasks WHERE id=?", (task_id,)).fetchone()
             if row is None or row["approval_response"] is None:
@@ -232,12 +251,17 @@ class TaskStore:
             return row["approval_response"]
 
     def finish(self, task_id: str, outcome: str, report: dict) -> None:
+        """End the task as done, storing the outcome and report."""
         self._end(task_id, TaskState.DONE, outcome, report)
 
     def fail(self, task_id: str, reason: str, extra: dict | None = None) -> None:
+        """End the task as failed, with the reason under "error" in the report
+        and any extra fields merged alongside it."""
         self._end(task_id, TaskState.FAILED, None, {"error": reason, **(extra or {})})
 
     def mark_cancelled(self, task_id: str, extra: dict | None = None) -> None:
+        """End the task as cancelled, storing any extra report fields (e.g.
+        files changed before the cancel)."""
         # Same optional extra merge as fail(): a task cancelled after editing
         # files must still report files_changed and the transcript path.
         self._end(task_id, TaskState.CANCELLED, None, dict(extra or {}))
@@ -250,6 +274,9 @@ class TaskStore:
             )
 
     def cancel(self, task_id: str) -> bool:
+        """Cancel a queued task (atomically, with a state guard), or flag an
+        active task for cooperative cancellation. Return True if either
+        happened; False for an unknown or already finished task."""
         with self._conn() as c:
             # Try to cancel if queued (atomic transition with state guard)
             cur = c.execute(
@@ -271,6 +298,8 @@ class TaskStore:
             return cur.rowcount == 1
 
     def is_cancel_requested(self, task_id: str) -> bool:
+        """Return True if a cooperative cancellation has been requested for
+        the task (False for an unknown task)."""
         with self._conn() as c:
             row = c.execute("SELECT cancel_requested FROM tasks WHERE id=?", (task_id,)).fetchone()
         return bool(row and row["cancel_requested"])
@@ -303,6 +332,8 @@ class TaskStore:
             return len(rows)
 
     def prune(self, retention: int) -> int:
+        """Delete finished tasks beyond the newest retention by finished_at,
+        returning how many rows were deleted."""
         with self._conn() as c:
             cur = c.execute(
                 "DELETE FROM tasks WHERE state IN (?,?,?) AND id NOT IN ("

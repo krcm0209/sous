@@ -555,3 +555,11 @@ def test_main_adopts_the_login_shell_path_before_serving(tmp_path: Path, monkeyp
         with pytest.raises(SystemExit):
             server.main()
     assert os.environ["PATH"] == "/resolved/bin:/usr/bin"
+
+
+def test_server_status_reports_context_policy(svc):
+    """Users need to see which sizing policy the daemon is running without
+    reading config files — this is the MCP-visible surface for it."""
+    service, _, _ = svc
+    ctx = service.server_status()["config"]["context"]
+    assert ctx == {"mode": "fixed", "fraction": 0.8, "min_tokens": 8192}

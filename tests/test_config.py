@@ -223,3 +223,19 @@ def test_persist_populated_allowlist_gains_only_the_new_entry(tmp_path: Path):
     p.write_text('[commands]\nallowlist = ["pytest"]\n')
     persist_allowlist_entry("go vet", p)
     assert current_allowlist(p) == [["pytest"], ["go", "vet"]]
+
+
+def test_context_section_parsed(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text('[context]\nmode = "auto"\nfraction = 0.6\nmin_tokens = 4096\n')
+    cfg = load_config(p)
+    assert cfg.context_mode == "auto"
+    assert cfg.context_fraction == 0.6
+    assert cfg.context_min_tokens == 4096
+
+
+def test_context_defaults_to_fixed_mode(tmp_path: Path):
+    cfg = load_config(tmp_path / "nope.toml")
+    assert cfg.context_mode == "fixed"
+    assert cfg.context_fraction == 0.8
+    assert cfg.context_min_tokens == 8192
