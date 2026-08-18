@@ -80,7 +80,11 @@ daemon. Open several clients and they share it, so the model is resident once
 no matter how many are connected. If no daemon is running it starts one, which
 is what makes this work without `sous install-launchd`.
 
-Optionally install the delegation skill so Claude knows when and how to use it:
+Claude discovers sous on its own: the daemon publishes MCP server
+instructions telling it when to delegate and why, so no extra setup is
+needed. Optionally install the delegation skill as a supplement — a fuller
+playbook (mirroring delegations into Claude's task list, approval etiquette,
+restarting a downed daemon):
 
 ```bash
 cp -r skills/delegating-to-local ~/.claude/skills/

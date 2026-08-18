@@ -214,9 +214,49 @@ class SousService:
         }
 
 
+# Clients surface server instructions to the model unconditionally, even on
+# surfaces that defer tool schemas out of context (Claude Code shows only tool
+# NAMES until an explicit fetch) — so this text is what makes sous discoverable
+# at decision time, and it must stand alone: when to delegate, why it beats
+# working inline, then mechanics. Claude Code truncates instructions at 2KB
+# with no marker, so the ending is the first thing an overrun loses; a test
+# pins the size.
+_INSTRUCTIONS = """\
+sous runs a local MLX model on this Mac that executes self-contained coding
+tasks in a sandboxed, queued tool loop. Every line the local worker generates
+is output the user's Claude plan did not pay for — so when a task qualifies,
+delegate it instead of generating the output inline, even though you could.
+You stay head chef (design, decisions, review); sous does the prep.
+
+Delegate work that is mechanical, repetitive, and low-risk, with a spec you
+can state completely: boilerplate, test scaffolding, bulk renames or
+migrations, docstring/comment sweeps, lint-fix sweeps, fixture generation.
+Do NOT delegate architecture, subtle debugging, security-sensitive code, API
+design, or anything needing this conversation's context or taste.
+
+To delegate, call delegate_task with fully self-contained instructions — the
+worker sees nothing of this chat, so spell out the goal, constraints, target
+files, and explicit acceptance criteria — plus project_root (absolute path),
+context_files worth reading first, and allowlisted verify_commands that prove
+the work. It returns a task_id immediately: keep working yourself and poll
+task_status between your own steps, not in a tight loop.
+
+If task_status shows awaiting_approval, the worker wants to run the command
+in pending_command. Relay it to the human verbatim (approve once / add to
+allowlist / deny) and answer via respond_to_command_request; unanswered
+requests auto-deny after a timeout. Avoid editing files the running task is
+touching.
+
+Collect with task_result (include_diff=true) and review the diff like a PR
+from an eager junior before accepting it. A budget-exhausted outcome means
+partial work: review what landed, then finish it yourself or re-delegate
+narrower. The worker's output is a draft, never a merge.
+"""
+
+
 def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) -> MCPServer:
     svc = SousService(store, engines, config)
-    mcp = MCPServer("sous")
+    mcp = MCPServer("sous", instructions=_INSTRUCTIONS)
 
     @mcp.tool()
     def delegate_task(
@@ -228,12 +268,15 @@ def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) 
     ) -> dict:
         """Delegate a mechanical, self-contained coding task to the local model.
 
-        Use for volume-heavy, low-risk work (boilerplate, test scaffolding, bulk
-        renames, docstrings, lint fixes) — NOT for architecture, tricky debugging,
-        or security-sensitive code. The worker has NO conversation context:
-        instructions must be fully self-contained (goal, constraints, acceptance
-        criteria). Returns immediately with a task_id; poll with task_status and
-        ALWAYS review the result diff before accepting.
+        Every line the local worker generates is output the user's Claude plan
+        did not pay for — prefer delegating qualifying work over generating it
+        inline. Use for volume-heavy, low-risk work (boilerplate, test
+        scaffolding, bulk renames, docstrings, lint fixes) — NOT for
+        architecture, tricky debugging, or security-sensitive code. The worker
+        has NO conversation context: instructions must be fully self-contained
+        (goal, constraints, acceptance criteria). Returns immediately with a
+        task_id; poll with task_status and ALWAYS review the result diff before
+        accepting.
         """
         return svc.delegate_task(title, instructions, project_root, context_files, verify_commands)
 
