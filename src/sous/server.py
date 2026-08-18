@@ -19,7 +19,7 @@ from typing import IO
 from mcp.server import MCPServer
 
 from sous.config import SousConfig, current_allowlist, load_config, persist_allowlist_entry
-from sous.engine.base import EngineManager
+from sous.engine.base import EngineManager, release_mlx_thread_state
 from sous.tasks import FINISHED_STATES, Task, TaskState, TaskStore
 from sous.toolexec import _is_within, command_allowed, terminate_active_commands
 from sous.worker import run_worker_loop
@@ -33,6 +33,11 @@ def _mlx_memory_gb() -> float | None:
         return round(mx.get_active_memory() / 1e9, 2)
     except Exception:  # noqa: BLE001 — mlx absent or API moved
         return None
+    finally:
+        # Runs in whatever short-lived MCP worker thread served the request;
+        # mlx state left behind segfaults that thread's eventual exit
+        # (ml-explore/mlx#4327).
+        release_mlx_thread_state()
 
 
 class SousService:

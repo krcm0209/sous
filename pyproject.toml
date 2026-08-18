@@ -36,13 +36,12 @@ classifiers = [
 dependencies = [
     "huggingface-hub",
     "mcp>=2.0,<3",
-    # mlx is transitive, but 0.32.1 segfaults at model load (SIGSEGV in
-    # CompileCache thread-local teardown, dyld TLS finalize path) — verified
-    # by bisect on 2026-08-18: 0.32.0+vlm 0.6.13 loads and completes tasks,
-    # 0.32.1+vlm 0.6.13 crashes the daemon on every task. CI cannot catch
-    # this (model-marked tests are local-only), so the ceiling guards it.
-    # Lift when an mlx release survives a local `pytest -m model` run.
-    "mlx>=0.31,<0.32.1",
+    # mlx >= 0.32.1 requires every thread that touched mlx to call
+    # mx.clear_streams() before exiting (ml-explore/mlx#4327) — sous complies
+    # via engine.base.release_mlx_thread_state, which is what allows mlx to
+    # float here. A new mlx-touching thread that skips it segfaults the
+    # daemon; see the helper's docstring.
+    "mlx>=0.31",
     "mlx-lm>=0.31",
     "mlx-vlm>=0.6.13",
     "psutil>=7",

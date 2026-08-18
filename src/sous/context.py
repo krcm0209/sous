@@ -132,13 +132,20 @@ def _live_memory() -> MemorySnapshot:
     import mlx.core as mx  # ty: ignore[unresolved-import]
     import psutil
 
-    info = mx.device_info()
-    return MemorySnapshot(
-        working_set=int(info["max_recommended_working_set_size"]),
-        active=mx.get_active_memory(),
-        cache=mx.get_cache_memory(),
-        available=psutil.virtual_memory().available,
-    )
+    from sous.engine.base import release_mlx_thread_state
+
+    try:
+        info = mx.device_info()
+        return MemorySnapshot(
+            working_set=int(info["max_recommended_working_set_size"]),
+            active=mx.get_active_memory(),
+            cache=mx.get_cache_memory(),
+            available=psutil.virtual_memory().available,
+        )
+    finally:
+        # mlx state must not outlive this call in whatever thread ran it
+        # (ml-explore/mlx#4327).
+        release_mlx_thread_state()
 
 
 def decide_context(

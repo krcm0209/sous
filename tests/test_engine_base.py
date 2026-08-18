@@ -119,3 +119,37 @@ def test_unload_refused_while_generation_in_flight():
     t.join(5)
     time.sleep(0.01)
     assert mgr.unload_if_idle() is True  # generation done → unload proceeds
+
+
+def test_release_mlx_thread_state_calls_clear_streams(monkeypatch):
+    """The call-site tests monkeypatch the helper away, so only this pins that
+    it really reaches mx.clear_streams — an API typo inside would otherwise be
+    swallowed by its own except and every test would stay green while the
+    native-crash safeguard is hollow."""
+    import sys
+    import types
+
+    from sous.engine.base import release_mlx_thread_state
+
+    calls = []
+    fake_core = types.SimpleNamespace(clear_streams=lambda: calls.append(True))
+    monkeypatch.setitem(sys.modules, "mlx", types.SimpleNamespace(core=fake_core))
+    monkeypatch.setitem(sys.modules, "mlx.core", fake_core)
+    release_mlx_thread_state()
+    assert calls == [True]
+
+
+def test_release_mlx_thread_state_never_raises(monkeypatch):
+    """Cleanup runs in dying threads; an mlx quirk must never raise out."""
+    import sys
+    import types
+
+    from sous.engine.base import release_mlx_thread_state
+
+    def boom():
+        raise RuntimeError("mlx teardown quirk")
+
+    fake_core = types.SimpleNamespace(clear_streams=boom)
+    monkeypatch.setitem(sys.modules, "mlx", types.SimpleNamespace(core=fake_core))
+    monkeypatch.setitem(sys.modules, "mlx.core", fake_core)
+    release_mlx_thread_state()  # must not raise

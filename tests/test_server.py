@@ -570,3 +570,16 @@ def test_server_status_reports_context_policy(svc):
         "min_tokens": 8192,
         "max_context_tokens": 32768,
     }
+
+
+def test_status_memory_probe_releases_mlx_thread_state(svc, monkeypatch):
+    """server_status runs in whatever short-lived worker thread the MCP layer
+    hands it; any mlx state it created must be released before that thread can
+    exit (ml-explore/mlx#4327)."""
+    import sous.server as server
+
+    service, _, _ = svc
+    released = []
+    monkeypatch.setattr(server, "release_mlx_thread_state", lambda: released.append(True))
+    service.server_status()
+    assert released

@@ -23,6 +23,27 @@ class Engine(Protocol):
     def unload(self) -> None: ...
 
 
+def release_mlx_thread_state() -> None:
+    """Destroy this thread's mlx streams before the thread exits.
+
+    mlx >= 0.32.1 no longer cleans up per-thread state automatically (PR
+    #4248 removed the GIL-acquiring thread_local guard), and the maintainers'
+    contract — ml-explore/mlx#4327 — is that every thread that touched mlx
+    calls mx.clear_streams() before exiting. A thread that skips it segfaults
+    the ENTIRE process in the dyld TLS finalizer (CompileCache teardown
+    reaching _Py_Dealloc without the GIL); observed killing the daemon
+    mid-task. A no-op when mlx is absent or the thread never touched it —
+    cleanup must never raise out of a dying thread.
+    """
+    try:
+        # mlx.core is a compiled extension with no type stubs.
+        import mlx.core as mx  # ty: ignore[unresolved-import]
+
+        mx.clear_streams()
+    except Exception:  # noqa: BLE001 — see docstring
+        pass
+
+
 def select_backend(model_config: dict) -> str:
     if "vision_config" in model_config:
         return "vlm"
