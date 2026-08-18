@@ -96,6 +96,7 @@ First delegation downloads the model (~28.7 GB for the default) — one time.
 
 ```bash
 sous status             # is it up, and what has it been doing
+sous wait <task-id>     # block until a task finishes or needs approval
 sous stop               # stop it (see below)
 sous uninstall-launchd  # stop it starting at login, and remove the agent
 ```
@@ -141,7 +142,9 @@ max_tokens_per_generation = 4096
 [commands]
 allowlist = ["pytest", "python -m pytest", "npm test", "npx eslint",
              "npx prettier", "ruff", "black", "mypy", "go test",
-             "cargo test", "cargo check", "make test"]
+             "cargo test", "cargo check", "make test", "uv run pytest",
+             "uv run python -m pytest", "uv run ruff", "uv run black",
+             "uv run mypy", "uv run ty"]
 timeout_seconds = 120
 approval_timeout_minutes = 10
 

@@ -225,22 +225,25 @@ _INSTRUCTIONS = """\
 sous runs a local MLX model on this Mac that executes self-contained coding
 tasks in a sandboxed, queued tool loop. Every line the local worker generates
 is output the user's Claude plan did not pay for — so when a task qualifies,
-delegate it instead of generating the output inline, even though you could.
-You stay head chef (design, decisions, review); sous does the prep.
+delegate it instead of generating the output inline. You stay head chef
+(design, decisions, review); sous does the prep.
 
-Delegate work that is mechanical, repetitive, and low-risk, with a spec you
-can state completely: boilerplate, test scaffolding, bulk renames or
-migrations, docstring/comment sweeps, lint-fix sweeps, fixture generation.
-Do NOT delegate architecture, subtle debugging, security-sensitive code, API
-design, or anything needing this conversation's context or taste.
+Delegate work that is mechanical, repetitive, and low-risk: boilerplate, test
+scaffolding, bulk renames or migrations, docstring/comment sweeps, lint-fix
+sweeps, fixture generation. Do NOT delegate architecture, subtle debugging,
+security-sensitive code, API design, or anything needing this conversation's
+context or taste. Delegation pays only when a short spec yields a large diff;
+if you must author the content in the spec, work inline instead.
 
-To delegate, call delegate_to_local_model with fully self-contained
-instructions — the worker sees nothing of this chat, so spell out the goal,
-constraints, target files, and explicit acceptance criteria — plus
-project_root (absolute path), context_files worth reading first, and
-allowlisted verify_commands that prove the work. It returns a task_id
-immediately: keep working yourself and poll task_status between your own
-steps, not in a tight loop.
+To delegate, call delegate_to_local_model with self-contained instructions —
+the worker sees nothing of this chat — stating the goal, scope limits, and
+acceptance criteria, plus project_root (absolute path). Trust the worker
+with the how: point context_files at convention docs instead of restating
+them, let allowlisted verify_commands catch what a linter would, and keep the
+spec lean — worker attempts are free, your prompt is not, so start minimal
+and re-delegate narrower after a miss. It returns a task_id at once; keep
+working and check task_status between steps, or run `sous wait <task_id>`
+in a background shell instead of tight-polling.
 
 If task_status shows awaiting_approval, the worker wants to run the command
 in pending_command. Relay it to the human verbatim (approve once / add to
@@ -249,9 +252,9 @@ requests auto-deny after a timeout. Avoid editing files the running task is
 touching.
 
 Collect with task_result (include_diff=true) and review the diff like a PR
-from an eager junior before accepting it. A budget-exhausted outcome means
-partial work: review what landed, then finish it yourself or re-delegate
-narrower. The worker's output is a draft, never a merge.
+from an eager junior before accepting it. A budget-exhausted outcome is
+partial work: review what landed, then finish or re-delegate narrower. The
+worker's output is a draft, never a merge.
 """
 
 
@@ -276,12 +279,15 @@ def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) 
 
         Every line the local worker generates is output the user's Claude plan
         did not pay for — prefer delegating qualifying work over generating it
-        inline. Use for volume-heavy, low-risk work (boilerplate, test
-        scaffolding, bulk renames, docstrings, lint fixes) — NOT for
-        architecture, tricky debugging, or security-sensitive code. The worker
-        has NO conversation context: instructions must be fully self-contained
-        (goal, constraints, acceptance criteria). Returns immediately with a
-        task_id; poll with task_status and ALWAYS review the result diff before
+        inline. It pays when a short spec yields a large diff; if you would be
+        authoring the content in the spec, work inline instead. Use for
+        volume-heavy, low-risk work (boilerplate, test scaffolding, bulk
+        renames, docstrings, lint fixes) — NOT for architecture, tricky
+        debugging, or security-sensitive code. The worker has NO conversation
+        context: instructions must be self-contained (goal, scope limits,
+        acceptance criteria) but lean — trust the worker with the how and
+        re-delegate narrower on a miss. Returns immediately with a task_id;
+        poll with task_status and ALWAYS review the result diff before
         accepting.
         """
         return svc.delegate_task(title, instructions, project_root, context_files, verify_commands)

@@ -1,4 +1,4 @@
-"""sous CLI: serve / status / stop / mcp / install- and uninstall-launchd."""
+"""sous CLI: serve / status / wait / stop / mcp / install- and uninstall-launchd."""
 
 from __future__ import annotations
 
@@ -27,6 +27,15 @@ def launchd_plist(sous_executable: str, log_dir: Path) -> str:
         {
             "Label": LABEL,
             "ProgramArguments": [sous_executable, "serve"],
+            # launchd starts agents with the bare system PATH, and the sandbox
+            # passes PATH through to worker commands — so without this neither
+            # `uv` nor any user-installed tool resolves, and every allowlisted
+            # verify command silently degrades into a human approval. The
+            # executable's own directory is where uv-tool shims (sous, uv) live.
+            "EnvironmentVariables": {
+                "PATH": f"{Path(sous_executable).parent}:"
+                "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            },
             "RunAtLoad": True,
             "KeepAlive": True,
             "StandardOutPath": f"{log_dir}/daemon.log",
@@ -50,6 +59,39 @@ def _cmd_status() -> None:
     store = TaskStore(config.data_dir / "tasks.db")
     for t in store.list_recent(limit=10):
         print(f"  {t.id}  {t.state:<18} {t.title}")
+
+
+def _cmd_wait(task_id: str, timeout: float | None, interval: float) -> None:
+    """Block until the task needs attention, so agents can park this in a
+    background shell instead of tight-polling task_status — or, worse, reading
+    tasks.db by hand (observed in the wild; the schema is not a contract).
+
+    Wakes on awaiting_approval as well as the terminal states: an approval
+    request needs a human NOW, and a wait that slept through it would let the
+    request time out into an auto-deny.
+    """
+    config = load_config()
+    from sous.tasks import FINISHED_STATES, TaskState, TaskStore
+
+    store = TaskStore(config.data_dir / "tasks.db")
+    deadline = (time.monotonic() + timeout) if timeout is not None else None
+    while True:
+        t = store.get(task_id)
+        if t is None:
+            print(f"sous: unknown task {task_id}")
+            raise SystemExit(2)
+        if t.state in FINISHED_STATES or t.state == TaskState.AWAITING_APPROVAL:
+            line = f"state={t.state}"
+            if t.outcome:
+                line += f" outcome={t.outcome}"
+            if t.state == TaskState.AWAITING_APPROVAL and t.pending_command:
+                line += f" pending_command={t.pending_command}"
+            print(line)
+            return
+        if deadline is not None and time.monotonic() >= deadline:
+            print(f"state={t.state} (timeout)")
+            raise SystemExit(1)
+        time.sleep(interval)
 
 
 def _plist_path() -> Path:
@@ -253,6 +295,12 @@ def main(argv: list[str] | None = None) -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="run the daemon (MCP over HTTP on 127.0.0.1)")
     sub.add_parser("status", help="check the daemon and recent tasks")
+    wait = sub.add_parser("wait", help="block until a task finishes or requests a command approval")
+    wait.add_argument("task_id")
+    wait.add_argument(
+        "--timeout", type=float, default=None, help="give up after N seconds (exit 1)"
+    )
+    wait.add_argument("--interval", type=float, default=2.0, help="poll every N seconds")
     sub.add_parser("stop", help="stop the daemon (unmanaged daemons only)")
     sub.add_parser("mcp", help="bridge stdio to the daemon (for stdio-only MCP clients)")
     sub.add_parser("install-launchd", help="install start-at-login LaunchAgent")
@@ -270,6 +318,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(sous.proxy.run())
     elif args.command == "status":
         _cmd_status()
+    elif args.command == "wait":
+        _cmd_wait(args.task_id, args.timeout, args.interval)
     elif args.command == "stop":
         _cmd_stop()
     elif args.command == "install-launchd":

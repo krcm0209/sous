@@ -28,6 +28,19 @@ def test_plist_is_valid_and_correct():
     assert data["StandardErrorPath"] == "/Users/x/.sous/daemon.err.log"
 
 
+def test_plist_puts_the_executables_dir_on_path():
+    """launchd starts agents with the bare system PATH, and worker commands
+    inherit it (the sandbox passes PATH through) — so without help, neither
+    `uv` nor any user-installed tool resolves, and every verify command
+    round-trips through a human approval. The executable's own directory is
+    where uv-tool shims (sous itself, uv) live."""
+    xml = launchd_plist("/Users/x/.local/bin/sous", Path("/Users/x/.sous"))
+    data = plistlib.loads(xml.encode())
+    path = data["EnvironmentVariables"]["PATH"]
+    assert path.startswith("/Users/x/.local/bin:")
+    assert "/usr/bin" in path.split(":") and "/bin" in path.split(":")
+
+
 def test_plist_escapes_xml_special_characters():
     """C5: a valid macOS path containing & or < must yield a plist that
     launchctl can actually parse — not silently-invalid XML."""
@@ -380,3 +393,85 @@ def test_uninstall_advises_stop_when_there_was_nothing_to_unload(tmp_path, capsy
         assert "sous stop" in capsys.readouterr().out
     finally:
         daemon.kill()
+
+
+# --- wait ----------------------------------------------------------------------
+
+
+def _wait_store(tmp_path, monkeypatch):
+    from sous import cli
+    from sous.config import SousConfig
+    from sous.tasks import TaskStore
+
+    cfg = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    return TaskStore(tmp_path / "tasks.db")
+
+
+def _enqueue(store):
+    return store.enqueue(
+        title="t", instructions="x", project_root="/", context_files=[], verify_commands=[]
+    )
+
+
+def test_wait_returns_immediately_for_a_finished_task(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    store = _wait_store(tmp_path, monkeypatch)
+    t = _enqueue(store)
+    store.claim_next()
+    store.finish(t.id, "completed", {"summary": "s"})
+    cli.main(["wait", t.id])
+    out = capsys.readouterr().out
+    assert "done" in out and "completed" in out
+
+
+def test_wait_blocks_until_approval_is_requested(tmp_path, capsys, monkeypatch):
+    """The point of `wait`: agents park it in a background shell instead of
+    tight-polling task_status or reading tasks.db by hand — so it must wake on
+    awaiting_approval (a human is needed NOW), not only on terminal states."""
+    from sous import cli
+
+    store = _wait_store(tmp_path, monkeypatch)
+    t = _enqueue(store)
+    store.claim_next()
+
+    def approve_later():
+        time.sleep(0.3)
+        store.request_approval(t.id, "git diff")
+
+    flipper = threading.Thread(target=approve_later)
+    started = time.monotonic()
+    flipper.start()
+    try:
+        cli.main(["wait", t.id, "--interval", "0.05"])
+    finally:
+        flipper.join()
+    elapsed = time.monotonic() - started
+    out = capsys.readouterr().out
+    assert "awaiting_approval" in out
+    assert "git diff" in out, "the pending command is the thing the human must see"
+    assert elapsed >= 0.3, f"returned in {elapsed:.2f}s — never actually waited"
+
+
+def test_wait_unknown_task_exits_2(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    _wait_store(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["wait", "nope"])
+    assert exc.value.code == 2
+
+
+def test_wait_timeout_exits_1(tmp_path, capsys, monkeypatch):
+    """A queued task that never advances must not hang the caller forever when
+    a timeout was asked for — and the timeout must be exit 1, distinct from
+    unknown-task (2), so scripts can tell 'still running' from 'gone'."""
+    from sous import cli
+
+    store = _wait_store(tmp_path, monkeypatch)
+    t = _enqueue(store)  # stays queued: nothing ever claims it
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["wait", t.id, "--timeout", "0.3", "--interval", "0.05"])
+    assert exc.value.code == 1
+    assert "queued" in capsys.readouterr().out
