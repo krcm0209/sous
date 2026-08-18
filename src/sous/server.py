@@ -212,6 +212,14 @@ class SousService:
                 "max_turns": self.config.max_turns,
                 "max_minutes": self.config.max_minutes,
                 "allowlist": current_allowlist(self.config.config_path),
+                "context": {
+                    "mode": self.config.context_mode,
+                    "fraction": self.config.context_fraction,
+                    "min_tokens": self.config.context_min_tokens,
+                    # Fixed mode's operative value — without it a client sees
+                    # THAT the policy is fixed but not what it's fixed to.
+                    "max_context_tokens": self.config.max_context_tokens,
+                },
             },
         }
 

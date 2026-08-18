@@ -223,3 +223,47 @@ def test_persist_populated_allowlist_gains_only_the_new_entry(tmp_path: Path):
     p.write_text('[commands]\nallowlist = ["pytest"]\n')
     persist_allowlist_entry("go vet", p)
     assert current_allowlist(p) == [["pytest"], ["go", "vet"]]
+
+
+def test_context_section_parsed(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text('[context]\nmode = "auto"\nfraction = 0.6\nmin_tokens = 4096\n')
+    cfg = load_config(p)
+    assert cfg.context_mode == "auto"
+    assert cfg.context_fraction == 0.6
+    assert cfg.context_min_tokens == 4096
+
+
+def test_context_defaults_to_fixed_mode(tmp_path: Path):
+    cfg = load_config(tmp_path / "nope.toml")
+    assert cfg.context_mode == "fixed"
+    assert cfg.context_fraction == 0.8
+    assert cfg.context_min_tokens == 8192
+
+
+def test_context_invalid_values_warn_and_default(tmp_path: Path):
+    """A fraction over 1 defeats the anti-thrashing headroom guarantee, an
+    unknown mode silently disables auto sizing the user asked for, and a
+    non-positive floor is nonsense — each must warn and fall back, matching
+    how the rest of the config degrades."""
+    p = tmp_path / "config.toml"
+    p.write_text('[context]\nmode = "warp"\nfraction = 2.0\nmin_tokens = -5\n')
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(p)
+    assert cfg.context_mode == "fixed"
+    assert cfg.context_fraction == 0.8
+    assert cfg.context_min_tokens == 8192
+    assert sum("context" in str(w.message) for w in caught) >= 3
+
+
+def test_context_fraction_boundaries(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[context]\nfraction = 1.0\n")
+    assert load_config(p).context_fraction == 1.0  # full headroom is coherent
+    p.write_text("[context]\nfraction = 0\n")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(p)
+    assert cfg.context_fraction == 0.8  # zero would size every window to the floor
+    assert caught

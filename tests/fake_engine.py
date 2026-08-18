@@ -7,10 +7,12 @@ class FakeEngine:
     def __init__(self, script: list[str]):
         self.script = list(script)
         self.calls: list[list[dict]] = []
+        self.max_tokens_seen: list[int] = []
         self.unloaded = False
 
     def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:
         self.calls.append([dict(m) for m in messages])
+        self.max_tokens_seen.append(max_tokens)
         if not self.script:
             raise AssertionError("FakeEngine script exhausted")
         return self.script.pop(0)

@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from sous.config import SousConfig
+from sous.context import ContextDecision, decide_context
 from sous.engine.base import Engine, EngineManager
 from sous.protocol import WORKER_TOOLS, ParseError, ToolCall, parse_tool_calls
 from sous.tasks import Task, TaskStore
@@ -117,12 +118,12 @@ def _execute(
         return f"error: {e}"
 
 
-def _elide_if_needed(messages: list[dict], engine: Engine, config: SousConfig) -> int:
+def _elide_if_needed(messages: list[dict], engine: Engine, max_context_tokens: int) -> int:
     """Elide old tool results until under the context cap. Returns the final
     token count — the caller must check it against the cap: when nothing
     elidable remains it can still be over, and an oversized prompt must never
     be sent (engine error or memory exhaustion is what the cap prevents)."""
-    while (count := engine.count_tokens(messages, WORKER_TOOLS)) > config.max_context_tokens:
+    while (count := engine.count_tokens(messages, WORKER_TOOLS)) > max_context_tokens:
         for m in messages:
             if (
                 m["role"] == "user"
@@ -187,7 +188,18 @@ def _tool_result_message(name: str, result: str) -> dict:
     }
 
 
-def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -> None:
+def run_task(
+    task: Task,
+    store: TaskStore,
+    engine: Engine,
+    config: SousConfig,
+    context: ContextDecision | None = None,
+) -> None:
+    # The caller (run_worker_loop) decides the window per task — memory
+    # headroom moves with whatever else the machine is doing. No decision
+    # means the fixed configured cap.
+    if context is None:
+        context = ContextDecision(config.max_context_tokens, "fixed")
     root = Path(task.project_root)
     ex = ToolExecutor(root, config.config_path, data_dir=config.data_dir)
     transcript = _Transcript(config.data_dir / "tasks" / task.id / "transcript.jsonl")
@@ -219,12 +231,24 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
             transcript.log(event="cancelled")
             store.mark_cancelled(task.id, extra=_failure_extra(ex, transcript))
             return
-        token_count = _elide_if_needed(messages, engine, config)
-        if token_count > config.max_context_tokens:
+        token_count = _elide_if_needed(messages, engine, context.tokens)
+        if token_count > context.tokens:
             reason = (
-                f"context overflow: {token_count} tokens exceeds "
-                f"max_context_tokens={config.max_context_tokens} with "
+                f"context overflow: {token_count} tokens exceeds the "
+                f"{context.tokens}-token window ({context.reason}) with "
                 f"nothing left to elide"
+            )
+            transcript.log(event="context_overflow", error=reason)
+            store.fail(task.id, reason, extra=_failure_extra(ex, transcript))
+            return
+        # The window bounds prompt PLUS output: with auto sizing the window
+        # can BE the model's native maximum, where an unbounded generation
+        # would run past the positional limit, not just the memory estimate.
+        output_room = context.tokens - token_count
+        if output_room <= 0:
+            reason = (
+                f"context overflow: prompt fills the {context.tokens}-token "
+                f"window ({context.reason}); no room to generate"
             )
             transcript.log(event="context_overflow", error=reason)
             store.fail(task.id, reason, extra=_failure_extra(ex, transcript))
@@ -234,7 +258,7 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
             text = _generate_with_timeout(
                 engine,
                 messages,
-                config.max_tokens_per_generation,
+                min(config.max_tokens_per_generation, output_room),
                 remaining,
             )
         except GenerationStalled as e:
@@ -350,7 +374,12 @@ def run_task(task: Task, store: TaskStore, engine: Engine, config: SousConfig) -
         "concerns": concerns,
         "files_changed": [vars(c) for c in ex.changed_files()],
         "verify": verify,
-        "budget": {"turns": turns, "seconds": round(time.monotonic() - started)},
+        "budget": {
+            "turns": turns,
+            "seconds": round(time.monotonic() - started),
+            "context_tokens": context.tokens,
+            "context_reason": context.reason,
+        },
         "transcript_path": str(transcript.path),
     }
     transcript.log(event="finished", outcome=outcome)
@@ -373,7 +402,9 @@ def run_worker_loop(
                 continue
             try:
                 engine = engines.get()
-                run_task(task, store, engine, config)
+                # After get(): the weights must be loaded (and counted in
+                # active memory) before headroom means anything.
+                run_task(task, store, engine, config, context=decide_context(config))
             except Exception as e:  # noqa: BLE001 — task-scoped failure
                 store.fail(task.id, f"worker error: {e}")
             finally:
