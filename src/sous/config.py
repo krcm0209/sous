@@ -26,6 +26,17 @@ DEFAULT_ALLOWLIST: list[str] = [
     "cargo test",
     "cargo check",
     "make test",
+    # `uv run <tool>` variants of the Python tools above (plus ty): in uv
+    # projects the bare tools usually aren't on the daemon's PATH at all, so
+    # without these every worker self-check needs a human approval. Full
+    # `uv run <tool>` entries, never a bare `uv run` prefix — that would
+    # allowlist running arbitrary scripts.
+    "uv run pytest",
+    "uv run python -m pytest",
+    "uv run ruff",
+    "uv run black",
+    "uv run mypy",
+    "uv run ty",
 ]
 
 _KNOWN = {

@@ -503,3 +503,55 @@ def test_main_installs_the_shutdown_handler_before_serving(tmp_path: Path, monke
         with pytest.raises(SystemExit):
             server.main()
     assert installed, "main() served without installing the shutdown handler"
+
+
+# --- login-shell PATH resolution ------------------------------------------------
+
+
+def test_login_shell_path_extracted_despite_noisy_init_files(tmp_path: Path, monkeypatch):
+    """Login shells are entitled to print banners from init files; the probe's
+    markers must keep that noise out of the captured PATH."""
+    from sous.server import _login_shell_path
+
+    fake = tmp_path / "shell"
+    fake.write_text(
+        '#!/bin/sh\necho "welcome banner"\nPATH="/fake/tools:/usr/bin"\nexport PATH\neval "$4"\n'
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("SHELL", str(fake))
+    assert _login_shell_path() == "/fake/tools:/usr/bin"
+
+
+def test_login_shell_path_none_when_the_shell_is_broken(monkeypatch):
+    """An exotic or missing shell must mean fallback, never a crashed daemon."""
+    from sous.server import _login_shell_path
+
+    monkeypatch.setenv("SHELL", "/nonexistent/shell")
+    assert _login_shell_path() is None
+
+
+def test_main_adopts_the_login_shell_path_before_serving(tmp_path: Path, monkeypatch):
+    """Under launchd the daemon inherits the bare system PATH, so allowlisted
+    commands like `uv run pytest` stop resolving even though they work in the
+    user's terminal. main() must adopt the login shell's PATH before the worker
+    exists — scrubbed_env() passes PATH through, so this is what sandboxed
+    commands resolve against."""
+    import sous.server as server
+
+    data = tmp_path / "data"
+    data.mkdir()
+    with socket.socket() as occupied:  # make mcp.run() fail fast instead of serving
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+        cfg = SousConfig(
+            data_dir=data,
+            config_path=tmp_path / "config.toml",
+            server_port=occupied.getsockname()[1],
+        )
+        cfg.config_path.write_text("")
+        monkeypatch.setattr(server, "load_config", lambda: cfg)
+        monkeypatch.setattr(server, "_login_shell_path", lambda: "/resolved/bin:/usr/bin")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")  # launchd-bare stand-in
+        with pytest.raises(SystemExit):
+            server.main()
+    assert os.environ["PATH"] == "/resolved/bin:/usr/bin"

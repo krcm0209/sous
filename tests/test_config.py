@@ -9,6 +9,20 @@ from sous.config import (
 )
 
 
+def test_default_allowlist_covers_uv_run_wrappers(tmp_path: Path):
+    """Python projects usually reach their tools through `uv run <tool>` — the
+    bare tool is often not on the daemon's PATH at all. With only bare names
+    allowlisted, every worker self-verification round-trips through a human
+    approval, which is exactly the friction the allowlist exists to avoid."""
+    import shlex
+
+    from sous.toolexec import command_allowed
+
+    allow = current_allowlist(tmp_path / "missing.toml")
+    for cmd in ("uv run pytest -q", "uv run ruff check .", "uv run ty check"):
+        assert command_allowed(shlex.split(cmd), allow), cmd
+
+
 def test_defaults_when_file_missing(tmp_path: Path):
     cfg = load_config(tmp_path / "nope.toml")
     assert cfg.server_port == 8383
