@@ -562,4 +562,11 @@ def test_server_status_reports_context_policy(svc):
     reading config files — this is the MCP-visible surface for it."""
     service, _, _ = svc
     ctx = service.server_status()["config"]["context"]
-    assert ctx == {"mode": "fixed", "fraction": 0.8, "min_tokens": 8192}
+    # max_context_tokens included so fixed mode reports its operative value,
+    # not just the fact that the policy is fixed.
+    assert ctx == {
+        "mode": "fixed",
+        "fraction": 0.8,
+        "min_tokens": 8192,
+        "max_context_tokens": 32768,
+    }

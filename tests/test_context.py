@@ -186,3 +186,22 @@ def test_decide_auto_unknown_model_shape_falls_back(tmp_path: Path):
         d = decide_context(cfg, model_config_fn=lambda mid: {}, memory_fn=lambda: None)
     assert d.tokens == cfg.max_context_tokens
     assert caught
+
+
+def test_auto_floor_never_exceeds_native_max():
+    """A small model (native 4096) with the default 8192 floor must get 4096:
+    applying the floor after the native cap would hand back a window past the
+    model's positional embeddings."""
+    d = _auto(
+        working_set=30 * GIB,
+        active=30 * GIB,  # zero headroom: the floor is what's being tested
+        available=100 * GIB,
+        native_max=4096,
+    )
+    assert d.tokens == 4096
+
+
+def test_auto_floor_is_step_aligned():
+    """An unaligned min_tokens must not bypass the 256-token alignment."""
+    d = _auto(working_set=30 * GIB, active=30 * GIB, min_tokens=5000)
+    assert d.tokens == 4864  # 5000 rounded down to the 256-token step

@@ -603,3 +603,45 @@ def test_report_records_the_context_window_used(env):
     got = store.get(task.id)
     assert got.report["budget"]["context_tokens"] == 5000
     assert got.report["budget"]["context_reason"] == "auto: test-run"
+
+
+def test_generation_is_bounded_by_the_remaining_window(env):
+    """The window bounds prompt PLUS output. With auto sizing the window can
+    BE the model's native maximum, where an unbounded 4096-token generation
+    would run past the positional limit — not just the memory estimate."""
+    from sous.context import ContextDecision
+    from sous.protocol import WORKER_TOOLS
+
+    root, cfg, store = env
+    task = _start(store, root)
+    engine = FakeEngine([FINISH])
+    run_task(task, store, engine, cfg, context=ContextDecision(3000, "test"))
+    prompt = engine.count_tokens(engine.calls[0], WORKER_TOOLS)
+    assert engine.max_tokens_seen[0] == 3000 - prompt
+
+    task2 = _start(store, root)
+    roomy = FakeEngine([FINISH])
+    run_task(task2, store, roomy, cfg, context=ContextDecision(100_000, "test"))
+    assert roomy.max_tokens_seen[0] == cfg.max_tokens_per_generation
+
+
+def test_prompt_leaving_no_output_room_is_overflow(env):
+    """A prompt that exactly fills the window passes the elision check but
+    cannot generate a single token — that must be the same clean overflow
+    failure, not a zero-token generation handed to the engine."""
+    from sous.context import ContextDecision
+    from sous.protocol import WORKER_TOOLS
+
+    root, cfg, store = env
+    probe_task = _start(store, root)
+    probe = FakeEngine([FINISH])
+    run_task(probe_task, store, probe, cfg)
+    prompt = probe.count_tokens(probe.calls[0], WORKER_TOOLS)
+
+    task = _start(store, root)
+    starved = FakeEngine([FINISH])
+    run_task(task, store, starved, cfg, context=ContextDecision(prompt, "test"))
+    got = store.get(task.id)
+    assert got.state == TaskState.FAILED
+    assert "no room" in got.report["error"]
+    assert starved.max_tokens_seen == []  # never reached the engine

@@ -241,12 +241,24 @@ def run_task(
             transcript.log(event="context_overflow", error=reason)
             store.fail(task.id, reason, extra=_failure_extra(ex, transcript))
             return
+        # The window bounds prompt PLUS output: with auto sizing the window
+        # can BE the model's native maximum, where an unbounded generation
+        # would run past the positional limit, not just the memory estimate.
+        output_room = context.tokens - token_count
+        if output_room <= 0:
+            reason = (
+                f"context overflow: prompt fills the {context.tokens}-token "
+                f"window ({context.reason}); no room to generate"
+            )
+            transcript.log(event="context_overflow", error=reason)
+            store.fail(task.id, reason, extra=_failure_extra(ex, transcript))
+            return
         remaining = max(0.1, deadline - time.monotonic())
         try:
             text = _generate_with_timeout(
                 engine,
                 messages,
-                config.max_tokens_per_generation,
+                min(config.max_tokens_per_generation, output_room),
                 remaining,
             )
         except GenerationStalled as e:

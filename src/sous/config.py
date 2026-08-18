@@ -118,6 +118,37 @@ def _section(raw: dict, name: str) -> dict:
     return value
 
 
+def _context_values(context: dict) -> tuple[str, float, int]:
+    """Validated [context] policy values, each degrading to its default with
+    a warning — same stance as the rest of the config. These are safety
+    knobs: a fraction over 1 defeats the anti-thrashing headroom guarantee,
+    and a typo'd mode would silently disable the auto sizing the user asked
+    for."""
+    mode = context.get("mode", "fixed")
+    if mode not in ("fixed", "auto"):
+        warnings.warn(
+            f"sous config: [context].mode {mode!r} is neither 'fixed' nor 'auto'; using 'fixed'",
+            stacklevel=3,
+        )
+        mode = "fixed"
+    fraction = context.get("fraction", 0.8)
+    if isinstance(fraction, bool) or not isinstance(fraction, int | float) or not 0 < fraction <= 1:
+        warnings.warn(
+            f"sous config: [context].fraction {fraction!r} must be in (0, 1]; using 0.8",
+            stacklevel=3,
+        )
+        fraction = 0.8
+    min_tokens = context.get("min_tokens", 8192)
+    if isinstance(min_tokens, bool) or not isinstance(min_tokens, int) or min_tokens <= 0:
+        warnings.warn(
+            f"sous config: [context].min_tokens {min_tokens!r} must be a positive "
+            f"integer; using 8192",
+            stacklevel=3,
+        )
+        min_tokens = 8192
+    return mode, float(fraction), min_tokens
+
+
 def load_config(config_path: Path | None = None) -> SousConfig:
     path = config_path or DEFAULT_CONFIG_PATH
     raw = _read_toml(path)
@@ -127,6 +158,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
     budgets = _section(raw, "budgets")
     commands = _section(raw, "commands")
     context = _section(raw, "context")
+    context_mode, context_fraction, context_min_tokens = _context_values(context)
     tasks = _section(raw, "tasks")
     return SousConfig(
         server_port=server.get("port", 8383),
@@ -142,9 +174,9 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         command_timeout_seconds=commands.get("timeout_seconds", 120),
         approval_timeout_minutes=commands.get("approval_timeout_minutes", 10),
         task_retention=tasks.get("retention", 200),
-        context_mode=context.get("mode", "fixed"),
-        context_fraction=context.get("fraction", 0.8),
-        context_min_tokens=context.get("min_tokens", 8192),
+        context_mode=context_mode,
+        context_fraction=context_fraction,
+        context_min_tokens=context_min_tokens,
         data_dir=(path.parent if path.parent != Path(".") else DEFAULT_DATA_DIR),
         config_path=path,
     )

@@ -100,11 +100,16 @@ def auto_context_tokens(
     system = available + cache
     headroom = max(0, min(metal, system))
     raw = int(headroom * fraction) // bytes_per_token
-    tokens = min(raw, native_max) // _TOKEN_STEP * _TOKEN_STEP
-    if tokens < min_tokens:
+    aligned_native = native_max // _TOKEN_STEP * _TOKEN_STEP
+    tokens = min(raw // _TOKEN_STEP * _TOKEN_STEP, aligned_native)
+    # The floor itself is bounded by the native maximum: a small model must
+    # never be handed a window past its positional embeddings just because
+    # the configured floor assumed a bigger one. Aligned like everything else.
+    floor = min(min_tokens // _TOKEN_STEP * _TOKEN_STEP, aligned_native)
+    if tokens < floor:
         return ContextDecision(
-            min_tokens,
-            f"auto: clamped to floor {min_tokens} "
+            floor,
+            f"auto: clamped to floor {floor} "
             f"(headroom {headroom / _GIB:.1f} GiB supports only {tokens})",
         )
     return ContextDecision(
