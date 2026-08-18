@@ -112,7 +112,7 @@ reconnect and start a fresh one on the next call.
 
 | Tool | Purpose |
 |---|---|
-| `delegate_task` | queue a self-contained task (returns immediately) |
+| `delegate_to_local_model` | queue a self-contained task (returns immediately) |
 | `task_status` | poll progress / queue position / approval requests |
 | `task_result` | fetch report, changed files, verify output, diff |
 | `cancel_task` | stop a queued or running task |

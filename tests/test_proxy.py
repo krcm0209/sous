@@ -172,7 +172,7 @@ def test_proxy_forwards_tool_calls_over_stdio(tmp_path: Path):
 
     try:
         names = anyio.run(drive)
-        assert "server_status" in names and "delegate_task" in names
+        assert "server_status" in names and "delegate_to_local_model" in names
     finally:
         daemon.kill()
         subprocess.run(["pkill", "-f", f"daemon_stub {data} {port}"], check=False)
@@ -299,7 +299,7 @@ def test_modern_protocol_client_works_through_the_bridge(tmp_path: Path):
 
     try:
         names, result = anyio.run(drive)
-        assert "server_status" in names and "delegate_task" in names
+        assert "server_status" in names and "delegate_to_local_model" in names
         assert result is not None
     finally:
         daemon.kill()
