@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import math
 import os
 import plistlib
 import shutil
@@ -12,6 +13,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from sous.config import load_config
@@ -19,10 +21,12 @@ from sous.config import load_config
 LABEL = "com.sous.daemon"
 
 
-def launchd_plist(sous_executable: str, log_dir: Path) -> str:
+def launchd_plist(sous_executable: str, log_dir: Path, tool_dirs: Sequence[str] = ()) -> str:
     # plistlib handles XML escaping — a path containing & or < must still
     # produce a plist launchctl can parse (string formatting silently
     # produced invalid XML while install-launchd reported success).
+    path_dirs = [str(Path(sous_executable).parent), *tool_dirs]
+    path_dirs += ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     return plistlib.dumps(
         {
             "Label": LABEL,
@@ -30,12 +34,11 @@ def launchd_plist(sous_executable: str, log_dir: Path) -> str:
             # launchd starts agents with the bare system PATH, and the sandbox
             # passes PATH through to worker commands — so without this neither
             # `uv` nor any user-installed tool resolves, and every allowlisted
-            # verify command silently degrades into a human approval. The
-            # executable's own directory is where uv-tool shims (sous, uv) live.
-            "EnvironmentVariables": {
-                "PATH": f"{Path(sous_executable).parent}:"
-                "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-            },
+            # verify command silently degrades into a human approval. The sous
+            # executable's directory covers uv-tool shims; tool_dirs carries
+            # wherever `uv` itself actually lives (install-time `which uv` —
+            # e.g. Homebrew's /opt/homebrew/bin), which need not be the same.
+            "EnvironmentVariables": {"PATH": ":".join(dict.fromkeys(path_dirs))},
             "RunAtLoad": True,
             "KeepAlive": True,
             "StandardOutPath": f"{log_dir}/daemon.log",
@@ -88,10 +91,16 @@ def _cmd_wait(task_id: str, timeout: float | None, interval: float) -> None:
                 line += f" pending_command={t.pending_command}"
             print(line)
             return
-        if deadline is not None and time.monotonic() >= deadline:
+        # Cap each sleep to the remaining budget: sleeping a full interval and
+        # only then checking would quantize the deadline to interval boundaries
+        # — and a task finishing inside that overrun would be reported as a
+        # success AFTER the caller's timeout. (--timeout 0 thereby becomes the
+        # non-blocking probe: one state check, then report.)
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
             print(f"state={t.state} (timeout)")
             raise SystemExit(1)
-        time.sleep(interval)
+        time.sleep(interval if remaining is None else min(interval, remaining))
 
 
 def _plist_path() -> Path:
@@ -276,10 +285,16 @@ def _cmd_uninstall_launchd() -> None:
 def _cmd_install_launchd() -> None:
     config = load_config()
     exe = shutil.which("sous") or sys.argv[0]
+    # Where `uv` actually is, not where we hope it is: a Homebrew uv lives in
+    # /opt/homebrew/bin while the sous shim sits in ~/.local/bin, and the
+    # `uv run ...` allowlist defaults are dead under launchd unless the plist
+    # PATH covers both.
+    uv = shutil.which("uv")
+    tool_dirs = [str(Path(uv).parent)] if uv else []
     plist_path = _plist_path()
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    plist_path.write_text(launchd_plist(exe, config.data_dir))
+    plist_path.write_text(launchd_plist(exe, config.data_dir, tool_dirs))
     print(f"wrote {plist_path}")
     cmd = ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)]
     try:
@@ -290,6 +305,26 @@ def _cmd_install_launchd() -> None:
         print("  " + " ".join(cmd))
 
 
+def _arg_interval(text: str) -> float:
+    """A zero interval recreates the tight-polling `wait` exists to prevent, a
+    negative one raises out of time.sleep, and NaN poisons the sleep math —
+    reject all three as usage errors instead of misbehaving at runtime."""
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("interval must be a positive finite number of seconds")
+    return value
+
+
+def _arg_timeout(text: str) -> float:
+    """NaN never compares past the deadline (the wait would ignore an explicit
+    timeout and block forever); negatives are nonsense. Zero is allowed and
+    defined: an immediate, non-blocking probe."""
+    value = float(text)
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("timeout must be a non-negative finite number of seconds")
+    return value
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="sous", description="local MLX sous-chef for Claude")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -298,9 +333,12 @@ def main(argv: list[str] | None = None) -> None:
     wait = sub.add_parser("wait", help="block until a task finishes or requests a command approval")
     wait.add_argument("task_id")
     wait.add_argument(
-        "--timeout", type=float, default=None, help="give up after N seconds (exit 1)"
+        "--timeout",
+        type=_arg_timeout,
+        default=None,
+        help="give up after N seconds, exit 1 (0 = non-blocking probe)",
     )
-    wait.add_argument("--interval", type=float, default=2.0, help="poll every N seconds")
+    wait.add_argument("--interval", type=_arg_interval, default=2.0, help="poll every N seconds")
     sub.add_parser("stop", help="stop the daemon (unmanaged daemons only)")
     sub.add_parser("mcp", help="bridge stdio to the daemon (for stdio-only MCP clients)")
     sub.add_parser("install-launchd", help="install start-at-login LaunchAgent")

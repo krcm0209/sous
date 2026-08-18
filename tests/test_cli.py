@@ -475,3 +475,100 @@ def test_wait_timeout_exits_1(tmp_path, capsys, monkeypatch):
         cli.main(["wait", t.id, "--timeout", "0.3", "--interval", "0.05"])
     assert exc.value.code == 1
     assert "queued" in capsys.readouterr().out
+
+
+def test_wait_timeout_is_not_quantized_by_interval(tmp_path, capsys, monkeypatch):
+    """A 0.3s timeout must expire near 0.3s even with the default 2s interval —
+    each sleep has to be capped to the remaining budget, or the deadline check
+    only runs on interval boundaries (and a task finishing inside the overrun
+    would be reported as success AFTER the caller's deadline)."""
+    from sous import cli
+
+    store = _wait_store(tmp_path, monkeypatch)
+    t = _enqueue(store)  # stays queued
+    started = time.monotonic()
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["wait", t.id, "--timeout", "0.3"])  # interval left at default
+    elapsed = time.monotonic() - started
+    assert exc.value.code == 1
+    assert elapsed < 1.0, f"timed out after {elapsed:.2f}s — quantized to the interval"
+
+
+def test_wait_rejects_degenerate_intervals_and_timeouts(tmp_path, capsys, monkeypatch):
+    """--interval 0 recreates the tight-polling this command exists to prevent,
+    a negative interval raises out of time.sleep, and a NaN timeout never
+    expires — all three must be argparse usage errors (exit 2), not runtime
+    misbehavior."""
+    from sous import cli
+
+    store = _wait_store(tmp_path, monkeypatch)
+    t = _enqueue(store)
+    store.claim_next()
+    store.finish(t.id, "completed", {"summary": "s"})  # even a done task: reject first
+    for argv in (
+        ["wait", t.id, "--interval", "0", "--timeout", "0.2"],
+        ["wait", t.id, "--interval", "-1", "--timeout", "0.2"],
+        ["wait", t.id, "--timeout", "nan"],
+        ["wait", t.id, "--interval", "nan", "--timeout", "0.2"],
+        ["wait", t.id, "--timeout", "-5"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(argv)
+        assert exc.value.code == 2, argv
+
+
+def test_wait_timeout_zero_is_an_immediate_probe(tmp_path, capsys, monkeypatch):
+    """--timeout 0 is the defined non-blocking form: one state check, then
+    report — exit 0 if the task already needs attention, exit 1 otherwise."""
+    from sous import cli
+
+    store = _wait_store(tmp_path, monkeypatch)
+    pending = _enqueue(store)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["wait", pending.id, "--timeout", "0"])
+    assert exc.value.code == 1
+    done = _enqueue(store)
+    store.claim_next()  # claims `pending`... order: claim_next takes oldest queued
+    store.claim_next()
+    store.finish(done.id, "completed", {"summary": "s"})
+    cli.main(["wait", done.id, "--timeout", "0"])
+    assert "done" in capsys.readouterr().out
+
+
+def test_plist_includes_extra_tool_dirs_deduped():
+    """uv does not necessarily live next to the sous shim (Homebrew's uv is in
+    /opt/homebrew/bin while the shim sits in ~/.local/bin) — the plist must
+    accept extra tool dirs, and not duplicate ones it already has."""
+    xml = launchd_plist(
+        "/Users/x/.local/bin/sous",
+        Path("/Users/x/.sous"),
+        tool_dirs=["/opt/homebrew/bin", "/Users/x/.local/bin"],
+    )
+    data = plistlib.loads(xml.encode())
+    parts = data["EnvironmentVariables"]["PATH"].split(":")
+    assert parts[0] == "/Users/x/.local/bin"
+    assert "/opt/homebrew/bin" in parts
+    assert parts.count("/Users/x/.local/bin") == 1
+
+
+def test_install_launchd_puts_the_uv_dir_on_path(tmp_path, capsys, monkeypatch):
+    """install-launchd must capture where uv actually is at install time, not
+    assume it shares a directory with the sous shim."""
+    import shutil as real_shutil
+
+    from sous import cli
+
+    plist = tmp_path / "com.sous.daemon.plist"
+    monkeypatch.setattr(cli, "load_config", lambda: _cfg(tmp_path, 1))
+    monkeypatch.setattr(cli, "_plist_path", lambda: plist)
+    which = {"sous": "/Users/x/.local/bin/sous", "uv": "/opt/homebrew/bin/uv"}
+    monkeypatch.setattr(real_shutil, "which", lambda name: which.get(name))
+    ran = []
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: ran.append(a) or subprocess.CompletedProcess(a, 0)
+    )
+    cli.main(["install-launchd"])
+    data = plistlib.loads(plist.read_bytes())
+    parts = data["EnvironmentVariables"]["PATH"].split(":")
+    assert parts[0] == "/Users/x/.local/bin"
+    assert "/opt/homebrew/bin" in parts
