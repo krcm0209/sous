@@ -242,7 +242,7 @@ tasks in a sandboxed, queued tool loop. Every line the local worker generates
 is output the user's Claude plan did not pay for — so when a task qualifies,
 delegate it instead of generating the output inline.
 
-Delegate work that is mechanical, repetitive, and low-risk: boilerplate, test
+Delegate mechanical, repetitive, low-risk work: boilerplate, test
 scaffolding, bulk renames or migrations, docstring/comment sweeps, lint-fix
 sweeps, fixture generation. Do NOT delegate architecture, subtle debugging,
 security-sensitive code, API design, or anything needing this conversation's
@@ -253,10 +253,10 @@ To delegate, call delegate_to_local_model with self-contained instructions —
 the worker sees nothing of this chat — stating the goal, scope limits, and
 acceptance criteria, plus project_root (absolute path). Trust the worker
 with the how: point context_files at convention docs instead of restating
-them, let allowlisted verify_commands catch what a linter would, and keep
-the spec lean — worker attempts are free, your prompt is not. It returns a
-task_id at once: keep working — check task_status between steps or
-background `sous wait <task_id>`.
+them, let allowlisted verify_commands catch what a linter would — worker
+attempts are free, your prompt is not. It returns a task_id at once. If
+your next step needs the result, block on `sous wait <task_id>`; otherwise
+keep working and check task_status between steps.
 
 If task_status shows awaiting_approval, the worker wants to run the command
 in pending_command: relay it to the human verbatim (approve once / allowlist
