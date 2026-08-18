@@ -227,8 +227,7 @@ _INSTRUCTIONS = """\
 sous runs a local MLX model on this Mac that executes self-contained coding
 tasks in a sandboxed, queued tool loop. Every line the local worker generates
 is output the user's Claude plan did not pay for — so when a task qualifies,
-delegate it instead of generating the output inline. You stay head chef
-(design, decisions, review); sous does the prep.
+delegate it instead of generating the output inline.
 
 Delegate work that is mechanical, repetitive, and low-risk: boilerplate, test
 scaffolding, bulk renames or migrations, docstring/comment sweeps, lint-fix
@@ -241,22 +240,23 @@ To delegate, call delegate_to_local_model with self-contained instructions —
 the worker sees nothing of this chat — stating the goal, scope limits, and
 acceptance criteria, plus project_root (absolute path). Trust the worker
 with the how: point context_files at convention docs instead of restating
-them, let allowlisted verify_commands catch what a linter would, and keep the
-spec lean — worker attempts are free, your prompt is not, so start minimal
-and re-delegate narrower after a miss. It returns a task_id at once; keep
-working and check task_status between steps, or run `sous wait <task_id>`
-in a background shell instead of tight-polling.
+them, let allowlisted verify_commands catch what a linter would, and keep
+the spec lean — worker attempts are free, your prompt is not. It returns a
+task_id at once: keep working — check task_status between steps or
+background `sous wait <task_id>`.
 
 If task_status shows awaiting_approval, the worker wants to run the command
-in pending_command. Relay it to the human verbatim (approve once / add to
-allowlist / deny) and answer via respond_to_command_request; unanswered
-requests auto-deny after a timeout. Avoid editing files the running task is
-touching.
+in pending_command: relay it to the human verbatim (approve once / allowlist
+/ deny), answer via respond_to_command_request — unanswered requests
+auto-deny. Don't edit files the running task is touching.
 
 Collect with task_result (include_diff=true) and review the diff like a PR
-from an eager junior before accepting it. A budget-exhausted outcome is
-partial work: review what landed, then finish or re-delegate narrower. The
-worker's output is a draft, never a merge.
+from an eager junior. A clean diff earns a brief acceptance — don't
+re-narrate good work. On a miss, re-delegate a narrower self-contained task
+scoped to just the flaws (the worker keeps nothing between tasks), and say
+only that you're re-instructing it. budget-exhausted is partial
+work: review, then finish or re-delegate narrower. The worker's output is a
+draft, never a merge.
 """
 
 
