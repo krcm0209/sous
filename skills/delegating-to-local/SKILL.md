@@ -41,7 +41,7 @@ user's plan didn't pay for, so prefer delegating work that qualifies.
    `sous wait <task_id>` in the foreground — an executor that backgrounds
    the wait with nothing else to do just ends its turn and stalls.
    Otherwise keep doing your own work and check `task_status` between your
-   own steps, or park `sous wait` in a background shell. Never a tight
+   own steps, or park `sous wait <task_id>` in a background shell. Never a tight
    loop, and never read `~/.sous/tasks.db` directly (internal schema, not
    a contract).
 
