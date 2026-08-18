@@ -15,22 +15,32 @@ user's plan didn't pay for, so prefer delegating work that qualifies.
 
 - Mechanical + repetitive + low-risk: boilerplate, test scaffolding, bulk
   renames/migrations, docstring/comment sweeps, lint fixes, fixture generation.
+- Pays only when a short spec yields a large diff. If you find yourself
+  authoring the content inside the instructions (taste-heavy prose, judgment
+  calls), do it inline — the spec would cost more than it saves.
 - NOT: architecture, subtle debugging, security-sensitive code, anything that
   needs conversation context, API design, or taste.
 
 ## How to delegate
 
 1. Write **self-contained** instructions — the worker sees nothing of this
-   chat. Include: goal, constraints, target files/patterns, explicit
-   acceptance criteria.
+   chat. State the *what*: goal, scope limits (files it must not touch),
+   explicit acceptance criteria. Trust the worker with the *how*: don't
+   pre-author content, don't restate conventions a `context_files` entry
+   already carries, don't prescribe what `verify_commands` will catch
+   mechanically. Worker attempts are free and your prompt is not — start
+   lean, review the miss, re-delegate narrower.
 2. Call `delegate_to_local_model` with `project_root` (absolute path),
-   `context_files` (files it should read first), and `verify_commands`
-   (allowlisted test/lint commands proving the work).
+   `context_files` (files it should read first, including convention docs
+   like CLAUDE.md), and `verify_commands` (allowlisted test/lint commands
+   proving the work).
 3. **Mirror into your native task list**: create a task (TaskCreate) named
    "sous: <title>" when you delegate, update it as status changes, complete
    it when you collect the result.
-4. Keep doing your own work. Poll `task_status` between your own steps, not
-   in a tight loop.
+4. Keep doing your own work. Check `task_status` between your own steps, or
+   park `sous wait <task_id>` in a background shell — never a tight loop,
+   and never read `~/.sous/tasks.db` directly (internal schema, not a
+   contract).
 
 ## While it runs
 

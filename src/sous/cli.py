@@ -1,9 +1,10 @@
-"""sous CLI: serve / status / stop / mcp / install- and uninstall-launchd."""
+"""sous CLI: serve / status / wait / stop / mcp / install- and uninstall-launchd."""
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import math
 import os
 import plistlib
 import shutil
@@ -23,6 +24,10 @@ def launchd_plist(sous_executable: str, log_dir: Path) -> str:
     # plistlib handles XML escaping — a path containing & or < must still
     # produce a plist launchctl can parse (string formatting silently
     # produced invalid XML while install-launchd reported success).
+    # No EnvironmentVariables.PATH here on purpose: the daemon adopts the
+    # user's login-shell PATH itself at startup (server._login_shell_path),
+    # which works identically however it was launched — an install-time
+    # snapshot in the plist would just be a second, staler mechanism.
     return plistlib.dumps(
         {
             "Label": LABEL,
@@ -50,6 +55,45 @@ def _cmd_status() -> None:
     store = TaskStore(config.data_dir / "tasks.db")
     for t in store.list_recent(limit=10):
         print(f"  {t.id}  {t.state:<18} {t.title}")
+
+
+def _cmd_wait(task_id: str, timeout: float | None, interval: float) -> None:
+    """Block until the task needs attention, so agents can park this in a
+    background shell instead of tight-polling task_status — or, worse, reading
+    tasks.db by hand (observed in the wild; the schema is not a contract).
+
+    Wakes on awaiting_approval as well as the terminal states: an approval
+    request needs a human NOW, and a wait that slept through it would let the
+    request time out into an auto-deny.
+    """
+    config = load_config()
+    from sous.tasks import FINISHED_STATES, TaskState, TaskStore
+
+    store = TaskStore(config.data_dir / "tasks.db")
+    deadline = (time.monotonic() + timeout) if timeout is not None else None
+    while True:
+        t = store.get(task_id)
+        if t is None:
+            print(f"sous: unknown task {task_id}")
+            raise SystemExit(2)
+        if t.state in FINISHED_STATES or t.state == TaskState.AWAITING_APPROVAL:
+            line = f"state={t.state}"
+            if t.outcome:
+                line += f" outcome={t.outcome}"
+            if t.state == TaskState.AWAITING_APPROVAL and t.pending_command:
+                line += f" pending_command={t.pending_command}"
+            print(line)
+            return
+        # Cap each sleep to the remaining budget: sleeping a full interval and
+        # only then checking would quantize the deadline to interval boundaries
+        # — and a task finishing inside that overrun would be reported as a
+        # success AFTER the caller's timeout. (--timeout 0 thereby becomes the
+        # non-blocking probe: one state check, then report.)
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            print(f"state={t.state} (timeout)")
+            raise SystemExit(1)
+        time.sleep(interval if remaining is None else min(interval, remaining))
 
 
 def _plist_path() -> Path:
@@ -248,11 +292,40 @@ def _cmd_install_launchd() -> None:
         print("  " + " ".join(cmd))
 
 
+def _arg_interval(text: str) -> float:
+    """A zero interval recreates the tight-polling `wait` exists to prevent, a
+    negative one raises out of time.sleep, and NaN poisons the sleep math —
+    reject all three as usage errors instead of misbehaving at runtime."""
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("interval must be a positive finite number of seconds")
+    return value
+
+
+def _arg_timeout(text: str) -> float:
+    """NaN never compares past the deadline (the wait would ignore an explicit
+    timeout and block forever); negatives are nonsense. Zero is allowed and
+    defined: an immediate, non-blocking probe."""
+    value = float(text)
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("timeout must be a non-negative finite number of seconds")
+    return value
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="sous", description="local MLX sous-chef for Claude")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="run the daemon (MCP over HTTP on 127.0.0.1)")
     sub.add_parser("status", help="check the daemon and recent tasks")
+    wait = sub.add_parser("wait", help="block until a task finishes or requests a command approval")
+    wait.add_argument("task_id")
+    wait.add_argument(
+        "--timeout",
+        type=_arg_timeout,
+        default=None,
+        help="give up after N seconds, exit 1 (0 = non-blocking probe)",
+    )
+    wait.add_argument("--interval", type=_arg_interval, default=2.0, help="poll every N seconds")
     sub.add_parser("stop", help="stop the daemon (unmanaged daemons only)")
     sub.add_parser("mcp", help="bridge stdio to the daemon (for stdio-only MCP clients)")
     sub.add_parser("install-launchd", help="install start-at-login LaunchAgent")
@@ -270,6 +343,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(sous.proxy.run())
     elif args.command == "status":
         _cmd_status()
+    elif args.command == "wait":
+        _cmd_wait(args.task_id, args.timeout, args.interval)
     elif args.command == "stop":
         _cmd_stop()
     elif args.command == "install-launchd":

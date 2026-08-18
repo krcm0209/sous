@@ -28,6 +28,16 @@ def test_plist_is_valid_and_correct():
     assert data["StandardErrorPath"] == "/Users/x/.sous/daemon.err.log"
 
 
+def test_plist_sets_no_environment_variables():
+    """PATH is deliberately NOT baked into the plist: the daemon adopts the
+    user's login-shell PATH at startup (server._login_shell_path), which stays
+    current and works however the daemon was launched. An install-time PATH
+    snapshot here would be a second, staler mechanism that shadows it."""
+    xml = launchd_plist("/Users/x/.local/bin/sous", Path("/Users/x/.sous"))
+    data = plistlib.loads(xml.encode())
+    assert "EnvironmentVariables" not in data
+
+
 def test_plist_escapes_xml_special_characters():
     """C5: a valid macOS path containing & or < must yield a plist that
     launchctl can actually parse — not silently-invalid XML."""
@@ -380,3 +390,143 @@ def test_uninstall_advises_stop_when_there_was_nothing_to_unload(tmp_path, capsy
         assert "sous stop" in capsys.readouterr().out
     finally:
         daemon.kill()
+
+
+# --- wait ----------------------------------------------------------------------
+
+
+def _wait_store(tmp_path, monkeypatch):
+    from sous import cli
+    from sous.config import SousConfig
+    from sous.tasks import TaskStore
+
+    cfg = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    return TaskStore(tmp_path / "tasks.db")
+
+
+def _enqueue(store):
+    return store.enqueue(
+        title="t", instructions="x", project_root="/", context_files=[], verify_commands=[]
+    )
+
+
+def test_wait_returns_immediately_for_a_finished_task(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    store = _wait_store(tmp_path, monkeypatch)
+    t = _enqueue(store)
+    store.claim_next()
+    store.finish(t.id, "completed", {"summary": "s"})
+    cli.main(["wait", t.id])
+    out = capsys.readouterr().out
+    assert "done" in out and "completed" in out
+
+
+def test_wait_blocks_until_approval_is_requested(tmp_path, capsys, monkeypatch):
+    """The point of `wait`: agents park it in a background shell instead of
+    tight-polling task_status or reading tasks.db by hand — so it must wake on
+    awaiting_approval (a human is needed NOW), not only on terminal states."""
+    from sous import cli
+
+    store = _wait_store(tmp_path, monkeypatch)
+    t = _enqueue(store)
+    store.claim_next()
+
+    def approve_later():
+        time.sleep(0.3)
+        store.request_approval(t.id, "git diff")
+
+    flipper = threading.Thread(target=approve_later)
+    started = time.monotonic()
+    flipper.start()
+    try:
+        cli.main(["wait", t.id, "--interval", "0.05"])
+    finally:
+        flipper.join()
+    elapsed = time.monotonic() - started
+    out = capsys.readouterr().out
+    assert "awaiting_approval" in out
+    assert "git diff" in out, "the pending command is the thing the human must see"
+    assert elapsed >= 0.3, f"returned in {elapsed:.2f}s — never actually waited"
+
+
+def test_wait_unknown_task_exits_2(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    _wait_store(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["wait", "nope"])
+    assert exc.value.code == 2
+
+
+def test_wait_timeout_exits_1(tmp_path, capsys, monkeypatch):
+    """A queued task that never advances must not hang the caller forever when
+    a timeout was asked for — and the timeout must be exit 1, distinct from
+    unknown-task (2), so scripts can tell 'still running' from 'gone'."""
+    from sous import cli
+
+    store = _wait_store(tmp_path, monkeypatch)
+    t = _enqueue(store)  # stays queued: nothing ever claims it
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["wait", t.id, "--timeout", "0.3", "--interval", "0.05"])
+    assert exc.value.code == 1
+    assert "queued" in capsys.readouterr().out
+
+
+def test_wait_timeout_is_not_quantized_by_interval(tmp_path, capsys, monkeypatch):
+    """A 0.3s timeout must expire near 0.3s even with the default 2s interval —
+    each sleep has to be capped to the remaining budget, or the deadline check
+    only runs on interval boundaries (and a task finishing inside the overrun
+    would be reported as success AFTER the caller's deadline)."""
+    from sous import cli
+
+    store = _wait_store(tmp_path, monkeypatch)
+    t = _enqueue(store)  # stays queued
+    started = time.monotonic()
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["wait", t.id, "--timeout", "0.3"])  # interval left at default
+    elapsed = time.monotonic() - started
+    assert exc.value.code == 1
+    assert elapsed < 1.0, f"timed out after {elapsed:.2f}s — quantized to the interval"
+
+
+def test_wait_rejects_degenerate_intervals_and_timeouts(tmp_path, capsys, monkeypatch):
+    """--interval 0 recreates the tight-polling this command exists to prevent,
+    a negative interval raises out of time.sleep, and a NaN timeout never
+    expires — all three must be argparse usage errors (exit 2), not runtime
+    misbehavior."""
+    from sous import cli
+
+    store = _wait_store(tmp_path, monkeypatch)
+    t = _enqueue(store)
+    store.claim_next()
+    store.finish(t.id, "completed", {"summary": "s"})  # even a done task: reject first
+    for argv in (
+        ["wait", t.id, "--interval", "0", "--timeout", "0.2"],
+        ["wait", t.id, "--interval", "-1", "--timeout", "0.2"],
+        ["wait", t.id, "--timeout", "nan"],
+        ["wait", t.id, "--interval", "nan", "--timeout", "0.2"],
+        ["wait", t.id, "--timeout", "-5"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(argv)
+        assert exc.value.code == 2, argv
+
+
+def test_wait_timeout_zero_is_an_immediate_probe(tmp_path, capsys, monkeypatch):
+    """--timeout 0 is the defined non-blocking form: one state check, then
+    report — exit 0 if the task already needs attention, exit 1 otherwise."""
+    from sous import cli
+
+    store = _wait_store(tmp_path, monkeypatch)
+    pending = _enqueue(store)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["wait", pending.id, "--timeout", "0"])
+    assert exc.value.code == 1
+    done = _enqueue(store)
+    store.claim_next()  # claims `pending`... order: claim_next takes oldest queued
+    store.claim_next()
+    store.finish(done.id, "completed", {"summary": "s"})
+    cli.main(["wait", done.id, "--timeout", "0"])
+    assert "done" in capsys.readouterr().out

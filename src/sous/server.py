@@ -5,6 +5,8 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+import pwd
+import re
 import shlex
 import signal
 import subprocess
@@ -225,22 +227,25 @@ _INSTRUCTIONS = """\
 sous runs a local MLX model on this Mac that executes self-contained coding
 tasks in a sandboxed, queued tool loop. Every line the local worker generates
 is output the user's Claude plan did not pay for — so when a task qualifies,
-delegate it instead of generating the output inline, even though you could.
-You stay head chef (design, decisions, review); sous does the prep.
+delegate it instead of generating the output inline. You stay head chef
+(design, decisions, review); sous does the prep.
 
-Delegate work that is mechanical, repetitive, and low-risk, with a spec you
-can state completely: boilerplate, test scaffolding, bulk renames or
-migrations, docstring/comment sweeps, lint-fix sweeps, fixture generation.
-Do NOT delegate architecture, subtle debugging, security-sensitive code, API
-design, or anything needing this conversation's context or taste.
+Delegate work that is mechanical, repetitive, and low-risk: boilerplate, test
+scaffolding, bulk renames or migrations, docstring/comment sweeps, lint-fix
+sweeps, fixture generation. Do NOT delegate architecture, subtle debugging,
+security-sensitive code, API design, or anything needing this conversation's
+context or taste. Delegation pays only when a short spec yields a large diff;
+if you must author the content in the spec, work inline instead.
 
-To delegate, call delegate_to_local_model with fully self-contained
-instructions — the worker sees nothing of this chat, so spell out the goal,
-constraints, target files, and explicit acceptance criteria — plus
-project_root (absolute path), context_files worth reading first, and
-allowlisted verify_commands that prove the work. It returns a task_id
-immediately: keep working yourself and poll task_status between your own
-steps, not in a tight loop.
+To delegate, call delegate_to_local_model with self-contained instructions —
+the worker sees nothing of this chat — stating the goal, scope limits, and
+acceptance criteria, plus project_root (absolute path). Trust the worker
+with the how: point context_files at convention docs instead of restating
+them, let allowlisted verify_commands catch what a linter would, and keep the
+spec lean — worker attempts are free, your prompt is not, so start minimal
+and re-delegate narrower after a miss. It returns a task_id at once; keep
+working and check task_status between steps, or run `sous wait <task_id>`
+in a background shell instead of tight-polling.
 
 If task_status shows awaiting_approval, the worker wants to run the command
 in pending_command. Relay it to the human verbatim (approve once / add to
@@ -249,9 +254,9 @@ requests auto-deny after a timeout. Avoid editing files the running task is
 touching.
 
 Collect with task_result (include_diff=true) and review the diff like a PR
-from an eager junior before accepting it. A budget-exhausted outcome means
-partial work: review what landed, then finish it yourself or re-delegate
-narrower. The worker's output is a draft, never a merge.
+from an eager junior before accepting it. A budget-exhausted outcome is
+partial work: review what landed, then finish or re-delegate narrower. The
+worker's output is a draft, never a merge.
 """
 
 
@@ -276,12 +281,15 @@ def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) 
 
         Every line the local worker generates is output the user's Claude plan
         did not pay for — prefer delegating qualifying work over generating it
-        inline. Use for volume-heavy, low-risk work (boilerplate, test
-        scaffolding, bulk renames, docstrings, lint fixes) — NOT for
-        architecture, tricky debugging, or security-sensitive code. The worker
-        has NO conversation context: instructions must be fully self-contained
-        (goal, constraints, acceptance criteria). Returns immediately with a
-        task_id; poll with task_status and ALWAYS review the result diff before
+        inline. It pays when a short spec yields a large diff; if you would be
+        authoring the content in the spec, work inline instead. Use for
+        volume-heavy, low-risk work (boilerplate, test scaffolding, bulk
+        renames, docstrings, lint fixes) — NOT for architecture, tricky
+        debugging, or security-sensitive code. The worker has NO conversation
+        context: instructions must be self-contained (goal, scope limits,
+        acceptance criteria) but lean — trust the worker with the how and
+        re-delegate narrower on a miss. Returns immediately with a task_id;
+        poll with task_status and ALWAYS review the result diff before
         accepting.
         """
         return svc.delegate_task(title, instructions, project_root, context_files, verify_commands)
@@ -323,6 +331,37 @@ def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) 
         return svc.server_status()
 
     return mcp
+
+
+def _login_shell_path() -> str | None:
+    """PATH as the user's login shell sees it, or None if that can't be learned.
+
+    Under launchd the daemon inherits the bare system PATH, so allowlisted
+    commands (`uv run pytest`, anything user-installed) stop resolving even
+    though they work in the user's terminal — each one silently degrades into
+    a human approval request. Guessing at install time (shim directories,
+    `which uv`, hardcoded Homebrew paths) bakes one machine's setup into a
+    plist that rots; the user's own shell is the only authority on where
+    their tools live, so ask it once at startup. Markers bracket the answer
+    because login shells are entitled to print banners from init files, and
+    `-i` is included because plenty of real PATH setup lives in rc files that
+    non-interactive shells skip.
+    """
+    shell = os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell
+    if not shell:
+        return None
+    probe = 'printf "%s" "<<sous-path>>$PATH<<sous-path-end>>"'
+    try:
+        out = subprocess.run(
+            [shell, "-l", "-i", "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except OSError, subprocess.SubprocessError:
+        return None
+    found = re.findall(r"<<sous-path>>(.*?)<<sous-path-end>>", out.stdout, re.DOTALL)
+    return found[-1] if found and found[-1] else None
 
 
 def _acquire_singleton_lock(data_dir: Path) -> IO[bytes]:
@@ -389,6 +428,12 @@ def _install_shutdown_handler(stop: threading.Event) -> None:
 def main() -> None:
     config = load_config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
+    # Adopt the login shell's PATH before the worker exists: scrubbed_env()
+    # passes PATH through, so this is what sandboxed commands resolve against,
+    # identically however the daemon was launched (launchd, `sous mcp`, or a
+    # terminal). Fallback on failure: whatever PATH we inherited.
+    if login_path := _login_shell_path():
+        os.environ["PATH"] = login_path
     # Before ANY queue access: recover_interrupted() below would fail a running
     # daemon's in-flight task, and the worker would load a second copy of the
     # model. The port bind at the end of this function is far too late to be
