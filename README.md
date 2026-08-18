@@ -148,6 +148,11 @@ allowlist = ["pytest", "python -m pytest", "npm test", "npx eslint",
 timeout_seconds = 120
 approval_timeout_minutes = 10
 
+[context]
+mode = "fixed"     # "auto": size the window per task from free memory
+fraction = 0.8     # auto: share of remaining memory headroom the KV cache may use
+min_tokens = 8192  # auto: never shrink the window below this
+
 [tasks]
 retention = 200
 ```
@@ -155,6 +160,19 @@ retention = 200
 Every value is optional; the allowlist is re-read on every command execution,
 so edits apply instantly. Swap `[model].id` for any MLX text or vision model
 (e.g. the `-8bit`/`-4bit` conversions, or a fast MoE coder via mlx-lm).
+
+`[context] mode = "auto"` sizes the worker's context window per task instead
+of using the fixed `[model].max_context_tokens`: when a task starts, sous
+measures the remaining memory headroom (the tighter of the Metal working-set
+ceiling and available system RAM), lets the KV cache have `fraction` of it,
+and clamps the result between `min_tokens` and the model's native maximum.
+The window is a cap, not a reservation — KV memory is only consumed while a
+generation is actually using it — and every task's report records the window
+it ran with and why (`budget.context_tokens` / `budget.context_reason`). The
+default model's hybrid attention makes context unusually cheap (only 16 of
+its 64 layers accumulate KV — about 64 KiB per token), so an otherwise-idle
+64 GB machine gets the full native 262k window. If sizing fails for any
+reason, the task runs with the fixed `max_context_tokens` and a warning.
 
 `temperature`/`top_p`/`top_k` control the worker's sampler (Qwen's own
 documented non-thinking-mode defaults). Greedy decoding (temperature 0)
