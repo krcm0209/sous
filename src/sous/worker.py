@@ -11,7 +11,7 @@ from pathlib import Path
 
 from sous.config import SousConfig
 from sous.context import ContextDecision, decide_context
-from sous.engine.base import Engine, EngineManager
+from sous.engine.base import Engine, EngineManager, release_mlx_thread_state
 from sous.protocol import WORKER_TOOLS, ParseError, ToolCall, parse_tool_calls
 from sous.tasks import Task, TaskStore
 from sous.toolexec import PathViolation, ToolExecutor
@@ -159,6 +159,12 @@ def _generate_with_timeout(
             result_q.put(("ok", engine.generate(messages, WORKER_TOOLS, max_tokens)))
         except BaseException as e:  # noqa: BLE001 — relayed to the caller
             result_q.put(("err", e))
+        finally:
+            # This thread dies after one generation, and an exiting thread
+            # that touched mlx without releasing its streams segfaults the
+            # whole daemon (ml-explore/mlx#4327). After the queue put, so the
+            # waiting caller is never delayed by cleanup.
+            release_mlx_thread_state()
 
     threading.Thread(target=_run, daemon=True).start()
     try:

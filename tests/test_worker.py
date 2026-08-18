@@ -645,3 +645,29 @@ def test_prompt_leaving_no_output_room_is_overflow(env):
     assert got.state == TaskState.FAILED
     assert "no room" in got.report["error"]
     assert starved.max_tokens_seen == []  # never reached the engine
+
+
+def test_generation_thread_releases_mlx_state_before_exit(env, monkeypatch):
+    """mlx >= 0.32.1 requires mx.clear_streams() at the end of every thread
+    that touched mlx (ml-explore/mlx#4327): without it, the exiting generation
+    thread's TLS teardown segfaults the WHOLE daemon mid-task. The release must
+    happen once per generation, in the generation thread itself."""
+    import sous.worker as worker
+
+    released_in = []
+    monkeypatch.setattr(
+        worker, "release_mlx_thread_state", lambda: released_in.append(threading.get_ident())
+    )
+    root, cfg, store = env
+    task = _start(store, root)
+    engine = FakeEngine(
+        [
+            CALL.format(name="write_file", args='{"path": "out.txt", "content": "x"}'),
+            FINISH,
+        ]
+    )
+    run_task(task, store, engine, cfg)
+    assert store.get(task.id).state == TaskState.DONE
+    assert len(released_in) == 2, "one release per generation turn"
+    here = threading.get_ident()
+    assert all(t != here for t in released_in), "must run in the generation thread"
