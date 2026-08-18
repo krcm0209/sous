@@ -330,7 +330,7 @@ def test_create_server_registers_six_tools(svc):
     tools = asyncio.run(mcp.list_tools())
     names = {t.name for t in tools}
     assert names == {
-        "delegate_task",
+        "delegate_to_local_model",
         "task_status",
         "task_result",
         "cancel_task",
@@ -351,7 +351,7 @@ def test_create_server_sets_discovery_instructions(svc):
 
     mcp = create_server(store, service.engines, service.config)
     assert mcp.instructions
-    assert "delegate_task" in mcp.instructions
+    assert "delegate_to_local_model" in mcp.instructions
     assert len(mcp.instructions.encode()) < 2048
 
 
@@ -364,7 +364,7 @@ def test_delegate_tool_description_carries_the_motive(svc):
 
     mcp = create_server(store, service.engines, service.config)
     tools = asyncio.run(mcp.list_tools())
-    delegate = next(t for t in tools if t.name == "delegate_task")
+    delegate = next(t for t in tools if t.name == "delegate_to_local_model")
     assert "plan" in (delegate.description or "").lower()
 
 

@@ -234,12 +234,13 @@ migrations, docstring/comment sweeps, lint-fix sweeps, fixture generation.
 Do NOT delegate architecture, subtle debugging, security-sensitive code, API
 design, or anything needing this conversation's context or taste.
 
-To delegate, call delegate_task with fully self-contained instructions — the
-worker sees nothing of this chat, so spell out the goal, constraints, target
-files, and explicit acceptance criteria — plus project_root (absolute path),
-context_files worth reading first, and allowlisted verify_commands that prove
-the work. It returns a task_id immediately: keep working yourself and poll
-task_status between your own steps, not in a tight loop.
+To delegate, call delegate_to_local_model with fully self-contained
+instructions — the worker sees nothing of this chat, so spell out the goal,
+constraints, target files, and explicit acceptance criteria — plus
+project_root (absolute path), context_files worth reading first, and
+allowlisted verify_commands that prove the work. It returns a task_id
+immediately: keep working yourself and poll task_status between your own
+steps, not in a tight loop.
 
 If task_status shows awaiting_approval, the worker wants to run the command
 in pending_command. Relay it to the human verbatim (approve once / add to
@@ -258,8 +259,13 @@ def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) 
     svc = SousService(store, engines, config)
     mcp = MCPServer("sous", instructions=_INSTRUCTIONS)
 
+    # The MCP-facing name deliberately differs from SousService.delegate_task:
+    # on surfaces that defer tool schemas, the name is the only signal the
+    # model has at decision time, so it must carry its own trigger (mechanical
+    # work -> a local model). Clients already namespace by server — Claude
+    # sees mcp__sous__delegate_to_local_model — so no sous_ prefix.
     @mcp.tool()
-    def delegate_task(
+    def delegate_to_local_model(
         title: str,
         instructions: str,
         project_root: str,

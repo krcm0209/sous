@@ -23,9 +23,9 @@ user's plan didn't pay for, so prefer delegating work that qualifies.
 1. Write **self-contained** instructions — the worker sees nothing of this
    chat. Include: goal, constraints, target files/patterns, explicit
    acceptance criteria.
-2. Call `delegate_task` with `project_root` (absolute path), `context_files`
-   (files it should read first), and `verify_commands` (allowlisted test/lint
-   commands proving the work).
+2. Call `delegate_to_local_model` with `project_root` (absolute path),
+   `context_files` (files it should read first), and `verify_commands`
+   (allowlisted test/lint commands proving the work).
 3. **Mirror into your native task list**: create a task (TaskCreate) named
    "sous: <title>" when you delegate, update it as status changes, complete
    it when you collect the result.
