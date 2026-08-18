@@ -1338,6 +1338,7 @@ source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "mcp" },
+    { name = "mlx" },
     { name = "mlx-lm" },
     { name = "mlx-vlm" },
     { name = "psutil" },
@@ -1357,6 +1358,7 @@ dev = [
 requires-dist = [
     { name = "huggingface-hub" },
     { name = "mcp", specifier = ">=2.0,<3" },
+    { name = "mlx", specifier = ">=0.31,<0.32.1" },
     { name = "mlx-lm", specifier = ">=0.31" },
     { name = "mlx-vlm", specifier = ">=0.6.13" },
     { name = "psutil", specifier = ">=7" },
