@@ -252,9 +252,9 @@ auto-deny. Don't edit files the running task is touching.
 
 Collect with task_result (include_diff=true) and review the diff like a PR
 from an eager junior. A clean diff earns a brief acceptance — don't
-re-narrate good work. On a miss, re-delegate with a short delta ("fix these
-two contracts"), never a rewritten spec, and say only that you're
-re-instructing the worker. budget-exhausted is partial
+re-narrate good work. On a miss, re-delegate a narrower self-contained task
+scoped to just the flaws (the worker keeps nothing between tasks), and say
+only that you're re-instructing it. budget-exhausted is partial
 work: review, then finish or re-delegate narrower. The worker's output is a
 draft, never a merge.
 """

@@ -62,9 +62,12 @@ user's plan didn't pay for, so prefer delegating work that qualifies.
   clean diff earns a two-sentence acceptance; re-narrating good work spends
   the tokens delegation just saved. Report what you *changed or rejected*,
   not what you merely confirmed.
-- On a miss, re-delegate with a short delta ("fix these two contracts"),
-  never a rewritten spec — and say only that you're re-instructing the
-  worker before moving on.
+- On a miss, re-delegate a narrower **self-contained** task scoped to just
+  the flaws. Each task starts a fresh worker with no memory of the last one,
+  so "fix these two contracts" means nothing to it: name the file, the
+  specific defects, and the acceptance criteria for the fix. The follow-up
+  stays short because the scope shrank, not because context was omitted.
+  Say only that you're re-instructing the worker before moving on.
 - `budget-exhausted` outcome = partial work; review what landed, then either
   finish it yourself or delegate a narrower follow-up.
 - The full transcript path is in the report if you need to audit behavior.
