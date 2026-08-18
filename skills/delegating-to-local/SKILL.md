@@ -37,10 +37,27 @@ user's plan didn't pay for, so prefer delegating work that qualifies.
 3. **Mirror into your native task list**: create a task (TaskCreate) named
    "sous: <title>" when you delegate, update it as status changes, complete
    it when you collect the result.
-4. Keep doing your own work. Check `task_status` between your own steps, or
-   park `sous wait <task_id>` in a background shell — never a tight loop,
-   and never read `~/.sous/tasks.db` directly (internal schema, not a
-   contract).
+4. If your next step depends on the worker's result, block on
+   `sous wait <task_id>` in the foreground — an executor that backgrounds
+   the wait with nothing else to do just ends its turn and stalls.
+   Otherwise keep doing your own work and check `task_status` between your
+   own steps, or park `sous wait` in a background shell. Never a tight
+   loop, and never read `~/.sous/tasks.db` directly (internal schema, not
+   a contract).
+
+## Executing an implementation plan
+
+A written plan is the ideal delegation source: the spec already exists, so
+the marginal prompt cost is near zero.
+
+- Batch adjacent mechanical plan tasks that share a pattern into ONE
+  delegation — one worker round-trip, one review.
+- Lift scope limits straight from the plan's task boundaries ("Task 3 is
+  out of scope — do not touch `__init__.py`").
+- Keep the plan's judgment tasks (API design, naming, trade-off calls)
+  inline — delegating them just moves the thinking into your prompt.
+- Review at the plan's own checkpoints: the worker's diff must meet the
+  task's verify criterion before the next task starts.
 
 ## While it runs
 
