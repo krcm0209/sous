@@ -173,14 +173,15 @@ residency rather than a per-generation peak, and a `run_command` subprocess
 competes with a live cache that used to be freed between turns. Residency
 still tracks the tokens a task actually uses, not the window. Every task's
 report records the window it ran with and why (`budget.context_tokens` /
-`budget.context_reason`). The
-default model's hybrid attention makes context unusually cheap (only 16 of
-its 64 layers accumulate KV — about 64 KiB per token), so an otherwise-idle
-64 GB machine gets the full native 262k window. If sizing fails for any
-reason, the task runs with the fixed `max_context_tokens` and a warning.
+`budget.context_reason`). The default model's hybrid attention makes context
+unusually cheap (only 16 of its 64 layers accumulate KV — about 64 KiB per
+token), so an otherwise-idle 64 GB machine gets the full native 262k window.
+If sizing fails for any reason, the task runs with the fixed
+`max_context_tokens` and a warning.
 Cache reuse pays most in `auto` mode: since elision is the only thing that
 discards the cache, and elision fires only when the prompt exceeds the window,
-a window the task never reaches means the cache survives the whole task.
+a window the task never reaches means the cache survives the whole task. The
+shipped default is `fixed` at 32768 tokens.
 
 `[model].prompt_cache` (default `true`) reuses one KV cache across the turns
 of a task; `false` restores per-turn prefill.
