@@ -20,6 +20,8 @@ class Engine(Protocol):
 
     def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str: ...
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int: ...
+    def reset_prompt_cache(self) -> None: ...
+    def prompt_cache_stats(self) -> dict: ...
     def unload(self) -> None: ...
 
 
@@ -61,16 +63,32 @@ def fetch_model_config(model_id: str) -> dict:
 
 
 def _default_factory(
-    model_id: str, temperature: float = 0.7, top_p: float = 0.8, top_k: int = 20
+    model_id: str,
+    temperature: float = 0.7,
+    top_p: float = 0.8,
+    top_k: int = 20,
+    prompt_cache: bool = False,
 ) -> Engine:
     backend = select_backend(fetch_model_config(model_id))
     if backend == "vlm":
         from sous.engine.vlm import VLMEngine
 
-        return VLMEngine(model_id, temperature=temperature, top_p=top_p, top_k=top_k)
+        return VLMEngine(
+            model_id,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            prompt_cache=prompt_cache,
+        )
     from sous.engine.lm import LMEngine
 
-    return LMEngine(model_id, temperature=temperature, top_p=top_p, top_k=top_k)
+    return LMEngine(
+        model_id,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        prompt_cache=prompt_cache,
+    )
 
 
 class ManagedEngine:
@@ -98,6 +116,21 @@ class ManagedEngine:
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
         return self._inner.count_tokens(messages, tools)
 
+    def reset_prompt_cache(self) -> None:
+        # No _gen_lock, on purpose. An abandoned stalled generation still holds
+        # it, and run_task calls this in a finally — waiting there would wedge
+        # the next task. What actually makes a lock-free reset safe against
+        # that thread's late write-back is not the epoch guard by itself: the
+        # cache is always published together with the exact token ids it
+        # contains, and reuse_length demands a full strict-prefix match, so a
+        # stale cache adopted by a later task is either rejected outright or
+        # genuinely correct for it. The epoch is only a cheap early-out on
+        # top of that — it skips the adoption, it doesn't guarantee it.
+        self._inner.reset_prompt_cache()
+
+    def prompt_cache_stats(self) -> dict:
+        return self._inner.prompt_cache_stats()
+
     def generation_in_flight(self) -> bool:
         return self._gen_lock.locked()
 
@@ -114,6 +147,7 @@ class EngineManager:
                 config.temperature,
                 config.top_p,
                 config.top_k,
+                config.prompt_cache,
             )
         )
         self._lock = threading.Lock()

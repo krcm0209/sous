@@ -2,7 +2,7 @@ import threading
 import time
 
 from sous.config import SousConfig
-from sous.engine.base import EngineManager, select_backend
+from sous.engine.base import EngineManager, ManagedEngine, select_backend
 from tests.fake_engine import FakeEngine
 
 
@@ -153,3 +153,43 @@ def test_release_mlx_thread_state_never_raises(monkeypatch):
     monkeypatch.setitem(sys.modules, "mlx", types.SimpleNamespace(core=fake_core))
     monkeypatch.setitem(sys.modules, "mlx.core", fake_core)
     release_mlx_thread_state()  # must not raise
+
+
+def test_managed_engine_forwards_reset_prompt_cache():
+    inner = FakeEngine([])
+    managed = ManagedEngine(inner)
+    managed.reset_prompt_cache()
+    assert inner.resets == 1
+
+
+def test_managed_engine_forwards_prompt_cache_stats():
+    inner = FakeEngine([])
+    inner.stats = {"hits": 3}
+    assert ManagedEngine(inner).prompt_cache_stats() == {"hits": 3}
+
+
+def test_reset_prompt_cache_does_not_wait_for_the_generation_lock():
+    """A stalled generation is abandoned while still holding _gen_lock. A reset
+    that waited for it would wedge the next task, so it must be lock-free."""
+    import threading
+    import time
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingEngine(FakeEngine):
+        def generate(self, messages, tools, max_tokens):
+            started.set()
+            release.wait(5)
+            return "done"
+
+    managed = ManagedEngine(BlockingEngine(["x"]))
+    t = threading.Thread(target=lambda: managed.generate([], [], 8), daemon=True)
+    t.start()
+    assert started.wait(5)
+    assert managed.generation_in_flight()
+    t0 = time.monotonic()
+    managed.reset_prompt_cache()  # must not block behind the lock
+    assert time.monotonic() - t0 < 1.0
+    release.set()
+    t.join(5)

@@ -118,11 +118,18 @@ def _execute(
         return f"error: {e}"
 
 
-def _elide_if_needed(messages: list[dict], engine: Engine, max_context_tokens: int) -> int:
+def _elide_if_needed(
+    messages: list[dict], engine: Engine, max_context_tokens: int
+) -> tuple[int, int]:
     """Elide old tool results until under the context cap. Returns the final
-    token count — the caller must check it against the cap: when nothing
-    elidable remains it can still be over, and an oversized prompt must never
-    be sent (engine error or memory exhaustion is what the cap prevents)."""
+    token count and how many messages were rewritten — the caller must check
+    the count against the cap, because when nothing elidable remains it can
+    still be over, and an oversized prompt must never be sent.
+
+    The rewrite count is the report's answer to "why did prompt-cache reuse
+    miss": an in-place edit to old history is the only thing that breaks the
+    prefix the cache is anchored to."""
+    elisions = 0
     while (count := engine.count_tokens(messages, WORKER_TOOLS)) > max_context_tokens:
         for m in messages:
             if (
@@ -131,10 +138,11 @@ def _elide_if_needed(messages: list[dict], engine: Engine, max_context_tokens: i
                 and "[elided" not in m["content"]
             ):
                 m["content"] = "<tool_result>[elided: re-read the file if needed]</tool_result>"
+                elisions += 1
                 break
         else:
-            return count  # nothing left to elide; still over the cap
-    return count
+            return count, elisions  # nothing left to elide; still over the cap
+    return count, elisions
 
 
 class GenerationStalled(Exception):
@@ -176,13 +184,17 @@ def _generate_with_timeout(
     return value
 
 
-def _failure_extra(ex: ToolExecutor, transcript: _Transcript) -> dict:
+def _failure_extra(
+    ex: ToolExecutor, transcript: _Transcript, engine: Engine, elisions: int
+) -> dict:
     """Attached to every terminal store.fail() in run_task so a failed task
-    still tells Claude what changed on disk and where to audit — silent,
-    unreviewed file modifications are the worst failure shape here."""
+    still tells Claude what changed on disk, where to audit, and what the
+    prompt cache did — silent, unreviewed file modifications are the worst
+    failure shape here."""
     return {
         "files_changed": [vars(c) for c in ex.changed_files()],
         "transcript_path": str(transcript.path),
+        "prompt_cache": {**engine.prompt_cache_stats(), "elisions": elisions},
     }
 
 
@@ -210,186 +222,206 @@ def run_task(
     ex = ToolExecutor(root, config.config_path, data_dir=config.data_dir)
     transcript = _Transcript(config.data_dir / "tasks" / task.id / "transcript.jsonl")
 
-    messages: list[dict] = [
-        {"role": "system", "content": build_system_prompt(root)},
-        {"role": "user", "content": task.instructions},
-    ]
-    for cf in task.context_files:
-        try:
-            content = ex.read_file(cf)
-        except (PathViolation, OSError) as e:
-            content = f"error: {e}"
-        messages.append({"role": "user", "content": f"Contents of {cf}:\n{content}"})
+    # Reset before the try too: a stale prefix left resident by whatever task
+    # ran on this engine last must never be reused by this one.
+    engine.reset_prompt_cache()
+    try:
+        messages: list[dict] = [
+            {"role": "system", "content": build_system_prompt(root)},
+            {"role": "user", "content": task.instructions},
+        ]
+        for cf in task.context_files:
+            try:
+                content = ex.read_file(cf)
+            except (PathViolation, OSError) as e:
+                content = f"error: {e}"
+            messages.append({"role": "user", "content": f"Contents of {cf}:\n{content}"})
 
-    started = time.monotonic()
-    # The one wall-clock authority for the whole task: the generation loop,
-    # the approval wait, run_command timeouts, and the verify loop are all
-    # bounded by this same deadline.
-    deadline = started + config.max_minutes * 60
-    approval = _make_approval_hook(task, store, config, deadline)
-    turns = 0
-    malformed = 0
-    summary, concerns = "", ""
-    outcome = "budget-exhausted"
-
-    while turns < config.max_turns and time.monotonic() < deadline:
-        if store.is_cancel_requested(task.id):
-            transcript.log(event="cancelled")
-            store.mark_cancelled(task.id, extra=_failure_extra(ex, transcript))
-            return
-        token_count = _elide_if_needed(messages, engine, context.tokens)
-        if token_count > context.tokens:
-            reason = (
-                f"context overflow: {token_count} tokens exceeds the "
-                f"{context.tokens}-token window ({context.reason}) with "
-                f"nothing left to elide"
-            )
-            transcript.log(event="context_overflow", error=reason)
-            store.fail(task.id, reason, extra=_failure_extra(ex, transcript))
-            return
-        # The window bounds prompt PLUS output: with auto sizing the window
-        # can BE the model's native maximum, where an unbounded generation
-        # would run past the positional limit, not just the memory estimate.
-        output_room = context.tokens - token_count
-        if output_room <= 0:
-            reason = (
-                f"context overflow: prompt fills the {context.tokens}-token "
-                f"window ({context.reason}); no room to generate"
-            )
-            transcript.log(event="context_overflow", error=reason)
-            store.fail(task.id, reason, extra=_failure_extra(ex, transcript))
-            return
-        remaining = max(0.1, deadline - time.monotonic())
-        try:
-            text = _generate_with_timeout(
-                engine,
-                messages,
-                min(config.max_tokens_per_generation, output_room),
-                remaining,
-            )
-        except GenerationStalled as e:
-            if time.monotonic() >= deadline:
-                # The generation timeout IS the remaining wall-clock budget,
-                # so a timeout here means the budget ran out, not that the
-                # engine wedged. Per spec, hitting any budget ends the task
-                # as done/budget-exhausted with a partial report.
-                transcript.log(event="budget-exhausted", error=str(e))
-                break
-            transcript.log(event="stalled", error=str(e))
-            store.fail(task.id, str(e), extra=_failure_extra(ex, transcript))
-            return
-        except Exception as e:
-            # The engine raised something other than a stall (a real
-            # generation failure). Fail the task cleanly rather than let it
-            # escape run_task's "never raises" contract.
-            transcript.log(event="engine_error", error=str(e))
-            store.fail(task.id, f"engine error: {e}", extra=_failure_extra(ex, transcript))
-            return
-        turns += 1
-        transcript.log(event="generation", turn=turns, text=text)
-        messages.append({"role": "assistant", "content": text})
-
-        try:
-            calls = parse_tool_calls(text)
-        except ParseError as e:
-            malformed += 1
-            transcript.log(event="malformed", error=str(e))
-            if malformed >= MAX_CONSECUTIVE_MALFORMED:
-                store.fail(
-                    task.id,
-                    "model-confused: 3 consecutive malformed tool calls",
-                    extra=_failure_extra(ex, transcript),
-                )
-                return
-            messages.append({"role": "user", "content": FORMAT_REMINDER.format(error=e)})
-            continue
-        if not calls:
-            malformed += 1
-            if malformed >= MAX_CONSECUTIVE_MALFORMED:
-                store.fail(
-                    task.id,
-                    "model-confused: 3 consecutive turns without a tool call",
-                    extra=_failure_extra(ex, transcript),
-                )
-                return
-            messages.append({"role": "user", "content": NUDGE})
-            continue
+        started = time.monotonic()
+        # The one wall-clock authority for the whole task: the generation loop,
+        # the approval wait, run_command timeouts, and the verify loop are all
+        # bounded by this same deadline.
+        deadline = started + config.max_minutes * 60
+        approval = _make_approval_hook(task, store, config, deadline)
+        turns = 0
         malformed = 0
+        elisions = 0
+        summary, concerns = "", ""
+        outcome = "budget-exhausted"
 
-        finished = False
-        for call in calls:
-            # Cancellation is honored at EVERY tool boundary: a response can
-            # carry several calls, and a cancel that lands while one executes
-            # must stop the rest — including a trailing finish, which would
-            # otherwise turn a cancelled task into done.
+        while turns < config.max_turns and time.monotonic() < deadline:
             if store.is_cancel_requested(task.id):
                 transcript.log(event="cancelled")
-                store.mark_cancelled(task.id, extra=_failure_extra(ex, transcript))
+                store.mark_cancelled(
+                    task.id, extra=_failure_extra(ex, transcript, engine, elisions)
+                )
                 return
-            if call.name == "finish":
-                raw_summary = call.arguments.get("summary")
-                if raw_summary is None or not str(raw_summary).strip():
-                    # summary is required by the finish schema: a finish
-                    # without one must not become a false completion with an
-                    # empty report. Same recoverable tool-error shape as every
-                    # other tool; the turn budget bounds retries.
-                    result = "error: finish requires a non-empty summary"
-                    transcript.log(
-                        event="tool", name=call.name, arguments=call.arguments, result=result
+            token_count, elided = _elide_if_needed(messages, engine, context.tokens)
+            elisions += elided
+            if token_count > context.tokens:
+                reason = (
+                    f"context overflow: {token_count} tokens exceeds the "
+                    f"{context.tokens}-token window ({context.reason}) with "
+                    f"nothing left to elide"
+                )
+                transcript.log(event="context_overflow", error=reason)
+                store.fail(task.id, reason, extra=_failure_extra(ex, transcript, engine, elisions))
+                return
+            # The window bounds prompt PLUS output: with auto sizing the window
+            # can BE the model's native maximum, where an unbounded generation
+            # would run past the positional limit, not just the memory estimate.
+            output_room = context.tokens - token_count
+            if output_room <= 0:
+                reason = (
+                    f"context overflow: prompt fills the {context.tokens}-token "
+                    f"window ({context.reason}); no room to generate"
+                )
+                transcript.log(event="context_overflow", error=reason)
+                store.fail(task.id, reason, extra=_failure_extra(ex, transcript, engine, elisions))
+                return
+            remaining = max(0.1, deadline - time.monotonic())
+            try:
+                text = _generate_with_timeout(
+                    engine,
+                    messages,
+                    min(config.max_tokens_per_generation, output_room),
+                    remaining,
+                )
+            except GenerationStalled as e:
+                if time.monotonic() >= deadline:
+                    # The generation timeout IS the remaining wall-clock budget,
+                    # so a timeout here means the budget ran out, not that the
+                    # engine wedged. Per spec, hitting any budget ends the task
+                    # as done/budget-exhausted with a partial report.
+                    transcript.log(event="budget-exhausted", error=str(e))
+                    break
+                transcript.log(event="stalled", error=str(e))
+                store.fail(task.id, str(e), extra=_failure_extra(ex, transcript, engine, elisions))
+                return
+            except Exception as e:
+                # The engine raised something other than a stall (a real
+                # generation failure). Fail the task cleanly rather than let it
+                # escape run_task's "never raises" contract.
+                transcript.log(event="engine_error", error=str(e))
+                store.fail(
+                    task.id,
+                    f"engine error: {e}",
+                    extra=_failure_extra(ex, transcript, engine, elisions),
+                )
+                return
+            turns += 1
+            transcript.log(event="generation", turn=turns, text=text)
+            messages.append({"role": "assistant", "content": text})
+
+            try:
+                calls = parse_tool_calls(text)
+            except ParseError as e:
+                malformed += 1
+                transcript.log(event="malformed", error=str(e))
+                if malformed >= MAX_CONSECUTIVE_MALFORMED:
+                    store.fail(
+                        task.id,
+                        "model-confused: 3 consecutive malformed tool calls",
+                        extra=_failure_extra(ex, transcript, engine, elisions),
                     )
-                    messages.append(_tool_result_message(call.name, result))
-                    continue
-                summary = str(raw_summary)
-                concerns = str(call.arguments.get("concerns", ""))
-                outcome = "completed"
-                finished = True
+                    return
+                messages.append({"role": "user", "content": FORMAT_REMINDER.format(error=e)})
+                continue
+            if not calls:
+                malformed += 1
+                if malformed >= MAX_CONSECUTIVE_MALFORMED:
+                    store.fail(
+                        task.id,
+                        "model-confused: 3 consecutive turns without a tool call",
+                        extra=_failure_extra(ex, transcript, engine, elisions),
+                    )
+                    return
+                messages.append({"role": "user", "content": NUDGE})
+                continue
+            malformed = 0
+
+            finished = False
+            for call in calls:
+                # Cancellation is honored at EVERY tool boundary: a response can
+                # carry several calls, and a cancel that lands while one executes
+                # must stop the rest — including a trailing finish, which would
+                # otherwise turn a cancelled task into done.
+                if store.is_cancel_requested(task.id):
+                    transcript.log(event="cancelled")
+                    store.mark_cancelled(
+                        task.id, extra=_failure_extra(ex, transcript, engine, elisions)
+                    )
+                    return
+                if call.name == "finish":
+                    raw_summary = call.arguments.get("summary")
+                    if raw_summary is None or not str(raw_summary).strip():
+                        # summary is required by the finish schema: a finish
+                        # without one must not become a false completion with an
+                        # empty report. Same recoverable tool-error shape as every
+                        # other tool; the turn budget bounds retries.
+                        result = "error: finish requires a non-empty summary"
+                        transcript.log(
+                            event="tool", name=call.name, arguments=call.arguments, result=result
+                        )
+                        messages.append(_tool_result_message(call.name, result))
+                        continue
+                    summary = str(raw_summary)
+                    concerns = str(call.arguments.get("concerns", ""))
+                    outcome = "completed"
+                    finished = True
+                    break
+                result = _execute(call, ex, config, approval, deadline)
+                arg_hint = next(iter(call.arguments.values()), "")
+                store.set_activity(task.id, f"{call.name}: {str(arg_hint)[:80]}", turns)
+                # Persist the changed-file list as we go: if the daemon dies here,
+                # recover_interrupted can still report what was already touched.
+                store.update_changed_files(task.id, [vars(c) for c in ex.changed_files()])
+                transcript.log(
+                    event="tool", name=call.name, arguments=call.arguments, result=result[:2000]
+                )
+                messages.append(_tool_result_message(call.name, result))
+            if finished:
                 break
-            result = _execute(call, ex, config, approval, deadline)
-            arg_hint = next(iter(call.arguments.values()), "")
-            store.set_activity(task.id, f"{call.name}: {str(arg_hint)[:80]}", turns)
-            # Persist the changed-file list as we go: if the daemon dies here,
-            # recover_interrupted can still report what was already touched.
-            store.update_changed_files(task.id, [vars(c) for c in ex.changed_files()])
-            transcript.log(
-                event="tool", name=call.name, arguments=call.arguments, result=result[:2000]
-            )
-            messages.append(_tool_result_message(call.name, result))
-        if finished:
-            break
 
-    def _run_verify(cmd: str) -> str:
-        # max_minutes bounds verify commands too: past the deadline each
-        # remaining command is recorded as skipped — visible in the report,
-        # never a silent multi-minute overshoot.
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return "skipped: task wall-clock budget exhausted"
-        try:
-            return ex.run_command(cmd, timeout=min(config.command_timeout_seconds, remaining))
-        except Exception as e:
-            # run_command already turns most failures (timeout, missing
-            # binary, denied) into strings, but not all of them (e.g. a
-            # verify script without the execute bit raises PermissionError).
-            # Budget exhaustion is not a failure — the report must still
-            # assemble and the task must still reach `done`.
-            return f"error: {e}"
+        def _run_verify(cmd: str) -> str:
+            # max_minutes bounds verify commands too: past the deadline each
+            # remaining command is recorded as skipped — visible in the report,
+            # never a silent multi-minute overshoot.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "skipped: task wall-clock budget exhausted"
+            try:
+                return ex.run_command(cmd, timeout=min(config.command_timeout_seconds, remaining))
+            except Exception as e:
+                # run_command already turns most failures (timeout, missing
+                # binary, denied) into strings, but not all of them (e.g. a
+                # verify script without the execute bit raises PermissionError).
+                # Budget exhaustion is not a failure — the report must still
+                # assemble and the task must still reach `done`.
+                return f"error: {e}"
 
-    verify = [{"command": cmd, "output": _run_verify(cmd)} for cmd in task.verify_commands]
-    report = {
-        "summary": summary,
-        "concerns": concerns,
-        "files_changed": [vars(c) for c in ex.changed_files()],
-        "verify": verify,
-        "budget": {
-            "turns": turns,
-            "seconds": round(time.monotonic() - started),
-            "context_tokens": context.tokens,
-            "context_reason": context.reason,
-        },
-        "transcript_path": str(transcript.path),
-    }
-    transcript.log(event="finished", outcome=outcome)
-    store.finish(task.id, outcome, report)
+        verify = [{"command": cmd, "output": _run_verify(cmd)} for cmd in task.verify_commands]
+        report = {
+            "summary": summary,
+            "concerns": concerns,
+            "files_changed": [vars(c) for c in ex.changed_files()],
+            "verify": verify,
+            "budget": {
+                "turns": turns,
+                "seconds": round(time.monotonic() - started),
+                "context_tokens": context.tokens,
+                "context_reason": context.reason,
+            },
+            "prompt_cache": {**engine.prompt_cache_stats(), "elisions": elisions},
+            "transcript_path": str(transcript.path),
+        }
+        transcript.log(event="finished", outcome=outcome)
+        store.finish(task.id, outcome, report)
+    finally:
+        # Runs on every exit from the try — normal finish, any early return
+        # in the loop, or an exception escaping it — so the cache never
+        # outlives the task that built it.
+        engine.reset_prompt_cache()
 
 
 def run_worker_loop(

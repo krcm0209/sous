@@ -130,6 +130,7 @@ port = 8383
 id = "mlx-community/Qwen3.8-27B-mxfp8"
 idle_unload_minutes = 30
 max_context_tokens = 32768
+prompt_cache = false
 temperature = 0.7
 top_p = 0.8
 top_k = 20
@@ -166,13 +167,30 @@ of using the fixed `[model].max_context_tokens`: when a task starts, sous
 measures the remaining memory headroom (the tighter of the Metal working-set
 ceiling and available system RAM), lets the KV cache have `fraction` of it,
 and clamps the result between `min_tokens` and the model's native maximum.
-The window is a cap, not a reservation — KV memory is only consumed while a
-generation is actually using it — and every task's report records the window
-it ran with and why (`budget.context_tokens` / `budget.context_reason`). The
-default model's hybrid attention makes context unusually cheap (only 16 of
-its 64 layers accumulate KV — about 64 KiB per token), so an otherwise-idle
-64 GB machine gets the full native 262k window. If sizing fails for any
-reason, the task runs with the fixed `max_context_tokens` and a warning.
+The window is a cap, not a reservation. At the shipped default,
+`[model].prompt_cache = false`, `[context] fraction` bounds only a
+per-generation peak. With reuse on, the KV cache lives for the whole task
+instead, so `fraction` bounds sustained residency, and a `run_command`
+subprocess competes with a live cache that used to be freed between turns.
+Residency still tracks the tokens a task actually uses, not the window.
+Every task's report records the window it ran with and why
+(`budget.context_tokens` / `budget.context_reason`). The default model's
+hybrid attention makes context unusually cheap (only 16 of its 64 layers
+accumulate KV — about 64 KiB per token), so an otherwise-idle 64 GB machine
+gets the full native 262k window. If sizing fails for any reason, the task
+runs with the fixed `max_context_tokens` and a warning.
+Cache reuse pays most in `auto` mode: since elision is the only thing that
+discards the cache, and elision fires only when the prompt exceeds the window,
+a window the task never reaches means the cache survives the whole task. The
+shipped default is `fixed` at 32768 tokens.
+
+`[model].prompt_cache` (default `false`) reuses one KV cache across the turns
+of a task, prefilling only what the conversation gained instead of the whole
+thing every turn. It's off by default because the worker currently runs each
+generation on its own thread, and that thread's exit releases the mlx streams
+the cache is bound to — so reuse falls back to a cold prefill every turn
+rather than saving anything. It will switch on once that threading is
+restructured to keep a task on one thread.
 
 `temperature`/`top_p`/`top_k` control the worker's sampler (Qwen's own
 documented non-thinking-mode defaults). Greedy decoding (temperature 0)

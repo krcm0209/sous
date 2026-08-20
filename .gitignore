@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 dist/
 .pytest_cache/
+
+# Subagent-driven-development scratch: ledger, briefs, reports, review
+# packages. Per-plan, regenerated on demand, never part of the history.
+.superpowers/

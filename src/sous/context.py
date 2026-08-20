@@ -3,8 +3,15 @@
 Fixed mode serves the configured max_context_tokens unchanged. Auto mode
 exists because the right window is a function of the machine's moment: the
 same 64 GB Mac supports a 262k window when idle and far less with a browser
-and an IDE resident — and the KV cache is transient per generation, so the
-window is a cap on what a task MAY use, not memory the daemon holds.
+and an IDE resident.
+
+The window is a cap on what a task MAY use, not memory the daemon holds. At
+the shipped default, `[model].prompt_cache = false`, that cap still bounds
+only a per-generation peak, same as before cache reuse existed. With reuse
+on, the KV cache lives for the whole task rather than for one generation, so
+`fraction` bounds sustained residency instead of a peak — a run_command
+subprocess competes with a live cache that used to be freed between turns.
+Residency still tracks the tokens a task actually uses, not the window.
 """
 
 from __future__ import annotations
