@@ -52,7 +52,7 @@
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `reuse_length(cached_ids: Sequence[int], new_ids: Sequence[int]) -> int`; `all_trimmable(cache: Sequence[object]) -> bool`; `snapshot(cache, copy_array) -> tuple[list, int]`; `restore(cache, snap, copy_array) -> None`; `trim_to(cache, n_tokens: int) -> None`; `PromptCacheStats` dataclass with fields `hits, misses, reused_tokens, snapshot_bytes, cold_retries` and method `as_dict() -> dict`; `PromptMemo` with `get(key: str, text: str) -> list[int] | None`, `put(key: str, text: str, ids: list[int]) -> None`, `clear() -> None`.
+- Produces: `reuse_length(cached_ids: Sequence[int], new_ids: Sequence[int]) -> int`; `all_trimmable(cache: Sequence[Any]) -> bool`; `snapshot(cache, copy_array) -> tuple[list, int]`; `restore(cache, snap, copy_array) -> None`; `trim_to(cache, n_tokens: int) -> None`; `PromptCacheStats` dataclass with fields `hits, misses, reused_tokens, snapshot_bytes, cold_retries` and method `as_dict() -> dict`; `PromptMemo` with `get(key: str, text: str) -> list[int] | None`, `put(key: str, text: str, ids: list[int]) -> None`, `clear() -> None`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -289,6 +289,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 
 def reuse_length(cached_ids: Sequence[int], new_ids: Sequence[int]) -> int:
@@ -302,13 +303,19 @@ def reuse_length(cached_ids: Sequence[int], new_ids: Sequence[int]) -> int:
     """
     if not cached_ids or len(new_ids) <= len(cached_ids):
         return 0
-    for a, b in zip(cached_ids, new_ids):
+    # strict=False is deliberate: the lengths differ by design. ruff selects B,
+    # so B905 requires the flag to be explicit either way.
+    for a, b in zip(cached_ids, new_ids, strict=False):
         if a != b:
             return 0
     return len(cached_ids)
 
 
-def all_trimmable(cache: Sequence[object]) -> bool:
+def all_trimmable(cache: Sequence[Any]) -> bool:
+    # Sequence[Any] rather than a Protocol: mlx-lm and mlx-vlm ship their own
+    # cache classes with no shared base and no type stubs, and trim/offset exist
+    # only on the layers that rewind. A precise type here would be a fiction no
+    # real class satisfies, and ty would reject the attribute access.
     """Whether every layer can rewind, so the cache needs no state copy.
 
     Asks `is_trimmable()` rather than testing for a `trim` attribute:
@@ -321,7 +328,7 @@ def all_trimmable(cache: Sequence[object]) -> bool:
     return all(getattr(c, "is_trimmable", lambda: False)() for c in cache)
 
 
-def snapshot(cache: Sequence[object], copy_array: Callable) -> tuple[list, int]:
+def snapshot(cache: Sequence[Any], copy_array: Callable) -> tuple[list, int]:
     """Record what it takes to put `cache` back exactly as it is now.
 
     A layer that can rewind needs only its offset — an integer. A layer that
@@ -343,9 +350,11 @@ def snapshot(cache: Sequence[object], copy_array: Callable) -> tuple[list, int]:
     return out, nbytes
 
 
-def restore(cache: Sequence[object], snap: Sequence[tuple], copy_array: Callable) -> None:
+def restore(cache: Sequence[Any], snap: Sequence[tuple], copy_array: Callable) -> None:
     """Put `cache` back to where `snapshot` was taken."""
-    for c, (kind, value) in zip(cache, snap):
+    # strict=True: the snapshot was built from this cache layer by layer, so a
+    # length mismatch is a bug rather than a case to tolerate.
+    for c, (kind, value) in zip(cache, snap, strict=True):
         if kind == "trim":
             current = int(getattr(c, "offset", 0) or 0)
             if current > value:
@@ -354,7 +363,7 @@ def restore(cache: Sequence[object], snap: Sequence[tuple], copy_array: Callable
         c.state = [None if a is None else copy_array(a) for a in value]
 
 
-def trim_to(cache: Sequence[object], n_tokens: int) -> None:
+def trim_to(cache: Sequence[Any], n_tokens: int) -> None:
     """Rewind every layer to hold exactly `n_tokens`. All layers must rewind."""
     for c in cache:
         current = int(getattr(c, "offset", 0) or 0)
@@ -440,8 +449,8 @@ trimming it then desyncs its ring index."
 ### Task 2: The per-turn orchestrator
 
 **Files:**
-- Modify: `src/sous/engine/promptcache.py` (append)
-- Test: `tests/test_promptcache.py` (append)
+- Modify: `src/sous/engine/promptcache.py` — new code appended, **new imports merged into the existing top-of-file block**
+- Test: `tests/test_promptcache.py` — new tests appended, **new import merged into the existing import block**
 
 **Interfaces:**
 - Consumes: `reuse_length`, `all_trimmable`, `snapshot`, `restore`, `trim_to`, `PromptCacheStats` from Task 1.
@@ -449,19 +458,32 @@ trimming it then desyncs its ring index."
 
 - [ ] **Step 1: Write the failing tests**
 
-```python
-# tests/test_promptcache.py  (append)
+Add `PrefixCache` to the **existing** `from sous.engine.promptcache import (...)`
+block at the top of `tests/test_promptcache.py`. Do not append a second import
+further down the file: ruff selects `E`, so `E402 module level import not at top
+of file` fails the lint job.
 
-from sous.engine.promptcache import PrefixCache
+```python
+# tests/test_promptcache.py  (tests appended; PrefixCache added to the existing
+# import block at the top of the file)
 
 
 class FakeHooks:
     """A whole engine, minus mlx. Records what the orchestrator asked for."""
 
-    def __init__(self, trimmable: bool, layers: int = 2, fail_once: bool = False):
+    def __init__(
+        self,
+        trimmable: bool,
+        layers: int = 2,
+        fail_once: bool = False,
+        decode_impl=None,
+    ):
         self.trimmable = trimmable
         self.layers = layers
         self.fail_once = fail_once
+        # Injected rather than monkeypatched: assigning over a bound method makes
+        # ty report invalid-assignment, and ty checks the tests too.
+        self.decode_impl = decode_impl
         self.caches: list[list] = []
         self.prefilled: list[list[int]] = []
         self.decoded: list[list[int]] = []
@@ -488,6 +510,8 @@ class FakeHooks:
         if self.fail_once:
             self.fail_once = False
             raise RuntimeError("boom")
+        if self.decode_impl is not None:
+            return self.decode_impl(self, cache, token_ids, max_tokens)
         self.decoded.append(list(token_ids))
         self._advance(cache, len(token_ids) + len(self.generated))
         return "text"
@@ -622,18 +646,16 @@ def test_the_cold_retrys_cache_is_adopted_for_the_next_turn():
 def test_a_propagating_failure_leaves_no_cache_behind():
     """A raise mid-stream leaves the cache holding tokens the token record does
     not describe, so the carrier must already be invalid when it propagates."""
+    def always_fail(hooks, cache, token_ids, max_tokens):
+        raise RuntimeError("boom")
+
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h)
     pc.generate(STABLE_1, FULL_1, 16)          # a warm cache is now held
-    ok_decode = h.decode
-
-    def always_fail(cache, token_ids, max_tokens):
-        raise RuntimeError("boom")
-
-    h.decode = always_fail
+    h.decode_impl = always_fail
     with pytest.warns(UserWarning), pytest.raises(RuntimeError):
         pc.generate(STABLE_2, FULL_2, 16)      # warm fails, then the cold retry does
-    h.decode = ok_decode
+    h.decode_impl = None
     built = len(h.caches)
     pc.generate(STABLE_2, FULL_2, 16)
     assert len(h.caches) == built + 1          # cold again: nothing was carried
@@ -642,17 +664,16 @@ def test_a_propagating_failure_leaves_no_cache_behind():
 def test_a_late_write_back_from_an_abandoned_generation_is_dropped():
     """reset() bumps an epoch, so a stalled thread landing afterwards drops
     itself instead of resurrecting a finished task's cache under the next one."""
-    h = FakeHooks(trimmable=True)
-    pc = PrefixCache(h)
     seen = {}
 
-    def slow_decode(cache, token_ids, max_tokens):
+    def resets_midway(hooks, cache, token_ids, max_tokens):
         pc.reset()                      # the task ends while this "thread" runs
         seen["reset"] = True
-        h.decoded.append(list(token_ids))
+        hooks.decoded.append(list(token_ids))
         return "text"
 
-    h.decode = slow_decode
+    h = FakeHooks(trimmable=True, decode_impl=resets_midway)
+    pc = PrefixCache(h)
     pc.generate(STABLE_1, FULL_1, 16)
     assert seen["reset"]
     pc.generate(STABLE_2, FULL_2, 16)
@@ -666,11 +687,25 @@ Expected: FAIL — `ImportError: cannot import name 'PrefixCache'`
 
 - [ ] **Step 3: Append the orchestrator**
 
+Merge `import warnings` into the stdlib group at the **top** of the file, and add
+`Protocol` to the existing `from typing import Any` line there. Appending them
+beside the new classes is `E402`, and putting `import warnings` *after* the
+`from` imports is `I001` — both fail the lint job. Neither is an mlx import, so
+the module's no-mlx constraint is unaffected. The whole import block must end up
+exactly like this:
+
 ```python
-# src/sous/engine/promptcache.py  (append)
+from __future__ import annotations
 
 import warnings
-from typing import Protocol
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Any, Protocol
+```
+
+```python
+# src/sous/engine/promptcache.py  (appended below PromptMemo; the two new imports
+# belong in the existing top-of-file block, not here)
 
 
 class CacheHooks(Protocol):
@@ -728,15 +763,20 @@ class PrefixCache:
         self._cache, self._held = None, []
 
         reuse = reuse_length(held, stable_ids) if cache is not None else 0
-        if reuse:
+        # `cache is not None and reuse` rather than a bare `if reuse`: it is what
+        # lets the type checker see `warm` as a plain list in both branches, with
+        # no assert and no ignore pragma.
+        if cache is not None and reuse:
             self._stats.hits += 1
             self._stats.reused_tokens += reuse
+            warm: list = cache
         else:
+            reuse = 0
             self._stats.misses += 1
-            cache, reuse = hooks.new_cache(), 0
+            warm = hooks.new_cache()
 
         try:
-            text = self._run(cache, stable_ids, full_ids, reuse, max_tokens)
+            text = self._run(warm, stable_ids, full_ids, reuse, max_tokens)
         except Exception as e:
             if reuse == 0:
                 raise
@@ -748,11 +788,11 @@ class PrefixCache:
                 f"sous prompt cache: warm generation failed ({e}); retrying cold",
                 stacklevel=2,
             )
-            cache = hooks.new_cache()
-            text = self._run(cache, stable_ids, full_ids, 0, max_tokens)
+            warm = hooks.new_cache()
+            text = self._run(warm, stable_ids, full_ids, 0, max_tokens)
 
         if epoch == self._epoch:
-            self._cache, self._held = cache, list(stable_ids)
+            self._cache, self._held = warm, list(stable_ids)
         return text
 
     def _run(
@@ -809,261 +849,15 @@ held between turns."
 
 ---
 
-### Task 3: Engine protocol, ManagedEngine, and the test fake
-
-**Files:**
-- Modify: `src/sous/engine/base.py:14-23` (protocol), `:86-105` (ManagedEngine)
-- Modify: `tests/fake_engine.py`
-- Test: `tests/test_engine_base.py`
-
-**Interfaces:**
-- Consumes: nothing from Tasks 1-2.
-- Produces: `Engine.reset_prompt_cache() -> None` and `Engine.prompt_cache_stats() -> dict`, forwarded by `ManagedEngine` and implemented by `FakeEngine`.
-
-- [ ] **Step 1: Write the failing tests**
-
-```python
-# tests/test_engine_base.py  (append)
-
-def test_managed_engine_forwards_reset_prompt_cache():
-    inner = FakeEngine([])
-    managed = ManagedEngine(inner)
-    managed.reset_prompt_cache()
-    assert inner.resets == 1
-
-
-def test_managed_engine_forwards_prompt_cache_stats():
-    inner = FakeEngine([])
-    inner.stats = {"hits": 3}
-    assert ManagedEngine(inner).prompt_cache_stats() == {"hits": 3}
-
-
-def test_reset_prompt_cache_does_not_wait_for_the_generation_lock():
-    """A stalled generation is abandoned while still holding _gen_lock. A reset
-    that waited for it would wedge the next task, so it must be lock-free."""
-    import threading
-    import time
-
-    started = threading.Event()
-    release = threading.Event()
-
-    class BlockingEngine(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
-            started.set()
-            release.wait(5)
-            return "done"
-
-    managed = ManagedEngine(BlockingEngine(["x"]))
-    t = threading.Thread(target=lambda: managed.generate([], [], 8), daemon=True)
-    t.start()
-    assert started.wait(5)
-    assert managed.generation_in_flight()
-    t0 = time.monotonic()
-    managed.reset_prompt_cache()          # must not block behind the lock
-    assert time.monotonic() - t0 < 1.0
-    release.set()
-    t.join(5)
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `uv run pytest tests/test_engine_base.py -k prompt_cache -v`
-Expected: FAIL — `AttributeError: 'ManagedEngine' object has no attribute 'reset_prompt_cache'`
-
-- [ ] **Step 3: Extend the protocol, the wrapper, and the fake**
-
-In `src/sous/engine/base.py`, add to the `Engine` protocol after `count_tokens`:
-
-```python
-    def reset_prompt_cache(self) -> None: ...
-    def prompt_cache_stats(self) -> dict: ...
-```
-
-Add to `ManagedEngine`, after `count_tokens`:
-
-```python
-    def reset_prompt_cache(self) -> None:
-        # No _gen_lock, on purpose. An abandoned stalled generation still holds
-        # it, and run_task calls this in a finally — waiting there would wedge
-        # the next task. PrefixCache's epoch guard is what makes a lock-free
-        # reset safe against that thread's late write-back.
-        self._inner.reset_prompt_cache()
-
-    def prompt_cache_stats(self) -> dict:
-        return self._inner.prompt_cache_stats()
-```
-
-In `tests/fake_engine.py`, add to `__init__`: `self.resets = 0` and `self.stats: dict = {}`. Then add:
-
-```python
-    def reset_prompt_cache(self) -> None:
-        self.resets += 1
-
-    def prompt_cache_stats(self) -> dict:
-        return dict(self.stats)
-```
-
-- [ ] **Step 4: Run the whole suite to verify it passes**
-
-Run: `uv run pytest -m "not model" -q`
-Expected: PASS.
-
-- [ ] **Step 5: Check lint and types**
-
-Run: `uv run ruff check . && uv run ruff format --check . && uv run ty check`
-Expected: all pass. `ty` checks the tests, so `FakeEngine` must satisfy `Engine` structurally.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/sous/engine/base.py tests/fake_engine.py tests/test_engine_base.py
-git commit -m "feat: reset_prompt_cache and prompt_cache_stats on the Engine protocol
-
-reset_prompt_cache deliberately skips ManagedEngine's generation lock. An
-abandoned stalled generation holds that lock for as long as it runs, and
-run_task resets in a finally, so taking it there would wedge the next
-task behind a wedged one."
-```
-
----
-
-### Task 4: The `[model] prompt_cache` flag
-
-**Files:**
-- Modify: `src/sous/config.py:44` (`_KNOWN`), `:64-65` (fields), `:170-171` (`from_toml`)
-- Modify: `src/sous/engine/base.py:63-73` (`_default_factory`), `:109-118` (`EngineManager.__init__`)
-- Test: `tests/test_config.py`
-
-**Interfaces:**
-- Consumes: nothing.
-- Produces: `SousConfig.prompt_cache: bool`; `_default_factory(model_id, temperature, top_p, top_k, prompt_cache)`; both engine constructors accept `prompt_cache: bool = True`.
-
-- [ ] **Step 1: Write the failing tests**
-
-`tests/test_config.py` already imports `load_config` from `sous.config`; add
-`SousConfig` to that same import list, since these tests need the dataclass
-default.
-
-```python
-# tests/test_config.py  (append)
-
-def test_prompt_cache_defaults_to_true():
-    assert SousConfig().prompt_cache is True
-
-
-def test_prompt_cache_can_be_disabled(tmp_path: Path):
-    path = tmp_path / "config.toml"
-    path.write_text("[model]\nprompt_cache = false\n")
-    assert load_config(path).prompt_cache is False
-
-
-def test_prompt_cache_is_a_known_model_key(tmp_path: Path):
-    path = tmp_path / "config.toml"
-    path.write_text("[model]\nprompt_cache = true\n")
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        load_config(path)
-    assert not [w for w in caught if "unknown" in str(w.message).lower()]
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `uv run pytest tests/test_config.py -k prompt_cache -v`
-Expected: FAIL — `AttributeError: 'SousConfig' object has no attribute 'prompt_cache'`
-
-- [ ] **Step 3: Thread the flag through**
-
-`src/sous/config.py:44` — add the key:
-
-```python
-    "model": {
-        "id",
-        "idle_unload_minutes",
-        "max_context_tokens",
-        "temperature",
-        "top_p",
-        "top_k",
-        "prompt_cache",
-    },
-```
-
-`src/sous/config.py` — after `top_k: int = 20`:
-
-```python
-    # Reuse one KV cache across the turns of a task, prefilling only what the
-    # conversation gained. false restores per-turn prefill without a downgrade.
-    prompt_cache: bool = True
-```
-
-`src/sous/config.py` — after `top_k=model.get("top_k", 20),`:
-
-```python
-        prompt_cache=model.get("prompt_cache", True),
-```
-
-`src/sous/engine/base.py` — `_default_factory`:
-
-```python
-def _default_factory(
-    model_id: str,
-    temperature: float = 0.7,
-    top_p: float = 0.8,
-    top_k: int = 20,
-    prompt_cache: bool = True,
-) -> Engine:
-    backend = select_backend(fetch_model_config(model_id))
-    if backend == "vlm":
-        from sous.engine.vlm import VLMEngine
-
-        return VLMEngine(
-            model_id, temperature=temperature, top_p=top_p, top_k=top_k,
-            prompt_cache=prompt_cache,
-        )
-    from sous.engine.lm import LMEngine
-
-    return LMEngine(
-        model_id, temperature=temperature, top_p=top_p, top_k=top_k,
-        prompt_cache=prompt_cache,
-    )
-```
-
-`src/sous/engine/base.py` — the factory lambda in `EngineManager.__init__`:
-
-```python
-            lambda model_id: _default_factory(
-                model_id,
-                config.temperature,
-                config.top_p,
-                config.top_k,
-                config.prompt_cache,
-            )
-```
-
-- [ ] **Step 4: Run the tests to verify they pass**
-
-Run: `uv run pytest -m "not model" -q`
-Expected: PASS. Tasks 5 and 6 add the constructor parameter; until then `_default_factory` would fail at runtime, which no CI test exercises because it needs a real model.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/sous/config.py src/sous/engine/base.py tests/test_config.py
-git commit -m "feat: add [model] prompt_cache config flag
-
-A kill switch matching the degrade-safely habit of context_mode: a
-suspected cache bug is a config edit, not a downgrade."
-```
-
----
-
-### Task 5: LMEngine — the mlx-lm hooks
+### Task 3: LMEngine — the mlx-lm hooks
 
 **Files:**
 - Modify: `src/sous/engine/lm.py` (whole file)
 - Test: `tests/test_engine_unloaded.py` (the unloaded guards must still hold)
 
 **Interfaces:**
-- Consumes: `PrefixCache`, `PromptMemo` from Tasks 1-2; `prompt_cache: bool` from Task 4.
+- Consumes: `PrefixCache`, `PromptMemo` from Tasks 1-2.
+- Introduces: the `prompt_cache: bool = True` constructor parameter. Nothing passes it until Task 6. That ordering is deliberate — engines first, factory last — because the reverse leaves `ty check` failing at a commit boundary.
 - Produces: `LMEngine.generate/count_tokens/unload/reset_prompt_cache/prompt_cache_stats`, satisfying `Engine`.
 
 - [ ] **Step 1: Write the failing test**
@@ -1072,9 +866,10 @@ suspected cache bug is a config edit, not a downgrade."
 # tests/test_engine_unloaded.py  (append)
 
 def test_lm_reset_prompt_cache_works_after_unload():
-    """run_task resets in a finally, which can land after an idle unload."""
+    """run_task resets in a finally, which can land after an idle unload. The
+    helper leaves a live PrefixCache beside a dead model, which is exactly the
+    state unload() produces — reset must not reach for the model."""
     engine = _unloaded_lm()
-    engine._cache = None
     engine.reset_prompt_cache()          # must not raise
     assert engine.prompt_cache_stats()["hits"] == 0
 ```
@@ -1185,8 +980,14 @@ class LMEngine:
         model, _ = self._loaded()
         if not token_ids:
             return
-        model(mx.array(token_ids)[None], cache=cache)
-        mx.eval([c.state for c in cache])
+        # Chunked at generate_step's own prefill_step_size (mlx_lm/generate.py:316
+        # defaults to 2048). One unchunked call would materialise attention over
+        # the whole delta at once, which is exactly the peak the spec promises not
+        # to move.
+        step = 2048
+        for i in range(0, len(token_ids), step):
+            model(mx.array(token_ids[i : i + step])[None], cache=cache)
+            mx.eval([c.state for c in cache])
 
     def decode(self, cache: list, token_ids: list[int], max_tokens: int) -> str:
         from mlx_lm import stream_generate
@@ -1264,7 +1065,7 @@ and stream_generate raises on max_tokens=0."
 
 ---
 
-### Task 6: VLMEngine — the mlx-vlm hooks
+### Task 4: VLMEngine — the mlx-vlm hooks
 
 **Files:**
 - Modify: `src/sous/engine/vlm.py` (whole file)
@@ -1496,6 +1297,267 @@ would silently miss on every turn."
 
 ---
 
+### Task 5: Engine protocol, ManagedEngine, and the test fake
+
+**Files:**
+- Modify: `src/sous/engine/base.py:14-23` (protocol), `:86-105` (ManagedEngine)
+- Modify: `tests/fake_engine.py`
+- Test: `tests/test_engine_base.py`
+
+**Interfaces:**
+- Consumes: `reset_prompt_cache` / `prompt_cache_stats`, already implemented by both engines in Tasks 3-4.
+- Produces: `Engine.reset_prompt_cache() -> None` and `Engine.prompt_cache_stats() -> dict`, forwarded by `ManagedEngine` and implemented by `FakeEngine`.
+
+- [ ] **Step 1: Write the failing tests**
+
+`tests/test_engine_base.py:5` currently reads
+`from sous.engine.base import EngineManager, select_backend`. Change it to
+`from sous.engine.base import EngineManager, ManagedEngine, select_backend` —
+these tests construct `ManagedEngine` directly and the file never imported it.
+
+```python
+# tests/test_engine_base.py  (appended; the import on line 5 gains ManagedEngine)
+
+def test_managed_engine_forwards_reset_prompt_cache():
+    inner = FakeEngine([])
+    managed = ManagedEngine(inner)
+    managed.reset_prompt_cache()
+    assert inner.resets == 1
+
+
+def test_managed_engine_forwards_prompt_cache_stats():
+    inner = FakeEngine([])
+    inner.stats = {"hits": 3}
+    assert ManagedEngine(inner).prompt_cache_stats() == {"hits": 3}
+
+
+def test_reset_prompt_cache_does_not_wait_for_the_generation_lock():
+    """A stalled generation is abandoned while still holding _gen_lock. A reset
+    that waited for it would wedge the next task, so it must be lock-free."""
+    import threading
+    import time
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingEngine(FakeEngine):
+        def generate(self, messages, tools, max_tokens):
+            started.set()
+            release.wait(5)
+            return "done"
+
+    managed = ManagedEngine(BlockingEngine(["x"]))
+    t = threading.Thread(target=lambda: managed.generate([], [], 8), daemon=True)
+    t.start()
+    assert started.wait(5)
+    assert managed.generation_in_flight()
+    t0 = time.monotonic()
+    managed.reset_prompt_cache()          # must not block behind the lock
+    assert time.monotonic() - t0 < 1.0
+    release.set()
+    t.join(5)
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `uv run pytest tests/test_engine_base.py -k prompt_cache -v`
+Expected: FAIL — `AttributeError: 'ManagedEngine' object has no attribute 'reset_prompt_cache'`. A `NameError: name 'ManagedEngine' is not defined` instead means the import on line 5 was not updated.
+
+- [ ] **Step 3: Extend the protocol, the wrapper, and the fake**
+
+In `src/sous/engine/base.py`, add to the `Engine` protocol after `count_tokens`:
+
+```python
+    def reset_prompt_cache(self) -> None: ...
+    def prompt_cache_stats(self) -> dict: ...
+```
+
+Add to `ManagedEngine`, after `count_tokens`:
+
+```python
+    def reset_prompt_cache(self) -> None:
+        # No _gen_lock, on purpose. An abandoned stalled generation still holds
+        # it, and run_task calls this in a finally — waiting there would wedge
+        # the next task. PrefixCache's epoch guard is what makes a lock-free
+        # reset safe against that thread's late write-back.
+        self._inner.reset_prompt_cache()
+
+    def prompt_cache_stats(self) -> dict:
+        return self._inner.prompt_cache_stats()
+```
+
+In `tests/fake_engine.py`, add to `__init__`: `self.resets = 0` and `self.stats: dict = {}`. Then add:
+
+```python
+    def reset_prompt_cache(self) -> None:
+        self.resets += 1
+
+    def prompt_cache_stats(self) -> dict:
+        return dict(self.stats)
+```
+
+- [ ] **Step 4: Run the whole suite to verify it passes**
+
+Run: `uv run pytest -m "not model" -q`
+Expected: PASS.
+
+- [ ] **Step 5: Check lint and types**
+
+Run: `uv run ruff check . && uv run ruff format --check . && uv run ty check`
+Expected: all pass. `ty` checks the tests, so `FakeEngine` must satisfy `Engine` structurally.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/sous/engine/base.py tests/fake_engine.py tests/test_engine_base.py
+git commit -m "feat: reset_prompt_cache and prompt_cache_stats on the Engine protocol
+
+reset_prompt_cache deliberately skips ManagedEngine's generation lock. An
+abandoned stalled generation holds that lock for as long as it runs, and
+run_task resets in a finally, so taking it there would wedge the next
+task behind a wedged one."
+```
+
+---
+
+### Task 6: The `[model] prompt_cache` flag
+
+**Files:**
+- Modify: `src/sous/config.py:44` (`_KNOWN`), `:64-65` (fields), `:170-171` (`from_toml`)
+- Modify: `src/sous/engine/base.py:63-73` (`_default_factory`), `:109-118` (`EngineManager.__init__`)
+- Test: `tests/test_config.py`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: `SousConfig.prompt_cache: bool`; `_default_factory(model_id, temperature, top_p, top_k, prompt_cache)`; both engine constructors accept `prompt_cache: bool = True`.
+
+- [ ] **Step 1: Write the failing tests**
+
+`tests/test_config.py` already imports `load_config` from `sous.config`; add
+`SousConfig` to that same import list, since these tests need the dataclass
+default.
+
+```python
+# tests/test_config.py  (append)
+
+def test_prompt_cache_defaults_to_true():
+    assert SousConfig().prompt_cache is True
+
+
+def test_prompt_cache_can_be_disabled(tmp_path: Path):
+    path = tmp_path / "config.toml"
+    path.write_text("[model]\nprompt_cache = false\n")
+    assert load_config(path).prompt_cache is False
+
+
+def test_prompt_cache_is_a_known_model_key(tmp_path: Path):
+    path = tmp_path / "config.toml"
+    path.write_text("[model]\nprompt_cache = true\n")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        load_config(path)
+    assert not [w for w in caught if "unknown" in str(w.message).lower()]
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `uv run pytest tests/test_config.py -k prompt_cache -v`
+Expected: FAIL — `AttributeError: 'SousConfig' object has no attribute 'prompt_cache'`
+
+- [ ] **Step 3: Thread the flag through**
+
+`src/sous/config.py:44` — add the key:
+
+```python
+    "model": {
+        "id",
+        "idle_unload_minutes",
+        "max_context_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "prompt_cache",
+    },
+```
+
+`src/sous/config.py` — after `top_k: int = 20`:
+
+```python
+    # Reuse one KV cache across the turns of a task, prefilling only what the
+    # conversation gained. false restores per-turn prefill without a downgrade.
+    prompt_cache: bool = True
+```
+
+`src/sous/config.py` — after `top_k=model.get("top_k", 20),`:
+
+```python
+        prompt_cache=model.get("prompt_cache", True),
+```
+
+`src/sous/engine/base.py` — `_default_factory`:
+
+```python
+def _default_factory(
+    model_id: str,
+    temperature: float = 0.7,
+    top_p: float = 0.8,
+    top_k: int = 20,
+    prompt_cache: bool = True,
+) -> Engine:
+    backend = select_backend(fetch_model_config(model_id))
+    if backend == "vlm":
+        from sous.engine.vlm import VLMEngine
+
+        return VLMEngine(
+            model_id, temperature=temperature, top_p=top_p, top_k=top_k,
+            prompt_cache=prompt_cache,
+        )
+    from sous.engine.lm import LMEngine
+
+    return LMEngine(
+        model_id, temperature=temperature, top_p=top_p, top_k=top_k,
+        prompt_cache=prompt_cache,
+    )
+```
+
+`src/sous/engine/base.py` — the factory lambda in `EngineManager.__init__`:
+
+```python
+            lambda model_id: _default_factory(
+                model_id,
+                config.temperature,
+                config.top_p,
+                config.top_k,
+                config.prompt_cache,
+            )
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `uv run pytest -m "not model" -q`
+Expected: PASS.
+
+- [ ] **Step 5: Check lint and types**
+
+Run: `uv run ruff check . && uv run ruff format --check . && uv run ty check`
+Expected: all pass. This gate matters most here. `_default_factory` now passes
+`prompt_cache=` into both engine constructors, and `ty` reports
+`unknown-argument` if either is missing the parameter — a static failure, not a
+runtime one. Tasks 3 and 4 added it to both, so this task is where the three
+edits are proven to agree.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/sous/config.py src/sous/engine/base.py tests/test_config.py
+git commit -m "feat: add [model] prompt_cache config flag
+
+A kill switch matching the degrade-safely habit of context_mode: a
+suspected cache bug is a config edit, not a downgrade."
+```
+
+---
+
 ### Task 7: worker.py — lifetime, elision count, and the report
 
 **Files:**
@@ -1503,7 +1565,7 @@ would silently miss on every turn."
 - Test: `tests/test_worker.py`
 
 **Interfaces:**
-- Consumes: `Engine.reset_prompt_cache()` and `Engine.prompt_cache_stats()` from Task 3.
+- Consumes: `Engine.reset_prompt_cache()` and `Engine.prompt_cache_stats()` from Task 5.
 - Produces: `_elide_if_needed(...) -> tuple[int, int]` returning `(token_count, elisions)`; a `prompt_cache` block in the task report and in `_failure_extra`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1732,11 +1794,22 @@ not the window.
 
 - [ ] **Step 2: Update the README**
 
-Add `prompt_cache` to the `[model]` section of the config reference, with
-`true` as the default and one line: reuse one KV cache across the turns of a
+Three edits.
+
+**One.** `README.md:169-170` currently reads "The window is a cap, not a
+reservation — KV memory is only consumed while a generation is actually using
+it —". That clause is now false and must be replaced. The window is still a cap
+rather than a reservation, but since prompt-cache reuse the KV cache lives for
+the whole task, so `[context] fraction` bounds sustained residency rather than a
+per-generation peak, and a `run_command` subprocess competes with a live cache
+that used to be freed between turns. Residency still tracks the tokens a task
+actually uses, not the window.
+
+**Two.** Add `prompt_cache` to the `[model]` section of the config reference,
+with `true` as the default and one line: reuse one KV cache across the turns of a
 task; `false` restores per-turn prefill.
 
-Add, next to the `[context]` documentation: reuse pays most in `auto` mode.
+**Three.** Next to the `[context]` documentation: reuse pays most in `auto` mode.
 Elision is the only thing that discards the cache, and elision fires only when
 the prompt exceeds the window, so a window the task never reaches means the
 cache survives the whole task. The shipped default is `fixed` at 32768 tokens.
@@ -1793,19 +1866,41 @@ before it writes, guaranteeing at least two turns:
         )
 ```
 
+`scripts/e2e_smoke.py:43` builds `SousConfig(...)` directly and never reads a
+config file, so editing `config.toml` cannot switch the flag. Put the switch in
+the script:
+
+```python
+import os
+
+        cfg = SousConfig(
+            model_id=TINY,
+            data_dir=base / "data",
+            config_path=base / "config.toml",
+            max_turns=8,
+            max_minutes=5,
+            prompt_cache=os.environ.get("SOUS_PROMPT_CACHE", "1") != "0",
+        )
+```
+
 After the existing report print, add:
 
 ```python
         cache = (current.report or {}).get("prompt_cache")
-        print(f"prompt_cache: {cache}")
+        print(f"prompt_cache={cfg.prompt_cache} stats: {cache}")
 ```
 
 - [ ] **Step 2: Update the module docstring**
 
 Add: the task is deliberately multi-turn so the `prompt_cache` block is
-non-trivial. Run it once with `[model] prompt_cache = true` and once with
-`false`, and compare `budget.seconds` — that is the before-and-after issue #27
-asks for. Note that the 0.6B model is text-only and therefore fully trimmable,
+non-trivial. Run it twice and compare `budget.seconds`:
+
+```bash
+uv run python scripts/e2e_smoke.py
+SOUS_PROMPT_CACHE=0 uv run python scripts/e2e_smoke.py
+```
+
+That is the before-and-after issue #27 asks for. Note that the 0.6B model is text-only and therefore fully trimmable,
 so it exercises the one-call path, not the snapshot path.
 
 - [ ] **Step 3: Verify**
@@ -1832,7 +1927,7 @@ script with the flag on and off is the reproducible before-and-after."
 - Modify: `tests/test_engine_lm.py`, `tests/test_engine_vlm.py`
 
 **Interfaces:**
-- Consumes: `snapshot`, `restore` from Task 1; both engines from Tasks 5-6.
+- Consumes: `snapshot`, `restore` from Task 1; both engines from Tasks 3-4.
 - Produces: nothing.
 
 These are the tests that would have caught the earlier draft's error. They are
@@ -1866,10 +1961,10 @@ def test_lm_snapshot_restore_is_bit_exact():
     e.prefill(work, suffix)
     restore(work, snap, e.copy_array)
 
-    for a, b in zip(work, ref):
+    for a, b in zip(work, ref, strict=True):
         off = int(a.offset)
         assert off == int(b.offset)
-        for xa, xb in zip(a.state, b.state):
+        for xa, xb in zip(a.state, b.state, strict=True):
             d = mx.max(mx.abs(xa[..., :off, :].astype(mx.float32)
                               - xb[..., :off, :].astype(mx.float32)))
             mx.eval(d)
@@ -1922,10 +2017,10 @@ def test_vlm_snapshot_restore_is_bit_exact():
     e.prefill(work, suffix)
     restore(work, snap, e.copy_array)
 
-    for a, b in zip(work, ref):
+    for a, b in zip(work, ref, strict=True):
         sa, sb = a.state, b.state
         off = int(getattr(a, "offset", 0) or 0)
-        for xa, xb in zip(sa, sb):
+        for xa, xb in zip(sa, sb, strict=True):
             if xa is None or xb is None:
                 continue
             if hasattr(a, "trim") and xa.ndim >= 3 and off:
@@ -1978,6 +2073,8 @@ prefix exactly, rather than merely producing plausible output."
 
 ---
 
+---
+
 ## Verification before the PR
 
 Not tasks, because none of them can run in CI. All three are required by the
@@ -1998,6 +2095,21 @@ spec and must be done on this machine before the PR is opened.
   `uv run pytest tests/test_promptcache.py -q --count=50` if any test in this
   plan looks non-deterministic (requires `pytest-repeat`; otherwise loop in the
   shell).
+
+## What was verified about this plan
+
+The plan's own code was assembled and run before the plan was committed, so
+Tasks 1 and 2 are not merely reviewed:
+
+- `src/sous/engine/promptcache.py` as written (both blocks, imports merged as
+  instructed above) passes `ruff check`, `ruff format --check`, and `ty check`
+  against this repo's own configuration.
+- All 37 tests from Tasks 1 and 2 pass against that module, including every
+  hand-computed expected value — `snapshot_bytes == 8`, the restored offsets,
+  and the hit/miss/reset counts.
+
+Tasks 3 onward could not be executed this way, because they need a model. Their
+gates are the per-task steps and the verification list above.
 
 ## Risks the executor should know
 
