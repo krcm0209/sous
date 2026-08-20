@@ -90,7 +90,9 @@ def test_vlm_engine_reuses_across_turns():
     from sous.engine.vlm import VLMEngine
     from sous.protocol import WORKER_TOOLS
 
-    e = VLMEngine(TINY_VLM)
+    # Explicitly on: the shipped default is off until the worker stops running
+    # each generation on its own thread, and this test is about reuse itself.
+    e = VLMEngine(TINY_VLM, prompt_cache=True)
     msgs = [{"role": "user", "content": "Say the word kiwi and nothing else."}]
     first = e.generate(msgs, WORKER_TOOLS, max_tokens=32)
     msgs = msgs + [
