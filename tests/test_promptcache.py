@@ -342,6 +342,45 @@ def test_divergence_rebuilds_the_cache():
     assert pc.stats()["hits"] == 0
 
 
+# ---- same-turn stable/full mismatch (finding 1) ----------------------------
+
+# A template that rewrites rather than appends for add_generation_prompt=True:
+# full_ids shares no prefix relation with stable_ids at all, unlike every
+# other fixture in this file where full = stable + a generation suffix.
+REWRITTEN_STABLE, REWRITTEN_FULL = [1, 2, 3, 4], [9, 9, 9, 9, 90, 91]
+
+
+@pytest.mark.parametrize("trimmable", [True, False])
+def test_same_turn_mismatch_decodes_whole_prompt_cold_and_warns(trimmable):
+    h = FakeHooks(trimmable=trimmable)
+    pc = PrefixCache(h)
+    with pytest.warns(UserWarning, match="prompt cache"):
+        assert pc.generate(REWRITTEN_STABLE, REWRITTEN_FULL, 16) == "text"
+    assert h.decoded == [REWRITTEN_FULL]  # the whole prompt, not a reuse-sliced suffix
+    assert h.prefilled == []  # the guard sits above the trim/state-copy split
+    assert pc.stats() == {
+        "hits": 0,
+        "misses": 1,
+        "reused_tokens": 0,
+        "snapshot_bytes": 0,
+        "cold_retries": 0,
+    }
+
+
+@pytest.mark.parametrize("trimmable", [True, False])
+def test_same_turn_mismatch_retains_nothing_so_the_next_turn_is_also_cold(trimmable):
+    h = FakeHooks(trimmable=trimmable)
+    pc = PrefixCache(h)
+    with pytest.warns(UserWarning, match="prompt cache"):
+        pc.generate(REWRITTEN_STABLE, REWRITTEN_FULL, 16)
+    # A well-formed turn follows; nothing from the bad turn was carried into it.
+    pc.generate(STABLE_1, FULL_1, 16)
+    assert len(h.caches) == 2  # a fresh cache was built, not a reuse of anything
+    assert h.prefilled == ([] if trimmable else [STABLE_1])  # the ordinary miss path
+    assert pc.stats()["hits"] == 0
+    assert pc.stats()["misses"] == 2
+
+
 def test_disabled_never_reuses_and_never_counts():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, enabled=False)
@@ -421,7 +460,10 @@ def test_the_cold_retrys_cache_is_adopted_for_the_next_turn():
     with pytest.warns(UserWarning):
         pc.generate(STABLE_2, FULL_2, 16)
     built = len(h.caches)
-    pc.generate(STABLE_2 + [7], FULL_2 + [7], 16)
+    # full = stable + the fixed generation suffix, same shape as every other
+    # fixture here (finding 1 now rejects a full_ids that isn't that).
+    stable_3 = STABLE_2 + [7]
+    pc.generate(stable_3, stable_3 + [90, 91], 16)
     assert len(h.caches) == built  # the retry's cache carried forward
 
 

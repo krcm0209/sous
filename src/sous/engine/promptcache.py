@@ -204,6 +204,26 @@ class PrefixCache:
         if not self.enabled:
             return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens)
 
+        # `_run`'s anchor (`len(stable_ids)`) only means what it assumes: that
+        # `full_ids` is the stable render plus a generation-only suffix, true
+        # for chat templates that append a generation block rather than
+        # rewrite one. [model].id accepts any MLX model and therefore any
+        # chat template, so sous cannot assume that in general. reuse_length
+        # already tests exactly this — strict prefix, with a suffix left to
+        # decode — so ask it instead of duplicating the rule. Checked before
+        # any cache is chosen or published: self._cache/self._held are left
+        # exactly as they were, so nothing from this turn is retained and a
+        # cache still held from an earlier, well-behaved turn survives for a
+        # later one to reuse.
+        if reuse_length(stable_ids, full_ids) == 0:
+            self._stats.misses += 1
+            warnings.warn(
+                "sous prompt cache: full prompt is not the stable render "
+                "plus a generation suffix; decoding cold this turn",
+                stacklevel=2,
+            )
+            return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens)
+
         epoch = self._epoch
         # Bind the stats object itself, not self._stats, and write through
         # this local for the whole call (passed into _run too). reset() swaps
