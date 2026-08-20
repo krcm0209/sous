@@ -1,19 +1,32 @@
 """End-to-end smoke test with a tiny real model (no MCP, no Claude needed).
 
 Run:  uv run python scripts/e2e_smoke.py
-Downloads ~350 MB on first run. Exercises the real multi-turn agent loop
-(generate -> parse -> execute -> append) against the smallest available
-Qwen3 model. hello.txt is usually written correctly on the first or second
-turn (check "content:" below) — but this 0.6B model is unreliable at then
-emitting a well-formed `finish` tool call, so the task can still end
+      SOUS_PROMPT_CACHE=0 uv run python scripts/e2e_smoke.py
+
+Downloads ~350 MB on first run. The task is deliberately multi-turn (read
+a file, then write one) so the prompt_cache block is non-trivial.
+SOUS_PROMPT_CACHE defaults to on here, deliberately overriding the shipped
+default (off, see SousConfig.prompt_cache) — this script exists to exercise
+the agent loop, and the cache path is worth exercising even though it
+currently falls back to a cold prefill every turn on the real daemon path.
+Run it twice and compare budget.seconds to see the before-and-after that
+issue #27 asks for. The 0.6B model is text-only and therefore fully
+trimmable, so it exercises the one-call trim path, not the snapshot path
+(you will see snapshot_bytes: 0, which is correct for text-only models).
+Exercises the real multi-turn agent loop (generate -> parse -> execute ->
+append) against the smallest available Qwen3 model. hello.txt must contain
+the last line of notes.md; correct content proves the read happened before
+the write (check "content:" below) — but this 0.6B model is unreliable at
+then emitting a well-formed `finish` tool call, so the task can still end
 `failed` (model-confused) or `done`/`budget-exhausted` even when the file
-is right. Judge success from the printed report and hello.txt content, not
-just the final state; the transcript_path in the report has full turn-by-
-turn detail if something looks wrong. Sous's default model
+is correct. Judge success from the printed report and hello.txt content,
+not just the final state; the transcript_path in the report has full
+turn-by-turn detail if something looks wrong. Sous's default model
 (mlx-community/Qwen3.8-27B-mxfp8) is far larger and far more reliable at
 closing out the loop than this tiny one.
 """
 
+import os
 import tempfile
 import threading
 import time
@@ -40,18 +53,21 @@ def main() -> None:
         base = Path(td)
         proj = base / "proj"
         proj.mkdir()
+        proj_file = proj / "notes.md"
+        proj_file.write_text("# Notes\n\nalpha\nbeta\ngamma\ndelta\nepsilon\nzeta\n")
         cfg = SousConfig(
             model_id=TINY,
             data_dir=base / "data",
             config_path=base / "config.toml",
             max_turns=8,
             max_minutes=5,
+            prompt_cache=os.environ.get("SOUS_PROMPT_CACHE", "1") != "0",
         )
         store = TaskStore(base / "tasks.db")
         task = store.enqueue(
             title="smoke",
             instructions=(
-                "Create a file named hello.txt containing exactly this one line: hello sous"
+                "Read notes.md, then create hello.txt containing exactly the last line of notes.md"
             ),
             project_root=str(proj),
             context_files=[],
@@ -70,6 +86,8 @@ def main() -> None:
         stop.set()
         print(f"\nstate={current.state} outcome={current.outcome}")
         print(f"report: {current.report}")
+        cache = (current.report or {}).get("prompt_cache")
+        print(f"prompt_cache={cfg.prompt_cache} stats: {cache}")
         hello = proj / "hello.txt"
         print(f"hello.txt exists: {hello.exists()}")
         if hello.exists():
