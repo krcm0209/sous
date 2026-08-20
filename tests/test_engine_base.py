@@ -1,8 +1,15 @@
 import threading
 import time
 
+import pytest
+
 from sous.config import SousConfig
-from sous.engine.base import EngineManager, ManagedEngine, select_backend
+from sous.engine.base import (
+    EngineManager,
+    GenerationStalled,
+    ManagedEngine,
+    select_backend,
+)
 from tests.fake_engine import FakeEngine
 
 
@@ -193,3 +200,138 @@ def test_reset_prompt_cache_does_not_wait_for_the_generation_lock():
     assert time.monotonic() - t0 < 1.0
     release.set()
     t.join(5)
+
+
+# ---- GenerationSession (issue #34) ----------------------------------------
+
+
+def _msgs() -> list[dict]:
+    return [{"role": "user", "content": "x"}]
+
+
+def test_session_runs_all_generations_on_one_fresh_thread():
+    inner = FakeEngine(["a", "b"])
+    session = ManagedEngine(inner).session()
+    assert session.generate(_msgs(), [], 8, timeout=5) == "a"
+    assert session.generate(_msgs(), [], 8, timeout=5) == "b"
+    session.close()
+    session._thread.join(5)
+    assert not session._thread.is_alive()
+    assert inner.generate_threads[0] is inner.generate_threads[1] is session._thread
+    assert session._thread is not threading.current_thread()
+
+
+def test_session_releases_mlx_state_once_on_its_own_thread(monkeypatch):
+    import sous.engine.base as base
+
+    released_in: list[int] = []
+    monkeypatch.setattr(
+        base, "release_mlx_thread_state", lambda: released_in.append(threading.get_ident())
+    )
+    inner = FakeEngine(["a"])
+    session = ManagedEngine(inner).session()
+    assert session.generate(_msgs(), [], 8, timeout=5) == "a"
+    session.close()
+    session._thread.join(5)
+    assert released_in == [session._thread.ident]
+
+
+def test_session_relays_exceptions_and_survives_them():
+    class Flaky(FakeEngine):
+        def generate(self, messages, tools, max_tokens):
+            out = super().generate(messages, tools, max_tokens)
+            if out == "boom":
+                raise ValueError("boom")
+            return out
+
+    inner = Flaky(["boom", "ok"])
+    session = ManagedEngine(inner).session()
+    with pytest.raises(ValueError, match="boom"):
+        session.generate(_msgs(), [], 8, timeout=5)
+    # The same session, the same thread: an engine error must not kill the loop.
+    assert session.generate(_msgs(), [], 8, timeout=5) == "ok"
+    session.close()
+    session._thread.join(5)
+    assert not session._thread.is_alive()
+
+
+def test_session_close_without_any_generation():
+    session = ManagedEngine(FakeEngine([])).session()
+    session.close()
+    session._thread.join(5)
+    assert not session._thread.is_alive()
+
+
+def test_stalled_generation_is_abandoned_and_its_late_result_dropped():
+    gate = threading.Event()
+
+    class Gated(FakeEngine):
+        def generate(self, messages, tools, max_tokens):
+            gate.wait(10)
+            return super().generate(messages, tools, max_tokens)
+
+    inner = Gated(["late"])
+    session = ManagedEngine(inner).session()
+    with pytest.raises(GenerationStalled):
+        session.generate(_msgs(), [], 8, timeout=0.05)
+    assert session._abandoned.is_set()
+    gate.set()  # ordering pin: the generation completes only after abandonment
+    session._thread.join(5)
+    assert not session._thread.is_alive()
+    assert session._replies.empty()  # the late result was dropped, not queued
+
+
+def test_abandoned_waiter_on_the_lock_never_generates():
+    """Issue #34, consideration 7: a generation abandoned while QUEUED on
+    _gen_lock must exit when the lock frees, never run under the next task's
+    identity. Fails if the session checks _abandoned before taking the lock
+    instead of after."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Wedged(FakeEngine):
+        def generate(self, messages, tools, max_tokens):
+            entered.set()
+            release.wait(10)
+            return super().generate(messages, tools, max_tokens)
+
+    inner = Wedged(["a"])
+    managed = ManagedEngine(inner)
+    session_a = managed.session()
+    session_b = managed.session()
+    a_result: list[str] = []
+    threading.Thread(
+        target=lambda: a_result.append(session_a.generate(_msgs(), [], 8, timeout=10)),
+        daemon=True,
+    ).start()
+    assert entered.wait(5)  # A is wedged inside generate, holding _gen_lock
+    with pytest.raises(GenerationStalled):
+        session_b.generate(_msgs(), [], 8, timeout=0.05)  # B abandoned on the lock
+    release.set()
+    session_b._thread.join(5)
+    assert not session_b._thread.is_alive()
+    session_a.close()
+    session_a._thread.join(5)
+    assert a_result == ["a"]
+    assert len(inner.calls) == 1  # B's request never reached the engine
+
+
+def test_close_unleaks_an_idle_thread_holding_an_unconsumed_reply():
+    """The reply-vs-timeout race can abandon a session whose thread already
+    queued its reply and parked. CLOSE must wake it so it exits and releases —
+    otherwise an ("err", e) reply would pin the KV cache through its traceback
+    for the daemon's lifetime."""
+    inner = FakeEngine(["a"])
+    session = ManagedEngine(inner).session()
+    # Drive the loop directly: a reply lands, but no caller consumes it.
+    session._requests.put_nowait((_msgs(), [], 8))
+    for _ in range(1000):
+        if not session._replies.empty():
+            break
+        time.sleep(0.005)
+    else:
+        pytest.fail("session thread never produced the reply")
+    session._abandoned.set()  # what generate() does when it times out
+    session.close()
+    session._thread.join(5)
+    assert not session._thread.is_alive()
