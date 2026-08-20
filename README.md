@@ -167,17 +167,18 @@ of using the fixed `[model].max_context_tokens`: when a task starts, sous
 measures the remaining memory headroom (the tighter of the Metal working-set
 ceiling and available system RAM), lets the KV cache have `fraction` of it,
 and clamps the result between `min_tokens` and the model's native maximum.
-The window is a cap, not a reservation. Since prompt-cache reuse, the KV
-cache lives for the whole task, so `[context] fraction` bounds sustained
-residency rather than a per-generation peak, and a `run_command` subprocess
-competes with a live cache that used to be freed between turns. Residency
-still tracks the tokens a task actually uses, not the window. Every task's
-report records the window it ran with and why (`budget.context_tokens` /
-`budget.context_reason`). The default model's hybrid attention makes context
-unusually cheap (only 16 of its 64 layers accumulate KV — about 64 KiB per
-token), so an otherwise-idle 64 GB machine gets the full native 262k window.
-If sizing fails for any reason, the task runs with the fixed
-`max_context_tokens` and a warning.
+The window is a cap, not a reservation. At the shipped default,
+`[model].prompt_cache = false`, `[context] fraction` bounds only a
+per-generation peak. With reuse on, the KV cache lives for the whole task
+instead, so `fraction` bounds sustained residency, and a `run_command`
+subprocess competes with a live cache that used to be freed between turns.
+Residency still tracks the tokens a task actually uses, not the window.
+Every task's report records the window it ran with and why
+(`budget.context_tokens` / `budget.context_reason`). The default model's
+hybrid attention makes context unusually cheap (only 16 of its 64 layers
+accumulate KV — about 64 KiB per token), so an otherwise-idle 64 GB machine
+gets the full native 262k window. If sizing fails for any reason, the task
+runs with the fixed `max_context_tokens` and a warning.
 Cache reuse pays most in `auto` mode: since elision is the only thing that
 discards the cache, and elision fires only when the prompt exceeds the window,
 a window the task never reaches means the cache survives the whole task. The
