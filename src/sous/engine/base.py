@@ -63,16 +63,32 @@ def fetch_model_config(model_id: str) -> dict:
 
 
 def _default_factory(
-    model_id: str, temperature: float = 0.7, top_p: float = 0.8, top_k: int = 20
+    model_id: str,
+    temperature: float = 0.7,
+    top_p: float = 0.8,
+    top_k: int = 20,
+    prompt_cache: bool = True,
 ) -> Engine:
     backend = select_backend(fetch_model_config(model_id))
     if backend == "vlm":
         from sous.engine.vlm import VLMEngine
 
-        return VLMEngine(model_id, temperature=temperature, top_p=top_p, top_k=top_k)
+        return VLMEngine(
+            model_id,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            prompt_cache=prompt_cache,
+        )
     from sous.engine.lm import LMEngine
 
-    return LMEngine(model_id, temperature=temperature, top_p=top_p, top_k=top_k)
+    return LMEngine(
+        model_id,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        prompt_cache=prompt_cache,
+    )
 
 
 class ManagedEngine:
@@ -126,6 +142,7 @@ class EngineManager:
                 config.temperature,
                 config.top_p,
                 config.top_k,
+                config.prompt_cache,
             )
         )
         self._lock = threading.Lock()

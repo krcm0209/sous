@@ -41,7 +41,15 @@ DEFAULT_ALLOWLIST: list[str] = [
 
 _KNOWN = {
     "server": {"port"},
-    "model": {"id", "idle_unload_minutes", "max_context_tokens", "temperature", "top_p", "top_k"},
+    "model": {
+        "id",
+        "idle_unload_minutes",
+        "max_context_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "prompt_cache",
+    },
     "budgets": {"max_turns", "max_minutes", "max_tokens_per_generation"},
     "commands": {"allowlist", "timeout_seconds", "approval_timeout_minutes"},
     "context": {"mode", "fraction", "min_tokens"},
@@ -62,6 +70,9 @@ class SousConfig:
     temperature: float = 0.7
     top_p: float = 0.8
     top_k: int = 20
+    # Reuse one KV cache across the turns of a task, prefilling only what the
+    # conversation gained. false restores per-turn prefill without a downgrade.
+    prompt_cache: bool = True
     max_turns: int = 40
     max_minutes: int = 15
     max_tokens_per_generation: int = 4096
@@ -168,6 +179,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         temperature=model.get("temperature", 0.7),
         top_p=model.get("top_p", 0.8),
         top_k=model.get("top_k", 20),
+        prompt_cache=model.get("prompt_cache", True),
         max_turns=budgets.get("max_turns", 40),
         max_minutes=budgets.get("max_minutes", 15),
         max_tokens_per_generation=budgets.get("max_tokens_per_generation", 4096),

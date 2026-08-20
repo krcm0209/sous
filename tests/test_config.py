@@ -3,6 +3,7 @@ from pathlib import Path
 
 from sous.config import (
     DEFAULT_ALLOWLIST,
+    SousConfig,
     current_allowlist,
     load_config,
     persist_allowlist_entry,
@@ -267,3 +268,22 @@ def test_context_fraction_boundaries(tmp_path: Path):
         cfg = load_config(p)
     assert cfg.context_fraction == 0.8  # zero would size every window to the floor
     assert caught
+
+
+def test_prompt_cache_defaults_to_true():
+    assert SousConfig().prompt_cache is True
+
+
+def test_prompt_cache_can_be_disabled(tmp_path: Path):
+    path = tmp_path / "config.toml"
+    path.write_text("[model]\nprompt_cache = false\n")
+    assert load_config(path).prompt_cache is False
+
+
+def test_prompt_cache_is_a_known_model_key(tmp_path: Path):
+    path = tmp_path / "config.toml"
+    path.write_text("[model]\nprompt_cache = true\n")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        load_config(path)
+    assert not [w for w in caught if "unknown" in str(w.message).lower()]
