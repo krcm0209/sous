@@ -720,7 +720,11 @@ def test_report_carries_the_prompt_cache_block(env):
         "cold_retries": 0,
     }
     run_task(task, store, engine, cfg)
-    block = store.get(task.id).report["prompt_cache"]
+    got = store.get(task.id)
+    # Pins that this exercises the success-report path, not _failure_extra —
+    # a different code path entirely that also assembles a prompt_cache block.
+    assert got.outcome == "completed"
+    block = got.report["prompt_cache"]
     assert block["hits"] == 4
     assert block["elisions"] == 0
 
@@ -769,5 +773,8 @@ def test_elide_if_needed_reports_how_many_messages_it_rewrote():
         {"role": "user", "content": "<tool_result>" + "y" * 400 + "</tool_result>"},
     ]
     count, elisions = _elide_if_needed(messages, engine, 40)
-    assert elisions >= 1
+    # Pins the exact count, not just "at least one": this is the only test
+    # exercising per-call accumulation across the loop's iterations, which is
+    # what the report's "why did reuse miss" answer rests on.
+    assert elisions == 2
     assert isinstance(count, int)
