@@ -14,10 +14,14 @@ MESSAGES = [{"role": "user", "content": "hi"}]
 
 
 def _unloaded_lm() -> LMEngine:
+    from sous.engine.promptcache import PrefixCache, PromptMemo
+
     engine = object.__new__(LMEngine)
     engine.model_id = "test/model"
     engine._model = None
     engine._tokenizer = None
+    engine._memo = PromptMemo()
+    engine._cache = PrefixCache(engine, enabled=True)
     return engine
 
 
@@ -54,3 +58,12 @@ def test_vlm_prompt_after_unload_raises_runtime_error():
 def test_unloaded_error_names_the_model():
     with pytest.raises(RuntimeError, match="test/model"):
         _unloaded_lm().count_tokens(MESSAGES, [])
+
+
+def test_lm_reset_prompt_cache_works_after_unload():
+    """run_task resets in a finally, which can land after an idle unload. The
+    helper leaves a live PrefixCache beside a dead model, which is exactly the
+    state unload() produces — reset must not reach for the model."""
+    engine = _unloaded_lm()
+    engine.reset_prompt_cache()  # must not raise
+    assert engine.prompt_cache_stats()["hits"] == 0
