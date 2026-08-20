@@ -3,6 +3,7 @@ import pytest
 pytestmark = pytest.mark.model
 
 TINY_VLM = "mlx-community/Qwen2-VL-2B-Instruct-4bit"  # ~1 GB, exercises vlm path
+HYBRID_VLM = "mlx-community/Qwen3.5-9B-MLX-4bit"  # ~5.6 GB, linear-attention hybrid
 
 
 def test_vlm_engine_text_only_generation():
@@ -17,20 +18,33 @@ def test_vlm_engine_text_only_generation():
     e.unload()
 
 
-def test_vlm_snapshot_restore_is_bit_exact():
-    """Same guarantee, driven through the VLM engine. TINY_VLM (Qwen2-VL-2B)
-    is pure attention, so this exercises the *trim* path through the VLM
-    engine, not the hybrid state-copy path — which is exactly the case that
-    proves the snapshot/trim split is architectural, not per-backend. The
-    state-copy path needs a linear-attention hybrid and is verified by hand
-    against mlx-community/Qwen3.5-9B-MLX-4bit before the PR, not here."""
+@pytest.mark.parametrize(
+    ("model_id", "is_hybrid"),
+    [
+        pytest.param(TINY_VLM, False, id="pure-attention"),
+        pytest.param(HYBRID_VLM, True, id="linear-attention-hybrid"),
+    ],
+)
+def test_vlm_snapshot_restore_is_bit_exact(model_id, is_hybrid):
+    """Restoring a contaminated cache must equal a cold prefill of the same
+    prefix, exactly — on both cache shapes the orchestrator can build.
+
+    TINY_VLM (Qwen2-VL-2B) is pure attention, so it takes the *trim* path —
+    the same one the LM engine's bit-exactness test takes — which is exactly
+    what proves the snapshot/trim-versus-state-copy split is architectural,
+    not per-backend. HYBRID_VLM (Qwen3.5-9B) is a linear-attention hybrid:
+    its make_cache() (mlx_vlm's qwen3_5 LanguageModel) pairs an ArraysCache
+    per linear-attention layer with a KVCache per full-attention layer, so it
+    takes the *state-copy* branch instead — the one every shipped user
+    actually hits on the default 27B model, and the only branch these two
+    bit-exactness tests previously left to manual verification."""
     import mlx.core as mx  # ty: ignore[unresolved-import]
     from mlx_vlm.models.cache import make_prompt_cache
 
     from sous.engine.promptcache import restore, snapshot
     from sous.engine.vlm import VLMEngine
 
-    e = VLMEngine(TINY_VLM)
+    e = VLMEngine(model_id)
     # _loaded() rather than e._model directly: it is annotated `-> tuple`, so
     # the unpacked local is untyped and needs no suppression for the None arm
     # that direct attribute access would otherwise hit.
@@ -43,7 +57,13 @@ def test_vlm_snapshot_restore_is_bit_exact():
     work = make_prompt_cache(model.language_model)
     e.prefill(work, prefix)
 
-    snap, _ = snapshot(work, e.copy_array)
+    snap, nbytes = snapshot(work, e.copy_array)
+    # The distinguishing property each model was chosen for: fail loudly if a
+    # model ever stops having the cache shape it was picked to exercise.
+    if is_hybrid:
+        assert nbytes > 0, "a hybrid cache's recurrent layers must be copied"
+    else:
+        assert nbytes == 0, "a pure-attention cache needs no state copy"
     e.prefill(work, suffix)
     restore(work, snap, e.copy_array)
 
@@ -53,9 +73,11 @@ def test_vlm_snapshot_restore_is_bit_exact():
         for xa, xb in zip(sa, sb, strict=True):
             if xa is None or xb is None:
                 continue
-            # Redundant on this model: KVCache.state already returns only the
-            # live region, so the slice below never trims anything further.
-            # Kept because a hybrid cache's state can differ; harmless here.
+            # Redundant on the pure-attention model: KVCache.state already
+            # returns only the live region, so the slice below never trims
+            # anything further there. Load-bearing on the hybrid model's own
+            # KVCache layers for the same reason; its ArraysCache layers have
+            # no offset/trim at all, so hasattr(a, "trim") skips them here.
             if hasattr(a, "trim") and xa.ndim >= 3 and off:
                 xa, xb = xa[..., :off, :], xb[..., :off, :]
             d = mx.max(mx.abs(xa.astype(mx.float32) - xb.astype(mx.float32)))
