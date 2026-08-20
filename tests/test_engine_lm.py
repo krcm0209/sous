@@ -27,12 +27,16 @@ def test_lm_snapshot_restore_is_bit_exact():
     from sous.engine.promptcache import restore, snapshot
 
     e = LMEngine(TINY)
-    ids = list(e._tokenizer.encode("def f(x):\n    return x + 1\n" * 40))  # ty: ignore[unresolved-attribute]
+    # _loaded() rather than e._model / e._tokenizer directly: it is annotated
+    # `-> tuple`, so the unpacked locals are untyped and need no suppression
+    # for the None arm that direct attribute access would otherwise hit.
+    model, tokenizer = e._loaded()
+    ids = list(tokenizer.encode("def f(x):\n    return x + 1\n" * 40))
     prefix, suffix = ids[: len(ids) // 2], ids[len(ids) // 2 :]
 
-    ref = make_prompt_cache(e._model)  # ty: ignore[invalid-argument-type]
+    ref = make_prompt_cache(model)
     e.prefill(ref, prefix)
-    work = make_prompt_cache(e._model)  # ty: ignore[invalid-argument-type]
+    work = make_prompt_cache(model)
     e.prefill(work, prefix)
 
     snap, nbytes = snapshot(work, e.copy_array)
