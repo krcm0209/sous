@@ -351,6 +351,32 @@ def test_disabled_never_reuses_and_never_counts():
     assert pc.stats() == PromptCacheStats().as_dict()
 
 
+def test_disabled_never_reads_stable_ids():
+    """LMEngine/VLMEngine.generate skip computing the stable render whenever
+    the cache is disabled, and pass `[]` in its place — safe only because the
+    disabled branch here, `hooks.decode(hooks.new_cache(), list(full_ids), ...)`,
+    never looks at `stable_ids` at all. Prove that directly rather than assuming
+    it: plant a stale cache plus a `_held` prefix that `stable_ids` genuinely
+    extends, so a real engine's `[]` would look nothing like it, and if the
+    disabled branch ever started consulting `stable_ids` (or `self._cache` /
+    `self._held`) for a reuse decision, this plant would register as a bona
+    fide hit — reusing the planted cache and decoding only the unreused suffix
+    of full_ids. It must instead build a brand new cache and decode the whole
+    prompt, exactly as if `stable_ids` had never been passed.
+    """
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, enabled=False)
+    # STABLE_1 is a genuine strict prefix of STABLE_2 (see reuse_length), so if
+    # consulted this is indistinguishable from a legitimate warm cache left by
+    # an earlier, enabled turn.
+    planted_cache = h.new_cache()
+    pc._cache, pc._held = planted_cache, STABLE_1
+    pc.generate(STABLE_2, FULL_2, 16)
+    assert h.decoded == [FULL_2]  # the whole prompt, not a reuse-sliced suffix
+    assert len(h.caches) == 2  # a fresh cache was built; the planted one was ignored
+    assert pc.stats() == PromptCacheStats().as_dict()  # no hit/miss ever recorded
+
+
 def test_reset_drops_the_cache_so_the_next_turn_is_cold():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h)

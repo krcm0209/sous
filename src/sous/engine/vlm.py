@@ -130,8 +130,12 @@ class VLMEngine:
     # ---- Engine ----------------------------------------------------------
 
     def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:
-        stable_ids = self._ids("stable", messages, tools)
         full_ids = self._ids("full", messages, tools)
+        # The stable render is only an anchor for reuse, and PrefixCache discards
+        # it when disabled — so computing it would cost a whole extra tokenization
+        # per turn for nothing. Off is the shipped default, so this is the common
+        # path.
+        stable_ids = self._ids("stable", messages, tools) if self._cache.enabled else []
         return self._cache.generate(stable_ids, full_ids, max_tokens)
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
