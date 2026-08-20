@@ -20,6 +20,8 @@ class Engine(Protocol):
 
     def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str: ...
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int: ...
+    def reset_prompt_cache(self) -> None: ...
+    def prompt_cache_stats(self) -> dict: ...
     def unload(self) -> None: ...
 
 
@@ -97,6 +99,16 @@ class ManagedEngine:
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
         return self._inner.count_tokens(messages, tools)
+
+    def reset_prompt_cache(self) -> None:
+        # No _gen_lock, on purpose. An abandoned stalled generation still holds
+        # it, and run_task calls this in a finally — waiting there would wedge
+        # the next task. PrefixCache's epoch guard is what makes a lock-free
+        # reset safe against that thread's late write-back.
+        self._inner.reset_prompt_cache()
+
+    def prompt_cache_stats(self) -> dict:
+        return self._inner.prompt_cache_stats()
 
     def generation_in_flight(self) -> bool:
         return self._gen_lock.locked()
