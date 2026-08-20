@@ -77,7 +77,7 @@ class SousConfig:
     # streams the cache arrays live on, so turn N+1 (a new thread) can't
     # touch them and falls back to a cold retry. Today, turning this on
     # costs one wasted warm attempt per turn instead of saving anything.
-    prompt_cache: bool = False
+    prompt_cache: bool = True
     max_turns: int = 40
     max_minutes: int = 15
     max_tokens_per_generation: int = 4096
@@ -184,7 +184,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         temperature=model.get("temperature", 0.7),
         top_p=model.get("top_p", 0.8),
         top_k=model.get("top_k", 20),
-        prompt_cache=model.get("prompt_cache", False),
+        prompt_cache=model.get("prompt_cache", True),
         max_turns=budgets.get("max_turns", 40),
         max_minutes=budgets.get("max_minutes", 15),
         max_tokens_per_generation=budgets.get("max_tokens_per_generation", 4096),
