@@ -26,10 +26,14 @@ def _unloaded_lm() -> LMEngine:
 
 
 def _unloaded_vlm() -> VLMEngine:
+    from sous.engine.promptcache import PrefixCache, PromptMemo
+
     engine = object.__new__(VLMEngine)
     engine.model_id = "test/model"
     engine._model = None
     engine._processor = None
+    engine._memo = PromptMemo()
+    engine._cache = PrefixCache(engine, enabled=True)
     return engine
 
 
@@ -65,5 +69,11 @@ def test_lm_reset_prompt_cache_works_after_unload():
     helper leaves a live PrefixCache beside a dead model, which is exactly the
     state unload() produces — reset must not reach for the model."""
     engine = _unloaded_lm()
+    engine.reset_prompt_cache()  # must not raise
+    assert engine.prompt_cache_stats()["hits"] == 0
+
+
+def test_vlm_reset_prompt_cache_works_after_unload():
+    engine = _unloaded_vlm()
     engine.reset_prompt_cache()  # must not raise
     assert engine.prompt_cache_stats()["hits"] == 0
