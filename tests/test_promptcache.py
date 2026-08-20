@@ -6,6 +6,7 @@ affects correctness is made here, against fakes.
 
 from __future__ import annotations
 
+import weakref
 from typing import cast
 
 import pytest
@@ -434,3 +435,69 @@ def test_a_late_write_back_from_an_abandoned_generation_is_dropped():
     assert seen["reset"]
     pc.generate(STABLE_2, FULL_2, 16)
     assert len(h.caches) == 2  # nothing was carried across the reset
+
+
+def test_a_miss_releases_the_previous_cache_before_the_replacement_is_prefilled():
+    """A miss can only happen mid-task once elision has already fired, which
+    means the prompt has already exceeded the window — so the previous cache
+    is at its largest exactly when this happens (finding 1). If PrefixCache
+    kept it referenced while the replacement is prefilled to full size, both
+    would be pinned in memory at once, which is exactly the doubling the spec
+    promises never happens.
+
+    Proven with a weakref, not gc internals: these fakes have no reference
+    cycle, so CPython's refcounting collects an object the instant its last
+    reference is dropped — `weak() is None` is a direct, deterministic read
+    of "PrefixCache itself holds nothing more", not a hint that needs
+    `gc.collect()` to come true.
+    """
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+
+    # Every other test wants h.caches to keep a full history; this one must
+    # not, or that history alone would keep the old cache reachable forever
+    # and the weakref would never go dead regardless of the fix under test.
+    old_cache = h.caches.pop(0)
+    weak = weakref.ref(old_cache[0])
+    del old_cache
+
+    seen: dict[str, bool] = {}
+
+    def checks_the_old_cache_is_already_gone(hooks, cache, token_ids, max_tokens):
+        seen["released"] = weak() is None
+        return "text"
+
+    h.decode_impl = checks_the_old_cache_is_already_gone
+    pc.generate(DIVERGED, DIVERGED_FULL, 16)  # no shared prefix with held: a miss
+    assert seen["released"] is True
+
+
+def test_a_late_cold_retry_write_after_reset_does_not_land_on_fresh_counters():
+    """The same trick as the cache case above, but for stats (finding 4): a
+    stalled "thread" that resets mid-decode and only afterwards raises still
+    gets its retry counted somewhere — but `generate` binds `stats =
+    self._stats` once at the top and writes through that local for the rest
+    of the call, so the write lands on the object this call started with.
+    reset()'s fresh replacement, the one the next task's counters actually
+    read via pc.stats(), is left untouched."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)  # an ordinary warm-up turn first
+
+    calls = {"n": 0}
+
+    def resets_then_fails_once(hooks, cache, token_ids, max_tokens):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            pc.reset()  # the task ends while this "thread" is still decoding
+            raise RuntimeError("stalled")
+        hooks.decoded.append(list(token_ids))
+        return "text"
+
+    h.decode_impl = resets_then_fails_once
+    with pytest.warns(UserWarning, match="prompt cache"):
+        pc.generate(STABLE_2, FULL_2, 16)
+
+    assert calls["n"] == 2  # the failure and its retry both really ran
+    assert pc.stats() == PromptCacheStats().as_dict()  # fresh counters, untouched

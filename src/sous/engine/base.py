@@ -119,8 +119,13 @@ class ManagedEngine:
     def reset_prompt_cache(self) -> None:
         # No _gen_lock, on purpose. An abandoned stalled generation still holds
         # it, and run_task calls this in a finally — waiting there would wedge
-        # the next task. PrefixCache's epoch guard is what makes a lock-free
-        # reset safe against that thread's late write-back.
+        # the next task. What actually makes a lock-free reset safe against
+        # that thread's late write-back is not the epoch guard by itself: the
+        # cache is always published together with the exact token ids it
+        # contains, and reuse_length demands a full strict-prefix match, so a
+        # stale cache adopted by a later task is either rejected outright or
+        # genuinely correct for it. The epoch is only a cheap early-out on
+        # top of that — it skips the adoption, it doesn't guarantee it.
         self._inner.reset_prompt_cache()
 
     def prompt_cache_stats(self) -> dict:

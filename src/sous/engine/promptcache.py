@@ -66,6 +66,18 @@ def snapshot(cache: Sequence[Any], copy_array: Callable) -> tuple[list, int]:
         if getattr(c, "is_trimmable", lambda: False)():
             out.append(("trim", int(getattr(c, "offset", 0) or 0)))
             continue
+        # mlx cache classes carry bookkeeping in meta_state as well as state.
+        # ArraysCache — today's only non-trimmable class — inherits "" from
+        # _BaseCache, so copying state alone is a complete snapshot. Assert
+        # that stays true: a future non-trimmable cache with real meta_state
+        # would otherwise restore wrongly and silently, and the warm-retry
+        # path even absorbs this raise into a cold run rather than failing
+        # the task, so this check is cheap insurance, not a new failure mode.
+        meta_state = getattr(c, "meta_state", "")
+        assert not meta_state, (
+            f"{type(c).__name__}.meta_state is non-empty; snapshot()/restore() "
+            "must be extended to copy it, not just state"
+        )
         copies = [None if a is None else copy_array(a) for a in c.state]
         nbytes += sum(getattr(a, "nbytes", 0) for a in copies if a is not None)
         out.append(("state", copies))
@@ -189,6 +201,13 @@ class PrefixCache:
             return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens)
 
         epoch = self._epoch
+        # Bind the stats object itself, not self._stats, and write through
+        # this local for the whole call (passed into _run too). reset() swaps
+        # in a fresh PromptCacheStats; if an abandoned generation thread
+        # reaches a late write (snapshot_bytes after prefill, cold_retries in
+        # the retry path) after that swap, it lands on this orphaned object
+        # instead of the next task's counters.
+        stats = self._stats
         cache, held = self._cache, self._held
         # Invalid until a generation completes. The cache is mutated in place,
         # so a raise mid-stream leaves it holding tokens `held` does not
@@ -200,29 +219,52 @@ class PrefixCache:
         # lets the type checker see `warm` as a plain list in both branches, with
         # no assert and no ignore pragma.
         if cache is not None and reuse:
-            self._stats.hits += 1
-            self._stats.reused_tokens += reuse
+            stats.hits += 1
+            stats.reused_tokens += reuse
             warm: list = cache
         else:
             reuse = 0
-            self._stats.misses += 1
+            stats.misses += 1
             warm = hooks.new_cache()
+        # Drop the only remaining reference to the previous turn's cache
+        # before a full-size replacement is prefilled below. On a miss,
+        # `cache` above still points at the prior turn's cache, and a miss
+        # only ever happens mid-task after elision — i.e. precisely when that
+        # cache is at its largest. Without this line both caches are pinned
+        # in memory at once while the new one is prefilled to full size,
+        # which is exactly the doubling the spec promises never happens.
+        cache = None
 
+        # `text` gets a real value on every reachable path below, but not one
+        # a flow analysis can prove without correlating `retry_reason` back to
+        # which branch of the try/except ran — so it starts bound here rather
+        # than relying on that proof.
+        text = ""
+        retry_reason: str | None = None
         try:
-            text = self._run(warm, stable_ids, full_ids, reuse, max_tokens)
+            text = self._run(stats, warm, stable_ids, full_ids, reuse, max_tokens)
         except Exception as e:
             if reuse == 0:
                 raise
+            # Capture only the message here; the retry itself runs after this
+            # suite exits. Python clears the `as e` binding and its traceback
+            # at the end of the except clause (PEP 3110) — retrying inside it
+            # would keep the failed full-size cache pinned by that traceback
+            # for the whole retry, on top of the cold replacement being
+            # prefilled, which is the same doubling as the miss path above.
+            retry_reason = str(e)
+
+        if retry_reason is not None:
             # An optimization bug must never fail a task; decide_context sets
             # the same rule for auto sizing. Only a warm attempt is retried, so
             # a genuine engine error still surfaces at once.
-            self._stats.cold_retries += 1
+            stats.cold_retries += 1
             warnings.warn(
-                f"sous prompt cache: warm generation failed ({e}); retrying cold",
+                f"sous prompt cache: warm generation failed ({retry_reason}); retrying cold",
                 stacklevel=2,
             )
             warm = hooks.new_cache()
-            text = self._run(warm, stable_ids, full_ids, 0, max_tokens)
+            text = self._run(stats, warm, stable_ids, full_ids, 0, max_tokens)
 
         if epoch == self._epoch:
             self._cache, self._held = warm, list(stable_ids)
@@ -230,6 +272,7 @@ class PrefixCache:
 
     def _run(
         self,
+        stats: PromptCacheStats,
         cache: list,
         stable_ids: list[int],
         full_ids: list[int],
@@ -249,7 +292,7 @@ class PrefixCache:
         # and put the cache back there once the generation is done.
         hooks.prefill(cache, list(stable_ids[reuse:]))
         snap, nbytes = snapshot(cache, hooks.copy_array)
-        self._stats.snapshot_bytes = nbytes
+        stats.snapshot_bytes = nbytes
         text = hooks.decode(cache, list(full_ids[anchor:]), max_tokens)
         restore(cache, snap, hooks.copy_array)
         return text
