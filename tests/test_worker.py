@@ -689,3 +689,85 @@ def test_worker_loop_releases_mlx_state_on_exit(env, monkeypatch):
     stop.set()  # loop exits immediately; the release must still happen
     run_worker_loop(store, engines, cfg, stop)
     assert released == [True]
+
+
+def test_run_task_resets_the_prompt_cache_at_start_and_end(env):
+    root, cfg, store = env
+    task = _start(store, root)
+    engine = FakeEngine([FINISH])
+    run_task(task, store, engine, cfg)
+    assert engine.resets == 2  # once at entry, once in the finally
+
+
+def test_run_task_resets_even_when_the_task_fails(env):
+    root, cfg, store = env
+    task = _start(store, root)
+    engine = FakeEngine(["<tool_call>{bad json}</tool_call>"] * 3)
+    run_task(task, store, engine, cfg)
+    assert store.get(task.id).state == TaskState.FAILED
+    assert engine.resets == 2
+
+
+def test_report_carries_the_prompt_cache_block(env):
+    root, cfg, store = env
+    task = _start(store, root)
+    engine = FakeEngine([FINISH])
+    engine.stats = {
+        "hits": 4,
+        "misses": 1,
+        "reused_tokens": 900,
+        "snapshot_bytes": 0,
+        "cold_retries": 0,
+    }
+    run_task(task, store, engine, cfg)
+    block = store.get(task.id).report["prompt_cache"]
+    assert block["hits"] == 4
+    assert block["elisions"] == 0
+
+
+def test_failure_extra_carries_the_prompt_cache_block(env):
+    root, cfg, store = env
+    task = _start(store, root)
+    engine = FakeEngine(["<tool_call>{bad json}</tool_call>"] * 3)
+    engine.stats = {
+        "hits": 1,
+        "misses": 1,
+        "reused_tokens": 10,
+        "snapshot_bytes": 0,
+        "cold_retries": 0,
+    }
+    run_task(task, store, engine, cfg)
+    assert store.get(task.id).report["prompt_cache"]["hits"] == 1
+
+
+def test_elisions_are_counted_in_the_report(env):
+    """A small window forces _elide_if_needed to rewrite old tool results,
+    which is the only thing that can break the prefix the cache is anchored to.
+    The count is the report's answer to why reuse missed."""
+    root, cfg, store = env
+    (root / "big.txt").write_text("word " * 4000)
+    cfg = dataclasses.replace(cfg, max_context_tokens=1500)
+    task = _start(store, root)
+    engine = FakeEngine(
+        [
+            CALL.format(name="read_file", args='{"path": "big.txt"}'),
+            CALL.format(name="read_file", args='{"path": "hello.py"}'),
+            FINISH,
+        ]
+    )
+    run_task(task, store, engine, cfg)
+    assert store.get(task.id).report["prompt_cache"]["elisions"] >= 1
+
+
+def test_elide_if_needed_reports_how_many_messages_it_rewrote():
+    from sous.worker import _elide_if_needed
+
+    engine = FakeEngine([])
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "<tool_result>" + "x" * 400 + "</tool_result>"},
+        {"role": "user", "content": "<tool_result>" + "y" * 400 + "</tool_result>"},
+    ]
+    count, elisions = _elide_if_needed(messages, engine, 40)
+    assert elisions >= 1
+    assert isinstance(count, int)
