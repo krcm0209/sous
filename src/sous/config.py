@@ -72,11 +72,9 @@ class SousConfig:
     top_k: int = 20
     # Reuse one KV cache across the turns of a task, prefilling only what the
     # conversation gained, instead of re-prefilling from scratch every turn.
-    # Off by default: worker.py's _generate_with_timeout runs each generation
-    # on a fresh daemon thread, and that thread's exit releases the mlx
-    # streams the cache arrays live on, so turn N+1 (a new thread) can't
-    # touch them and falls back to a cold retry. Today, turning this on
-    # costs one wasted warm attempt per turn instead of saving anything.
+    # Works because all of a task's generations share one GenerationSession
+    # thread (#34) — mlx streams are thread-scoped, so the cache only
+    # survives between turns that run on the thread that built it.
     prompt_cache: bool = True
     max_turns: int = 40
     max_minutes: int = 15

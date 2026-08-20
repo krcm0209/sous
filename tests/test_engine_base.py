@@ -316,6 +316,38 @@ def test_abandoned_waiter_on_the_lock_never_generates():
     assert len(inner.calls) == 1  # B's request never reached the engine
 
 
+def test_close_tolerates_an_undequeued_stalled_request():
+    """A starved session thread may never dequeue a timed-out request, so the
+    request still fills the maxsize-1 queue when run_task's finally calls
+    close(). close() must not raise queue.Full there — the thread dequeues
+    that request eventually, sees _abandoned under the lock, and exits."""
+    gate = threading.Event()
+
+    class Gated(FakeEngine):
+        def generate(self, messages, tools, max_tokens):
+            gate.wait(10)
+            return super().generate(messages, tools, max_tokens)
+
+    inner = Gated(["a"])
+    session = ManagedEngine(inner).session()
+    # Occupy the thread inside generate, then fill the queue behind its back —
+    # the exact state a stalled, never-dequeued request leaves behind.
+    session._requests.put_nowait((_msgs(), [], 8))
+    for _ in range(1000):
+        if session._requests.empty():
+            break
+        time.sleep(0.005)
+    else:
+        pytest.fail("session thread never dequeued the first request")
+    session._requests.put_nowait((_msgs(), [], 8))  # the undequeued stalled request
+    session._abandoned.set()  # what generate() does when it times out
+    session.close()  # must not raise queue.Full
+    gate.set()
+    session._thread.join(5)
+    assert not session._thread.is_alive()
+    assert len(inner.calls) == 1  # the undequeued request never generated
+
+
 def test_close_unleaks_an_idle_thread_holding_an_unconsumed_reply():
     """The reply-vs-timeout race can abandon a session whose thread already
     queued its reply and parked. CLOSE must wake it so it exits and releases —

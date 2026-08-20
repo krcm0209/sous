@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import queue
 import threading
@@ -75,7 +76,7 @@ def _default_factory(
     temperature: float = 0.7,
     top_p: float = 0.8,
     top_k: int = 20,
-    prompt_cache: bool = False,
+    prompt_cache: bool = True,
 ) -> Engine:
     backend = select_backend(fetch_model_config(model_id))
     if backend == "vlm":
@@ -179,10 +180,11 @@ class GenerationSession:
 
     def __init__(self, managed: ManagedEngine):
         self._managed = managed
-        # maxsize=1 plus put_nowait everywhere: the loop always dequeues a
-        # request before parking again, so Full is unreachable — and if a
-        # future edit breaks that, failing loudly beats deadlocking the
-        # worker inside run_task's finally.
+        # maxsize=1 plus put_nowait everywhere: at most one request is ever
+        # outstanding, so Full in generate() means a protocol bug — failing
+        # loudly beats deadlocking the worker inside run_task's finally.
+        # close() alone tolerates Full: a stalled request the starved thread
+        # never dequeued may still occupy the queue.
         self._requests: queue.Queue = queue.Queue(maxsize=1)
         self._replies: queue.Queue = queue.Queue(maxsize=1)
         self._abandoned = threading.Event()
@@ -236,7 +238,12 @@ class GenerationSession:
         if self._closed:
             return
         self._closed = True
-        self._requests.put_nowait(_CLOSE)
+        # Full means a timed-out request is still queued: the session thread
+        # lost the scheduler race that stalled it and never dequeued it.
+        # _CLOSE is unnecessary then — the thread will dequeue that request,
+        # see _abandoned under the lock, and exit.
+        with contextlib.suppress(queue.Full):
+            self._requests.put_nowait(_CLOSE)
 
 
 class EngineManager:

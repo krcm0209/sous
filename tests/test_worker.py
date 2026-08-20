@@ -60,6 +60,10 @@ class SessionCapturingEngine(ManagedEngine):
 
 
 def _join_sessions(engine: SessionCapturingEngine, timeout: float = 5.0) -> None:
+    # Guards its own usefulness: a run_task call that bypassed the capturing
+    # engine (e.g. re-wrapped it in a plain ManagedEngine) would make every
+    # join silently vacuous.
+    assert engine.sessions, "no sessions captured — was the engine re-wrapped?"
     for s in engine.sessions:
         s._thread.join(timeout)
         assert not s._thread.is_alive()
@@ -263,7 +267,7 @@ def test_restart_recovery_reports_files_changed_and_transcript(env):
     )
     engine = SessionCapturingEngine(inner)
     with pytest.raises(KeyboardInterrupt):
-        run_task(task, store, ManagedEngine(engine), cfg)
+        run_task(task, store, engine, cfg)
     _join_sessions(engine)  # the finally closed the session before the raise
     assert store.get(task.id).state == TaskState.RUNNING  # left mid-flight
     assert store.recover_interrupted(cfg.data_dir) == 1
@@ -400,7 +404,7 @@ def test_generation_timeout_at_wall_budget_is_budget_exhausted(env):
     inner = StallingEngine([FINISH])
     engine = SessionCapturingEngine(inner)
     task = _start(store, root)
-    run_task(task, store, ManagedEngine(engine), cfg)
+    run_task(task, store, engine, cfg)
     got = store.get(task.id)
     assert got.state == TaskState.DONE
     assert got.outcome == "budget-exhausted"
@@ -447,7 +451,7 @@ def test_context_over_cap_with_nothing_to_elide_fails_cleanly(env):
     inner = FakeEngine([FINISH])
     engine = SessionCapturingEngine(inner)
     t0 = time.monotonic()
-    run_task(task, store, ManagedEngine(engine), cfg)
+    run_task(task, store, engine, cfg)
     elapsed = time.monotonic() - t0
     got = store.get(task.id)
     assert got.state == TaskState.FAILED
@@ -613,7 +617,7 @@ def test_engine_exception_fails_task_cleanly(env):
 
     inner = ExplodingEngine([FINISH])
     engine = SessionCapturingEngine(inner)
-    run_task(task, store, ManagedEngine(engine), cfg)
+    run_task(task, store, engine, cfg)
     got = store.get(task.id)
     assert got.state == TaskState.FAILED
     assert "engine error" in got.report["error"]
@@ -721,7 +725,7 @@ def test_session_thread_releases_mlx_state_once_per_task(env, monkeypatch):
         ]
     )
     engine = SessionCapturingEngine(inner)
-    run_task(task, store, ManagedEngine(engine), cfg)
+    run_task(task, store, engine, cfg)
     assert store.get(task.id).state == TaskState.DONE
     _join_sessions(engine)
     gen_idents = {t.ident for t in inner.generate_threads}
@@ -742,7 +746,7 @@ def test_consecutive_tasks_get_fresh_session_threads(env, monkeypatch):
     engine = SessionCapturingEngine(inner)
     for _ in range(2):
         task = _start(store, root)
-        run_task(task, store, ManagedEngine(engine), cfg)
+        run_task(task, store, engine, cfg)
         assert store.get(task.id).state == TaskState.DONE
     _join_sessions(engine)
     assert len(inner.generate_threads) == 2
@@ -773,7 +777,7 @@ def test_run_task_resets_the_prompt_cache_at_start_and_end(env):
     task = _start(store, root)
     inner = FakeEngine([FINISH])
     engine = SessionCapturingEngine(inner)
-    run_task(task, store, ManagedEngine(engine), cfg)
+    run_task(task, store, engine, cfg)
     assert inner.resets == 2  # once at entry, once in the finally
     _join_sessions(engine)
     here = threading.get_ident()
