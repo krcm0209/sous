@@ -9,7 +9,7 @@ from typing import cast
 import pytest
 
 from sous.config import SousConfig
-from sous.engine.base import EngineManager
+from sous.engine.base import EngineManager, GenerationStalled, ManagedEngine
 from sous.tasks import TaskState, TaskStore
 from sous.worker import run_task, run_worker_loop
 from tests.fake_engine import FakeEngine
@@ -46,6 +46,25 @@ CALL = '<tool_call>{{"name": "{name}", "arguments": {args}}}</tool_call>'
 FINISH = CALL.format(name="finish", args='{"summary": "did it", "concerns": ""}')
 
 
+class SessionCapturingEngine(ManagedEngine):
+    """Keeps every session it hands out so tests can join session threads."""
+
+    def __init__(self, inner):
+        super().__init__(inner)
+        self.sessions: list = []
+
+    def session(self):
+        s = super().session()
+        self.sessions.append(s)
+        return s
+
+
+def _join_sessions(engine: SessionCapturingEngine, timeout: float = 5.0) -> None:
+    for s in engine.sessions:
+        s._thread.join(timeout)
+        assert not s._thread.is_alive()
+
+
 def test_happy_path_write_then_finish(env):
     root, cfg, store = env
     task = _start(store, root)
@@ -55,7 +74,7 @@ def test_happy_path_write_then_finish(env):
             FINISH,
         ]
     )
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     got = store.get(task.id)
     assert got.state == TaskState.DONE and got.outcome == "completed"
     assert (root / "out.txt").read_text() == "hello"
@@ -67,7 +86,7 @@ def test_happy_path_write_then_finish(env):
 def test_transcript_is_jsonl(env):
     root, cfg, store = env
     task = _start(store, root)
-    run_task(task, store, FakeEngine([FINISH]), cfg)
+    run_task(task, store, ManagedEngine(FakeEngine([FINISH])), cfg)
     lines = Path(store.get(task.id).report["transcript_path"]).read_text().splitlines()
     assert all(json.loads(line) for line in lines)
     assert len(lines) >= 2  # at least one generation + terminal event
@@ -77,7 +96,7 @@ def test_context_files_preloaded(env):
     root, cfg, store = env
     task = _start(store, root, context=["hello.py"])
     engine = FakeEngine([FINISH])
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     first_messages = engine.calls[0]
     assert any("print('hi')" in str(m.get("content", "")) for m in first_messages)
 
@@ -87,7 +106,7 @@ def test_budget_exhaustion_by_turns(env):
     cfg = dataclasses.replace(cfg, max_turns=2)
     task = _start(store, root)
     engine = FakeEngine([CALL.format(name="list_dir", args="{}")] * 2)
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     got = store.get(task.id)
     assert got.state == TaskState.DONE and got.outcome == "budget-exhausted"
 
@@ -96,7 +115,7 @@ def test_three_consecutive_malformed_fails(env):
     root, cfg, store = env
     task = _start(store, root)
     engine = FakeEngine(["<tool_call>{bad json}</tool_call>"] * 3)
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     got = store.get(task.id)
     assert got.state == TaskState.FAILED
     assert "model-confused" in got.report["error"]
@@ -116,7 +135,7 @@ def test_file_written_then_model_confused_still_reports_files_changed(env):
             "and a third turn with no tool call at all",
         ]
     )
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     got = store.get(task.id)
     assert got.state == TaskState.FAILED
     assert "model-confused" in got.report["error"]
@@ -137,7 +156,7 @@ def test_malformed_then_recovery_resets_counter(env):
             FINISH,
         ]
     )
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     assert store.get(task.id).state == TaskState.DONE  # never hit 3 in a row
 
 
@@ -145,7 +164,7 @@ def test_prose_only_gets_nudge(env):
     root, cfg, store = env
     task = _start(store, root)
     engine = FakeEngine(["let me think about this...", FINISH])
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     assert store.get(task.id).state == TaskState.DONE
     nudge_turn = engine.calls[1]
     assert any("must call a tool" in str(m.get("content", "")) for m in nudge_turn)
@@ -155,7 +174,7 @@ def test_cancel_mid_loop(env):
     root, cfg, store = env
     task = _start(store, root)
     store.cancel(task.id)  # flag set while "running"
-    run_task(task, store, FakeEngine([FINISH]), cfg)
+    run_task(task, store, ManagedEngine(FakeEngine([FINISH])), cfg)
     assert store.get(task.id).state == TaskState.CANCELLED
 
 
@@ -183,7 +202,7 @@ def test_cancel_after_write_still_reports_files_changed(env):
             FINISH,
         ]
     )
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     got = store.get(task.id)
     assert got.state == TaskState.CANCELLED
     assert (root / "hello.txt").read_text() == "hello sous"
@@ -214,7 +233,7 @@ def test_cancel_between_calls_in_same_turn_stops_before_finish(env):
             + FINISH,  # both calls in ONE response
         ]
     )
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     got = store.get(task.id)
     assert got.state == TaskState.CANCELLED
     assert got.outcome != "completed"
@@ -237,13 +256,15 @@ def test_restart_recovery_reports_files_changed_and_transcript(env):
                 raise KeyboardInterrupt  # simulates the daemon dying mid-task
             return super().generate(messages, tools, max_tokens)
 
-    engine = DyingEngine(
+    inner = DyingEngine(
         [
             CALL.format(name="write_file", args='{"path": "hello.txt", "content": "hello sous"}'),
         ]
     )
+    engine = SessionCapturingEngine(inner)
     with pytest.raises(KeyboardInterrupt):
-        run_task(task, store, engine, cfg)
+        run_task(task, store, ManagedEngine(engine), cfg)
+    _join_sessions(engine)  # the finally closed the session before the raise
     assert store.get(task.id).state == TaskState.RUNNING  # left mid-flight
     assert store.recover_interrupted(cfg.data_dir) == 1
     got = store.get(task.id)
@@ -268,7 +289,7 @@ def test_finish_without_summary_is_retriable_not_completion(env):
             FINISH,  # proper retry
         ]
     )
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     got = store.get(task.id)
     assert got.state == TaskState.DONE and got.outcome == "completed"
     assert got.report["summary"] == "did it"  # from the proper finish only
@@ -284,7 +305,7 @@ def test_verify_commands_run_and_reported(env):
     root, cfg, store = env
     cfg.config_path.write_text('[commands]\nallowlist = ["/bin/echo"]\n')
     task = _start(store, root, verify=["/bin/echo verified-ok"])
-    run_task(task, store, FakeEngine([FINISH]), cfg)
+    run_task(task, store, ManagedEngine(FakeEngine([FINISH])), cfg)
     [v] = store.get(task.id).report["verify"]
     assert v["command"] == "/bin/echo verified-ok"
     assert "verified-ok" in v["output"]
@@ -299,7 +320,7 @@ def test_path_violation_reported_not_fatal(env):
             FINISH,
         ]
     )
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     assert store.get(task.id).state == TaskState.DONE
     result_turn = engine.calls[1]
     assert any("escapes project root" in str(m.get("content", "")) for m in result_turn)
@@ -327,7 +348,7 @@ def test_approval_flow_approved(env):
 
     thread = threading.Thread(target=approver)
     thread.start()
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     thread.join()
     got = store.get(task.id)
     assert got.state == TaskState.DONE
@@ -355,7 +376,7 @@ def test_approval_flow_denied(env):
 
     thread = threading.Thread(target=denier)
     thread.start()
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     thread.join()
     result_turn = engine.calls[1]
     assert any("denied" in str(m.get("content", "")) for m in result_turn)
@@ -369,34 +390,47 @@ def test_generation_timeout_at_wall_budget_is_budget_exhausted(env):
     FAILED/'stalled' for exactly this case.)"""
     root, cfg, store = env
     cfg = dataclasses.replace(cfg, max_minutes=0.005)  # 0.3 s wall budget
+    unwedge = threading.Event()
 
     class StallingEngine(FakeEngine):
         def generate(self, messages, tools, max_tokens):
-            time.sleep(2)
+            unwedge.wait(10)  # released by the test AFTER run_task returns
             return FINISH
 
+    inner = StallingEngine([FINISH])
+    engine = SessionCapturingEngine(inner)
     task = _start(store, root)
-    run_task(task, store, StallingEngine([FINISH]), cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     got = store.get(task.id)
     assert got.state == TaskState.DONE
     assert got.outcome == "budget-exhausted"
     assert "files_changed" in got.report  # partial report still assembled
     assert Path(got.report["transcript_path"]).exists()
+    # Both resets ran on the worker thread — the abandoned session must never
+    # reset anything (a late reset would race the next task's cache).
+    assert inner.resets == 2
+    assert all(i == threading.get_ident() for i in inner.reset_idents)
+    # Unwedge and join the leaked session thread so it cannot outlive this
+    # test and fire a later test's monkeypatched hooks.
+    unwedge.set()
+    _join_sessions(engine)
 
 
 def test_genuine_stall_with_budget_remaining_fails(env, monkeypatch):
     """C1 (the other side): a stall while wall-clock budget genuinely remains
-    is still a failure, not budget exhaustion."""
-    import sous.worker as worker_mod
+    is still a failure, not budget exhaustion. The stall is injected — a real
+    blocking engine cannot reach this branch, because the per-turn timeout IS
+    the remaining budget."""
+    from sous.engine.base import GenerationSession
 
     root, cfg, store = env  # max_minutes=1: plenty of budget remains
 
-    def stall_immediately(engine, messages, max_tokens, timeout_seconds):
-        raise worker_mod.GenerationStalled("generation stalled (> 5s)")
+    def stall_immediately(self, messages, tools, max_tokens, timeout):
+        raise GenerationStalled("generation stalled (> 5s)")
 
-    monkeypatch.setattr(worker_mod, "_generate_with_timeout", stall_immediately)
+    monkeypatch.setattr(GenerationSession, "generate", stall_immediately)
     task = _start(store, root)
-    run_task(task, store, FakeEngine([FINISH]), cfg)
+    run_task(task, store, ManagedEngine(FakeEngine([FINISH])), cfg)
     got = store.get(task.id)
     assert got.state == TaskState.FAILED
     assert "stalled" in got.report["error"]
@@ -410,16 +444,24 @@ def test_context_over_cap_with_nothing_to_elide_fails_cleanly(env):
     root, cfg, store = env
     cfg = dataclasses.replace(cfg, max_context_tokens=10)
     task = _start(store, root)
-    engine = FakeEngine([FINISH])
-    run_task(task, store, engine, cfg)
+    inner = FakeEngine([FINISH])
+    engine = SessionCapturingEngine(inner)
+    t0 = time.monotonic()
+    run_task(task, store, ManagedEngine(engine), cfg)
+    elapsed = time.monotonic() - t0
     got = store.get(task.id)
     assert got.state == TaskState.FAILED
     err = got.report["error"]
     assert "context" in err.lower()
     assert "10" in err  # the cap, named
-    assert engine.calls == []  # the oversized prompt was never sent
+    assert inner.calls == []  # the oversized prompt was never sent
     assert "files_changed" in got.report
     assert Path(got.report["transcript_path"]).exists()
+    # Zero-generation task: the session was created and must still close
+    # promptly, with both resets present and the thread gone.
+    assert elapsed < 3.0
+    assert inner.resets == 2
+    _join_sessions(engine)
 
 
 def test_context_elision_replaces_old_tool_results(env):
@@ -434,7 +476,7 @@ def test_context_elision_replaces_old_tool_results(env):
             FINISH,
         ]
     )
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     assert store.get(task.id).state == TaskState.DONE
     final_turn = engine.calls[-1]
     assert any("[elided" in str(m.get("content", "")) for m in final_turn)
@@ -449,7 +491,7 @@ def test_tool_error_from_bad_argument_value_does_not_crash_task(env):
             FINISH,
         ]
     )
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     got = store.get(task.id)
     assert got.state == TaskState.DONE and got.outcome == "completed"
     result_turn = engine.calls[1]
@@ -463,7 +505,7 @@ def test_verify_command_that_raises_is_reported_not_fatal(env):
     script.chmod(0o644)  # no execute bit -> subprocess.run raises PermissionError
     cfg.config_path.write_text(f'[commands]\nallowlist = ["{script}"]\n')
     task = _start(store, root, verify=[str(script)])
-    run_task(task, store, FakeEngine([FINISH]), cfg)
+    run_task(task, store, ManagedEngine(FakeEngine([FINISH])), cfg)
     got = store.get(task.id)
     assert got.state == TaskState.DONE
     [v] = got.report["verify"]
@@ -479,7 +521,7 @@ def test_verify_commands_skipped_when_budget_exhausted(env):
     cfg = dataclasses.replace(cfg, max_minutes=0)  # deadline already passed
     cfg.config_path.write_text('[commands]\nallowlist = ["/usr/bin/touch"]\n')
     task = _start(store, root, verify=["/usr/bin/touch verify-ran.txt"])
-    run_task(task, store, FakeEngine([]), cfg)  # engine never consulted
+    run_task(task, store, ManagedEngine(FakeEngine([])), cfg)  # engine never consulted
     got = store.get(task.id)
     assert got.state == TaskState.DONE and got.outcome == "budget-exhausted"
     [v] = got.report["verify"]  # the skip keeps the {command, output} shape
@@ -569,11 +611,15 @@ def test_engine_exception_fails_task_cleanly(env):
         def generate(self, messages, tools, max_tokens):
             raise ValueError("boom")
 
-    run_task(task, store, ExplodingEngine([FINISH]), cfg)
+    inner = ExplodingEngine([FINISH])
+    engine = SessionCapturingEngine(inner)
+    run_task(task, store, ManagedEngine(engine), cfg)
     got = store.get(task.id)
     assert got.state == TaskState.FAILED
     assert "engine error" in got.report["error"]
     assert "boom" in got.report["error"]
+    assert inner.resets == 2  # the finally still closed the session and reset
+    _join_sessions(engine)
 
 
 def test_run_task_honors_context_decision_over_config(env):
@@ -584,7 +630,9 @@ def test_run_task_honors_context_decision_over_config(env):
 
     root, cfg, store = env
     task = _start(store, root)
-    run_task(task, store, FakeEngine([FINISH]), cfg, context=ContextDecision(10, "test"))
+    run_task(
+        task, store, ManagedEngine(FakeEngine([FINISH])), cfg, context=ContextDecision(10, "test")
+    )
     got = store.get(task.id)
     assert got.state == TaskState.FAILED
     assert "context" in got.report["error"].lower()
@@ -598,7 +646,11 @@ def test_report_records_the_context_window_used(env):
     root, cfg, store = env
     task = _start(store, root)
     run_task(
-        task, store, FakeEngine([FINISH]), cfg, context=ContextDecision(5000, "auto: test-run")
+        task,
+        store,
+        ManagedEngine(FakeEngine([FINISH])),
+        cfg,
+        context=ContextDecision(5000, "auto: test-run"),
     )
     got = store.get(task.id)
     assert got.report["budget"]["context_tokens"] == 5000
@@ -615,13 +667,13 @@ def test_generation_is_bounded_by_the_remaining_window(env):
     root, cfg, store = env
     task = _start(store, root)
     engine = FakeEngine([FINISH])
-    run_task(task, store, engine, cfg, context=ContextDecision(3000, "test"))
+    run_task(task, store, ManagedEngine(engine), cfg, context=ContextDecision(3000, "test"))
     prompt = engine.count_tokens(engine.calls[0], WORKER_TOOLS)
     assert engine.max_tokens_seen[0] == 3000 - prompt
 
     task2 = _start(store, root)
     roomy = FakeEngine([FINISH])
-    run_task(task2, store, roomy, cfg, context=ContextDecision(100_000, "test"))
+    run_task(task2, store, ManagedEngine(roomy), cfg, context=ContextDecision(100_000, "test"))
     assert roomy.max_tokens_seen[0] == cfg.max_tokens_per_generation
 
 
@@ -635,42 +687,67 @@ def test_prompt_leaving_no_output_room_is_overflow(env):
     root, cfg, store = env
     probe_task = _start(store, root)
     probe = FakeEngine([FINISH])
-    run_task(probe_task, store, probe, cfg)
+    run_task(probe_task, store, ManagedEngine(probe), cfg)
     prompt = probe.count_tokens(probe.calls[0], WORKER_TOOLS)
 
     task = _start(store, root)
     starved = FakeEngine([FINISH])
-    run_task(task, store, starved, cfg, context=ContextDecision(prompt, "test"))
+    run_task(task, store, ManagedEngine(starved), cfg, context=ContextDecision(prompt, "test"))
     got = store.get(task.id)
     assert got.state == TaskState.FAILED
     assert "no room" in got.report["error"]
     assert starved.max_tokens_seen == []  # never reached the engine
 
 
-def test_generation_thread_releases_mlx_state_before_exit(env, monkeypatch):
+def test_session_thread_releases_mlx_state_once_per_task(env, monkeypatch):
     """mlx >= 0.32.1 requires mx.clear_streams() at the end of every thread
     that touched mlx (ml-explore/mlx#4327): without it, the exiting generation
-    thread's TLS teardown segfaults the WHOLE daemon mid-task. The release must
-    happen once per generation, in the generation thread itself."""
-    import sous.worker as worker
+    thread's TLS teardown segfaults the WHOLE daemon mid-task. With one
+    generation thread per task the release runs once per task, on that thread.
+    Patching sous.engine.base is sufficient: run_task-level tests never invoke
+    the copy imported into sous.worker (that one belongs to run_worker_loop)."""
+    import sous.engine.base as base
 
-    released_in = []
+    released_in: list[int] = []
     monkeypatch.setattr(
-        worker, "release_mlx_thread_state", lambda: released_in.append(threading.get_ident())
+        base, "release_mlx_thread_state", lambda: released_in.append(threading.get_ident())
     )
     root, cfg, store = env
     task = _start(store, root)
-    engine = FakeEngine(
+    inner = FakeEngine(
         [
             CALL.format(name="write_file", args='{"path": "out.txt", "content": "x"}'),
             FINISH,
         ]
     )
-    run_task(task, store, engine, cfg)
+    engine = SessionCapturingEngine(inner)
+    run_task(task, store, ManagedEngine(engine), cfg)
     assert store.get(task.id).state == TaskState.DONE
-    assert len(released_in) == 2, "one release per generation turn"
-    here = threading.get_ident()
-    assert all(t != here for t in released_in), "must run in the generation thread"
+    _join_sessions(engine)
+    gen_idents = {t.ident for t in inner.generate_threads}
+    assert len(gen_idents) == 1, "all generations on one thread"
+    assert released_in == list(gen_idents), "one release, on the generation thread"
+
+
+def test_consecutive_tasks_get_fresh_session_threads(env, monkeypatch):
+    """One session thread per task (issue #34): a session reused across tasks
+    would resurrect the original bug after any abandoned task. Thread objects,
+    not idents — idents recycle."""
+    import sous.engine.base as base
+
+    released: list[bool] = []
+    monkeypatch.setattr(base, "release_mlx_thread_state", lambda: released.append(True))
+    root, cfg, store = env
+    inner = FakeEngine([FINISH, FINISH])
+    engine = SessionCapturingEngine(inner)
+    for _ in range(2):
+        task = _start(store, root)
+        run_task(task, store, ManagedEngine(engine), cfg)
+        assert store.get(task.id).state == TaskState.DONE
+    _join_sessions(engine)
+    assert len(inner.generate_threads) == 2
+    assert inner.generate_threads[0] is not inner.generate_threads[1]
+    assert len(released) == 2  # one release per task
 
 
 def test_worker_loop_releases_mlx_state_on_exit(env, monkeypatch):
@@ -694,16 +771,20 @@ def test_worker_loop_releases_mlx_state_on_exit(env, monkeypatch):
 def test_run_task_resets_the_prompt_cache_at_start_and_end(env):
     root, cfg, store = env
     task = _start(store, root)
-    engine = FakeEngine([FINISH])
-    run_task(task, store, engine, cfg)
-    assert engine.resets == 2  # once at entry, once in the finally
+    inner = FakeEngine([FINISH])
+    engine = SessionCapturingEngine(inner)
+    run_task(task, store, ManagedEngine(engine), cfg)
+    assert inner.resets == 2  # once at entry, once in the finally
+    _join_sessions(engine)
+    here = threading.get_ident()
+    assert inner.reset_idents == [here, here]  # the worker thread owns every reset
 
 
 def test_run_task_resets_even_when_the_task_fails(env):
     root, cfg, store = env
     task = _start(store, root)
     engine = FakeEngine(["<tool_call>{bad json}</tool_call>"] * 3)
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     assert store.get(task.id).state == TaskState.FAILED
     assert engine.resets == 2
 
@@ -719,7 +800,7 @@ def test_report_carries_the_prompt_cache_block(env):
         "snapshot_bytes": 0,
         "cold_retries": 0,
     }
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     got = store.get(task.id)
     # Pins that this exercises the success-report path, not _failure_extra —
     # a different code path entirely that also assembles a prompt_cache block.
@@ -740,7 +821,7 @@ def test_failure_extra_carries_the_prompt_cache_block(env):
         "snapshot_bytes": 0,
         "cold_retries": 0,
     }
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     assert store.get(task.id).report["prompt_cache"]["hits"] == 1
 
 
@@ -759,7 +840,7 @@ def test_elisions_are_counted_in_the_report(env):
             FINISH,
         ]
     )
-    run_task(task, store, engine, cfg)
+    run_task(task, store, ManagedEngine(engine), cfg)
     assert store.get(task.id).report["prompt_cache"]["elisions"] >= 1
 
 
