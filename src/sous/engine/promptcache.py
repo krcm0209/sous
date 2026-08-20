@@ -8,9 +8,10 @@ a fake cache layer can exercise it. Array copies arrive through an injected
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 
 def reuse_length(cached_ids: Sequence[int], new_ids: Sequence[int]) -> int:
@@ -138,3 +139,117 @@ class PromptMemo:
 
     def clear(self) -> None:
         self._slots = dict.fromkeys(_MEMO_SLOTS)
+
+
+class CacheHooks(Protocol):
+    """The four things only an engine can do. Everything else is shared."""
+
+    def new_cache(self) -> list: ...
+    def prefill(self, cache: list, token_ids: list[int]) -> None: ...
+    def decode(self, cache: list, token_ids: list[int], max_tokens: int) -> str: ...
+    def copy_array(self, a: object) -> object: ...
+
+
+class PrefixCache:
+    """One KV cache per task, always left at the stable-render boundary.
+
+    The boundary matters: the stable render (`add_generation_prompt=False`) is a
+    strict prefix of the next turn's stable render, while the full prompt never
+    is — the chat template appends a generation-only block that it strips when
+    it later re-renders that same assistant turn as history. Anchoring here is
+    what makes reuse possible at all.
+    """
+
+    def __init__(self, hooks: CacheHooks, enabled: bool = True):
+        self._hooks = hooks
+        self.enabled = enabled
+        self._cache: list | None = None
+        self._held: list[int] = []
+        self._epoch = 0
+        self._stats = PromptCacheStats()
+
+    def reset(self) -> None:
+        """Drop the cache, the token record, and the counters.
+
+        Deliberately takes no lock. ManagedEngine's generation lock is still
+        held by an abandoned stalled generation, so a reset that waited for it
+        would wedge the next task. The epoch bump is what makes that safe.
+        """
+        self._epoch += 1
+        self._cache = None
+        self._held = []
+        self._stats = PromptCacheStats()
+
+    def stats(self) -> dict:
+        return self._stats.as_dict()
+
+    def generate(self, stable_ids: list[int], full_ids: list[int], max_tokens: int) -> str:
+        hooks = self._hooks
+        if not self.enabled:
+            return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens)
+
+        epoch = self._epoch
+        cache, held = self._cache, self._held
+        # Invalid until a generation completes. The cache is mutated in place,
+        # so a raise mid-stream leaves it holding tokens `held` does not
+        # describe, and reusing it then would duplicate them.
+        self._cache, self._held = None, []
+
+        reuse = reuse_length(held, stable_ids) if cache is not None else 0
+        # `cache is not None and reuse` rather than a bare `if reuse`: it is what
+        # lets the type checker see `warm` as a plain list in both branches, with
+        # no assert and no ignore pragma.
+        if cache is not None and reuse:
+            self._stats.hits += 1
+            self._stats.reused_tokens += reuse
+            warm: list = cache
+        else:
+            reuse = 0
+            self._stats.misses += 1
+            warm = hooks.new_cache()
+
+        try:
+            text = self._run(warm, stable_ids, full_ids, reuse, max_tokens)
+        except Exception as e:
+            if reuse == 0:
+                raise
+            # An optimization bug must never fail a task; decide_context sets
+            # the same rule for auto sizing. Only a warm attempt is retried, so
+            # a genuine engine error still surfaces at once.
+            self._stats.cold_retries += 1
+            warnings.warn(
+                f"sous prompt cache: warm generation failed ({e}); retrying cold",
+                stacklevel=2,
+            )
+            warm = hooks.new_cache()
+            text = self._run(warm, stable_ids, full_ids, 0, max_tokens)
+
+        if epoch == self._epoch:
+            self._cache, self._held = warm, list(stable_ids)
+        return text
+
+    def _run(
+        self,
+        cache: list,
+        stable_ids: list[int],
+        full_ids: list[int],
+        reuse: int,
+        max_tokens: int,
+    ) -> str:
+        hooks = self._hooks
+        anchor = len(stable_ids)
+        if all_trimmable(cache):
+            # Everything rewinds, so prefill and decode fuse into one pass and
+            # the generation block plus the generated tokens are simply trimmed
+            # back off afterwards.
+            text = hooks.decode(cache, list(full_ids[reuse:]), max_tokens)
+            trim_to(cache, anchor)
+            return text
+        # A recurrent layer cannot rewind, so stop at the anchor, record it,
+        # and put the cache back there once the generation is done.
+        hooks.prefill(cache, list(stable_ids[reuse:]))
+        snap, nbytes = snapshot(cache, hooks.copy_array)
+        self._stats.snapshot_bytes = nbytes
+        text = hooks.decode(cache, list(full_ids[anchor:]), max_tokens)
+        restore(cache, snap, hooks.copy_array)
+        return text
