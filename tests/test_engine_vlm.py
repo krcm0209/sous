@@ -72,6 +72,10 @@ def test_vlm_snapshot_restore_is_bit_exact(model_id, is_hybrid):
         off = int(getattr(a, "offset", 0) or 0)
         for xa, xb in zip(sa, sb, strict=True):
             if xa is None or xb is None:
+                # Only a *pair* of Nones is bit-exact equality; one side None
+                # and the other populated is a dropped/invented state entry,
+                # exactly the restore bug this test exists to catch.
+                assert xa is None and xb is None, "one side is None, the other is not"
                 continue
             # Redundant on the pure-attention model: KVCache.state already
             # returns only the live region, so the slice below never trims
