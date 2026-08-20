@@ -128,8 +128,7 @@ class LMEngine:
         full_ids = self._ids("full", messages, tools)
         # The stable render is only an anchor for reuse, and PrefixCache discards
         # it when disabled — so computing it would cost a whole extra tokenization
-        # per turn for nothing. Off is the shipped default, so this is the common
-        # path.
+        # per turn for nothing.
         stable_ids = self._ids("stable", messages, tools) if self._cache.enabled else []
         return self._cache.generate(stable_ids, full_ids, max_tokens)
 
