@@ -270,14 +270,14 @@ def test_context_fraction_boundaries(tmp_path: Path):
     assert caught
 
 
-def test_prompt_cache_defaults_to_true():
-    assert SousConfig().prompt_cache is True
+def test_prompt_cache_defaults_to_false():
+    assert SousConfig().prompt_cache is False
 
 
-def test_prompt_cache_can_be_disabled(tmp_path: Path):
+def test_prompt_cache_can_be_enabled(tmp_path: Path):
     path = tmp_path / "config.toml"
-    path.write_text("[model]\nprompt_cache = false\n")
-    assert load_config(path).prompt_cache is False
+    path.write_text("[model]\nprompt_cache = true\n")
+    assert load_config(path).prompt_cache is True
 
 
 def test_prompt_cache_is_a_known_model_key(tmp_path: Path):

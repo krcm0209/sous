@@ -173,6 +173,10 @@ class PrefixCache:
     """
 
     def __init__(self, hooks: CacheHooks, enabled: bool = True):
+        # This default is the orchestrator's own semantics, not the user-facing
+        # one — both engines always pass `enabled` explicitly. The shipped
+        # default (currently off) lives in SousConfig.prompt_cache; don't
+        # "fix" this one to match it.
         self._hooks = hooks
         self.enabled = enabled
         self._cache: list | None = None

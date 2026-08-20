@@ -4,22 +4,26 @@ Run:  uv run python scripts/e2e_smoke.py
       SOUS_PROMPT_CACHE=0 uv run python scripts/e2e_smoke.py
 
 Downloads ~350 MB on first run. The task is deliberately multi-turn (read
-a file, then write one) so the prompt_cache block is non-trivial. Run it
-twice and compare budget.seconds to see the before-and-after that issue #27
-asks for. The 0.6B model is text-only and therefore fully trimmable, so it
-exercises the one-call trim path, not the snapshot path (you will see
-snapshot_bytes: 0, which is correct for text-only models). Exercises the
-real multi-turn agent loop (generate -> parse -> execute -> append) against
-the smallest available Qwen3 model. hello.txt must contain the last line of
-notes.md; correct content proves the read happened before the write (check
-"content:" below) — but this 0.6B model is unreliable at then emitting a
-well-formed `finish` tool call, so the task can still end `failed`
-(model-confused) or `done`/`budget-exhausted` even when the file is correct.
-Judge success from the printed report and hello.txt content, not just the
-final state; the transcript_path in the report has full turn-by-turn detail
-if something looks wrong. Sous's default model (mlx-community/Qwen3.8-27B-
-mxfp8) is far larger and far more reliable at closing out the loop than
-this tiny one.
+a file, then write one) so the prompt_cache block is non-trivial.
+SOUS_PROMPT_CACHE defaults to on here, deliberately overriding the shipped
+default (off, see SousConfig.prompt_cache) — this script exists to exercise
+the agent loop, and the cache path is worth exercising even though it
+currently falls back to a cold prefill every turn on the real daemon path.
+Run it twice and compare budget.seconds to see the before-and-after that
+issue #27 asks for. The 0.6B model is text-only and therefore fully
+trimmable, so it exercises the one-call trim path, not the snapshot path
+(you will see snapshot_bytes: 0, which is correct for text-only models).
+Exercises the real multi-turn agent loop (generate -> parse -> execute ->
+append) against the smallest available Qwen3 model. hello.txt must contain
+the last line of notes.md; correct content proves the read happened before
+the write (check "content:" below) — but this 0.6B model is unreliable at
+then emitting a well-formed `finish` tool call, so the task can still end
+`failed` (model-confused) or `done`/`budget-exhausted` even when the file
+is correct. Judge success from the printed report and hello.txt content,
+not just the final state; the transcript_path in the report has full
+turn-by-turn detail if something looks wrong. Sous's default model
+(mlx-community/Qwen3.8-27B-mxfp8) is far larger and far more reliable at
+closing out the loop than this tiny one.
 """
 
 import os

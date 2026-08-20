@@ -130,7 +130,7 @@ port = 8383
 id = "mlx-community/Qwen3.8-27B-mxfp8"
 idle_unload_minutes = 30
 max_context_tokens = 32768
-prompt_cache = true
+prompt_cache = false
 temperature = 0.7
 top_p = 0.8
 top_k = 20
@@ -183,8 +183,13 @@ discards the cache, and elision fires only when the prompt exceeds the window,
 a window the task never reaches means the cache survives the whole task. The
 shipped default is `fixed` at 32768 tokens.
 
-`[model].prompt_cache` (default `true`) reuses one KV cache across the turns
-of a task; `false` restores per-turn prefill.
+`[model].prompt_cache` (default `false`) reuses one KV cache across the turns
+of a task, prefilling only what the conversation gained instead of the whole
+thing every turn. It's off by default because the worker currently runs each
+generation on its own thread, and that thread's exit releases the mlx streams
+the cache is bound to — so reuse falls back to a cold prefill every turn
+rather than saving anything. It will switch on once that threading is
+restructured to keep a task on one thread.
 
 `temperature`/`top_p`/`top_k` control the worker's sampler (Qwen's own
 documented non-thinking-mode defaults). Greedy decoding (temperature 0)

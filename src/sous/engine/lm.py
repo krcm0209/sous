@@ -12,7 +12,7 @@ class LMEngine:
         temperature: float = 0.7,
         top_p: float = 0.8,
         top_k: int = 20,
-        prompt_cache: bool = True,
+        prompt_cache: bool = False,
     ):
         from mlx_lm import load
         from mlx_lm.sample_utils import make_sampler

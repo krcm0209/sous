@@ -71,8 +71,13 @@ class SousConfig:
     top_p: float = 0.8
     top_k: int = 20
     # Reuse one KV cache across the turns of a task, prefilling only what the
-    # conversation gained. false restores per-turn prefill without a downgrade.
-    prompt_cache: bool = True
+    # conversation gained, instead of re-prefilling from scratch every turn.
+    # Off by default: worker.py's _generate_with_timeout runs each generation
+    # on a fresh daemon thread, and that thread's exit releases the mlx
+    # streams the cache arrays live on, so turn N+1 (a new thread) can't
+    # touch them and falls back to a cold retry. Today, turning this on
+    # costs one wasted warm attempt per turn instead of saving anything.
+    prompt_cache: bool = False
     max_turns: int = 40
     max_minutes: int = 15
     max_tokens_per_generation: int = 4096
@@ -179,7 +184,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         temperature=model.get("temperature", 0.7),
         top_p=model.get("top_p", 0.8),
         top_k=model.get("top_k", 20),
-        prompt_cache=model.get("prompt_cache", True),
+        prompt_cache=model.get("prompt_cache", False),
         max_turns=budgets.get("max_turns", 40),
         max_minutes=budgets.get("max_minutes", 15),
         max_tokens_per_generation=budgets.get("max_tokens_per_generation", 4096),
