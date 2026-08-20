@@ -49,17 +49,29 @@ class LMEngine:
             enable_thinking=False,
         )
 
-    def _ids(self, slot: str, messages: list[dict], tools: list[dict]) -> tuple[str, list[int]]:
+    def _ids(self, slot: str, messages: list[dict], tools: list[dict]) -> list[int]:
         """Tokenize a render once per turn. The two slots are the stable render
         and the full prompt; count_tokens and generate both read them."""
         _, tokenizer = self._loaded()
         text = self._prompt(messages, tools, generation=slot == "full")
         cached = self._memo.get(slot, text)
         if cached is not None:
-            return text, cached
-        ids = list(tokenizer.encode(text))
+            return cached
+        # mlx_lm.generate's stream_generate (mlx_lm/generate.py:691-694) only
+        # adds special tokens when the tokenizer has no bos_token, or the
+        # prompt doesn't already start with it — because the chat template
+        # usually emits BOS itself. Before this cache existed, sous handed
+        # stream_generate a string and got this for free; encoding ids
+        # ourselves has to replicate the same rule explicitly, mirroring
+        # VLMEngine._encode's should_add_special_tokens for the same model.
+        # A mismatch would not fail loudly — it would silently duplicate BOS
+        # on every turn for any model whose template already emits it (e.g.
+        # Llama-3, Gemma, Mistral MLX conversions).
+        bos = getattr(tokenizer, "bos_token", None)
+        add_special = bos is None or not text.startswith(bos)
+        ids = list(tokenizer.encode(text, add_special_tokens=add_special))
         self._memo.put(slot, text, ids)
-        return text, ids
+        return ids
 
     # ---- CacheHooks ------------------------------------------------------
 
@@ -113,12 +125,12 @@ class LMEngine:
     # ---- Engine ----------------------------------------------------------
 
     def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:
-        _, stable_ids = self._ids("stable", messages, tools)
-        _, full_ids = self._ids("full", messages, tools)
+        stable_ids = self._ids("stable", messages, tools)
+        full_ids = self._ids("full", messages, tools)
         return self._cache.generate(stable_ids, full_ids, max_tokens)
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
-        return len(self._ids("full", messages, tools)[1])
+        return len(self._ids("full", messages, tools))
 
     def reset_prompt_cache(self) -> None:
         self._cache.reset()

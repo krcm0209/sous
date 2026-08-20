@@ -60,14 +60,14 @@ class VLMEngine:
         add_special = should_add_special_tokens(model.config.model_type, processor)
         return list(self._tokenizer.encode(text, add_special_tokens=add_special))
 
-    def _ids(self, slot: str, messages: list[dict], tools: list[dict]) -> tuple[str, list[int]]:
+    def _ids(self, slot: str, messages: list[dict], tools: list[dict]) -> list[int]:
         text = self._prompt(messages, tools, generation=slot == "full")
         cached = self._memo.get(slot, text)
         if cached is not None:
-            return text, cached
+            return cached
         ids = self._encode(text)
         self._memo.put(slot, text, ids)
-        return text, ids
+        return ids
 
     # ---- CacheHooks ------------------------------------------------------
 
@@ -130,12 +130,12 @@ class VLMEngine:
     # ---- Engine ----------------------------------------------------------
 
     def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:
-        _, stable_ids = self._ids("stable", messages, tools)
-        _, full_ids = self._ids("full", messages, tools)
+        stable_ids = self._ids("stable", messages, tools)
+        full_ids = self._ids("full", messages, tools)
         return self._cache.generate(stable_ids, full_ids, max_tokens)
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
-        return len(self._ids("full", messages, tools)[1])
+        return len(self._ids("full", messages, tools))
 
     def reset_prompt_cache(self) -> None:
         self._cache.reset()
