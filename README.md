@@ -30,16 +30,26 @@ Other ways to put local models next to Claude Code make a different trade:
   endpoint — every task drops to local-model quality, including the ones you
   wanted a frontier model for.
 - **Routers/proxies** swap models per request, but the work still runs
-  synchronously inside your session, and nothing sandboxes what the local
-  model does to your files.
-- **Subagent/skill delegates** hand tasks to a local model without a
-  persistent queue, path confinement, command allowlisting, or an audit
-  trail.
+  synchronously inside your session, and the only thing between the local
+  model and your files is a permission ruleset calibrated for a frontier
+  model's judgement.
+- **Subagent/skill delegates** hand tasks to a local model with your
+  session's permissions and none of the rest: no persistent queue, no
+  project-root confinement, no allowlist scoped to a model you trust less,
+  no audit trail.
 
 sous is the hybrid: Claude keeps the reasoning, and an asynchronous queue
 hands the mechanical work to a local worker that is sandboxed, budgeted,
 approval-gated, and journaled — with the diff always reviewed before it
 counts.
+
+The cost is capability, and it is deliberate. The worker runs its own loop
+over eight fixed tools (`read_file`, `write_file`, `edit_file`, `list_dir`,
+`glob`, `grep`, `run_command`, `finish`); it cannot reach your MCP servers,
+your skills, or your hooks, all of which a subagent delegate inherits. sous
+buys confinement, persistence, and a reviewable diff by giving the local
+model a much smaller world to work in. Work that genuinely needs the harness
+is work to keep in Claude.
 
 ## Requirements
 
