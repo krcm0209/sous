@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import queue
 import threading
 import time
 from collections.abc import Callable
@@ -46,6 +48,13 @@ def release_mlx_thread_state() -> None:
         pass
 
 
+class GenerationStalled(Exception):
+    """A generation produced no reply within its deadline."""
+
+
+_CLOSE = object()  # session shutdown sentinel; ends the loop, carries no reset
+
+
 def select_backend(model_config: dict) -> str:
     if "vision_config" in model_config:
         return "vlm"
@@ -67,7 +76,7 @@ def _default_factory(
     temperature: float = 0.7,
     top_p: float = 0.8,
     top_k: int = 20,
-    prompt_cache: bool = False,
+    prompt_cache: bool = True,
 ) -> Engine:
     backend = select_backend(fetch_model_config(model_id))
     if backend == "vlm":
@@ -134,8 +143,107 @@ class ManagedEngine:
     def generation_in_flight(self) -> bool:
         return self._gen_lock.locked()
 
+    def session(self) -> GenerationSession:
+        """One task's generation thread; run_task creates one per task."""
+        return GenerationSession(self)
+
     def unload(self) -> None:
         self._inner.unload()
+
+
+class GenerationSession:
+    """One task's generations, all on one daemon thread (issue #34).
+
+    mlx KV cache arrays are usable only from the thread whose streams created
+    them (streams are thread-scoped for use — probed empirically, see the
+    design spec), and every thread that touched mlx must call
+    release_mlx_thread_state() before it exits (ml-explore/mlx#4327). A fresh
+    thread per generation therefore killed the prompt cache every turn; one
+    thread per task lets turn N+1 reuse turn N's cache.
+
+    The loop re-checks `_abandoned` while it HOLDS _gen_lock: a request whose
+    task gave up while still queued on the lock exits instead of running
+    under the next task's identity (issue #34, consideration 7).
+
+    close() sends _CLOSE and never joins. A healthy or abandoned-but-idle
+    thread dequeues it, releases its mlx state, and exits — this is also what
+    un-leaks a thread whose reply lost the timeout race, so nothing it pinned
+    (worst case an ("err", e) traceback holding the KV cache) outlives the
+    task. A wedged thread never dequeues it and is leaked deliberately, like
+    the abandoned per-generation threads before this class: it never exits,
+    so it never hits the TLS-teardown segfault, and _gen_lock keeps the next
+    task off the engine meanwhile. _CLOSE deliberately carries no cache
+    reset — a late reset from a stale session thread would race the next
+    task's cache and stats, the same class of bug as consideration 7. Every
+    reset belongs to the worker thread.
+    """
+
+    def __init__(self, managed: ManagedEngine):
+        self._managed = managed
+        # maxsize=1 plus put_nowait everywhere: at most one request is ever
+        # outstanding, so Full in generate() means a protocol bug — failing
+        # loudly beats deadlocking the worker inside run_task's finally.
+        # close() alone tolerates Full: a stalled request the starved thread
+        # never dequeued may still occupy the queue.
+        self._requests: queue.Queue = queue.Queue(maxsize=1)
+        self._replies: queue.Queue = queue.Queue(maxsize=1)
+        self._abandoned = threading.Event()
+        self._closed = False
+        # Kept as an attribute so tests can join it; production never joins —
+        # a wedged generation must not block task teardown.
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        try:
+            while True:
+                req = self._requests.get()
+                if req is _CLOSE:
+                    return
+                with self._managed._gen_lock:
+                    if self._abandoned.is_set():
+                        return
+                    try:
+                        reply = ("ok", self._managed._inner.generate(*req))
+                    except BaseException as e:  # noqa: BLE001 — relayed to the caller
+                        reply = ("err", e)
+                if self._abandoned.is_set():
+                    return
+                self._replies.put_nowait(reply)
+                # A parked thread must not pin the reply: an ("err", e) entry
+                # holds the whole generation frame — KV cache included —
+                # through the traceback.
+                del reply
+        finally:
+            release_mlx_thread_state()
+
+    def generate(
+        self, messages: list[dict], tools: list[dict], max_tokens: int, timeout: float
+    ) -> str:
+        assert not self._closed and not self._abandoned.is_set(), (
+            "session reused after close() or a stall"
+        )
+        self._requests.put_nowait((messages, tools, max_tokens))
+        try:
+            kind, value = self._replies.get(timeout=timeout)
+        except queue.Empty:
+            self._abandoned.set()
+            raise GenerationStalled(f"generation stalled (> {round(timeout, 1)}s)") from None
+        if kind == "err":
+            raise value
+        return value
+
+    def close(self) -> None:
+        """End the session thread; never joined (see the class docstring)."""
+        if self._closed:
+            return
+        self._closed = True
+        # Full means a timed-out request is still queued: the session thread
+        # lost the scheduler race that stalled it and never dequeued it.
+        # _CLOSE is unnecessary then — the thread will dequeue that request,
+        # see _abandoned under the lock, and exit.
+        with contextlib.suppress(queue.Full):
+            self._requests.put_nowait(_CLOSE)
 
 
 class EngineManager:
@@ -154,7 +262,7 @@ class EngineManager:
         self._engine: ManagedEngine | None = None
         self._last_used: float | None = None
 
-    def get(self) -> Engine:
+    def get(self) -> ManagedEngine:
         with self._lock:
             if self._engine is None:
                 self._engine = ManagedEngine(self._factory(self._config.model_id))
