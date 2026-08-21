@@ -5,12 +5,11 @@ Run:  uv run python scripts/e2e_smoke.py
 
 Downloads ~350 MB on first run. The task is deliberately multi-turn (read
 a file, then write one) so the prompt_cache block is non-trivial.
-SOUS_PROMPT_CACHE defaults to on here, deliberately overriding the shipped
-default (off, see SousConfig.prompt_cache) — this script exists to exercise
-the agent loop, and the cache path is worth exercising even though it
-currently falls back to a cold prefill every turn on the real daemon path.
-Run it twice and compare budget.seconds to see the before-and-after that
-issue #27 asks for. The 0.6B model is text-only and therefore fully
+SOUS_PROMPT_CACHE=0 turns the cache off; when the variable is unset the
+shipped default applies. A healthy cached run reports cold_retries: 0 with non-zero
+reused_tokens — a cold retry per turn is the #34 thread-shape regression.
+Run it twice, once with SOUS_PROMPT_CACHE=0, and compare budget.seconds to
+see the before-and-after that issue #27 asks for. The 0.6B model is text-only and therefore fully
 trimmable, so it exercises the one-call trim path, not the snapshot path
 (you will see snapshot_bytes: 0, which is correct for text-only models).
 Exercises the real multi-turn agent loop (generate -> parse -> execute ->
@@ -26,6 +25,7 @@ turn-by-turn detail if something looks wrong. Sous's default model
 closing out the loop than this tiny one.
 """
 
+import dataclasses
 import os
 import tempfile
 import threading
@@ -61,8 +61,12 @@ def main() -> None:
             config_path=base / "config.toml",
             max_turns=8,
             max_minutes=5,
-            prompt_cache=os.environ.get("SOUS_PROMPT_CACHE", "1") != "0",
         )
+        # Unset means the shipped default, by construction — the script must
+        # not carry its own copy of it.
+        cache_env = os.environ.get("SOUS_PROMPT_CACHE")
+        if cache_env is not None:
+            cfg = dataclasses.replace(cfg, prompt_cache=cache_env != "0")
         store = TaskStore(base / "tasks.db")
         task = store.enqueue(
             title="smoke",

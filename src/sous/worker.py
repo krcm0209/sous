@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import queue
 import sys
 import threading
 import time
@@ -11,7 +10,13 @@ from pathlib import Path
 
 from sous.config import SousConfig
 from sous.context import ContextDecision, decide_context
-from sous.engine.base import Engine, EngineManager, release_mlx_thread_state
+from sous.engine.base import (
+    Engine,
+    EngineManager,
+    GenerationStalled,
+    ManagedEngine,
+    release_mlx_thread_state,
+)
 from sous.protocol import WORKER_TOOLS, ParseError, ToolCall, parse_tool_calls
 from sous.tasks import Task, TaskStore
 from sous.toolexec import PathViolation, ToolExecutor
@@ -145,45 +150,6 @@ def _elide_if_needed(
     return count, elisions
 
 
-class GenerationStalled(Exception):
-    pass
-
-
-def _generate_with_timeout(
-    engine: Engine, messages: list[dict], max_tokens: int, timeout_seconds: float
-) -> str:
-    """Run a (synchronous, uninterruptible) MLX generation with a deadline.
-
-    MLX generation can't be aborted mid-stream. The generation runs on a
-    daemon thread so a truly wedged model can never block interpreter (or
-    daemon-shutdown) exit — only the queue hand-off is waited on, with a
-    bounded timeout. On timeout the thread is abandoned to finish (or hang)
-    in the background; its eventual result or exception is simply dropped.
-    """
-    result_q: queue.Queue = queue.Queue(maxsize=1)
-
-    def _run() -> None:
-        try:
-            result_q.put(("ok", engine.generate(messages, WORKER_TOOLS, max_tokens)))
-        except BaseException as e:  # noqa: BLE001 — relayed to the caller
-            result_q.put(("err", e))
-        finally:
-            # This thread dies after one generation, and an exiting thread
-            # that touched mlx without releasing its streams segfaults the
-            # whole daemon (ml-explore/mlx#4327). After the queue put, so the
-            # waiting caller is never delayed by cleanup.
-            release_mlx_thread_state()
-
-    threading.Thread(target=_run, daemon=True).start()
-    try:
-        kind, value = result_q.get(timeout=timeout_seconds)
-    except queue.Empty:
-        raise GenerationStalled(f"generation stalled (> {round(timeout_seconds, 1)}s)") from None
-    if kind == "err":
-        raise value
-    return value
-
-
 def _failure_extra(
     ex: ToolExecutor, transcript: _Transcript, engine: Engine, elisions: int
 ) -> dict:
@@ -209,7 +175,7 @@ def _tool_result_message(name: str, result: str) -> dict:
 def run_task(
     task: Task,
     store: TaskStore,
-    engine: Engine,
+    engine: ManagedEngine,
     config: SousConfig,
     context: ContextDecision | None = None,
 ) -> None:
@@ -225,6 +191,9 @@ def run_task(
     # Reset before the try too: a stale prefix left resident by whatever task
     # ran on this engine last must never be reused by this one.
     engine.reset_prompt_cache()
+    # One generation thread for the whole task: the prompt cache lives on
+    # that thread's mlx streams, so this is what lets turn N+1 reuse it (#34).
+    session = engine.session()
     try:
         messages: list[dict] = [
             {"role": "system", "content": build_system_prompt(root)},
@@ -281,11 +250,11 @@ def run_task(
                 return
             remaining = max(0.1, deadline - time.monotonic())
             try:
-                text = _generate_with_timeout(
-                    engine,
+                text = session.generate(
                     messages,
+                    WORKER_TOOLS,
                     min(config.max_tokens_per_generation, output_room),
-                    remaining,
+                    timeout=remaining,
                 )
             except GenerationStalled as e:
                 if time.monotonic() >= deadline:
@@ -419,8 +388,10 @@ def run_task(
         store.finish(task.id, outcome, report)
     finally:
         # Runs on every exit from the try — normal finish, any early return
-        # in the loop, or an exception escaping it — so the cache never
-        # outlives the task that built it.
+        # in the loop, or an exception escaping it. The session thread ends
+        # here; the reset stays on the worker thread, the single reset owner
+        # on every path, so the cache never outlives the task that built it.
+        session.close()
         engine.reset_prompt_cache()
 
 
