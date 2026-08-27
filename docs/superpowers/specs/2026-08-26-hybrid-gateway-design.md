@@ -9,7 +9,7 @@ synthesis: https://claude.ai/code/artifact/140227fa-2f12-4e21-b1e5-fd4f9b3a9385*
 sous today is an MCP daemon: Claude writes a spec, a sandboxed worker executes
 it, Claude reviews the diff. Issue #41 proposes a second, complementary mode —
 an Anthropic Messages endpoint on the same daemon, so Claude Code subagents
-run on the local model with the full harness tool surface while the main loop
+run on the local model with the session's tool surface while the main loop
 stays frontier. This spec commits the design for that mode.
 
 ## What the research changed about #41
@@ -73,8 +73,12 @@ live implementation is inline in its `server.py:5158-6030` plus
 - A Claude Code session where the main loop runs on the user's subscription,
   untouched, and Task-tool subagents are served by the local model — one
   `ANTHROPIC_BASE_URL`, routing on `request.model`.
-- Subagents get first-class citizenship: the session's full tool surface,
-  skills, hooks, permission rules, and native UI (the #41 motivation).
+- Subagents get first-class citizenship: the session's client-side tool
+  surface (built-ins, MCP servers, skills), hooks, permission rules, and
+  native UI (the #41 motivation). Anthropic *server-side* tools (web search,
+  code execution) cannot execute on a local endpoint and are dropped — a
+  deliberate narrowing of #41's "full tool surface" claim, documented in
+  checklist item 7 and in the Phase 4 mode comparison.
 - The MCP delegation mode is unchanged and remains the sandboxed,
   diff-reviewed path.
 - Off by default, opt-in via config, labelled experimental.
@@ -98,8 +102,8 @@ live implementation is inline in its `server.py:5158-6030` plus
 | Where the endpoint lives | `MCPServer.custom_route` on the existing daemon, same `127.0.0.1:8383` (SDK applies no auth to custom routes; starlette/uvicorn/sse-starlette already ship with `mcp` 2.0). |
 | Routing predicate | `request.model` ∈ `[gateway].local_models` → local engine; everything else forwards upstream. |
 | Local model id | Honest, non-`claude-*` (default `sous-local`). Required for context-window control, and it keeps the README's honesty posture. |
-| Client configuration | A `sous claude` launcher verb cloning oMLX's env contract; `CLAUDE_CODE_SUBAGENT_MODEL=sous-local`, tier vars left unset. |
-| Upstream auth | Byte-preserved passthrough of the inbound request, auth headers untouched. sous stores no credential and never logs bodies or headers. |
+| Client configuration | A `sous claude` launcher verb adapting oMLX's env contract **minus its credential lines**: it must not set `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` (either one replaces subscription OAuth with API-credit billing — the load-bearing #41 fact; oMLX sets both because it never forwards), and it warns if the user's env already sets them. Sets `CLAUDE_CODE_SUBAGENT_MODEL=sous-local`; tier vars left unset. |
+| Upstream auth | End-to-end headers forwarded unmodified — auth headers, `anthropic-beta`, `anthropic-version`, and anything unrecognized — while `Host` is regenerated for the upstream origin and hop-by-hop headers (RFC 9110 §7.6.1: `Connection` and the headers it names, `Transfer-Encoding`, etc.) are stripped. sous stores no credential and never logs bodies or headers. |
 | Tool execution | Never. The gateway returns `tool_use` blocks; Claude Code executes tools under its own permission system. `toolexec.py` is not in this path and the docs say so plainly. |
 | Concurrency, initially | Serialized behind the existing generation lock, with SSE keepalive pings holding queued clients. Batching is Phase 3b, built only if measurement demands it. |
 | Prompt cache | Strict-prefix reuse (existing machinery), made effective by server-side prompt stabilization; keyed multi-conversation slots in Phase 3a. |
@@ -132,7 +136,11 @@ provenance. Phase 1 implements all of them.
    content-block indices contiguous. (`omlx/server.py:5310-5315,5476-5483`)
 7. **Accept and drop Anthropic server-side tools** (types prefixed
    `web_search_`, `code_execution_`, `bash_`, `text_editor_`, `computer_`)
-   with an INFO log. (`omlx/api/anthropic_utils.py:884-898`)
+   with an INFO log. (`omlx/api/anthropic_utils.py:884-898`) Consequence,
+   stated rather than hidden: a locally-served subagent has no WebSearch or
+   other server-executed capability, because those run inside Anthropic's
+   API, not the client. Bridging them locally is out of scope; the gateway
+   docs must list them as unavailable on local routes.
 8. **Tolerate unknown fields.** Unknown top-level request fields are ignored;
    unknown *content-block types* get a tolerant catch-all rather than oMLX's
    422 — their sharpest forward-compat cliff, and one we fix rather than
@@ -160,7 +168,10 @@ provenance. Phase 1 implements all of them.
 **Phase 0 — spike gates (throwaway code, ~2 days).**
 Gate 1: a trivial transparent proxy logging method, path, `model`, and sizes
 — never bodies or headers. Launch Claude Code against it with the oMLX env
-recipe. Answers: does subscription billing survive; does
+recipe **minus its credential lines** — no `ANTHROPIC_AUTH_TOKEN`, no
+`ANTHROPIC_API_KEY` — because setting either switches Claude Code off the
+OAuth path this gate exists to observe. Answers: does subscription billing
+survive; does
 `CLAUDE_CODE_SUBAGENT_MODEL` reach the wire verbatim; does anything
 unexpected match. If billing falls back to API credits, the hybrid is dead —
 stop. Gate 2: capture one real Explore-subagent request (opt-in body dump for
@@ -172,15 +183,25 @@ wire data.
 **Phase 1 — Anthropic endpoint, serialized (~1.5–2.5k lines + tests).**
 Opt-in `[gateway]` config; `/v1/messages` + `count_tokens` mounted on the
 daemon; streaming threaded through `GenerationSession` (the reply queue
-carries chunks instead of one string); client tool schemas injected via the
-chat template and returned as `tool_use` blocks; the accommodation checklist
-above; prompt stabilization (items 3–4) from day one; 48K floor enforced.
+carries chunks instead of one string). Two Phase 1 requirements the current
+internals don't meet: `parse_tool_calls` validates against a request-scoped
+tool set instead of the module-level `WORKER_TOOLS` names
+(`protocol.py:173` rejects anything else today), and **client disconnect
+must never wedge the session** — today's one-slot reply queue with
+`_gen_lock` held means an undrained producer blocks every later generation,
+so the route drains the session to turn completion even after the client is
+gone (the GPU finishes the turn; true mid-generation abort arrives in 3b).
+Also: client tool schemas injected via the chat template and returned as
+`tool_use` blocks; the accommodation checklist above; prompt stabilization
+(items 3–4) from day one; 48K floor enforced.
 Exit: one full-local Claude Code session (no routing yet) completes a real
 bounded task against sous — which also answers most of #44's gate 1 for free.
 
 **Phase 2 — hybrid routing + launcher (~400–700 lines).**
 Routing on `request.model`; passthrough via httpx (promoted from transitive
-to explicit dependency) with headers byte-preserved; `sous claude` launcher;
+to explicit dependency) with end-to-end headers forwarded, `Host`
+regenerated, and hop-by-hop headers stripped (see the upstream-auth
+decision); `sous claude` launcher, which sets no credential vars;
 SECURITY.md gains the gateway boundary. Exit: one session, frontier main
 loop on verified subscription billing, subagents local, task completed.
 
@@ -195,7 +216,9 @@ existing epoch/strict-prefix correctness argument.
 mlx-lm `BatchGenerator` decode; always-chunked prefill ("Metal cannot preempt
 a running kernel, so bounding chunk duration IS the interleave mechanism");
 one decode-fairness debt scalar (fair share 0.5); deferred aborts drained at
-step top; client-disconnect → abort. Empirical constants worth keeping
+step top; client-disconnect → true mid-generation abort (upgrading Phase 1's
+drain-to-completion, which stops the wedge but still spends the GPU on an
+abandoned turn). Empirical constants worth keeping
 verbatim: the 64-token chunk grid, and descending through chunk tiers rather
 than dropping straight to the floor. Known hazards, all evidenced: sous's
 `snapshot`/`restore`/`trim_to` need a rewrite for batched cache objects
