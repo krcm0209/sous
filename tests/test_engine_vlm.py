@@ -38,7 +38,7 @@ def test_vlm_snapshot_restore_is_bit_exact(model_id, is_hybrid):
     takes the *state-copy* branch instead — the one every shipped user
     actually hits on the default 27B model, and the only branch these two
     bit-exactness tests previously left to manual verification."""
-    import mlx.core as mx  # ty: ignore[unresolved-import]
+    import mlx.core as mx
     from mlx_vlm.models.cache import make_prompt_cache
 
     from sous.engine.promptcache import restore, snapshot
@@ -86,7 +86,7 @@ def test_vlm_snapshot_restore_is_bit_exact(model_id, is_hybrid):
                 xa, xb = xa[..., :off, :], xb[..., :off, :]
             d = mx.max(mx.abs(xa.astype(mx.float32) - xb.astype(mx.float32)))
             mx.eval(d)
-            assert float(d.item()) == 0.0
+            assert d.item() == 0.0
     e.unload()
 
 
