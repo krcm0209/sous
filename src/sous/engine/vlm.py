@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from sous.engine.promptcache import PrefixCache, PromptMemo
 
 
@@ -81,7 +83,7 @@ class VLMEngine:
         return make_prompt_cache(model.language_model)
 
     def prefill(self, cache: list, token_ids: list[int]) -> None:
-        import mlx.core as mx  # ty: ignore[unresolved-import]
+        import mlx.core as mx
         from mlx_vlm import generate
 
         model, processor = self._loaded()
@@ -101,7 +103,7 @@ class VLMEngine:
         )
 
     def decode(self, cache: list, token_ids: list[int], max_tokens: int) -> str:
-        import mlx.core as mx  # ty: ignore[unresolved-import]
+        import mlx.core as mx
         from mlx_vlm import generate
 
         model, processor = self._loaded()
@@ -123,9 +125,11 @@ class VLMEngine:
         return result.text if hasattr(result, "text") else str(result)
 
     def copy_array(self, a: object) -> object:
-        import mlx.core as mx  # ty: ignore[unresolved-import]
+        import mlx.core as mx
 
-        return mx.array(a)
+        # promptcache is deliberately mlx-free and so types cache entries as
+        # `object`; everything that reaches here is an mx.array.
+        return mx.array(cast("mx.array", a))
 
     # ---- Engine ----------------------------------------------------------
 
@@ -150,8 +154,7 @@ class VLMEngine:
     def unload(self) -> None:
         import gc
 
-        # mlx.core is a compiled extension with no type stubs.
-        import mlx.core as mx  # ty: ignore[unresolved-import]
+        import mlx.core as mx
 
         self.reset_prompt_cache()
         self._model = None

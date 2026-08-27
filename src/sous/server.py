@@ -27,8 +27,7 @@ from sous.worker import run_worker_loop
 
 def _mlx_memory_gb() -> float | None:
     try:
-        # mlx.core is a compiled extension with no type stubs.
-        import mlx.core as mx  # ty: ignore[unresolved-import]
+        import mlx.core as mx
 
         return round(mx.get_active_memory() / 1e9, 2)
     except Exception:  # noqa: BLE001 — mlx absent or API moved

@@ -40,8 +40,7 @@ def release_mlx_thread_state() -> None:
     cleanup must never raise out of a dying thread.
     """
     try:
-        # mlx.core is a compiled extension with no type stubs.
-        import mlx.core as mx  # ty: ignore[unresolved-import]
+        import mlx.core as mx
 
         mx.clear_streams()
     except Exception:  # noqa: BLE001 — see docstring

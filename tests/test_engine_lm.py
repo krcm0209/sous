@@ -20,7 +20,7 @@ def test_lm_engine_generates_and_counts():
 def test_lm_snapshot_restore_is_bit_exact():
     """Restoring a contaminated cache must equal a cold prefill of the same
     prefix, exactly. Anything less and reuse silently changes the context."""
-    import mlx.core as mx  # ty: ignore[unresolved-import]
+    import mlx.core as mx
     from mlx_lm.models.cache import make_prompt_cache
 
     from sous.engine.lm import LMEngine
@@ -52,7 +52,7 @@ def test_lm_snapshot_restore_is_bit_exact():
                 mx.abs(xa[..., :off, :].astype(mx.float32) - xb[..., :off, :].astype(mx.float32))
             )
             mx.eval(d)
-            assert float(d.item()) == 0.0
+            assert d.item() == 0.0
     e.unload()
 
 

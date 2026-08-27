@@ -136,7 +136,7 @@ def _model_config(model_id: str) -> dict:
 def _live_memory() -> MemorySnapshot:
     # mlx.core is a compiled extension absent on non-macOS; psutil is only
     # needed on this path — both stay function-local like every mlx import.
-    import mlx.core as mx  # ty: ignore[unresolved-import]
+    import mlx.core as mx
     import psutil
 
     from sous.engine.base import release_mlx_thread_state
