@@ -223,9 +223,11 @@ delegation downloads and uses it.
 | 16 GB | `mlx-community/Qwen3.5-9B-MLX-4bit` | ~6 GB |
 
 The default is the affine 4-bit Qwen3.8-27B: half the footprint of the
-8-bit-class quants with no measured tool-loop quality loss, and the only
-quant mode mlx-vlm's speculative-decoding fast path currently supports
-(krcm0209/sous#58 has the measurements behind both claims). The 16 GB pick
+8-bit-class quants with no measured tool-loop quality loss. It also keeps
+mlx-vlm's speculative-decoding fast path available, which requires affine
+quantization (4-, 5-, or 8-bit); mxfp quants fall into a much slower
+per-token verify fallback (krcm0209/sous#58 has the measurements behind
+both claims). The 16 GB pick
 drops to the 9B tier because an 8-bit 9B (~11 GB) would crowd the ≈10.7 GB
 Metal working-set limit of a 16 GB machine once the KV cache lands on top of
 the weights; on 16 GB, also consider `[model].max_context_tokens = 16384` if
