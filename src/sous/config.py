@@ -60,7 +60,7 @@ _KNOWN = {
 @dataclass(frozen=True)
 class SousConfig:
     server_port: int = 8383
-    model_id: str = "mlx-community/Qwen3.8-27B-mxfp8"
+    model_id: str = "mlx-community/Qwen3.8-27B-4bit"
     idle_unload_minutes: int = 30
     max_context_tokens: int = 32768
     # Qwen's documented non-thinking-mode sampling settings — greedy (temp=0)
@@ -176,7 +176,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
     tasks = _section(raw, "tasks")
     return SousConfig(
         server_port=server.get("port", 8383),
-        model_id=model.get("id", "mlx-community/Qwen3.8-27B-mxfp8"),
+        model_id=model.get("id", "mlx-community/Qwen3.8-27B-4bit"),
         idle_unload_minutes=model.get("idle_unload_minutes", 30),
         max_context_tokens=model.get("max_context_tokens", 32768),
         temperature=model.get("temperature", 0.7),
