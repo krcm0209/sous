@@ -56,7 +56,7 @@ is work to keep in Claude.
 ## Requirements
 
 - Apple silicon Mac (tested on M-series with 64 GB; the default model needs
-  ~30 GB free unified memory — for 32 GB and 16 GB machines, see
+  ~18 GB free unified memory — for 16 GB machines, see
   [Smaller machines](#smaller-machines))
 - Python 3.14 (standard build) via [uv](https://docs.astral.sh/uv/)
 - Claude Code or Claude Desktop with a Pro/Max plan
@@ -102,7 +102,7 @@ restarting a downed daemon):
 cp -r skills/delegating-to-local ~/.claude/skills/
 ```
 
-First delegation downloads the model (~28.7 GB for the default) — one time.
+First delegation downloads the model (~16.1 GB for the default) — one time.
 
 ### Managing the daemon
 
@@ -139,7 +139,7 @@ reconnect and start a fresh one on the next call.
 port = 8383
 
 [model]
-id = "mlx-community/Qwen3.8-27B-mxfp8"
+id = "mlx-community/Qwen3.8-27B-4bit"
 idle_unload_minutes = 30
 max_context_tokens = 32768
 prompt_cache = true
@@ -212,26 +212,28 @@ still argmaxes to the same wrong output every time.
 
 ## Smaller machines
 
-The default model wants a 64 GB machine. Both alternatives below share the
-default's `qwen3_5` architecture, so they load through the exact same mlx-vlm
-path — edit `[model].id` in `~/.sous/config.toml` and the next delegation
-downloads and uses them.
+The default model fits 64 GB and 32 GB machines. The alternative below shares
+the default's `qwen3_5` architecture, so it loads through the exact same
+mlx-vlm path — edit `[model].id` in `~/.sous/config.toml` and the next
+delegation downloads and uses it.
 
 | Unified memory | `[model].id` | Weights |
 |---|---|---|
-| 64 GB (default) | `mlx-community/Qwen3.8-27B-mxfp8` | ~28.7 GB |
-| 32 GB | `mlx-community/Qwen3.8-27B-mxfp4` | ~15.2 GB |
+| 64 GB / 32 GB (default) | `mlx-community/Qwen3.8-27B-4bit` | ~16.1 GB |
 | 16 GB | `mlx-community/Qwen3.5-9B-MLX-4bit` | ~6 GB |
 
-The 32 GB pick is the same Qwen3.8-27B checkpoint at mxfp4 — same model at
-half the footprint for a modest quality cost. The 16 GB pick drops to the 9B
-tier because an 8-bit 9B (~11 GB) would crowd the ≈10.7 GB Metal working-set
-limit of a 16 GB machine once the KV cache lands on top of the weights; on
-16 GB, also consider `[model].max_context_tokens = 16384` if you see memory
-pressure. (`mlx-community/Qwen3.5-9B-mxfp8`/`-mxfp4` look like the obvious
-picks, but as of 2026-08 they are empty placeholder repos with no weights.)
+The default is the affine 4-bit Qwen3.8-27B: half the footprint of the
+8-bit-class quants with no measured tool-loop quality loss, and the only
+quant mode mlx-vlm's speculative-decoding fast path currently supports
+(krcm0209/sous#58 has the measurements behind both claims). The 16 GB pick
+drops to the 9B tier because an 8-bit 9B (~11 GB) would crowd the ≈10.7 GB
+Metal working-set limit of a 16 GB machine once the KV cache lands on top of
+the weights; on 16 GB, also consider `[model].max_context_tokens = 16384` if
+you see memory pressure. (`mlx-community/Qwen3.5-9B-mxfp8`/`-mxfp4` look
+like the obvious picks, but as of 2026-08 they are empty placeholder repos
+with no weights.)
 
-Both alternatives passed the same worker-path validation as the default
+The 16 GB alternative passed the same worker-path validation as the default
 (see [Validation status](#validation-status)), run on the 64 GB test
 machine — which validates the models and quants through sous's whole stack,
 not the memory fit on physical 32 GB / 16 GB hardware (that remains
@@ -287,8 +289,8 @@ draft from a small local model costs your plan nothing.
 
 ## Validation status
 
-Validated end to end against the default model
-(`mlx-community/Qwen3.8-27B-mxfp8`) on an M5 Pro / 64 GB:
+Validated end to end on an M5 Pro / 64 GB (originally against
+`mlx-community/Qwen3.8-27B-mxfp8`, which remains a supported `[model].id`):
 
 - **Worker path** — a delegated "add type hints and docstrings" task completed
   in 57s over 3 turns (`done` / `completed`). The worker edited the file, chose
@@ -298,11 +300,14 @@ Validated end to end against the default model
   path Claude Code uses: all six tools registered with the expected names, and
   a delegated task ran to `done` / `completed` in 42s with a correct diff and
   verify output.
-- **Smaller-machine models** — both [Smaller machines](#smaller-machines)
-  picks passed the same worker-path check on the same machine (delegated
-  type-hints task, worker self-verified with `pytest`, independent re-run
-  confirmed, accurate report): `Qwen3.8-27B-mxfp4` in 35s over 4 turns —
-  confirming mlx-vlm loads mxfp4-mode quants — and `Qwen3.5-9B-MLX-4bit` in
+- **Current default (`Qwen3.8-27B-4bit`)** — three delegated tasks
+  (module-from-spec, docstring sweep, test scaffolding) through the real
+  worker loop on 2026-08-29, all `done` / `completed` in 4/7/3 turns; every
+  artifact passed independent grading, including hidden spec tests
+  (krcm0209/sous#58).
+- **Other models through the same stack** — the same worker-path check also
+  passed on `Qwen3.8-27B-mxfp4` in 35s over 4 turns — confirming mlx-vlm
+  loads mxfp4-mode quants — and on the 16 GB pick `Qwen3.5-9B-MLX-4bit` in
   25s over 8 turns.
 
 Tool-call parsing accepts both the XML-ish `<function=…>/<parameter=…>` format

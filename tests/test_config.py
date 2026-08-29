@@ -27,7 +27,7 @@ def test_default_allowlist_covers_uv_run_wrappers(tmp_path: Path):
 def test_defaults_when_file_missing(tmp_path: Path):
     cfg = load_config(tmp_path / "nope.toml")
     assert cfg.server_port == 8383
-    assert cfg.model_id == "mlx-community/Qwen3.8-27B-mxfp8"
+    assert cfg.model_id == "mlx-community/Qwen3.8-27B-4bit"
     assert cfg.idle_unload_minutes == 30
     assert cfg.max_context_tokens == 32768
     assert cfg.temperature == 0.7
@@ -126,7 +126,7 @@ def test_non_table_section_falls_back_to_defaults(tmp_path: Path):
         warnings.simplefilter("always")
         cfg = load_config(p)
     assert cfg.server_port == 8383
-    assert cfg.model_id == "mlx-community/Qwen3.8-27B-mxfp8"
+    assert cfg.model_id == "mlx-community/Qwen3.8-27B-4bit"
     messages = [str(w.message) for w in caught]
     assert any("server" in m for m in messages)
     assert any("model" in m for m in messages)
