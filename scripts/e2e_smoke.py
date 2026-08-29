@@ -21,7 +21,7 @@ then emitting a well-formed `finish` tool call, so the task can still end
 is correct. Judge success from the printed report and hello.txt content,
 not just the final state; the transcript_path in the report has full
 turn-by-turn detail if something looks wrong. Sous's default model
-(mlx-community/Qwen3.8-27B-mxfp8) is far larger and far more reliable at
+(mlx-community/Qwen3.8-27B-4bit) is far larger and far more reliable at
 closing out the loop than this tiny one.
 """
 
