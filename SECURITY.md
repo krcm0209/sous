@@ -7,9 +7,10 @@ reporting.
 
 ## Supported versions
 
-sous is pre-1.0 and has no released versions yet. Fixes land on `main`; there
-is nothing to backport to. When releases start, this section will say which
-ones get security fixes.
+sous is pre-1.0. Only the latest release is supported: fixes land on `main`
+and ship in the next release, and nothing is backported to earlier versions.
+If you are running an older one, upgrade before reporting — the bug may
+already be gone.
 
 ## Reporting a vulnerability
 
