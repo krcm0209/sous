@@ -5,7 +5,9 @@
 The sous-chef for Claude's kitchen: delegate mechanical, volume-heavy coding
 tasks from Claude Code / Claude Desktop to a local MLX model on your Mac.
 Claude designs the menu; sous does the prep — in a sandboxed, auditable,
-autonomous tool loop. You (and Claude) review everything it cooks.
+autonomous tool loop. The sandbox is application-level, not an OS jail
+([what that means](#security-model)). You (and Claude) review everything it
+cooks.
 
 ## Why
 
