@@ -25,6 +25,59 @@ ApprovalHook = Callable[[str], bool]
 _ENV_PASS = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR")
 
 
+_CD_GUIDANCE = (
+    "commands already run at the project root without a shell; "
+    "run a single command per call, without 'cd'"
+)
+
+
+def normalize_cd_prefix(argv: list[str], project_root: Path) -> tuple[list[str], Path | None]:
+    """Turn the shell idiom `cd <dir> && <command...>` into (<command...>, dir).
+
+    The runner is deliberately shell-less, so local models' habitual
+    `cd proj && pytest` used to fail twice over: the `cd` prefix missed the
+    leading-token allowlist (burning the approval timeout headless), and even
+    an approved run exec'd a nonexistent `cd` binary. The idiom has an exact
+    no-shell equivalent — run the remainder with cwd=<dir> — so honor that,
+    and nothing more:
+
+    - <dir> goes through resolve_confined: outside the project root (via
+      absolute path, '..', case variants, or symlinks) is rejected HERE,
+      before the approval hook — path confinement is not approvable anywhere
+      else in the sandbox and must not become approvable through `cd`.
+    - The remainder must be a single command: a further '&&', '||', ';' or
+      '|' token means shell semantics this runner cannot honor, so reject
+      with guidance instead of running something subtly different. (The cost:
+      a cd-prefixed command with a *literal* '&&' argument is also rejected —
+      indistinguishable after shlex, and rare next to the chained-command
+      mistake.)
+    - Anything that is not exactly `cd <dir> && ...` (bare `cd x`, `cd` with
+      no target) is rejected with the same guidance rather than left to fail
+      as "command not found: cd".
+
+    Non-cd argv is returned untouched with cwd None: '&&' stays an inert
+    literal argument everywhere else, per the existing metacharacter tests.
+    Raises ValueError (shape) or PathViolation (escape); run_command turns
+    both into a rejection message.
+    """
+    if argv[0] != "cd":
+        return argv, None
+    if len(argv) < 3 or argv[2] != "&&":
+        raise ValueError(_CD_GUIDANCE)
+    rest = argv[3:]
+    if not rest:
+        raise ValueError(_CD_GUIDANCE)
+    if any(tok in ("&&", "||", ";", "|") for tok in rest):
+        raise ValueError(
+            "chained shell commands are not supported; run one command per call "
+            "(commands already run at the project root)"
+        )
+    target = resolve_confined(project_root, argv[1], for_write=False)
+    if not target.is_dir():
+        raise ValueError(f"cd target is not a directory: {argv[1]}")
+    return rest, target
+
+
 def command_allowed(argv: list[str], allowlist: list[list[str]]) -> bool:
     """Check if argv is allowlisted by leading-token equality.
 
@@ -472,6 +525,13 @@ class ToolExecutor:
             return f"command rejected: unparseable ({e})"
         if not argv:
             return "command rejected: empty"
+        # Before the allowlist/approval gate, on purpose: a confinement
+        # violation in the cd target must be unapprovable, and the allowlist
+        # must match the command that will actually run.
+        try:
+            argv, cd_target = normalize_cd_prefix(argv, self.project_root)
+        except (ValueError, PathViolation) as e:
+            return f"command rejected: {e}"
         if not command_allowed(argv, current_allowlist(self.config_path)) and (
             approval is None or not approval(command)
         ):
@@ -494,7 +554,7 @@ class ToolExecutor:
                 proc = subprocess.Popen(
                     argv,
                     shell=False,
-                    cwd=self.project_root,
+                    cwd=cd_target if cd_target is not None else self.project_root,
                     env=scrubbed_env(),
                     stdin=subprocess.DEVNULL,
                     stdout=out_f,

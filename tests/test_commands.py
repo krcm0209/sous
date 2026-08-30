@@ -667,3 +667,109 @@ def test_group_is_unregistered_before_the_audit_runs(tmp_path: Path, monkeypatch
 
     assert "exit code 0" in out
     assert seen["registered"] == set(), "reaped pgid was still registered during the audit"
+
+
+# ---- `cd <dir> && <command>` normalization -------------------------------
+
+
+@pytest.fixture()
+def ex_pwd(tmp_path: Path) -> ToolExecutor:
+    """Executor whose allowlist includes /bin/pwd so tests can observe cwd."""
+    root = tmp_path / "proj"
+    (root / "sub").mkdir(parents=True)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[commands]\nallowlist = ["/bin/echo", "/bin/pwd"]\n')
+    return ToolExecutor(root, cfg)
+
+
+def test_cd_prefix_runs_allowlisted_command_in_that_dir(ex_pwd: ToolExecutor):
+    """The worker's habitual `cd <dir> && cmd` must behave as a shell user
+    expects: cmd runs with cwd=<dir> — not "command not found: cd"."""
+    sub = ex_pwd.project_root / "sub"
+    out = ex_pwd.run_command(f"cd {sub} && /bin/pwd")
+    assert "exit code 0" in out
+    assert str(sub.resolve()) in out
+
+
+def test_cd_prefix_relative_dir(ex_pwd: ToolExecutor):
+    out = ex_pwd.run_command("cd sub && /bin/pwd")
+    assert "exit code 0" in out
+    assert str((ex_pwd.project_root / "sub").resolve()) in out
+
+
+def test_cd_outside_root_denied_and_never_offered_for_approval(ex_pwd: ToolExecutor):
+    """Path confinement is not approvable anywhere else in the sandbox; the
+    cd target must be checked BEFORE the approval hook can bless it."""
+    calls: list[str] = []
+
+    def hook(cmd: str) -> bool:
+        calls.append(cmd)
+        return True
+
+    out = ex_pwd.run_command("cd /etc && /bin/echo hi", approval=hook)
+    assert out.startswith("command rejected")
+    assert "escapes" in out or "root" in out
+    assert calls == []
+
+
+def test_cd_dotdot_escape_denied(ex_pwd: ToolExecutor):
+    out = ex_pwd.run_command(f"cd {ex_pwd.project_root}/.. && /bin/echo hi")
+    assert out.startswith("command rejected")
+
+
+def test_cd_symlink_escape_denied(ex_pwd: ToolExecutor, tmp_path: Path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (ex_pwd.project_root / "link").symlink_to(outside)
+    out = ex_pwd.run_command("cd link && /bin/echo hi")
+    assert out.startswith("command rejected")
+
+
+def test_cd_chained_commands_rejected_with_guidance(ex_pwd: ToolExecutor):
+    calls: list[str] = []
+    out = ex_pwd.run_command(
+        "cd sub && /bin/echo a && /bin/echo b",
+        approval=lambda c: calls.append(c) or True,
+    )
+    assert out.startswith("command rejected")
+    assert "one command" in out
+    assert calls == []
+
+
+def test_bare_cd_rejected_with_guidance(ex_pwd: ToolExecutor):
+    out = ex_pwd.run_command("cd sub")
+    assert out.startswith("command rejected")
+    assert "project root" in out
+
+
+def test_cd_to_missing_dir_rejected(ex_pwd: ToolExecutor):
+    out = ex_pwd.run_command("cd nope && /bin/echo hi")
+    assert out.startswith("command rejected")
+    assert "not a directory" in out
+
+
+def test_cd_prefix_rest_still_goes_through_allowlist_and_approval(ex_pwd: ToolExecutor):
+    """Normalization must not widen the allowlist: the remainder is matched
+    exactly as if typed alone, and the approval hook sees the ORIGINAL
+    command string so the human reviews what the model actually asked for."""
+    seen: list[str] = []
+
+    def approve(cmd: str) -> bool:
+        seen.append(cmd)
+        return True
+
+    original = "cd sub && /usr/bin/printf ok"
+    out = ex_pwd.run_command(original, approval=approve)
+    assert "exit code 0" in out and "ok" in out
+    assert seen == [original]
+
+    out = ex_pwd.run_command("cd sub && /usr/bin/printf no", approval=lambda c: False)
+    assert out.startswith("command denied")
+
+
+def test_literal_amp_amp_argument_stays_inert_without_cd(ex_pwd: ToolExecutor):
+    """Only the `cd` idiom is normalized: && anywhere else stays a literal
+    argument, exactly like the existing metacharacter guarantee."""
+    out = ex_pwd.run_command("/bin/echo a && b")
+    assert "exit code 0" in out
+    assert "a && b" in out
