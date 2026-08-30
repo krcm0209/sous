@@ -173,6 +173,23 @@ def _context_values(context: dict) -> tuple[str, float, int]:
     return mode, float(fraction), min_tokens
 
 
+def _speculative_block_size(model: dict) -> int:
+    """Validated [model].speculative_block_size, degrading to 0 (auto) with a
+    warning — same stance as [context]. This one is a silent-truncation knob:
+    mlx-vlm treats the value as the total verify-block size and ends its round
+    loop when it is <= 1, so a configured 1 (or a negative) would cap every
+    response at a single token without any error."""
+    value = model.get("speculative_block_size", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value == 1 or value < 0:
+        warnings.warn(
+            f"sous config: [model].speculative_block_size {value!r} must be 0 (auto) "
+            "or an integer >= 2; using 0",
+            stacklevel=3,
+        )
+        return 0
+    return value
+
+
 def load_config(config_path: Path | None = None) -> SousConfig:
     path = config_path or DEFAULT_CONFIG_PATH
     raw = _read_toml(path)
@@ -194,7 +211,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         top_k=model.get("top_k", 20),
         prompt_cache=model.get("prompt_cache", True),
         speculative_draft_id=model.get("speculative_draft_id", "z-lab/Qwen3.8-27B-DFlash2"),
-        speculative_block_size=model.get("speculative_block_size", 0),
+        speculative_block_size=_speculative_block_size(model),
         max_turns=budgets.get("max_turns", 40),
         max_minutes=budgets.get("max_minutes", 15),
         max_tokens_per_generation=budgets.get("max_tokens_per_generation", 4096),

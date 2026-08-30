@@ -17,7 +17,11 @@ def _load_quantized_drafter(model: object, draft_id: str) -> tuple[Any, str]:
     from huggingface_hub import snapshot_download
     from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
 
-    drafter, kind = cast("tuple[Any, str]", load_drafter(snapshot_download(draft_id)))
+    # lazy=True: load_drafter's default evaluates every bf16 parameter on the
+    # spot (~4 GB peak). Deferring keeps the weights unevaluated through
+    # validation, and on the happy path quantize consumes the lazy loads so
+    # the final eval materializes only the 4-bit copy.
+    drafter, kind = cast("tuple[Any, str]", load_drafter(snapshot_download(draft_id), lazy=True))
     # Validate BEFORE quantize+eval: for an incompatible target (a swapped
     # [model].id) this fails while the weights are still lazy, so the mismatch
     # costs a config check instead of materializing ~4 GB of bf16 first.

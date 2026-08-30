@@ -167,3 +167,20 @@ def test_vlm_incompatible_drafter_degrades_gracefully():
     out = e.generate(msgs, WORKER_TOOLS, max_tokens=32)
     assert isinstance(out, str) and len(out) > 0
     e.unload()
+
+
+def test_incompatible_drafter_never_materializes_bf16():
+    """The drafter is loaded lazily: on the degrade path (incompatible
+    target), validation must fail while the ~3.9 GB of bf16 weights are still
+    unevaluated. Peak memory therefore stays near the 1 GB target model —
+    materializing the drafter first would push it past ~4.5 GB."""
+    import mlx.core as mx
+
+    from sous.engine.vlm import VLMEngine
+
+    mx.reset_peak_memory()
+    e = VLMEngine(TINY_VLM, draft_id=DRAFTER)
+    assert e._draft is None
+    peak_gb = mx.get_peak_memory() / 1e9
+    assert peak_gb < 3.0, f"peak {peak_gb:.2f} GB — drafter bf16 was materialized"
+    e.unload()
