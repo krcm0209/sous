@@ -287,3 +287,51 @@ def test_prompt_cache_is_a_known_model_key(tmp_path: Path):
         warnings.simplefilter("always")
         load_config(path)
     assert not [w for w in caught if "unknown" in str(w.message).lower()]
+
+
+def test_speculative_defaults(tmp_path: Path):
+    cfg = load_config(tmp_path / "nope.toml")
+    assert cfg.speculative_draft_id == "z-lab/Qwen3.8-27B-DFlash2"
+    assert cfg.speculative_block_size == 0
+
+
+def test_speculative_keys_from_toml_without_unknown_key_warnings(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text('[model]\nspeculative_draft_id = ""\nspeculative_block_size = 3\n')
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(p)
+    assert cfg.speculative_draft_id == ""
+    assert cfg.speculative_block_size == 3
+    assert not [w for w in caught if "unknown" in str(w.message).lower()]
+
+
+def test_speculative_block_size_one_or_negative_warns_and_defaults_to_auto(tmp_path: Path):
+    """mlx-vlm treats the override as the total verify-block size and ends the
+    round loop at <= 1 — a configured 1 would silently truncate every response
+    to one token. Invalid values degrade to 0 (auto) with a warning, matching
+    the [context] policy stance."""
+    for bad in ("1", "-3", "true"):
+        p = tmp_path / f"c{bad}.toml"
+        p.write_text(f"[model]\nspeculative_block_size = {bad}\n")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            cfg = load_config(p)
+        assert cfg.speculative_block_size == 0, bad
+        assert any("speculative_block_size" in str(w.message) for w in caught), bad
+
+
+def test_speculative_block_size_zero_and_ge_two_accepted(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nspeculative_block_size = 2\n")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(p)
+    assert cfg.speculative_block_size == 2
+    assert not [w for w in caught if "speculative_block_size" in str(w.message)]
+    p.write_text("[model]\nspeculative_block_size = 0\n")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(p)
+    assert cfg.speculative_block_size == 0
+    assert not [w for w in caught if "speculative_block_size" in str(w.message)]

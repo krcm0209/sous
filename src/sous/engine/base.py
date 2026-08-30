@@ -76,21 +76,29 @@ def _default_factory(
     top_p: float = 0.8,
     top_k: int = 20,
     prompt_cache: bool = True,
+    draft_id: str = "",
+    draft_block_size: int = 0,
 ) -> Engine:
     backend = select_backend(fetch_model_config(model_id))
     if backend == "vlm":
-        from sous.engine.vlm import VLMEngine
+        # Import the module, not the class, so tests can monkeypatch the
+        # engine class on its home module and be seen here.
+        from sous.engine import vlm
 
-        return VLMEngine(
+        return vlm.VLMEngine(
             model_id,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             prompt_cache=prompt_cache,
+            draft_id=draft_id,
+            draft_block_size=draft_block_size,
         )
-    from sous.engine.lm import LMEngine
+    # The drafter settings stop here: speculative decoding is an mlx-vlm
+    # feature, and the mlx-lm backend has no parameter for it.
+    from sous.engine import lm
 
-    return LMEngine(
+    return lm.LMEngine(
         model_id,
         temperature=temperature,
         top_p=top_p,
@@ -255,6 +263,8 @@ class EngineManager:
                 config.top_p,
                 config.top_k,
                 config.prompt_cache,
+                draft_id=config.speculative_draft_id,
+                draft_block_size=config.speculative_block_size,
             )
         )
         self._lock = threading.Lock()

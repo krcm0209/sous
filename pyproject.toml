@@ -43,7 +43,7 @@ dependencies = [
     # daemon; see the helper's docstring.
     "mlx>=0.31",
     "mlx-lm>=0.31",
-    "mlx-vlm>=0.6.13",
+    "mlx-vlm>=0.6.16",
     "psutil>=7",
     "tomlkit>=0.13",
 ]

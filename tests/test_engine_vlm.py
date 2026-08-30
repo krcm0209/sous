@@ -107,3 +107,80 @@ def test_vlm_engine_reuses_across_turns():
     stats = e.prompt_cache_stats()
     assert stats["hits"] == 1, stats
     e.unload()
+
+
+DEFAULT_27B = "mlx-community/Qwen3.8-27B-4bit"
+DRAFTER = "z-lab/Qwen3.8-27B-DFlash2"
+
+
+@pytest.mark.parametrize("prompt_cache", [False, True], ids=["cold", "warm-cache"])
+def test_vlm_drafter_speeds_up_generation_on_default_model(prompt_cache):
+    """The configured drafter must actually engage: after a generation, the
+    drafter has recorded speculative rounds, and output is non-empty. Uses the
+    shipped default model + drafter pair (heavy — local only, like every test
+    in this file).
+
+    Parametrized over prompt_cache because the #55 gate demands both: the
+    warm path decodes a SUFFIX onto a cache prefilled by a separate drafter-
+    less generate() call, and that split — not the cold path — is where a
+    drafter with no captured hidden state would break. Two generations in the
+    warm case so the second one actually rides a reused prefix."""
+    from sous.engine.vlm import VLMEngine
+    from sous.protocol import WORKER_TOOLS
+
+    e = VLMEngine(DEFAULT_27B, draft_id=DRAFTER, prompt_cache=prompt_cache)
+    assert e._draft is not None, "drafter should load and validate on the default model"
+    msgs = [{"role": "user", "content": "Write a haiku about rain."}]
+    out = e.generate(msgs, WORKER_TOOLS, max_tokens=64)
+    assert isinstance(out, str) and len(out) > 0
+    assert len(getattr(e._draft, "accept_lens", [])) > 0, "no speculative rounds ran"
+    if prompt_cache:
+        msgs = [
+            *msgs,
+            {"role": "assistant", "content": out},
+            {"role": "user", "content": "Now one about snow."},
+        ]
+        e._draft.accept_lens.clear()
+        out2 = e.generate(msgs, WORKER_TOOLS, max_tokens=64)
+        assert isinstance(out2, str) and len(out2) > 0
+        stats = e.prompt_cache_stats()
+        assert stats.get("hits", 0) >= 1, f"warm path never engaged: {stats}"
+        assert len(e._draft.accept_lens) > 0, "no speculative rounds on the warm path"
+    e.unload()
+    assert e._draft is None
+
+
+def test_vlm_incompatible_drafter_degrades_gracefully():
+    """A drafter that cannot serve the target (wrong architecture) must not
+    take the engine down: warn, run without it, and still generate."""
+    import warnings as w
+
+    from sous.engine.vlm import VLMEngine
+    from sous.protocol import WORKER_TOOLS
+
+    with w.catch_warnings(record=True) as caught:
+        w.simplefilter("always")
+        e = VLMEngine(TINY_VLM, draft_id=DRAFTER)
+    assert e._draft is None
+    assert any("drafter" in str(x.message).lower() for x in caught)
+    msgs = [{"role": "user", "content": "Say the word kiwi and nothing else."}]
+    out = e.generate(msgs, WORKER_TOOLS, max_tokens=32)
+    assert isinstance(out, str) and len(out) > 0
+    e.unload()
+
+
+def test_incompatible_drafter_never_materializes_bf16():
+    """The drafter is loaded lazily: on the degrade path (incompatible
+    target), validation must fail while the ~3.9 GB of bf16 weights are still
+    unevaluated. Peak memory therefore stays near the 1 GB target model —
+    materializing the drafter first would push it past ~4.5 GB."""
+    import mlx.core as mx
+
+    from sous.engine.vlm import VLMEngine
+
+    mx.reset_peak_memory()
+    e = VLMEngine(TINY_VLM, draft_id=DRAFTER)
+    assert e._draft is None
+    peak_gb = mx.get_peak_memory() / 1e9
+    assert peak_gb < 3.0, f"peak {peak_gb:.2f} GB — drafter bf16 was materialized"
+    e.unload()

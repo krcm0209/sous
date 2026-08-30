@@ -1368,7 +1368,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=2.0,<3" },
     { name = "mlx", specifier = ">=0.31" },
     { name = "mlx-lm", specifier = ">=0.31" },
-    { name = "mlx-vlm", specifier = ">=0.6.13" },
+    { name = "mlx-vlm", specifier = ">=0.6.16" },
     { name = "psutil", specifier = ">=7" },
     { name = "tomlkit", specifier = ">=0.13" },
 ]
