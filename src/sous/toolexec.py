@@ -31,7 +31,44 @@ _CD_GUIDANCE = (
 )
 
 
-def normalize_cd_prefix(argv: list[str], project_root: Path) -> list[str]:
+_CD_SHELL_PUNCTUATION = ";&|<>"
+
+
+def _parse_cd_idiom(command: str) -> tuple[str, list[str]] | None:
+    """Parse `cd <dir> && <command...>`, returning (<dir>, <command argv>).
+
+    None when `command` is not a `cd ...` invocation at all. Raises ValueError
+    when it is a `cd` but not the honored idiom: no `&&`, an empty remainder,
+    or any further shell operator in the remainder.
+
+    Tokenized with `punctuation_chars` so shell operators are their own tokens
+    even glued to a word (`echo hi>out`, `a|b`), closing the gap a plain
+    shlex.split leaves — it would hand back `>`/`|` as ordinary arguments and
+    the shell-less runner would execute them literally, which is different
+    semantics from what the operator asked for. Shared by normalize_cd_prefix
+    and canonical_command_for_allowlist so both judge the idiom identically.
+    A quoted operator in the remainder is over-rejected (rare, and the model
+    can drop the `cd`); that is preferred to running a redirection literally.
+    """
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=_CD_SHELL_PUNCTUATION)
+    lexer.whitespace_split = True
+    tokens = list(lexer)
+    if not tokens or tokens[0] != "cd":
+        return None
+    if len(tokens) < 3 or tokens[2] != "&&":
+        raise ValueError(_CD_GUIDANCE)
+    directory, rest = tokens[1], tokens[3:]
+    if not rest:
+        raise ValueError(_CD_GUIDANCE)
+    if any(set(tok) <= set(_CD_SHELL_PUNCTUATION) for tok in (directory, *rest)):
+        raise ValueError(
+            "chained shell commands, pipes, and redirections are not supported; "
+            "run one command per call (commands already run at the project root)"
+        )
+    return directory, rest
+
+
+def normalize_cd_prefix(command: str, argv: list[str], project_root: Path) -> list[str]:
     """Strip the shell idiom `cd <dir> && <command...>` down to <command...>.
 
     The runner is deliberately shell-less, so local models' habitual
@@ -43,15 +80,13 @@ def normalize_cd_prefix(argv: list[str], project_root: Path) -> list[str]:
     identical, and cwd is never taken from `<dir>`, so there is no path for a
     `cd` to widen confinement or move the working directory out of the root.
 
-    - The remainder must be a single command: a further '&&', '||', ';' or
-      '|' token means shell semantics this runner cannot honor, so reject
-      with guidance instead of running something subtly different. (The cost:
-      a cd-prefixed command with a *literal* '&&' argument is also rejected —
-      indistinguishable after shlex, and rare next to the chained-command
-      mistake.)
-    - `<dir>` is still confinement-checked, purely so an out-of-root `cd`
-      earns a clear "runs at the project root" message instead of silently
-      running somewhere the model did not intend. It is never used as cwd.
+    - The remainder must be a single command: `_parse_cd_idiom` rejects any
+      further shell operator (`&&`, `||`, `;`, `|`, and redirections `<`/`>`),
+      including one glued to a token, rather than run it as a literal argument.
+    - `<dir>` must resolve to an existing directory inside the root. A failed
+      `cd` short-circuits `&&` in a real shell, so a missing or non-directory
+      target rejects the whole command instead of running the remainder; an
+      out-of-root target is rejected too (for the message — it is never cwd).
     - Anything that is not exactly `cd <dir> && ...` (bare `cd x`, `cd` with
       no target) is rejected with guidance rather than left to fail as
       "command not found: cd".
@@ -60,22 +95,19 @@ def normalize_cd_prefix(argv: list[str], project_root: Path) -> list[str]:
     everywhere else, per the existing metacharacter tests. Raises ValueError
     (shape/escape); run_command turns it into a rejection message.
     """
-    if argv[0] != "cd":
+    if not argv or argv[0] != "cd":
         return argv
-    if len(argv) < 3 or argv[2] != "&&":
+    parsed = _parse_cd_idiom(command)
+    if parsed is None:  # argv[0] == "cd" but the lexer disagreed; treat as bad
         raise ValueError(_CD_GUIDANCE)
-    rest = argv[3:]
-    if not rest:
-        raise ValueError(_CD_GUIDANCE)
-    if any(tok in ("&&", "||", ";", "|") for tok in rest):
-        raise ValueError(
-            "chained shell commands are not supported; run one command per call "
-            "(commands already run at the project root)"
-        )
-    # Confinement check for a clear message only — the result is discarded and
-    # the command runs at the project root regardless. Because <dir> never
-    # becomes cwd, no TOCTOU race exists between this check and the launch.
-    resolve_confined(project_root, argv[1], for_write=False)
+    directory, rest = parsed
+    # resolve_confined bounds the path (out-of-root → clear message); is_dir
+    # enforces the `&&` short-circuit — a failed cd must not run the remainder.
+    # The resolved path is otherwise discarded: <dir> never becomes cwd, so
+    # there is no TOCTOU race between this check and the launch.
+    resolved = resolve_confined(project_root, directory, for_write=False)
+    if not resolved.is_dir():
+        raise ValueError(f"cd target is not a directory: {directory}")
     return rest
 
 
@@ -98,18 +130,17 @@ def canonical_command_for_allowlist(command: str) -> str:
     write an entry no future request can ever match (leading token 'cd'), so
     an approve-and-persist on a cd-prefixed command would keep prompting.
 
-    Pure and filesystem-free: shape only, no confinement. Returns `command`
-    unchanged if it is not the cd idiom or cannot be parsed."""
+    Pure and filesystem-free: shares _parse_cd_idiom's shape judgement (so the
+    persisted form matches exactly what run_command strips), but skips its
+    confinement/is_dir checks. Returns `command` unchanged when it is not the
+    clean cd idiom or cannot be parsed."""
     try:
-        argv = shlex.split(command)
+        parsed = _parse_cd_idiom(command)
     except ValueError:
         return command
-    if not argv or argv[0] != "cd" or len(argv) < 3 or argv[2] != "&&":
+    if parsed is None:
         return command
-    rest = argv[3:]
-    if not rest or any(tok in ("&&", "||", ";", "|") for tok in rest):
-        return command
-    return shlex.join(rest)
+    return shlex.join(parsed[1])
 
 
 def scrubbed_env() -> dict[str, str]:
@@ -552,7 +583,7 @@ class ToolExecutor:
         # must match the command that will actually run (the cd prefix
         # stripped). The command always runs at the project root.
         try:
-            argv = normalize_cd_prefix(argv, self.project_root)
+            argv = normalize_cd_prefix(command, argv, self.project_root)
         except (ValueError, PathViolation) as e:
             return f"command rejected: {e}"
         if not command_allowed(argv, current_allowlist(self.config_path)) and (

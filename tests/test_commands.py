@@ -811,3 +811,42 @@ def test_canonical_command_for_allowlist_strips_cd_prefix():
     assert canon("/bin/echo a && b") == "/bin/echo a && b"
     assert canon("cd sub && a && b") == "cd sub && a && b"
     assert canon("cd sub") == "cd sub"
+
+
+def test_cd_redirection_and_pipe_operators_rejected(ex_pwd: ToolExecutor):
+    """The cd remainder must be a single command with no further shell syntax.
+    Redirections and pipes — including operators glued to a token — are shell
+    semantics this runner cannot honor, so reject with guidance rather than
+    run the operator as a literal argument."""
+    for cmd in (
+        "cd sub && /bin/echo hi > out",
+        "cd sub && /bin/echo hi>out",
+        "cd sub && /bin/echo a | /bin/echo b",
+        "cd sub && /bin/echo a|b",
+        "cd sub && /bin/echo a; /bin/echo b",
+        "cd sub && /bin/echo a < in",
+    ):
+        out = ex_pwd.run_command(cmd, approval=lambda c: True)
+        assert out.startswith("command rejected"), cmd
+    # the redirection target must not have been created as a side effect
+    assert not (ex_pwd.project_root / "out").exists()
+
+
+def test_cd_missing_or_nondir_target_rejected(ex_pwd: ToolExecutor):
+    """A failed `cd` short-circuits `&&` in a real shell, so the remainder must
+    not run. Reject a target that does not resolve to an existing directory."""
+    (ex_pwd.project_root / "afile").write_text("x")
+    for cmd in ("cd nope && /bin/echo hi", "cd afile && /bin/echo hi"):
+        out = ex_pwd.run_command(cmd, approval=lambda c: True)
+        assert out.startswith("command rejected"), cmd
+        assert "not a directory" in out, cmd
+
+
+def test_canonical_command_rejects_operators_in_remainder():
+    """canonical_command_for_allowlist shares the cd parse: a remainder with a
+    further operator is not the clean idiom, so it returns the input unchanged
+    rather than persisting a half-parsed command."""
+    from sous.toolexec import canonical_command_for_allowlist as canon
+
+    assert canon("cd sub && pytest > log") == "cd sub && pytest > log"
+    assert canon("cd sub && a|b") == "cd sub && a|b"

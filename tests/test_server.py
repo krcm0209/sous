@@ -283,9 +283,11 @@ def test_persisting_a_cd_prefixed_command_matches_the_next_request(svc):
     assert not any(entry and entry[0] == "cd" for entry in allow)
     # and the same request now passes the allowlist that run_command applies
     ex = ToolExecutor(root, service.config.config_path)
+    (ex.project_root / "sub").mkdir()
     from sous.toolexec import normalize_cd_prefix
 
-    argv = normalize_cd_prefix(["cd", "sub", "&&", "go", "vet", "./..."], ex.project_root)
+    cmd = "cd sub && go vet ./..."
+    argv = normalize_cd_prefix(cmd, ["cd", "sub", "&&", "go", "vet", "./..."], ex.project_root)
     assert command_allowed(argv, current_allowlist(service.config.config_path))
 
 
