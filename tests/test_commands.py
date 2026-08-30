@@ -908,3 +908,27 @@ def test_cd_escaped_operator_argument_runs(ex_pwd: ToolExecutor):
     out = ex_pwd.run_command(r"cd sub && /bin/echo \>")
     assert "exit code 0" in out
     assert ">" in out
+
+
+def test_cd_unquoted_operator_in_dir_position_rejected(ex_pwd: ToolExecutor):
+    """The `cd <dir>` side must be scanned for unquoted operators too, not just
+    word-counted: `cd sub; && cmd` is not the supported idiom even when a
+    directory literally named `sub;` exists, so it must reject with guidance
+    rather than strip the prefix and run the allowlisted remainder."""
+    import os
+
+    os.mkdir(ex_pwd.project_root / "sub;")  # a real dir whose name ends in ';'
+    calls: list[str] = []
+    out = ex_pwd.run_command("cd sub; && /bin/echo hi", approval=lambda c: calls.append(c) or True)
+    assert out.startswith("command rejected")
+    assert "not a directory" not in out  # rejected for the operator, not is_dir
+    assert calls == []
+
+
+def test_cd_quoted_operator_in_dir_name_not_flagged_as_operator(ex_pwd: ToolExecutor):
+    """A quoted operator in the directory name is a literal part of the name,
+    not shell syntax; the left-side scan must respect quoting (it will then
+    fail the is_dir check, which is a different, correct rejection)."""
+    out = ex_pwd.run_command("cd 'weird;name' && /bin/echo hi", approval=lambda c: True)
+    assert out.startswith("command rejected")
+    assert "not a directory" in out  # reached confinement/is_dir, not the operator guard

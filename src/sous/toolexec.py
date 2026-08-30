@@ -114,7 +114,13 @@ def _parse_cd_idiom(command: str) -> tuple[str, list[str]] | None:
     if len(left) != 2:  # exactly `cd <dir>` before the &&
         raise ValueError(_CD_GUIDANCE)
     remainder = command[amp + 2 :]
-    if any(c in _CD_OPERATOR_CHARS for _, c in _scan_unquoted(remainder)):
+    # Scan BOTH sides for unquoted operators — the `cd <dir>` side too, or a
+    # directory literally named `sub;` would let `cd sub; && cmd` (a `;`
+    # separator, not the idiom) strip the prefix and run the remainder. A
+    # quoted/escaped operator in the dir name stays a literal (and then fails
+    # the is_dir check, a different, correct rejection).
+    scanned = (*_scan_unquoted(command[:amp]), *_scan_unquoted(remainder))
+    if any(c in _CD_OPERATOR_CHARS for _, c in scanned):
         raise ValueError(
             "chained shell commands, pipes, redirections, and grouping are not "
             "supported; run one command per call (commands already run at the "
