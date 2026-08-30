@@ -49,6 +49,8 @@ _KNOWN = {
         "top_p",
         "top_k",
         "prompt_cache",
+        "speculative_draft_id",
+        "speculative_block_size",
     },
     "budgets": {"max_turns", "max_minutes", "max_tokens_per_generation"},
     "commands": {"allowlist", "timeout_seconds", "approval_timeout_minutes"},
@@ -70,6 +72,14 @@ class SousConfig:
     temperature: float = 0.7
     top_p: float = 0.8
     top_k: int = 20
+    # Speculative decoding (VLM backend only): a DFlash-style drafter predicts
+    # blocks the target verifies in one forward, ~2.4x decode on the default
+    # affine-4bit model (krcm0209/sous#55, #58). Empty id disables it. The
+    # drafter must match the target architecture; when it doesn't (or fails to
+    # load), the engine logs and continues without it. Block size 0 lets the
+    # drafter's own policy pick the depth — the best-measured setting.
+    speculative_draft_id: str = "z-lab/Qwen3.8-27B-DFlash2"
+    speculative_block_size: int = 0
     # Reuse one KV cache across the turns of a task, prefilling only what the
     # conversation gained, instead of re-prefilling from scratch every turn.
     # Works because all of a task's generations share one GenerationSession
@@ -183,6 +193,8 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         top_p=model.get("top_p", 0.8),
         top_k=model.get("top_k", 20),
         prompt_cache=model.get("prompt_cache", True),
+        speculative_draft_id=model.get("speculative_draft_id", "z-lab/Qwen3.8-27B-DFlash2"),
+        speculative_block_size=model.get("speculative_block_size", 0),
         max_turns=budgets.get("max_turns", 40),
         max_minutes=budgets.get("max_minutes", 15),
         max_tokens_per_generation=budgets.get("max_tokens_per_generation", 4096),

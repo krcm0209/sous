@@ -2,9 +2,29 @@
 
 from __future__ import annotations
 
-from typing import cast
+import warnings
+from typing import Any, cast
 
 from sous.engine.promptcache import PrefixCache, PromptMemo
+
+
+def _load_quantized_drafter(model: object, draft_id: str) -> tuple[Any, str]:
+    """Download, quantize, and validate a speculative drafter for `model`.
+
+    Raises on any problem — the caller degrades to running without one."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from huggingface_hub import snapshot_download
+    from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
+
+    drafter, kind = cast("tuple[Any, str]", load_drafter(snapshot_download(draft_id)))
+    # Published DFlash checkpoints ship bf16; left unquantized the drafter
+    # costs more per round than speculation saves (measured in #58: a bf16
+    # drafter regresses throughput below the no-drafter baseline).
+    nn.quantize(drafter, group_size=64, bits=4)
+    mx.eval(drafter.parameters())
+    validate_drafter_compatibility(model, drafter, kind)
+    return drafter, kind
 
 
 class VLMEngine:
@@ -15,6 +35,8 @@ class VLMEngine:
         top_p: float = 0.8,
         top_k: int = 20,
         prompt_cache: bool = False,
+        draft_id: str = "",
+        draft_block_size: int = 0,
     ):
         from mlx_vlm import load
         from mlx_vlm.sample_utils import make_sampler
@@ -24,6 +46,18 @@ class VLMEngine:
         self._sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
         self._memo = PromptMemo()
         self._cache = PrefixCache(self, enabled=prompt_cache)
+        self._draft = None
+        self._draft_kind = ""
+        self._draft_block_size = draft_block_size
+        if draft_id:
+            try:
+                self._draft, self._draft_kind = _load_quantized_drafter(self._model, draft_id)
+            except Exception as e:  # noqa: BLE001 — degrade, never block the model
+                warnings.warn(
+                    f"sous: speculative drafter {draft_id!r} unavailable for"
+                    f" {model_id} ({e}); generating without it",
+                    stacklevel=2,
+                )
 
     def _loaded(self) -> tuple:
         """The (model, processor) pair, or a clear error if already unloaded.
@@ -107,6 +141,19 @@ class VLMEngine:
         from mlx_vlm import generate
 
         model, processor = self._loaded()
+        # Speculative decoding rides on the decode call only: prefill has no
+        # tokens to draft, and generate_step captures the hidden states the
+        # drafter needs during its own prefill of these input_ids. block size
+        # 0 means None — let the drafter's own policy pick the depth.
+        draft_kwargs = (
+            {
+                "draft_model": self._draft,
+                "draft_kind": self._draft_kind,
+                "draft_block_size": self._draft_block_size or None,
+            }
+            if self._draft is not None
+            else {}
+        )
         # prompt_cache plus input_ids, not prompt_cache_state. mlx-vlm primes
         # Qwen mRoPE state before feeding a suffix, and that priming turns out
         # to be bit-identical to no priming for text-only prompts — so sous
@@ -120,6 +167,7 @@ class VLMEngine:
             verbose=False,
             prompt_cache=cache,
             input_ids=mx.array(token_ids)[None],
+            **draft_kwargs,
         )
         # mlx-vlm returns GenerationResult in recent versions; older return str
         return result.text if hasattr(result, "text") else str(result)
@@ -159,5 +207,6 @@ class VLMEngine:
         self.reset_prompt_cache()
         self._model = None
         self._processor = None
+        self._draft = None
         gc.collect()
         mx.clear_cache()

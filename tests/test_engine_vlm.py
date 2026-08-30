@@ -107,3 +107,44 @@ def test_vlm_engine_reuses_across_turns():
     stats = e.prompt_cache_stats()
     assert stats["hits"] == 1, stats
     e.unload()
+
+
+DEFAULT_27B = "mlx-community/Qwen3.8-27B-4bit"
+DRAFTER = "z-lab/Qwen3.8-27B-DFlash2"
+
+
+def test_vlm_drafter_speeds_up_generation_on_default_model():
+    """The configured drafter must actually engage: after a generation, the
+    drafter has recorded speculative rounds, and output is non-empty. Uses the
+    shipped default model + drafter pair (heavy — local only, like every test
+    in this file)."""
+    from sous.engine.vlm import VLMEngine
+    from sous.protocol import WORKER_TOOLS
+
+    e = VLMEngine(DEFAULT_27B, draft_id=DRAFTER)
+    assert e._draft is not None, "drafter should load and validate on the default model"
+    msgs = [{"role": "user", "content": "Write a haiku about rain."}]
+    out = e.generate(msgs, WORKER_TOOLS, max_tokens=64)
+    assert isinstance(out, str) and len(out) > 0
+    assert len(getattr(e._draft, "accept_lens", [])) > 0, "no speculative rounds ran"
+    e.unload()
+    assert e._draft is None
+
+
+def test_vlm_incompatible_drafter_degrades_gracefully():
+    """A drafter that cannot serve the target (wrong architecture) must not
+    take the engine down: warn, run without it, and still generate."""
+    import warnings as w
+
+    from sous.engine.vlm import VLMEngine
+    from sous.protocol import WORKER_TOOLS
+
+    with w.catch_warnings(record=True) as caught:
+        w.simplefilter("always")
+        e = VLMEngine(TINY_VLM, draft_id=DRAFTER)
+    assert e._draft is None
+    assert any("drafter" in str(x.message).lower() for x in caught)
+    msgs = [{"role": "user", "content": "Say the word kiwi and nothing else."}]
+    out = e.generate(msgs, WORKER_TOOLS, max_tokens=32)
+    assert isinstance(out, str) and len(out) > 0
+    e.unload()

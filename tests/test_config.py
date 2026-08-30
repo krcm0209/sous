@@ -287,3 +287,20 @@ def test_prompt_cache_is_a_known_model_key(tmp_path: Path):
         warnings.simplefilter("always")
         load_config(path)
     assert not [w for w in caught if "unknown" in str(w.message).lower()]
+
+
+def test_speculative_defaults(tmp_path: Path):
+    cfg = load_config(tmp_path / "nope.toml")
+    assert cfg.speculative_draft_id == "z-lab/Qwen3.8-27B-DFlash2"
+    assert cfg.speculative_block_size == 0
+
+
+def test_speculative_keys_from_toml_without_unknown_key_warnings(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text('[model]\nspeculative_draft_id = ""\nspeculative_block_size = 3\n')
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(p)
+    assert cfg.speculative_draft_id == ""
+    assert cfg.speculative_block_size == 3
+    assert not [w for w in caught if "unknown" in str(w.message).lower()]
