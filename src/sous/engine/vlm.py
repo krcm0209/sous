@@ -18,12 +18,15 @@ def _load_quantized_drafter(model: object, draft_id: str) -> tuple[Any, str]:
     from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
 
     drafter, kind = cast("tuple[Any, str]", load_drafter(snapshot_download(draft_id)))
+    # Validate BEFORE quantize+eval: for an incompatible target (a swapped
+    # [model].id) this fails while the weights are still lazy, so the mismatch
+    # costs a config check instead of materializing ~4 GB of bf16 first.
+    validate_drafter_compatibility(model, drafter, kind)
     # Published DFlash checkpoints ship bf16; left unquantized the drafter
     # costs more per round than speculation saves (measured in #58: a bf16
     # drafter regresses throughput below the no-drafter baseline).
     nn.quantize(drafter, group_size=64, bits=4)
     mx.eval(drafter.parameters())
-    validate_drafter_compatibility(model, drafter, kind)
     return drafter, kind
 
 
