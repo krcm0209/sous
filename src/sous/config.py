@@ -73,8 +73,9 @@ class SousConfig:
     top_p: float = 0.8
     top_k: int = 20
     # Speculative decoding (VLM backend only): a DFlash-style drafter predicts
-    # blocks the target verifies in one forward, ~2.4x decode on the default
-    # affine-4bit model (krcm0209/sous#55, #58). Empty id disables it. The
+    # blocks the target verifies in one forward — ~1.8x decode on the default
+    # affine-4bit model with the shipped sampling, up to ~2.4x greedy
+    # (krcm0209/sous#55, #58). Empty id disables it. The
     # drafter must match the target architecture; when it doesn't (or fails to
     # load), the engine logs and continues without it. Block size 0 lets the
     # drafter's own policy pick the depth — the best-measured setting.

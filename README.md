@@ -146,9 +146,10 @@ prompt_cache = true
 temperature = 0.7
 top_p = 0.8
 top_k = 20
-# Speculative decoding (~2.4x decode on the default model). "" disables it;
-# block size 0 lets the drafter's own policy pick the depth. Auto-disables
-# with a warning when the drafter can't serve the configured model.
+# Speculative decoding: ~1.8x decode on the default model with the shipped
+# sampling, up to ~2.4x greedy. "" disables it; block size 0 lets the
+# drafter's own policy pick the depth. Auto-disables with a warning when
+# the drafter can't serve the configured model.
 speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
 speculative_block_size = 0
 
