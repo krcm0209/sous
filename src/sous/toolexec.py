@@ -31,7 +31,7 @@ _CD_GUIDANCE = (
 )
 
 
-def normalize_cd_prefix(argv: list[str], project_root: Path) -> tuple[list[str], Path | None]:
+def normalize_cd_prefix(argv: list[str], project_root: Path) -> tuple[list[str], str | None]:
     """Turn the shell idiom `cd <dir> && <command...>` into (<command...>, dir).
 
     The runner is deliberately shell-less, so local models' habitual
@@ -55,6 +55,13 @@ def normalize_cd_prefix(argv: list[str], project_root: Path) -> tuple[list[str],
       no target) is rejected with the same guidance rather than left to fail
       as "command not found: cd".
 
+    Returns the cd target as the ORIGINAL candidate string, not a resolved
+    path: run_command re-opens it as a pinned fd at launch time so the exec
+    cannot follow a symlink swapped in after this check (see
+    open_confined_dir). The escape check here is the pre-approval gate — path
+    confinement must be rejected before the approval hook can bless it — and
+    is repeated at open time against the fd.
+
     Non-cd argv is returned untouched with cwd None: '&&' stays an inert
     literal argument everywhere else, per the existing metacharacter tests.
     Raises ValueError (shape) or PathViolation (escape); run_command turns
@@ -72,10 +79,13 @@ def normalize_cd_prefix(argv: list[str], project_root: Path) -> tuple[list[str],
             "chained shell commands are not supported; run one command per call "
             "(commands already run at the project root)"
         )
+    # Reject escapes before the approval hook (confinement is unapprovable),
+    # and confirm the target is a directory for a clear message. The launch
+    # re-opens by fd; this resolved path is intentionally not carried forward.
     target = resolve_confined(project_root, argv[1], for_write=False)
     if not target.is_dir():
         raise ValueError(f"cd target is not a directory: {argv[1]}")
-    return rest, target
+    return rest, argv[1]
 
 
 def command_allowed(argv: list[str], allowlist: list[list[str]]) -> bool:
@@ -88,6 +98,51 @@ def command_allowed(argv: list[str], allowlist: list[list[str]]) -> bool:
         if argv
         else False
     )
+
+
+def _fd_real_path(fd: int) -> Path:
+    """The absolute path an open directory fd currently resolves to. F_GETPATH
+    on Darwin (the product's target), /proc/self/fd on Linux (where CI runs
+    the command tests)."""
+    import fcntl
+
+    f_getpath = getattr(fcntl, "F_GETPATH", None)
+    if f_getpath is not None:
+        buf = fcntl.fcntl(fd, f_getpath, b"\0" * 1024)
+        return Path(os.fsdecode(buf.split(b"\0", 1)[0]))
+    return Path(os.readlink(f"/proc/self/fd/{fd}"))
+
+
+def open_confined_dir(project_root: Path, candidate: str) -> int:
+    """Open `candidate` as a directory fd confined to the project root.
+
+    The caller launches the command with `os.fchdir(fd)` in the child, so the
+    working directory is the exact inode verified here — never a path string
+    re-walked by the kernel at exec time. `Popen(cwd=<string>)` does re-walk,
+    which is a genuine TOCTOU hole: between the resolve_confined check and the
+    command actually launching (the approval hook can block for minutes) a
+    concurrent process can rename the target and drop a symlink to the outside
+    in its place, and the exec then follows it out of the root. An open fd
+    keeps pointing at the inode it was opened on across any later
+    rename/replace; and the fd's own real path is re-checked against the root
+    after opening, so a swap that beat the open is caught too. Caller owns the
+    fd and must close it. Raises PathViolation on escape (via resolve_confined
+    or the post-open recheck), OSError if the directory cannot be opened."""
+    root = project_root.resolve()
+    # resolve_confined first: canonicalize, collapse '..', resolve symlinks,
+    # reject a string-level escape before opening anything.
+    resolved = resolve_confined(root, candidate, for_write=False)
+    fd = os.open(resolved, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        # Re-verify the OPENED inode is within the root: if the target was
+        # swapped for an escaping symlink between resolve and open, the fd now
+        # points outside, and only this fd-level check can catch it.
+        if not _is_within(_fd_real_path(fd).resolve(), root):
+            raise PathViolation(f"cd target escaped the project root: {candidate}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def scrubbed_env() -> dict[str, str]:
@@ -536,6 +591,26 @@ class ToolExecutor:
             approval is None or not approval(command)
         ):
             return f"command denied (not allowlisted): {command}"
+        # Pin the cd target AFTER approval, as a directory fd: the child does
+        # os.fchdir(dir_fd), so the launch cannot be redirected by a symlink
+        # swapped in during the (possibly minutes-long) approval wait. Opened
+        # here, not in normalize_cd_prefix, to keep the fd's lifetime tight and
+        # to re-verify confinement against the post-approval filesystem.
+        dir_fd: int | None = None
+        if cd_target is not None:
+            try:
+                dir_fd = open_confined_dir(self.project_root, cd_target)
+            except (PathViolation, OSError) as e:
+                return f"command rejected: {e}"
+        try:
+            return self._spawn_and_collect(command, argv, dir_fd, timeout)
+        finally:
+            if dir_fd is not None:
+                os.close(dir_fd)
+
+    def _spawn_and_collect(
+        self, command: str, argv: list[str], dir_fd: int | None, timeout: float
+    ) -> str:
         before_snap = self._tree_snapshot()
         # stdout/stderr are spooled to unlinked temp files, NOT pipes:
         # communicate() would buffer the ENTIRE output in RAM before the
@@ -551,15 +626,21 @@ class ToolExecutor:
                 # worker must never block on input, and a session leader has
                 # no controlling terminal for inherited TTY stdin to make
                 # sense.
+                # dir_fd set → fchdir to the pinned inode in the child (immune
+                # to a post-approval path swap); else run at the project root.
+                # os.fchdir is a single async-signal-safe syscall, the only
+                # work done in preexec_fn.
                 proc = subprocess.Popen(
                     argv,
                     shell=False,
-                    cwd=cd_target if cd_target is not None else self.project_root,
+                    cwd=None if dir_fd is not None else self.project_root,
                     env=scrubbed_env(),
                     stdin=subprocess.DEVNULL,
                     stdout=out_f,
                     stderr=err_f,
                     start_new_session=True,
+                    preexec_fn=(lambda fd=dir_fd: os.fchdir(fd)) if dir_fd is not None else None,
+                    pass_fds=(dir_fd,) if dir_fd is not None else (),
                 )
             except FileNotFoundError:
                 return f"command not found: {argv[0]}"

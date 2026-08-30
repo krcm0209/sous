@@ -773,3 +773,65 @@ def test_literal_amp_amp_argument_stays_inert_without_cd(ex_pwd: ToolExecutor):
     out = ex_pwd.run_command("/bin/echo a && b")
     assert "exit code 0" in out
     assert "a && b" in out
+
+
+def test_cd_target_swap_during_approval_cannot_redirect_cwd(tmp_path: Path):
+    """TOCTOU guard: the approval hook can block for minutes, and a background
+    process from an earlier command can swap the cd target for a symlink in
+    that window. The launch must use the directory handle pinned at check
+    time, not re-walk the path — a swapped-in symlink to the outside must
+    never become cwd. Observed via marker files: the pinned inode still shows
+    its own file after a rename; the escape target's file must never appear."""
+    import os
+
+    root = tmp_path / "proj"
+    sub = root / "sub"
+    sub.mkdir(parents=True)
+    (sub / "canary_inside").write_text("x")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "canary_outside").write_text("x")
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[commands]\nallowlist = ["/bin/ls"]\n')
+    ex2 = ToolExecutor(root, cfg)
+
+    def swap_then_approve(cmd: str) -> bool:
+        os.rename(sub, root / "sub_moved")
+        os.symlink(outside, sub)
+        return True
+
+    out = ex2.run_command("cd sub && /bin/ls", approval=swap_then_approve)
+    assert "canary_outside" not in out, out
+    # If it ran at all, it ran in the pinned inode (now named sub_moved),
+    # which still carries its own marker — never the escape target.
+    if "exit code 0" in out:
+        assert "canary_inside" in out, out
+
+
+def test_open_confined_dir_rejects_fd_that_escaped_the_root(tmp_path: Path, monkeypatch):
+    """Layered defense for the resolve->open race: even when the path-string
+    check passes, the OPENED directory is re-verified by its own fd. An fd
+    that really points outside the root must be rejected."""
+    import sous.toolexec as tx
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(tx, "resolve_confined", lambda *a, **k: outside.resolve())
+    with pytest.raises(tx.PathViolation):
+        tx.open_confined_dir(root, "sub")
+
+
+def test_open_confined_dir_returns_usable_fd_for_valid_dir(tmp_path: Path):
+    import os
+
+    import sous.toolexec as tx
+
+    root = tmp_path / "proj"
+    (root / "sub").mkdir(parents=True)
+    fd = tx.open_confined_dir(root, "sub")
+    try:
+        assert os.path.samestat(os.fstat(fd), os.stat(root / "sub"))
+    finally:
+        os.close(fd)
