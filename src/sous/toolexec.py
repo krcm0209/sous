@@ -32,55 +32,98 @@ _CD_GUIDANCE = (
 
 
 # Shell control characters rejected in a cd remainder: command separators and
-# chaining (; & |), redirections (< >), and grouping ( ). Newlines are handled
-# separately (they are whitespace to the lexer, so checked on the raw string).
-_CD_SHELL_PUNCTUATION = ";&|<>()"
+# chaining (; & |), redirections (< >), and grouping ( ). Only UNQUOTED,
+# UNESCAPED occurrences count — a quoted or backslash-escaped one is an
+# ordinary argument.
+_CD_OPERATOR_CHARS = frozenset(";&|<>()")
+
+
+def _scan_unquoted(text: str):
+    """Yield (index, char) for every character of `text` that is outside single
+    and double quotes and not backslash-escaped — i.e. the characters a POSIX
+    shell would interpret. This preserves the quote/escape provenance that
+    shlex tokenization discards, so an operator can be told apart from a
+    literal argument that merely contains the same character."""
+    single = double = escaped = False
+    for i, c in enumerate(text):
+        if escaped:  # previous backslash consumed this char as a literal
+            escaped = False
+            continue
+        if single:
+            single = c != "'"
+            continue
+        if double:
+            if c == "\\":
+                escaped = True
+            elif c == '"':
+                double = False
+            continue
+        if c == "\\":
+            escaped = True
+        elif c == "'":
+            single = True
+        elif c == '"':
+            double = True
+        else:
+            yield i, c
+
+
+def _first_unquoted_amp2(command: str) -> int:
+    """Index of the first unquoted `&&`, or -1. The `&&` that separates the cd
+    idiom must itself be unquoted, and a quoted `&&` inside the directory name
+    must not be mistaken for it."""
+    prev = -2
+    for i, c in _scan_unquoted(command):
+        if c == "&" and i == prev + 1:
+            return prev
+        prev = i if c == "&" else -2
+    return -1
 
 
 def _parse_cd_idiom(command: str) -> tuple[str, list[str]] | None:
     """Parse `cd <dir> && <command...>`, returning (<dir>, <command argv>).
 
     None when `command` is not a `cd ...` invocation at all. Raises ValueError
-    when it is a `cd` but not the honored idiom: no `&&`, an empty remainder,
-    a newline (a command separator), or any further shell operator in the
-    remainder.
+    when it is a `cd` but not the honored idiom: no `&&`, more than one word
+    before it, an empty remainder, a newline (a command separator), or any
+    further shell operator in the remainder.
 
-    Tokenized with `punctuation_chars` so shell operators are their own tokens
-    even glued to a word (`echo hi>out`, `a|b`), closing the gap a plain
-    shlex.split leaves — it would hand back `>`/`|` as ordinary arguments and
-    the shell-less runner would execute them literally, which is different
-    semantics from what the operator asked for. `commenters` is cleared so a
-    `#` matches shlex.split's literal handling instead of truncating the
-    remainder at a "comment". Shared by normalize_cd_prefix and
-    canonical_command_for_allowlist so both judge the idiom identically. A
-    quoted operator in the remainder is over-rejected (rare, and the model can
-    drop the `cd`); that is preferred to running a redirection literally.
+    Operator detection scans the raw remainder with quote/escape tracking
+    (`_scan_unquoted`), so `> < | ; & ( )` glued to a word (`echo hi>out`) is
+    rejected while the SAME character quoted (`echo '>'`) or escaped (`echo
+    \\>`) runs as a literal argument. shlex.split (which the argv is built
+    with) treats `#` as a literal and would hand an unquoted `>` back as an
+    ordinary token — hence the separate raw scan. Shared by normalize_cd_prefix
+    and canonical_command_for_allowlist so both judge the idiom identically.
     """
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=_CD_SHELL_PUNCTUATION)
-    lexer.whitespace_split = True
-    lexer.commenters = ""  # match shlex.split: '#' is a literal, not a comment
-    tokens = list(lexer)
+    try:
+        tokens = shlex.split(command)  # commenters='' by default: '#' is literal
+    except ValueError:
+        return None  # unbalanced quotes: run_command already reported it
     if not tokens or tokens[0] != "cd":
         return None
-    # Newlines split as whitespace above, so a multi-line `cd ... && a\n b`
-    # would look like one long command; reject on the raw string instead.
     if any(nl in command for nl in "\n\r"):
         raise ValueError(
             "a command may not span multiple lines; run one command per call "
             "(commands already run at the project root)"
         )
-    if len(tokens) < 3 or tokens[2] != "&&":
+    amp = _first_unquoted_amp2(command)
+    if amp < 0:
         raise ValueError(_CD_GUIDANCE)
-    directory, rest = tokens[1], tokens[3:]
-    if not rest:
+    left = shlex.split(command[:amp])
+    if len(left) != 2:  # exactly `cd <dir>` before the &&
         raise ValueError(_CD_GUIDANCE)
-    if any(set(tok) <= set(_CD_SHELL_PUNCTUATION) for tok in (directory, *rest)):
+    remainder = command[amp + 2 :]
+    if any(c in _CD_OPERATOR_CHARS for _, c in _scan_unquoted(remainder)):
         raise ValueError(
             "chained shell commands, pipes, redirections, and grouping are not "
             "supported; run one command per call (commands already run at the "
             "project root)"
         )
-    return directory, rest
+    rest = shlex.split(remainder)
+    if not rest:
+        raise ValueError(_CD_GUIDANCE)
+    return left[1], rest
 
 
 def normalize_cd_prefix(command: str, argv: list[str], project_root: Path) -> list[str]:

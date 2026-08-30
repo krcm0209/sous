@@ -884,3 +884,27 @@ def test_cd_quoted_shell_chars_are_literal_and_run(ex_pwd: ToolExecutor):
     out = ex_pwd.run_command("cd sub && /bin/echo '(x)#y'")
     assert "exit code 0" in out
     assert "(x)#y" in out
+
+
+def test_cd_quoted_operator_argument_runs(ex_pwd: ToolExecutor):
+    """'only UNQUOTED operators reject': a quoted operator character is an
+    ordinary argument, so the command runs and the operator reaches it."""
+    out = ex_pwd.run_command("cd sub && /bin/echo '>'")
+    assert "exit code 0" in out
+    assert ">" in out
+
+
+def test_cd_empty_string_argument_runs(ex_pwd: ToolExecutor):
+    """An empty-string argument must not be mistaken for a shell operator —
+    set('') is a vacuous subset of any operator set, the exact false positive
+    a token-based check hits."""
+    out = ex_pwd.run_command("cd sub && /bin/echo '' done")
+    assert "exit code 0" in out
+    assert "done" in out
+
+
+def test_cd_escaped_operator_argument_runs(ex_pwd: ToolExecutor):
+    r"""A backslash-escaped operator outside quotes is also a literal."""
+    out = ex_pwd.run_command(r"cd sub && /bin/echo \>")
+    assert "exit code 0" in out
+    assert ">" in out
