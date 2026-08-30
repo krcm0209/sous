@@ -367,3 +367,51 @@ def test_close_unleaks_an_idle_thread_holding_an_unconsumed_reply():
     session.close()
     session._thread.join(5)
     assert not session._thread.is_alive()
+
+
+def test_default_factory_passes_drafter_settings_to_vlm_only(monkeypatch):
+    """The drafter is an mlx-vlm feature: the VLM backend must receive the
+    configured drafter id and block size, and the LM backend must not be
+    handed arguments it has no parameter for."""
+    import sous.engine.base as base
+    import sous.engine.lm as lm_mod
+    import sous.engine.vlm as vlm_mod
+
+    captured: dict[str, dict] = {}
+
+    class FakeVLM:
+        def __init__(self, model_id, **kwargs):
+            captured["vlm"] = kwargs
+
+    class FakeLM:
+        def __init__(self, model_id, **kwargs):
+            captured["lm"] = kwargs
+
+    monkeypatch.setattr(vlm_mod, "VLMEngine", FakeVLM)
+    monkeypatch.setattr(lm_mod, "LMEngine", FakeLM)
+
+    monkeypatch.setattr(base, "fetch_model_config", lambda _id: {"vision_config": {}})
+    base._default_factory("m", 0.7, 0.8, 20, True, draft_id="z-lab/drafter", draft_block_size=3)
+    assert captured["vlm"]["draft_id"] == "z-lab/drafter"
+    assert captured["vlm"]["draft_block_size"] == 3
+
+    monkeypatch.setattr(base, "fetch_model_config", lambda _id: {"model_type": "qwen3"})
+    base._default_factory("m", 0.7, 0.8, 20, True, draft_id="z-lab/drafter", draft_block_size=3)
+    assert "draft_id" not in captured["lm"]
+    assert "draft_block_size" not in captured["lm"]
+
+
+def test_engine_manager_threads_drafter_config_into_default_factory(monkeypatch):
+    import sous.engine.base as base
+
+    seen: dict[str, dict] = {}
+
+    def fake_default_factory(model_id, *args, **kwargs):
+        seen["kwargs"] = kwargs
+        return FakeEngine([])
+
+    monkeypatch.setattr(base, "_default_factory", fake_default_factory)
+    cfg = SousConfig(speculative_draft_id="z-lab/drafter", speculative_block_size=5)
+    EngineManager(cfg).get()
+    assert seen["kwargs"]["draft_id"] == "z-lab/drafter"
+    assert seen["kwargs"]["draft_block_size"] == 5
