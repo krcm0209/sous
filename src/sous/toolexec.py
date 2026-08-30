@@ -31,7 +31,10 @@ _CD_GUIDANCE = (
 )
 
 
-_CD_SHELL_PUNCTUATION = ";&|<>"
+# Shell control characters rejected in a cd remainder: command separators and
+# chaining (; & |), redirections (< >), and grouping ( ). Newlines are handled
+# separately (they are whitespace to the lexer, so checked on the raw string).
+_CD_SHELL_PUNCTUATION = ";&|<>()"
 
 
 def _parse_cd_idiom(command: str) -> tuple[str, list[str]] | None:
@@ -39,22 +42,33 @@ def _parse_cd_idiom(command: str) -> tuple[str, list[str]] | None:
 
     None when `command` is not a `cd ...` invocation at all. Raises ValueError
     when it is a `cd` but not the honored idiom: no `&&`, an empty remainder,
-    or any further shell operator in the remainder.
+    a newline (a command separator), or any further shell operator in the
+    remainder.
 
     Tokenized with `punctuation_chars` so shell operators are their own tokens
     even glued to a word (`echo hi>out`, `a|b`), closing the gap a plain
     shlex.split leaves — it would hand back `>`/`|` as ordinary arguments and
     the shell-less runner would execute them literally, which is different
-    semantics from what the operator asked for. Shared by normalize_cd_prefix
-    and canonical_command_for_allowlist so both judge the idiom identically.
-    A quoted operator in the remainder is over-rejected (rare, and the model
-    can drop the `cd`); that is preferred to running a redirection literally.
+    semantics from what the operator asked for. `commenters` is cleared so a
+    `#` matches shlex.split's literal handling instead of truncating the
+    remainder at a "comment". Shared by normalize_cd_prefix and
+    canonical_command_for_allowlist so both judge the idiom identically. A
+    quoted operator in the remainder is over-rejected (rare, and the model can
+    drop the `cd`); that is preferred to running a redirection literally.
     """
     lexer = shlex.shlex(command, posix=True, punctuation_chars=_CD_SHELL_PUNCTUATION)
     lexer.whitespace_split = True
+    lexer.commenters = ""  # match shlex.split: '#' is a literal, not a comment
     tokens = list(lexer)
     if not tokens or tokens[0] != "cd":
         return None
+    # Newlines split as whitespace above, so a multi-line `cd ... && a\n b`
+    # would look like one long command; reject on the raw string instead.
+    if any(nl in command for nl in "\n\r"):
+        raise ValueError(
+            "a command may not span multiple lines; run one command per call "
+            "(commands already run at the project root)"
+        )
     if len(tokens) < 3 or tokens[2] != "&&":
         raise ValueError(_CD_GUIDANCE)
     directory, rest = tokens[1], tokens[3:]
@@ -62,8 +76,9 @@ def _parse_cd_idiom(command: str) -> tuple[str, list[str]] | None:
         raise ValueError(_CD_GUIDANCE)
     if any(set(tok) <= set(_CD_SHELL_PUNCTUATION) for tok in (directory, *rest)):
         raise ValueError(
-            "chained shell commands, pipes, and redirections are not supported; "
-            "run one command per call (commands already run at the project root)"
+            "chained shell commands, pipes, redirections, and grouping are not "
+            "supported; run one command per call (commands already run at the "
+            "project root)"
         )
     return directory, rest
 

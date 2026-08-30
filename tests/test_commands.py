@@ -850,3 +850,37 @@ def test_canonical_command_rejects_operators_in_remainder():
 
     assert canon("cd sub && pytest > log") == "cd sub && pytest > log"
     assert canon("cd sub && a|b") == "cd sub && a|b"
+
+
+def test_cd_hash_in_argument_is_not_treated_as_comment(ex_pwd: ToolExecutor):
+    """The cd lexer must match shlex.split's no-comment semantics: a '#' in an
+    argument is a literal character, not the start of a comment, so the arg
+    reaches the command intact rather than being silently truncated."""
+    out = ex_pwd.run_command("cd sub && /bin/echo foo#bar")
+    assert "exit code 0" in out
+    assert "foo#bar" in out
+
+
+def test_cd_newline_rejected_as_multi_command(ex_pwd: ToolExecutor):
+    """A newline is a shell command separator; the single-command idiom must
+    reject it rather than silently run one command with extra arguments."""
+    out = ex_pwd.run_command("cd sub && /bin/echo a\n/bin/echo b", approval=lambda c: True)
+    assert out.startswith("command rejected")
+
+
+def test_cd_grouped_subshell_rejected(ex_pwd: ToolExecutor):
+    """Grouping parentheses are shell control syntax; reject before approval
+    so they can't burn the approval timeout on a command that would never run."""
+    calls: list[str] = []
+    out = ex_pwd.run_command("cd sub && (/bin/echo hi)", approval=lambda c: calls.append(c) or True)
+    assert out.startswith("command rejected")
+    assert calls == []
+
+
+def test_cd_quoted_shell_chars_are_literal_and_run(ex_pwd: ToolExecutor):
+    """Only UNQUOTED operators reject: a quoted '(...)' or '#' is an ordinary
+    argument and the command runs, so the operator guard doesn't over-reject
+    legitimate arguments."""
+    out = ex_pwd.run_command("cd sub && /bin/echo '(x)#y'")
+    assert "exit code 0" in out
+    assert "(x)#y" in out
