@@ -3,7 +3,7 @@
 # The bare name is squatted on PyPI (placeholder, untouched since 2022), so
 # this uses the fallback the design spec reserved.
 name = "sous-mcp"
-version = "0.4.0"
+version = "0.5.0"
 description = "The sous-chef for Claude's kitchen: an MCP daemon that delegates mechanical, volume-heavy coding tasks to a sandboxed local MLX worker on Apple silicon, so heavy Claude Code use stretches further on the same plan"
 readme = "README.md"
 authors = [
