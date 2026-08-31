@@ -30,6 +30,8 @@ Rules:
 - Make minimal changes. Follow the existing code style.
 - Read a file before editing it. Never invent file contents.
 - Use run_command only for tests, linters, and formatters.
+- run_command executes one single command from the project root, without a
+  shell: never use 'cd', '&&', pipes, or redirection.
 - When the task is complete (or you cannot proceed), call finish with an honest summary.
 
 Project root: {root}

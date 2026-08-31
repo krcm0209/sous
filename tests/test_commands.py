@@ -667,3 +667,268 @@ def test_group_is_unregistered_before_the_audit_runs(tmp_path: Path, monkeypatch
 
     assert "exit code 0" in out
     assert seen["registered"] == set(), "reaped pgid was still registered during the audit"
+
+
+# ---- `cd <dir> && <command>` normalization -------------------------------
+
+
+@pytest.fixture()
+def ex_pwd(tmp_path: Path) -> ToolExecutor:
+    """Executor whose allowlist includes /bin/pwd so tests can observe cwd."""
+    root = tmp_path / "proj"
+    (root / "sub").mkdir(parents=True)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[commands]\nallowlist = ["/bin/echo", "/bin/pwd"]\n')
+    return ToolExecutor(root, cfg)
+
+
+def test_cd_prefix_runs_allowlisted_command_at_project_root(ex_pwd: ToolExecutor):
+    """The worker's habitual `cd <dir> && cmd` runs cmd at the project root —
+    not "command not found: cd", and never with cwd taken from <dir>. The
+    dominant case `cd <project-root> && cmd` is identical to running cmd
+    plain; a subdir target is ignored (commands run at the root)."""
+    out = ex_pwd.run_command(f"cd {ex_pwd.project_root} && /bin/pwd")
+    assert "exit code 0" in out
+    assert str(ex_pwd.project_root.resolve()) in out
+
+
+def test_cd_prefix_subdir_still_runs_at_root(ex_pwd: ToolExecutor):
+    out = ex_pwd.run_command("cd sub && /bin/pwd")
+    assert "exit code 0" in out
+    assert str(ex_pwd.project_root.resolve()) in out
+    # explicitly NOT the subdir — cwd is never taken from the cd target
+    assert str((ex_pwd.project_root / "sub").resolve()) not in out
+
+
+def test_cd_outside_root_denied_and_never_offered_for_approval(ex_pwd: ToolExecutor):
+    """An out-of-root cd earns a clear rejection before the approval hook —
+    the model learns the command would not run where it thinks. (Confinement
+    here is for the message; the command never uses <dir> as cwd.)"""
+    calls: list[str] = []
+
+    def hook(cmd: str) -> bool:
+        calls.append(cmd)
+        return True
+
+    out = ex_pwd.run_command("cd /etc && /bin/echo hi", approval=hook)
+    assert out.startswith("command rejected")
+    assert "escapes" in out or "root" in out
+    assert calls == []
+
+
+def test_cd_dotdot_escape_denied(ex_pwd: ToolExecutor):
+    out = ex_pwd.run_command(f"cd {ex_pwd.project_root}/.. && /bin/echo hi")
+    assert out.startswith("command rejected")
+
+
+def test_cd_symlink_escape_denied(ex_pwd: ToolExecutor, tmp_path: Path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (ex_pwd.project_root / "link").symlink_to(outside)
+    out = ex_pwd.run_command("cd link && /bin/echo hi")
+    assert out.startswith("command rejected")
+
+
+def test_cd_chained_commands_rejected_with_guidance(ex_pwd: ToolExecutor):
+    calls: list[str] = []
+    out = ex_pwd.run_command(
+        "cd sub && /bin/echo a && /bin/echo b",
+        approval=lambda c: calls.append(c) or True,
+    )
+    assert out.startswith("command rejected")
+    assert "one command" in out
+    assert calls == []
+
+
+def test_bare_cd_rejected_with_guidance(ex_pwd: ToolExecutor):
+    out = ex_pwd.run_command("cd sub")
+    assert out.startswith("command rejected")
+    assert "project root" in out
+
+
+def test_cd_prefix_rest_still_goes_through_allowlist_and_approval(ex_pwd: ToolExecutor):
+    """Normalization must not widen the allowlist: the remainder is matched
+    exactly as if typed alone, and the approval hook sees the ORIGINAL
+    command string so the human reviews what the model actually asked for."""
+    seen: list[str] = []
+
+    def approve(cmd: str) -> bool:
+        seen.append(cmd)
+        return True
+
+    original = "cd sub && /usr/bin/printf ok"
+    out = ex_pwd.run_command(original, approval=approve)
+    assert "exit code 0" in out and "ok" in out
+    assert seen == [original]
+
+    out = ex_pwd.run_command("cd sub && /usr/bin/printf no", approval=lambda c: False)
+    assert out.startswith("command denied")
+
+
+def test_literal_amp_amp_argument_stays_inert_without_cd(ex_pwd: ToolExecutor):
+    """Only the `cd` idiom is normalized: && anywhere else stays a literal
+    argument, exactly like the existing metacharacter guarantee."""
+    out = ex_pwd.run_command("/bin/echo a && b")
+    assert "exit code 0" in out
+    assert "a && b" in out
+
+
+def test_cd_target_swap_during_approval_cannot_escape(tmp_path: Path):
+    """A cd target swapped for an escaping symlink during the (minutes-long)
+    approval wait cannot redirect anything: the command runs at the project
+    root and never uses <dir> as cwd, so there is no TOCTOU window at all."""
+    import os
+
+    root = tmp_path / "proj"
+    sub = root / "sub"
+    sub.mkdir(parents=True)
+    (root / "canary_root").write_text("x")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "canary_outside").write_text("x")
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[commands]\nallowlist = ["/bin/ls"]\n')
+    ex2 = ToolExecutor(root, cfg)
+
+    def swap_then_approve(cmd: str) -> bool:
+        os.rename(sub, root / "sub_moved")
+        os.symlink(outside, sub)
+        return True
+
+    out = ex2.run_command("cd sub && /bin/ls", approval=swap_then_approve)
+    assert "exit code 0" in out
+    assert "canary_root" in out  # ran at the project root
+    assert "canary_outside" not in out
+
+
+def test_canonical_command_for_allowlist_strips_cd_prefix():
+    from sous.toolexec import canonical_command_for_allowlist as canon
+
+    assert canon("cd sub && pytest tests/x.py -v") == "pytest tests/x.py -v"
+    assert canon("cd /the/project && pytest") == "pytest"
+    # not the idiom → unchanged
+    assert canon("pytest tests/x.py") == "pytest tests/x.py"
+    assert canon("/bin/echo a && b") == "/bin/echo a && b"
+    assert canon("cd sub && a && b") == "cd sub && a && b"
+    assert canon("cd sub") == "cd sub"
+
+
+def test_cd_redirection_and_pipe_operators_rejected(ex_pwd: ToolExecutor):
+    """The cd remainder must be a single command with no further shell syntax.
+    Redirections and pipes — including operators glued to a token — are shell
+    semantics this runner cannot honor, so reject with guidance rather than
+    run the operator as a literal argument."""
+    for cmd in (
+        "cd sub && /bin/echo hi > out",
+        "cd sub && /bin/echo hi>out",
+        "cd sub && /bin/echo a | /bin/echo b",
+        "cd sub && /bin/echo a|b",
+        "cd sub && /bin/echo a; /bin/echo b",
+        "cd sub && /bin/echo a < in",
+    ):
+        out = ex_pwd.run_command(cmd, approval=lambda c: True)
+        assert out.startswith("command rejected"), cmd
+    # the redirection target must not have been created as a side effect
+    assert not (ex_pwd.project_root / "out").exists()
+
+
+def test_cd_missing_or_nondir_target_rejected(ex_pwd: ToolExecutor):
+    """A failed `cd` short-circuits `&&` in a real shell, so the remainder must
+    not run. Reject a target that does not resolve to an existing directory."""
+    (ex_pwd.project_root / "afile").write_text("x")
+    for cmd in ("cd nope && /bin/echo hi", "cd afile && /bin/echo hi"):
+        out = ex_pwd.run_command(cmd, approval=lambda c: True)
+        assert out.startswith("command rejected"), cmd
+        assert "not a directory" in out, cmd
+
+
+def test_canonical_command_rejects_operators_in_remainder():
+    """canonical_command_for_allowlist shares the cd parse: a remainder with a
+    further operator is not the clean idiom, so it returns the input unchanged
+    rather than persisting a half-parsed command."""
+    from sous.toolexec import canonical_command_for_allowlist as canon
+
+    assert canon("cd sub && pytest > log") == "cd sub && pytest > log"
+    assert canon("cd sub && a|b") == "cd sub && a|b"
+
+
+def test_cd_hash_in_argument_is_not_treated_as_comment(ex_pwd: ToolExecutor):
+    """The cd lexer must match shlex.split's no-comment semantics: a '#' in an
+    argument is a literal character, not the start of a comment, so the arg
+    reaches the command intact rather than being silently truncated."""
+    out = ex_pwd.run_command("cd sub && /bin/echo foo#bar")
+    assert "exit code 0" in out
+    assert "foo#bar" in out
+
+
+def test_cd_newline_rejected_as_multi_command(ex_pwd: ToolExecutor):
+    """A newline is a shell command separator; the single-command idiom must
+    reject it rather than silently run one command with extra arguments."""
+    out = ex_pwd.run_command("cd sub && /bin/echo a\n/bin/echo b", approval=lambda c: True)
+    assert out.startswith("command rejected")
+
+
+def test_cd_grouped_subshell_rejected(ex_pwd: ToolExecutor):
+    """Grouping parentheses are shell control syntax; reject before approval
+    so they can't burn the approval timeout on a command that would never run."""
+    calls: list[str] = []
+    out = ex_pwd.run_command("cd sub && (/bin/echo hi)", approval=lambda c: calls.append(c) or True)
+    assert out.startswith("command rejected")
+    assert calls == []
+
+
+def test_cd_quoted_shell_chars_are_literal_and_run(ex_pwd: ToolExecutor):
+    """Only UNQUOTED operators reject: a quoted '(...)' or '#' is an ordinary
+    argument and the command runs, so the operator guard doesn't over-reject
+    legitimate arguments."""
+    out = ex_pwd.run_command("cd sub && /bin/echo '(x)#y'")
+    assert "exit code 0" in out
+    assert "(x)#y" in out
+
+
+def test_cd_quoted_operator_argument_runs(ex_pwd: ToolExecutor):
+    """'only UNQUOTED operators reject': a quoted operator character is an
+    ordinary argument, so the command runs and the operator reaches it."""
+    out = ex_pwd.run_command("cd sub && /bin/echo '>'")
+    assert "exit code 0" in out
+    assert ">" in out
+
+
+def test_cd_empty_string_argument_runs(ex_pwd: ToolExecutor):
+    """An empty-string argument must not be mistaken for a shell operator —
+    set('') is a vacuous subset of any operator set, the exact false positive
+    a token-based check hits."""
+    out = ex_pwd.run_command("cd sub && /bin/echo '' done")
+    assert "exit code 0" in out
+    assert "done" in out
+
+
+def test_cd_escaped_operator_argument_runs(ex_pwd: ToolExecutor):
+    r"""A backslash-escaped operator outside quotes is also a literal."""
+    out = ex_pwd.run_command(r"cd sub && /bin/echo \>")
+    assert "exit code 0" in out
+    assert ">" in out
+
+
+def test_cd_unquoted_operator_in_dir_position_rejected(ex_pwd: ToolExecutor):
+    """The `cd <dir>` side must be scanned for unquoted operators too, not just
+    word-counted: `cd sub; && cmd` is not the supported idiom even when a
+    directory literally named `sub;` exists, so it must reject with guidance
+    rather than strip the prefix and run the allowlisted remainder."""
+    import os
+
+    os.mkdir(ex_pwd.project_root / "sub;")  # a real dir whose name ends in ';'
+    calls: list[str] = []
+    out = ex_pwd.run_command("cd sub; && /bin/echo hi", approval=lambda c: calls.append(c) or True)
+    assert out.startswith("command rejected")
+    assert "not a directory" not in out  # rejected for the operator, not is_dir
+    assert calls == []
+
+
+def test_cd_quoted_operator_in_dir_name_not_flagged_as_operator(ex_pwd: ToolExecutor):
+    """A quoted operator in the directory name is a literal part of the name,
+    not shell syntax; the left-side scan must respect quoting (it will then
+    fail the is_dir check, which is a different, correct rejection)."""
+    out = ex_pwd.run_command("cd 'weird;name' && /bin/echo hi", approval=lambda c: True)
+    assert out.startswith("command rejected")
+    assert "not a directory" in out  # reached confinement/is_dir, not the operator guard

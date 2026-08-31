@@ -863,3 +863,14 @@ def test_elide_if_needed_reports_how_many_messages_it_rewrote():
     # what the report's "why did reuse miss" answer rests on.
     assert elisions == 2
     assert isinstance(count, int)
+
+
+def test_system_prompt_warns_against_cd_and_shell_chaining(tmp_path):
+    """Local models habitually emit `cd <dir> && cmd`; toolexec normalizes the
+    common form, but the prompt should steer them off shell idioms entirely —
+    the runner is shell-less and every denial burns the approval timeout."""
+    from sous.worker import build_system_prompt
+
+    prompt = build_system_prompt(tmp_path)
+    assert "cd" in prompt
+    assert "single command" in prompt
