@@ -21,7 +21,12 @@ from mcp.server import MCPServer
 from sous.config import SousConfig, current_allowlist, load_config, persist_allowlist_entry
 from sous.engine.base import EngineManager, release_mlx_thread_state
 from sous.tasks import FINISHED_STATES, Task, TaskState, TaskStore
-from sous.toolexec import _is_within, command_allowed, terminate_active_commands
+from sous.toolexec import (
+    _is_within,
+    canonical_command_for_allowlist,
+    command_allowed,
+    terminate_active_commands,
+)
 from sous.worker import run_worker_loop
 
 
@@ -196,8 +201,14 @@ class SousService:
         ok = self.store.respond_approval(task_id, approve)
         # Persist only after the approval actually landed — a timeout-deny
         # racing this call must not leave the command allowlisted forever.
+        # Persist the canonical form the allowlist actually matches: run_command
+        # strips a `cd <dir> &&` prefix before checking, so persisting the raw
+        # `cd ... && ...` would write an entry no future request can ever match,
+        # and the "remembered" approval would keep prompting.
         if ok and approve and persist_to_allowlist and t.pending_command:
-            persist_allowlist_entry(t.pending_command, self.config.config_path)
+            persist_allowlist_entry(
+                canonical_command_for_allowlist(t.pending_command), self.config.config_path
+            )
         return {"ok": ok}
 
     def server_status(self) -> dict:

@@ -262,6 +262,35 @@ def test_respond_approves_and_persists(svc):
     assert store.poll_approval(tid) == "approved"
 
 
+def test_persisting_a_cd_prefixed_command_matches_the_next_request(svc):
+    """Approve-and-persist on `cd <dir> && <cmd>` must persist the canonical
+    form the allowlist actually matches (the stripped remainder), so the same
+    cd-prefixed request runs next time WITHOUT prompting. Persisting the raw
+    `cd ... && ...` would write an entry that can never match the stripped
+    argv, and the 'remembered' approval would keep asking."""
+    from sous.config import current_allowlist
+    from sous.toolexec import ToolExecutor, command_allowed
+
+    service, store, root = svc
+    tid = service.delegate_task("t", "x", str(root))["task_id"]
+    store.claim_next()
+    store.request_approval(tid, "cd sub && go vet ./...")
+    out = service.respond_to_command_request(tid, approve=True, persist_to_allowlist=True)
+    assert out["ok"] is True
+    # persisted the remainder, not the cd-prefixed string
+    allow = current_allowlist(service.config.config_path)
+    assert ["go", "vet", "./..."] in allow
+    assert not any(entry and entry[0] == "cd" for entry in allow)
+    # and the same request now passes the allowlist that run_command applies
+    ex = ToolExecutor(root, service.config.config_path)
+    (ex.project_root / "sub").mkdir()
+    from sous.toolexec import normalize_cd_prefix
+
+    cmd = "cd sub && go vet ./..."
+    argv = normalize_cd_prefix(cmd, ["cd", "sub", "&&", "go", "vet", "./..."], ex.project_root)
+    assert command_allowed(argv, current_allowlist(service.config.config_path))
+
+
 def test_respond_race_does_not_persist_allowlist(svc, monkeypatch):
     """M2: if the approval races a timeout-deny (respond_approval returns
     False), the command must NOT already be persisted to the allowlist."""
