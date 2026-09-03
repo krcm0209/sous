@@ -633,6 +633,24 @@ def test_a_dropped_tool_type_cannot_forge_a_log_line(tmp_path: Path, capsys):
     assert "\\n" in err
 
 
+def test_a_non_string_tool_type_is_a_400_and_never_reaches_the_log(tmp_path: Path, capsys):
+    """A non-string `type` must be rejected before conversion, not str()-ed
+    into the dropped-tool-types log line — that would put body content
+    (an arbitrary JSON value) into the daemon log."""
+    engine = FakeEngine(["ok"])
+    app = _app(tmp_path, engine)
+    secret = "s3cr3t-value"
+    body = _body(
+        tools=[{"type": {"token": secret}, "name": "X", "input_schema": {"type": "object"}}]
+    )
+    r = _post(app, body)
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"
+    err = capsys.readouterr().err
+    assert secret not in err
+    assert engine.calls == []
+
+
 # --- app-shutdown cleanup (session thread + executors) -----------------------------
 
 

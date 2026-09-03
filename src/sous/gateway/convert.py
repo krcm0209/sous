@@ -260,8 +260,14 @@ def chat_tools(tools: object) -> tuple[list[dict], list[str]]:
     for tool in tools:
         if not isinstance(tool, dict):
             raise _invalid("tools: each entry must be an object")
-        if tool.get("type") not in _CLIENT_TOOL_TYPES:
-            dropped.append(str(tool.get("type")))
+        tool_type = tool.get("type")
+        if tool_type is not None and not isinstance(tool_type, str):
+            # The API's `type` is a string; a non-string is a shape error, not
+            # a value to log — str()-ing it here would put arbitrary body
+            # content into the daemon log via dropped_tool_types.
+            raise _invalid("tools: type must be a string")
+        if tool_type not in _CLIENT_TOOL_TYPES:
+            dropped.append(tool_type)
             continue
         name = tool.get("name")
         schema = tool.get("input_schema")

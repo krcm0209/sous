@@ -359,6 +359,32 @@ def test_schemaless_tools_are_dropped_and_only_their_type_reported():
     assert dropped == ["web_search_20250305", "browser_toolset_20260801", "bash_20250124"]
 
 
+@pytest.mark.parametrize("bad_type", [{"token": "s3cr3t"}, 5, ["x"], 1.5])
+def test_non_string_tool_type_is_a_400_not_logged(bad_type):
+    """A non-string `type` must be rejected before the drop logic's str()
+    could turn arbitrary body content into a log line."""
+    with pytest.raises(RequestError) as exc:
+        chat_tools([{"type": bad_type, "name": "X", "input_schema": {"type": "object"}}])
+    assert exc.value.status == 400
+    assert exc.value.error_type == "invalid_request_error"
+
+
+@pytest.mark.parametrize("ok_type", [None, "custom"])
+def test_none_or_custom_tool_type_still_converts(ok_type):
+    tool = {"name": "X", "input_schema": {"type": "object"}}
+    if ok_type is not None:
+        tool = {"type": ok_type, **tool}
+    tools, dropped = chat_tools([tool])
+    assert [t["function"]["name"] for t in tools] == ["X"]
+    assert dropped == []
+
+
+def test_absent_tool_type_still_converts():
+    tools, dropped = chat_tools([{"name": "X", "input_schema": {"type": "object"}}])
+    assert [t["function"]["name"] for t in tools] == ["X"]
+    assert dropped == []
+
+
 def test_client_tool_without_schema_or_name_is_a_400():
     with pytest.raises(RequestError, match="input_schema"):
         chat_tools([{"name": "Broken"}])
