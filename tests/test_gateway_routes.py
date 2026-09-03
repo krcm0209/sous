@@ -448,14 +448,39 @@ def test_mounting_pins_the_sse_logger_above_debug(tmp_path: Path, monkeypatch):
     assert logger.level == logging.INFO
 
 
-def test_dropped_server_tool_names_cannot_forge_a_log_line(tmp_path: Path, capsys):
-    """`type` and `name` are client-controlled strings. Logged raw, a newline
-    in one would write whatever line the client chose into the daemon log."""
+def test_a_dropped_tools_name_never_reaches_the_log_and_its_type_is_bounded(tmp_path: Path, capsys):
+    """`name` is free-form client text out of a request body, which the log
+    never carries; `type` is one of Anthropic's fixed identifiers and worth
+    keeping, but a client can still send any string, so it is truncated."""
     app = _app(tmp_path, FakeEngine(["ok"]))
-    forged = "x\nsous gateway: POST /v1/messages model=sous-local stream=0 status=200"
-    body = _body(tools=[{"type": "web_search_20250305", "name": forged}])
+    name = "n" * 10_000
+    kind = "t" * 500
+    assert _post(app, _body(tools=[{"type": kind, "name": name}])).status_code == 200
+    err = capsys.readouterr().err
+    assert "dropped 1 tool" in err
+    assert "n" * 20 not in err  # no part of the name is logged
+    assert "t" * 60 in err and "t" * 100 not in err  # the type, truncated
+
+
+def test_a_long_dropped_tool_list_is_capped_in_the_log(tmp_path: Path, capsys):
+    app = _app(tmp_path, FakeEngine(["ok"]))
+    tools = [{"type": f"tool_{n}_20250101", "name": "x"} for n in range(11)]
+    assert _post(app, _body(tools=tools)).status_code == 200
+    err = capsys.readouterr().err
+    assert "dropped 11 tool(s)" in err
+    assert "tool_7_20250101" in err and "tool_8_20250101" not in err
+    assert "… (+3 more)" in err
+
+
+def test_a_dropped_tool_type_cannot_forge_a_log_line(tmp_path: Path, capsys):
+    """`type` is a client-controlled string. Logged raw, a newline in one would
+    write whatever line the client chose into the daemon log. Short enough here
+    to survive the length cap, so the escaping is what has to stop it."""
+    app = _app(tmp_path, FakeEngine(["ok"]))
+    forged = "x\nsous gateway: POST /v1/messages status=200"
+    body = _body(tools=[{"type": forged, "name": "web_search"}])
     assert _post(app, body).status_code == 200
     err = capsys.readouterr().err
-    assert "dropped 1 server-side tool(s)" in err
+    assert "dropped 1 tool(s)" in err
     assert forged not in err  # the newline was escaped, so the forged line never lands
     assert "\\n" in err

@@ -65,6 +65,24 @@ def test_no_unload_when_fresh():
     assert mgr.status()["loaded"] is True
 
 
+def test_a_lease_holds_off_the_idle_unload():
+    """A gateway turn holds the engine across count_tokens and generate, and
+    only the latter takes _gen_lock. Without a lease the unload sweep would
+    free the weights under the tokenizer pass."""
+    mgr, created = _manager(idle_minutes=0)
+    mgr.get()
+    time.sleep(0.01)
+    assert mgr.unload_if_idle() is True  # baseline: idle 0 unloads at once
+    mgr.get()
+    time.sleep(0.01)
+    with mgr.lease():
+        assert mgr.unload_if_idle() is False
+        assert mgr.status()["loaded"] is True
+        assert created[1].unloaded is False
+    assert mgr.unload_if_idle() is True  # lease gone → the sweep proceeds
+    assert created[1].unloaded is True
+
+
 def test_status_when_never_loaded():
     mgr, _ = _manager()
     s = mgr.status()

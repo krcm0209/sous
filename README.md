@@ -157,10 +157,15 @@ What a locally served turn gives up, stated plainly:
   tool; `toolexec.py` (path confinement, allowlist, audit) is not in this
   path. Claude Code's own permission system is the boundary, and a 27B model
   inherits whatever permissiveness you configured for frontier subagents.
-- **No server-side tools.** `WebSearch`, `WebFetch`-as-server-tool, code
-  execution and the other tools that run inside Anthropic's API are dropped
-  from the request (logged as `dropped N server-side tool(s)`) — they cannot
-  execute on a local endpoint.
+- **No Anthropic server-side or built-in tool types (no client-supplied
+  schema).** `WebSearch`, `WebFetch`-as-server-tool and code execution run
+  inside Anthropic's API; `bash_*`, `text_editor_*` and the other built-ins
+  run on the client but arrive with their schema implied by the type. Both are
+  dropped from the request (logged as `dropped N tool(s) with no
+  client-supplied schema`) — the local chat template can only offer a tool it
+  has an explicit schema for. Claude Code sends custom-typed equivalents when
+  it drives a non-claude model, so a delegated turn keeps its file and shell
+  tools.
 - **No thinking, no request-level sampling.** `thinking`, `temperature`,
   `top_p`, `top_k`, `stop_sequences` and `tool_choice` are accepted and
   ignored; the daemon's `[model]` sampler applies. Images and documents in
@@ -403,8 +408,9 @@ that Qwen3 emits and the hermes JSON format used by other MLX models.
   exercises the plumbing, not model competence. The real-model runs above are
   the meaningful end-to-end evidence.
 - Gateway mode (experimental) serves one turn at a time on a single-slot
-  prompt cache, drops Anthropic server-side tools, ignores request-level
-  sampling and thinking, and finishes a turn even after the client hangs up.
+  prompt cache, drops Anthropic server-side and built-in tool types (the ones
+  that carry no client-supplied schema), ignores request-level sampling and
+  thinking, and finishes a turn even after the client hangs up.
   It serves *every* request that reaches it locally; routing frontier models
   upstream (the hybrid in issue #41) is not built yet.
 

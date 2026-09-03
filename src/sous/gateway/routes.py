@@ -69,6 +69,11 @@ _ALLOWED_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 # netloc carries, so these are bare addresses.
 _ALLOWED_ORIGIN_HOSTS = ("127.0.0.1", "localhost", "::1")
 
+# How much of the dropped-tool set the log names. Anthropic's identifiers are
+# short and few, so these bounds only ever bite on a client sending junk.
+_LOG_TYPES = 8
+_LOG_TYPE_CHARS = 64
+
 
 def _log(message: str) -> None:
     print(f"sous gateway: {message}", file=sys.stderr, flush=True)
@@ -222,10 +227,17 @@ class Gateway:
         except RequestError as e:
             _log(f"POST /v1/messages status={e.status} error={e.error_type}")
             return JSONResponse(e.body(), status_code=e.status)
-        if chat.dropped_server_tools:
+        if chat.dropped_tool_types:
+            # Anthropic's type identifiers are a bounded, useful set, but a
+            # client can put any string there, so cap the line: repr escapes a
+            # forged newline, the slice bounds a padded one.
+            shown = [repr(t[:_LOG_TYPE_CHARS]) for t in chat.dropped_tool_types[:_LOG_TYPES]]
+            hidden = len(chat.dropped_tool_types) - len(shown)
+            if hidden:
+                shown.append(f"… (+{hidden} more)")
             _log(
-                f"dropped {len(chat.dropped_server_tools)} server-side tool(s) not executable "
-                f"locally: {', '.join(repr(t) for t in chat.dropped_server_tools)}"
+                f"dropped {len(chat.dropped_tool_types)} tool(s) with no client-supplied "
+                f"schema (Anthropic server-side or built-in): {', '.join(shown)}"
             )
         assembler = TurnAssembler(
             new_message_id(), chat.model, ToolSet.from_tools(chat.tools, strict=False)

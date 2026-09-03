@@ -421,3 +421,99 @@ def test_toolset_tolerates_tools_without_properties():
     assert parse_tool_calls("<tool_call>\n<function=Ping>\n</function>\n</tool_call>", ts) == [
         ToolCall("Ping", {})
     ]
+
+
+# --- nullable schema types ------------------------------------------------------
+
+from sous.protocol import _schema_type  # noqa: E402 — grouped with its tests
+
+NULLABLE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "Search",
+            "description": "",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": ["integer", "null"]},
+                    "tags": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "opts": {"type": ["null", "object"]},
+                    "depth": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+        },
+    }
+]
+
+
+def test_schema_type_keeps_the_null_member_of_a_union():
+    assert _schema_type({"type": ["null", "integer"]}) == "integer|null"
+    assert _schema_type({"type": ["integer", "null"]}) == "integer|null"
+    assert _schema_type({"type": "integer"}) == "integer"
+    assert _schema_type({"type": ["null"]}) == "string|null"
+    assert _schema_type({"enum": ["a"]}) == "string"
+
+
+def test_xml_null_for_a_nullable_parameter_becomes_none():
+    """Claude Code sends `["integer", "null"]` schemas (Read.limit is one).
+    The template writes a null argument as the text `null`, and coercing that
+    to an int used to fail the parse and demote the whole call to prose."""
+    ts = ToolSet.from_tools(NULLABLE_TOOLS, strict=False)
+    text = (
+        "<tool_call>\n<function=Search>\n"
+        "<parameter=query>\nx\n</parameter>\n"
+        "<parameter=limit>\nnull\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    [call] = parse_tool_calls(text, ts)
+    assert call.arguments == {"query": "x", "limit": None}
+
+
+def test_a_nullable_parameter_still_coerces_a_real_value():
+    ts = ToolSet.from_tools(NULLABLE_TOOLS, strict=False)
+    text = (
+        "<tool_call>\n<function=Search>\n"
+        "<parameter=query>\nx\n</parameter>\n"
+        "<parameter=limit>\n20\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    [call] = parse_tool_calls(text, ts)
+    assert call.arguments["limit"] == 20 and isinstance(call.arguments["limit"], int)
+
+
+def test_null_for_a_non_nullable_parameter_still_raises():
+    """The worker's fail-loudly contract: a schema that does not allow null
+    must not silently hand the executor a None."""
+    ts = ToolSet.from_tools(NULLABLE_TOOLS, strict=False)
+    text = (
+        "<tool_call>\n<function=Search>\n"
+        "<parameter=query>\nx\n</parameter>\n"
+        "<parameter=depth>\nnull\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    with pytest.raises(ParseError, match="depth"):
+        parse_tool_calls(text, ts)
+
+
+def test_nullable_array_and_object_parameters_accept_null():
+    ts = ToolSet.from_tools(NULLABLE_TOOLS, strict=False)
+    text = (
+        "<tool_call>\n<function=Search>\n"
+        "<parameter=query>\nx\n</parameter>\n"
+        "<parameter=tags>\nnull\n</parameter>\n"
+        "<parameter=opts>\nnull\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    [call] = parse_tool_calls(text, ts)
+    assert call.arguments == {"query": "x", "tags": None, "opts": None}
+
+
+def test_json_call_passes_a_real_null_through_untouched():
+    """Regression pin for the path this fix does not touch: JSON arguments are
+    native, so a null has always arrived as None."""
+    ts = ToolSet.from_tools(NULLABLE_TOOLS, strict=False)
+    text = '<tool_call>{"name": "Search", "arguments": {"query": "x", "limit": null}}</tool_call>'
+    assert parse_tool_calls(text, ts) == [ToolCall("Search", {"query": "x", "limit": None})]

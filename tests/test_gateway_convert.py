@@ -298,19 +298,21 @@ def test_client_tools_convert_to_function_schemas():
     assert dropped == []
 
 
-def test_server_side_tools_are_dropped_and_named():
-    """Checklist item 7: anything with a non-custom `type` executes inside
-    Anthropic's API; toolset entries carry no `name` at all."""
+def test_schemaless_tools_are_dropped_and_only_their_type_reported():
+    """Checklist item 7: anything with a non-custom `type` arrives without an
+    input_schema — server-side tools and client-executed built-ins alike. The
+    `name` is free-form client text, so it is never carried out of here."""
     tools, dropped = chat_tools(
         [
             {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
             {"type": "browser_toolset_20260801", "configs": {}},
+            {"type": "bash_20250124", "name": "bash"},
             {"type": "custom", **READ_TOOL},
             READ_TOOL,
         ]
     )
     assert [t["function"]["name"] for t in tools] == ["Read", "Read"]
-    assert dropped == ["web_search_20250305:web_search", "browser_toolset_20260801:"]
+    assert dropped == ["web_search_20250305", "browser_toolset_20260801", "bash_20250124"]
 
 
 def test_client_tool_without_schema_or_name_is_a_400():
@@ -348,7 +350,7 @@ def test_parse_messages_request_converts_and_ignores_unknown_fields():
     assert chat.model == "sous-local" and chat.stream is True and chat.max_tokens == 32000
     assert chat.messages == [{"role": "system", "content": "S"}, {"role": "user", "content": "hi"}]
     assert chat.tools[0]["function"]["name"] == "Read"
-    assert chat.dropped_server_tools == []
+    assert chat.dropped_tool_types == []
 
 
 @pytest.mark.parametrize(

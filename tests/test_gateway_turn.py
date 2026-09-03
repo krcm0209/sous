@@ -123,6 +123,38 @@ def test_a_reloaded_engine_gets_a_fresh_session(tmp_path: Path):
     assert not first_session._thread.is_alive()
 
 
+def test_a_running_turn_pins_the_engine_against_the_idle_unload(tmp_path: Path):
+    """count_tokens runs before anything takes _gen_lock and takes seconds on
+    a real 80K prompt. The worker sweeps unload_if_idle() from its own thread
+    every 0.5s, so with a 0-minute idle threshold it would free the weights
+    mid-count and the turn would then generate on an unloaded engine."""
+    counting = threading.Event()
+    gate = threading.Event()
+
+    class SlowCount(FakeEngine):
+        def count_tokens(self, messages, tools):
+            counting.set()
+            gate.wait(10)
+            return super().count_tokens(messages, tools)
+
+    inner = SlowCount(["ok"])
+    runner, engines = _runner(tmp_path, inner, idle_unload_minutes=0)
+    results: list[TurnResult] = []
+    t = threading.Thread(target=lambda: results.append(runner.run(MSGS, [], 100, RecordingSink())))
+    t.start()
+    try:
+        assert counting.wait(5)
+        time.sleep(0.01)  # let the 0-minute idle threshold elapse
+        assert engines.unload_if_idle() is False
+        assert engines.status()["loaded"] is True
+        assert inner.unloaded is False
+    finally:
+        gate.set()
+    t.join(5)
+    assert not t.is_alive()
+    assert len(results) == 1 and results[0].text == "ok"
+
+
 def test_turns_are_serialized(tmp_path: Path):
     inner = ChunkedFakeEngine(["one|two", "three"], delay=0.2)
     runner, _ = _runner(tmp_path, inner)

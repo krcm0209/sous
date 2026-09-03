@@ -317,6 +317,7 @@ class EngineManager:
         self._lock = threading.Lock()
         self._engine: ManagedEngine | None = None
         self._last_used: float | None = None
+        self._leases = 0
 
     def get(self) -> ManagedEngine:
         with self._lock:
@@ -329,13 +330,33 @@ class EngineManager:
         with self._lock:
             self._last_used = time.monotonic()
 
+    @contextlib.contextmanager
+    def lease(self):
+        """Pin the loaded engine for the caller's whole span of use.
+
+        _gen_lock only covers generate(). A gateway turn holds the engine from
+        get() through count_tokens() — seconds on a large prompt — before
+        anything takes that lock, and the idle sweep runs on a different
+        thread (the worker's loop), so it could free the weights in between.
+        The worker never needed one: it sweeps on the same thread that runs
+        its tasks, serially.
+        """
+        with self._lock:
+            self._leases += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._leases -= 1
+
     def unload_if_idle(self) -> bool:
         with self._lock:
             if self._engine is None or self._last_used is None:
                 return False
-            if self._engine.generation_in_flight():
+            if self._engine.generation_in_flight() or self._leases:
                 # Never free the model weights under an active (possibly
-                # abandoned-as-stalled) generation.
+                # abandoned-as-stalled) generation, nor under a caller that is
+                # holding this engine across calls that take no _gen_lock.
                 return False
             idle = time.monotonic() - self._last_used
             if idle > self._config.idle_unload_minutes * 60:

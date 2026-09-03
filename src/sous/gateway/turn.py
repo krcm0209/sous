@@ -87,65 +87,69 @@ class TurnRunner:
             raise GatewayBusy(f"no generation slot within {self._timeout:.0f}s")
         started = time.monotonic()
         try:
-            if abandoned is not None and abandoned.is_set():
-                # Queued behind another turn, and the client gave up meanwhile:
-                # a generation nobody reads would only delay the live requests
-                # behind it. (A turn that has started still drains — the GPU
-                # cannot be interrupted and the lock discipline depends on it.)
-                raise TurnAbandoned
-            engine = self._engines.get()
-            session = self._session_for(engine)
-            input_tokens = engine.count_tokens(messages, tools)
-            room = self._window - input_tokens
-            if room <= 0:
-                raise PromptTooLong(input_tokens, self._window)
-            # Hit/miss is for the log only: the counters are global, and a
-            # worker task resetting the cache mid-turn zeroes them, so a hit
-            # can read as a miss. Exact per-turn reuse comes with keyed slots.
-            before = engine.prompt_cache_stats()
-            sink.started(input_tokens)
-            final: Delta | None = None
+            # The idle sweep runs on the worker's thread, and _gen_lock only
+            # covers generate(): without a lease the model could be unloaded
+            # under count_tokens(), which is seconds of work on a long prompt.
+            with self._engines.lease():
+                if abandoned is not None and abandoned.is_set():
+                    # Queued behind another turn, and the client gave up meanwhile:
+                    # a generation nobody reads would only delay the live requests
+                    # behind it. (A turn that has started still drains — the GPU
+                    # cannot be interrupted and the lock discipline depends on it.)
+                    raise TurnAbandoned
+                engine = self._engines.get()
+                session = self._session_for(engine)
+                input_tokens = engine.count_tokens(messages, tools)
+                room = self._window - input_tokens
+                if room <= 0:
+                    raise PromptTooLong(input_tokens, self._window)
+                # Hit/miss is for the log only: the counters are global, and a
+                # worker task resetting the cache mid-turn zeroes them, so a hit
+                # can read as a miss. Exact per-turn reuse comes with keyed slots.
+                before = engine.prompt_cache_stats()
+                sink.started(input_tokens)
+                final: Delta | None = None
 
-            def on_delta(delta: Delta) -> None:
-                nonlocal final
-                final = delta
-                sink.delta(delta)
+                def on_delta(delta: Delta) -> None:
+                    nonlocal final
+                    final = delta
+                    sink.delta(delta)
 
-            try:
-                text = session.generate(
-                    messages,
-                    tools,
-                    min(max_tokens, room),
-                    timeout=self._timeout,
-                    on_delta=on_delta,
+                try:
+                    text = session.generate(
+                        messages,
+                        tools,
+                        min(max_tokens, room),
+                        timeout=self._timeout,
+                        on_delta=on_delta,
+                    )
+                except GenerationStalled:
+                    # The session is unusable after a stall (its thread may still
+                    # be generating, holding the engine lock); the next turn gets a
+                    # fresh one and waits on the lock like the worker would. Reset
+                    # the cache too: when the abandoned thread finishes it publishes
+                    # the KV cache it built on ITS streams, and a cache is usable
+                    # only from the thread that built it (#34). The reset's epoch
+                    # bump makes that late publish drop itself — the same guard
+                    # run_task's finally relies on.
+                    self._drop_session()
+                    # Best-effort: a reset that raises would replace GenerationStalled
+                    # with a generic 500 and lose the stall's classification.
+                    with contextlib.suppress(Exception):
+                        engine.reset_prompt_cache()
+                    raise
+                after = engine.prompt_cache_stats()
+                return TurnResult(
+                    text=text,
+                    input_tokens=input_tokens,
+                    output_tokens=final.output_tokens if final else 0,
+                    finish_reason=final.finish_reason if final else "stop",
+                    cache_hit=after.get("hits", 0) > before.get("hits", 0),
+                    reused_tokens=max(
+                        0, after.get("reused_tokens", 0) - before.get("reused_tokens", 0)
+                    ),
+                    seconds=time.monotonic() - started,
                 )
-            except GenerationStalled:
-                # The session is unusable after a stall (its thread may still
-                # be generating, holding the engine lock); the next turn gets a
-                # fresh one and waits on the lock like the worker would. Reset
-                # the cache too: when the abandoned thread finishes it publishes
-                # the KV cache it built on ITS streams, and a cache is usable
-                # only from the thread that built it (#34). The reset's epoch
-                # bump makes that late publish drop itself — the same guard
-                # run_task's finally relies on.
-                self._drop_session()
-                # Best-effort: a reset that raises would replace GenerationStalled
-                # with a generic 500 and lose the stall's classification.
-                with contextlib.suppress(Exception):
-                    engine.reset_prompt_cache()
-                raise
-            after = engine.prompt_cache_stats()
-            return TurnResult(
-                text=text,
-                input_tokens=input_tokens,
-                output_tokens=final.output_tokens if final else 0,
-                finish_reason=final.finish_reason if final else "stop",
-                cache_hit=after.get("hits", 0) > before.get("hits", 0),
-                reused_tokens=max(
-                    0, after.get("reused_tokens", 0) - before.get("reused_tokens", 0)
-                ),
-                seconds=time.monotonic() - started,
-            )
         finally:
             self._engines.touch()
             self._lock.release()
@@ -157,7 +161,9 @@ class TurnRunner:
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
         try:
-            count = self._engines.get().count_tokens(messages, tools)
+            # Same race as run(): this whole call happens outside _gen_lock.
+            with self._engines.lease():
+                count = self._engines.get().count_tokens(messages, tools)
             self._engines.touch()
             return count
         finally:

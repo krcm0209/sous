@@ -112,13 +112,18 @@ class ParseError(Exception):
 
 def _schema_type(prop: object) -> str:
     """The JSON-schema type coercion should target. A union (`["integer",
-    "null"]`) resolves to its first non-null member; a property without a
-    `type` (enum, anyOf, free-form) stays a raw string."""
+    "null"]`) resolves to its first non-null member, marked `"integer|null"`
+    so `_coerce` knows the literal `null` is a legal value for it rather than
+    a malformed integer; a property without a `type` (enum, anyOf, free-form)
+    stays a raw string."""
     if not isinstance(prop, dict):
         return "string"
     typ = prop.get("type", "string")
     if isinstance(typ, list):
-        typ = next((t for t in typ if t != "null"), "string")
+        base = next((t for t in typ if t != "null"), "string")
+        if not isinstance(base, str):
+            base = "string"
+        return f"{base}|null" if "null" in typ else base
     return typ if isinstance(typ, str) else "string"
 
 
@@ -281,8 +286,13 @@ def _coerce(tool: str, key: str, typ: str, raw: str):
 
     Strings stay raw (the template writes them unquoted); non-strings were
     written via tojson. Failing loudly here beats handing the executor
-    offset="5".
+    offset="5" — so a `null` is accepted only where the schema is a union
+    with "null" (Claude Code sends several), and rejected everywhere else.
     """
+    if typ.endswith("|null"):
+        if raw.strip() == "null":
+            return None
+        typ = typ[: -len("|null")]
     if typ == "integer":
         try:
             return int(raw.strip())

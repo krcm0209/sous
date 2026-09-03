@@ -2,8 +2,9 @@
 
 Pure: no engine, no mlx, no I/O. Everything Claude Code sends that the local
 model cannot use is dropped here, deliberately and visibly (the spec's
-accommodation checklist): server-side tools, thinking blocks, images, and the
-per-request volatile markers that would otherwise defeat the prefix cache.
+accommodation checklist): tools that carry no schema, thinking blocks, images,
+and the per-request volatile markers that would otherwise defeat the prefix
+cache.
 """
 
 from __future__ import annotations
@@ -11,10 +12,17 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-# A client tool's `type` is absent, null, or "custom"; every other value names
-# a tool that runs inside Anthropic's API (web_search_*, web_fetch_*,
-# code_execution_*, bash_*, text_editor_*, computer_*, memory_*,
-# browser_toolset_*, tool_search_tool_*), which no local endpoint can run.
+# A client tool's `type` is absent, null, or "custom", and it comes with its own
+# input_schema. Every other value names an Anthropic-defined tool: some genuinely
+# server-side (web_search_*, web_fetch_*, code_execution_*, tool_search_tool_*),
+# the rest client-executed built-ins whose schema is implicit (bash_*,
+# text_editor_*, computer_*, memory_*, browser_toolset_*). Both kinds are dropped
+# for one reason — no client-supplied schema, and the local chat template can
+# only offer a tool it can render a schema for. The frontier model knows the
+# built-ins from training; the local model does not. Translating them into
+# explicit schemas is future work, and nothing is lost meanwhile: driving a
+# non-claude model, Claude Code sends custom-typed equivalents instead
+# (Read/Write/Bash with schemas, observed in a live session).
 _CLIENT_TOOL_TYPES = (None, "custom")
 
 # The first system block of a Claude Code request: per-request random values
@@ -54,14 +62,15 @@ def _invalid(message: str) -> RequestError:
 @dataclass
 class ChatRequest:
     """What the engine needs from a /v1/messages body, plus what the response
-    has to echo (`model`) and the log has to mention (dropped tools)."""
+    has to echo (`model`) and the log has to mention (the `type` of every
+    dropped tool — never its client-supplied name)."""
 
     model: str
     messages: list[dict]
     tools: list[dict]
     max_tokens: int
     stream: bool
-    dropped_server_tools: list[str] = field(default_factory=list)
+    dropped_tool_types: list[str] = field(default_factory=list)
 
 
 def strip_volatile(text: str) -> str:
@@ -223,8 +232,11 @@ def chat_messages(system: object, messages: list[dict]) -> list[dict]:
 
 
 def chat_tools(tools: object) -> tuple[list[dict], list[str]]:
-    """OpenAI-style function schemas for the template, plus the server-side
-    tools dropped on the way ("type:name", for the log)."""
+    """OpenAI-style function schemas for the template, plus the `type` of each
+    tool dropped on the way (for the log).
+
+    The type is one of Anthropic's fixed identifiers; the name is free-form
+    client text out of the request body, so it is not returned at all."""
     if tools is None:
         return [], []
     if not isinstance(tools, list):
@@ -235,7 +247,7 @@ def chat_tools(tools: object) -> tuple[list[dict], list[str]]:
         if not isinstance(tool, dict):
             raise _invalid("tools: each entry must be an object")
         if tool.get("type") not in _CLIENT_TOOL_TYPES:
-            dropped.append(f"{tool.get('type')}:{tool.get('name', '')}")
+            dropped.append(str(tool.get("type")))
             continue
         name = tool.get("name")
         schema = tool.get("input_schema")
