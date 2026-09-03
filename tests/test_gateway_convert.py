@@ -108,6 +108,15 @@ def test_an_inline_marker_mention_survives_but_an_own_line_marker_still_strips()
     assert strip_volatile("A\n\n<total_tokens>9 tokens left</total_tokens>\n\nB") == "A\n\nB"
 
 
+def test_a_marker_with_trailing_space_or_crlf_still_strips():
+    # The line anchor must not let a marker with an odd line ending survive:
+    # its ever-changing count would then sit in every turn's prefix.
+    assert strip_volatile("Rules.\n\n<total_tokens>9 tokens left</total_tokens> \n") == "Rules.\n"
+    crlf = strip_volatile("Rules.\r\n\r\n<total_tokens>9 tokens left</total_tokens>\r\n")
+    assert "<total_tokens>" not in crlf
+    assert crlf.startswith("Rules.\r\n")
+
+
 def test_marker_only_text_after_tool_results_adds_no_user_turn():
     """Claude Code emits the marker as an attachment after every tool-result
     batch (bare, or wrapped in a system-reminder). Stripped, nothing remains,

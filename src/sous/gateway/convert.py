@@ -38,8 +38,9 @@ _BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 # line inside a <system-reminder>), so anchoring keeps the prefix-stability
 # benefit for every real shape while leaving a user's inline mention of the
 # marker text alone. It still eats up to two preceding newlines with the
-# marker.
-_TOTAL_TOKENS_RE = re.compile(r"(?m)\n{0,2}^<total_tokens>\d+ tokens left</total_tokens>$")
+# marker, and tolerates trailing spaces or a CR before the line end so a
+# marker with an unexpected line ending cannot stay behind and thrash the cache.
+_TOTAL_TOKENS_RE = re.compile(r"(?m)\n{0,2}^<total_tokens>\d+ tokens left</total_tokens>[ \t]*\r?$")
 # One of Claude Code's assembly paths wraps that marker in a system-reminder;
 # stripping the marker leaves the hollow shell, which goes too.
 _EMPTY_REMINDER_RE = re.compile(r"\n{0,2}<system-reminder>\s*</system-reminder>")
