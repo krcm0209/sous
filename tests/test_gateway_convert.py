@@ -50,6 +50,18 @@ def test_system_blocks_are_joined_and_the_billing_header_block_is_dropped():
     assert out[0] == {"role": "system", "content": "You are Claude Code.\n\nRules follow."}
 
 
+def test_a_string_system_carrying_the_billing_header_is_dropped_too():
+    """Same checklist item, the other shape the field accepts: dropped only in
+    the block form, the per-request random values would still land in the
+    cached prefix, and a string system prompt is a documented shape."""
+    header = "x-anthropic-billing-header: cc_version=2.1; cc_is_subagent=true"
+    assert chat_messages(header, [{"role": "user", "content": "hi"}]) == [
+        {"role": "user", "content": "hi"}
+    ]
+    # Only the header itself: an ordinary string system prompt still stands.
+    assert chat_messages("Be terse.", [])[0] == {"role": "system", "content": "Be terse."}
+
+
 def test_inline_system_messages_fold_into_the_leading_system_message():
     """Checklist item 1: Claude Code >= 2.1.154 puts system content in
     messages[] (gate 2 saw a 7.8 KB string there); Qwen's template accepts a

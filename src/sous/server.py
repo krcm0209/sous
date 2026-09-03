@@ -467,6 +467,10 @@ def _install_shutdown_handler(stop: threading.Event) -> None:
 # _install_shutdown_handler by the same amount. Bound it: streams already
 # cancel themselves on the exit signal (sse-starlette), and a cancelled
 # non-streaming handler leaves its turn draining on the executor thread.
+# This is the whole of the shutdown story in the daemon: capture_signals
+# re-raises SIGTERM inside the serve() coroutine, so _install_shutdown_handler
+# os._exit()s from there — anyio.run's teardown, and any thread pool it would
+# join on the way out, is never reached.
 GRACEFUL_SHUTDOWN_SECONDS = 5
 
 

@@ -257,10 +257,12 @@ class GenerationSession:
                 if self._abandoned.is_set():
                     return
                 self._replies.put_nowait(reply)
-                # A parked thread must not pin the reply: an ("err", e) entry
-                # holds the whole generation frame — KV cache included —
-                # through the traceback.
-                del reply
+                # A parked thread must not pin either end of the exchange: an
+                # ("err", e) reply holds the whole generation frame — KV cache
+                # included — through the traceback, and a gateway request holds
+                # its on_delta closure and through it the client's queue and
+                # event loop, for as long as the thread waits for the next one.
+                del reply, req
         finally:
             release_mlx_thread_state()
 

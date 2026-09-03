@@ -1344,6 +1344,7 @@ name = "sous-mcp"
 version = "0.5.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "huggingface-hub" },
     { name = "mcp" },
     { name = "mlx" },
@@ -1368,6 +1369,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4" },
     { name = "huggingface-hub" },
     { name = "mcp", specifier = ">=2.0,<3" },
     { name = "mlx", specifier = ">=0.31" },

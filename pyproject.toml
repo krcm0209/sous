@@ -34,6 +34,9 @@ classifiers = [
     "Topic :: Software Development :: Code Generators",
 ]
 dependencies = [
+    # Same rule as the sse-starlette block below: server.serve imports anyio
+    # directly, so it belongs here even though mcp already pulls it in.
+    "anyio>=4",
     "huggingface-hub",
     "mcp>=2.0,<3",
     # mlx >= 0.32.1 requires every thread that touched mlx to call

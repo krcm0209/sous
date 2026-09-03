@@ -180,12 +180,14 @@ def test_shutdown_is_bounded_while_a_non_streaming_turn_runs(tmp_path: Path):
     """uvicorn owns SIGTERM while it serves and, unbounded, waits for every open
     connection before sous's own handler runs; a non-streaming gateway turn
     (Claude Code's retry shape) can hold one for the whole generation timeout.
-    Two things bound that wait, and both are load-bearing: the daemon's
-    `timeout_graceful_shutdown`, and the gateway's private turn pool — because
-    `Server.run` is `asyncio.run(...)`, whose teardown joins the DEFAULT
-    executor for up to 300s, so a turn draining there would hold the serving
-    thread for the whole generation no matter what the graceful bound says.
-    The generation runs far longer than the bound to tell the cases apart."""
+    What bounds that wait is the daemon's `timeout_graceful_shutdown`, and this
+    test measures exactly that bound. It can only see it because turns run on
+    the gateway's private pool: this harness pokes `should_exit` on a server
+    off the main thread, where `capture_signals` is a no-op, so `Server.run`'s
+    `asyncio.run` teardown runs and joins the DEFAULT executor for up to 300s —
+    a turn draining there would hold the serving thread for the whole
+    generation and the assertion below would be timing the drain instead. The
+    generation runs far longer than the bound to tell the cases apart."""
     inner = ChunkedFakeEngine(["|".join(["slow"] * 12)], delay=1.0)  # ~12s, vs a 5s bound
     outcome: list[object] = []
     client = httpx.Client(timeout=60)

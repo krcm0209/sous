@@ -10,6 +10,7 @@ crosses back to the event loop through the Sink.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from dataclasses import dataclass
@@ -128,7 +129,10 @@ class TurnRunner:
                 # bump makes that late publish drop itself — the same guard
                 # run_task's finally relies on.
                 self._drop_session()
-                engine.reset_prompt_cache()
+                # Best-effort: a reset that raises would replace GenerationStalled
+                # with a generic 500 and lose the stall's classification.
+                with contextlib.suppress(Exception):
+                    engine.reset_prompt_cache()
                 raise
             after = engine.prompt_cache_stats()
             return TurnResult(

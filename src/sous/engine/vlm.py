@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import warnings
 from typing import Any, cast
 
@@ -53,6 +54,7 @@ class VLMEngine:
         self._model, self._processor = load(model_id)
         self._sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
         self._memo = PromptMemo()
+        self._tokenize_lock = threading.Lock()
         self._cache = PrefixCache(self, enabled=prompt_cache)
         self._draft = None
         self._draft_kind = ""
@@ -105,13 +107,19 @@ class VLMEngine:
         return list(self._tokenizer.encode(text, add_special_tokens=add_special))
 
     def _ids(self, slot: str, messages: list[dict], tools: list[dict]) -> list[int]:
-        text = self._prompt(messages, tools, generation=slot == "full")
-        cached = self._memo.get(slot, text)
-        if cached is not None:
-            return cached
-        ids = self._encode(text)
-        self._memo.put(slot, text, ids)
-        return ids
+        # One lock for every tokenization: HF's fast tokenizer mutates shared
+        # Rust state on each encode (set_truncation_and_padding), and since the
+        # gateway there are two callers — a turn on a pool thread and Claude
+        # Code's count_tokens, which it sends mid-turn. Not _gen_lock: that
+        # would queue a token count behind a whole generation.
+        with self._tokenize_lock:
+            text = self._prompt(messages, tools, generation=slot == "full")
+            cached = self._memo.get(slot, text)
+            if cached is not None:
+                return cached
+            ids = self._encode(text)
+            self._memo.put(slot, text, ids)
+            return ids
 
     # ---- CacheHooks ------------------------------------------------------
 

@@ -5,6 +5,7 @@ test_gateway_http.py against a real server."""
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import httpx
@@ -127,9 +128,46 @@ def test_host_header_must_be_loopback(tmp_path: Path):
         r = _post(app, _body(), headers={"host": host})
         assert r.status_code == 403 and r.json()["error"]["type"] == "permission_error"
         assert _request(app, "HEAD", "/api/hello", headers={"host": host}).status_code == 403
-    for host in ("127.0.0.1:8383", "localhost", "[::1]:8383", "[::1]"):
+    for host in ("127.0.0.1:8383", "localhost", "[::1]:8383", "[::1]", "LOCALHOST:8383"):
         assert _request(app, "HEAD", "/api/hello", headers={"host": host}).status_code == 200
     assert set(routes._ALLOWED_HOSTS) == {"127.0.0.1", "localhost", "[::1]"}
+
+
+def test_a_foreign_origin_is_rejected_before_the_model_is_touched(tmp_path: Path):
+    """A cross-origin fetch with Content-Type: text/plain is a CORS simple
+    request: no preflight, and a perfectly legitimate loopback Host. The page
+    never reads the reply, but the turn it starts would hold the gateway lock,
+    the engine lock and the cache slot for a whole generation."""
+    inner = FakeEngine(["never", "never"])
+    app = _app(tmp_path, inner)
+    for body in (_body(), _body(stream=True)):
+        r = _post(app, body, headers={"origin": "https://evil.example"})
+        assert r.status_code == 403
+        assert r.json()["error"]["type"] == "permission_error"
+        assert "origins" in r.json()["error"]["message"]
+    for origin in ("http://evil.example:8383", "null", "http://127.0.0.1.evil.example"):
+        r = _request(app, "HEAD", "/api/hello", headers={"origin": origin})
+        assert r.status_code == 403, origin
+    assert inner.calls == []  # rejected before any generation, streamed or not
+
+
+def test_loopback_and_absent_origins_pass(tmp_path: Path):
+    """Absent Origin is the normal case — Claude Code, httpx and curl send
+    none — and a page served from the daemon's own loopback origin is the
+    gateway's own client."""
+    app = _app(tmp_path, FakeEngine([]))
+    for origin in (
+        "http://127.0.0.1",
+        "http://127.0.0.1:8383",
+        "http://localhost",
+        "http://localhost:8383",
+        "http://[::1]",
+        "http://[::1]:8383",
+        "http://LOCALHOST:8383",
+    ):
+        r = _request(app, "HEAD", "/api/hello", headers={"origin": origin})
+        assert r.status_code == 200, origin
+    assert _request(app, "HEAD", "/api/hello").status_code == 200
 
 
 # --- request validation ---------------------------------------------------------------
@@ -385,3 +423,26 @@ def test_log_lines_carry_metadata_only(tmp_path: Path, capsys):
     assert secret_text not in err
     assert secret_token not in err and "oauth-2025-04-20" not in err
     assert "a reply" not in err
+
+
+def test_mounting_pins_the_sse_logger_above_debug(tmp_path: Path, monkeypatch):
+    """sse-starlette logs every frame it sends at DEBUG — the model's reply,
+    verbatim. Mounting the gateway pins that logger, so the no-bodies rule does
+    not depend on the daemon happening to run at INFO."""
+    logger = logging.getLogger("sse_starlette")
+    monkeypatch.setattr(logger, "level", logging.DEBUG)
+    _app(tmp_path, FakeEngine([]))
+    assert logger.level == logging.INFO
+
+
+def test_dropped_server_tool_names_cannot_forge_a_log_line(tmp_path: Path, capsys):
+    """`type` and `name` are client-controlled strings. Logged raw, a newline
+    in one would write whatever line the client chose into the daemon log."""
+    app = _app(tmp_path, FakeEngine(["ok"]))
+    forged = "x\nsous gateway: POST /v1/messages model=sous-local stream=0 status=200"
+    body = _body(tools=[{"type": "web_search_20250305", "name": forged}])
+    assert _post(app, body).status_code == 200
+    err = capsys.readouterr().err
+    assert "dropped 1 server-side tool(s)" in err
+    assert forged not in err  # the newline was escaped, so the forged line never lands
+    assert "\\n" in err

@@ -15,6 +15,7 @@ import logging
 import sys
 import threading
 from collections.abc import AsyncIterator
+from urllib.parse import urlsplit
 
 from mcp.server import MCPServer
 from sse_starlette import EventSourceResponse, ServerSentEvent
@@ -59,11 +60,14 @@ _PING = ServerSentEvent(event="ping", data='{"type": "ping"}', sep=_SEP)
 # loopback binds; without it a web page whose hostname re-resolves to
 # 127.0.0.1 could drive the local model. Same allow-list as the SDK's.
 _ALLOWED_HOSTS = ("127.0.0.1", "localhost", "[::1]")
-
-# sse-starlette logs every frame it sends at DEBUG — the model's reply,
-# verbatim. The daemon runs at INFO, but the no-bodies-in-logs rule must not
-# depend on that: pin the library's logger above DEBUG where the frames are made.
-logging.getLogger("sse_starlette").setLevel(logging.INFO)
+# The SDK checks Origin as well, and Host alone does not cover what it covers:
+# a cross-origin fetch with Content-Type: text/plain is a CORS simple request,
+# so it skips the preflight and arrives with a perfectly legitimate loopback
+# Host. The page cannot read the reply, but the turn it starts holds the
+# gateway lock, the engine lock and a prompt-cache slot for a whole generation
+# timeout — a drive-by DoS of the daemon. urlsplit unwraps the IPv6 brackets a
+# netloc carries, so these are bare addresses.
+_ALLOWED_ORIGIN_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 def _log(message: str) -> None:
@@ -113,8 +117,9 @@ async def _read_json(request: Request) -> object:
         raise RequestError(400, "invalid_request_error", "request body is not valid JSON") from None
 
 
-def _check_host(request: Request) -> None:
-    host = request.headers.get("host", "")
+def _check_loopback(request: Request) -> None:
+    """Host and Origin, the pair the /mcp transport checks on a loopback bind."""
+    host = request.headers.get("host", "").lower()
     # Strip the port; an IPv6 literal keeps its brackets.
     if host.startswith("[") and "]" in host:
         host = host[: host.index("]") + 1]
@@ -122,6 +127,15 @@ def _check_host(request: Request) -> None:
         host = host.split(":", 1)[0]
     if host not in _ALLOWED_HOSTS:
         raise RequestError(403, "permission_error", "the gateway serves loopback hosts only")
+    # Only a browser sends Origin, and only a browser can be someone else's
+    # page: absent (Claude Code, httpx, curl) passes untouched. `null` — a
+    # sandboxed frame or a file:// page — has no hostname and is refused.
+    origin = request.headers.get("origin")
+    if (
+        origin is not None
+        and (urlsplit(origin).hostname or "").lower() not in _ALLOWED_ORIGIN_HOSTS
+    ):
+        raise RequestError(403, "permission_error", "the gateway serves loopback origins only")
 
 
 def _frame(event: dict) -> ServerSentEvent:
@@ -160,39 +174,44 @@ class Gateway:
         self._config = config
         self._runner = TurnRunner(engines, config)
         # Turns get their own pool, never asyncio's default executor. A turn
-        # drains to completion after its client is gone, and asyncio.run's
-        # teardown joins the DEFAULT executor before returning (3.14 waits
-        # THREAD_JOIN_TIMEOUT = 300s for it). A draining turn parked there
-        # would hold uvicorn's Server.run() open for a whole generation, which
-        # defers the daemon's SIGTERM handler — the process-group kill of any
-        # sandboxed command — by exactly the time GRACEFUL_SHUTDOWN_SECONDS
-        # exists to bound. Off that path, the drain outlives the loop harmlessly.
+        # drains to completion after its client is gone, so a shared pool would
+        # mean one generation-long thread starving every asyncio.to_thread user
+        # in the daemon; here the drain outlives the event loop harmlessly,
+        # because asyncio.run's teardown joins only the DEFAULT executor (3.14
+        # waits THREAD_JOIN_TIMEOUT = 300s there). In production that join is
+        # not what bounds shutdown — uvicorn re-raises the captured SIGTERM
+        # inside serve(), long before teardown (see GRACEFUL_SHUTDOWN_SECONDS
+        # in server.py) — but off the main thread, which is how the real-server
+        # test drives it, it is: the pool is what lets that test observe the
+        # graceful bound instead of the drain.
         self._turns = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="sous-gateway-turn")
 
     async def hello(self, request: Request) -> Response:
         # Claude Code probes HEAD /api/hello at startup (gate 1, O3).
         try:
-            _check_host(request)
+            _check_loopback(request)
         except RequestError as e:
             return JSONResponse(e.body(), status_code=e.status)
         return Response(status_code=200)
 
     async def count_tokens(self, request: Request) -> Response:
         try:
-            _check_host(request)
+            _check_loopback(request)
             chat = parse_count_tokens_request(await _read_json(request))
             self._check_model(chat.model)
         except RequestError as e:
             return JSONResponse(e.body(), status_code=e.status)
         try:
-            count = await asyncio.to_thread(self._runner.count_tokens, chat.messages, chat.tools)
+            count = await asyncio.get_running_loop().run_in_executor(
+                self._turns, self._runner.count_tokens, chat.messages, chat.tools
+            )
         except Exception as e:  # noqa: BLE001 — every failure becomes an Anthropic error body
             return _error_response(*_classify(e))
         return JSONResponse({"input_tokens": count})
 
     async def messages(self, request: Request) -> Response:
         try:
-            _check_host(request)
+            _check_loopback(request)
             chat = parse_messages_request(await _read_json(request))
             self._check_model(chat.model)
         except RequestError as e:
@@ -201,7 +220,7 @@ class Gateway:
         if chat.dropped_server_tools:
             _log(
                 f"dropped {len(chat.dropped_server_tools)} server-side tool(s) not executable "
-                f"locally: {', '.join(chat.dropped_server_tools)}"
+                f"locally: {', '.join(repr(t) for t in chat.dropped_server_tools)}"
             )
         assembler = TurnAssembler(
             new_message_id(), chat.model, ToolSet.from_tools(chat.tools, strict=False)
@@ -316,6 +335,12 @@ def mount_gateway(mcp: MCPServer, engines: EngineManager, config: SousConfig) ->
     custom_route adds bare routes: no auth (loopback only, like /mcp), no
     body limit (enforced above), no DNS-rebinding check (the /mcp transport's
     settings do not reach here)."""
+    # sse-starlette logs every frame it sends at DEBUG — the model's reply,
+    # verbatim. The daemon runs at INFO, but the no-bodies-in-logs rule must not
+    # depend on that: pin the library's logger above DEBUG where the frames are
+    # made. Here rather than at import, because server.py imports this module
+    # unconditionally and a disabled gateway must not reconfigure a logger.
+    logging.getLogger("sse_starlette").setLevel(logging.INFO)
     gateway = Gateway(engines, config)
     mcp.custom_route("/v1/messages", methods=["POST"])(gateway.messages)
     mcp.custom_route("/v1/messages/count_tokens", methods=["POST"])(gateway.count_tokens)

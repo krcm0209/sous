@@ -1,5 +1,7 @@
+import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -332,14 +334,14 @@ def test_close_tolerates_an_undequeued_stalled_request():
     session = ManagedEngine(inner).session()
     # Occupy the thread inside generate, then fill the queue behind its back —
     # the exact state a stalled, never-dequeued request leaves behind.
-    session._requests.put_nowait((_msgs(), [], 8))
+    session._requests.put_nowait((_msgs(), [], 8, None))
     for _ in range(1000):
         if session._requests.empty():
             break
         time.sleep(0.005)
     else:
         pytest.fail("session thread never dequeued the first request")
-    session._requests.put_nowait((_msgs(), [], 8))  # the undequeued stalled request
+    session._requests.put_nowait((_msgs(), [], 8, None))  # the undequeued stalled request
     session._abandoned.set()  # what generate() does when it times out
     session.close()  # must not raise queue.Full
     gate.set()
@@ -356,7 +358,7 @@ def test_close_unleaks_an_idle_thread_holding_an_unconsumed_reply():
     inner = FakeEngine(["a"])
     session = ManagedEngine(inner).session()
     # Drive the loop directly: a reply lands, but no caller consumes it.
-    session._requests.put_nowait((_msgs(), [], 8))
+    session._requests.put_nowait((_msgs(), [], 8, None))
     for _ in range(1000):
         if not session._replies.empty():
             break
@@ -456,3 +458,78 @@ def test_chunked_fake_engine_streams_pieces_with_cumulative_counts():
     assert e.generate(_msgs(), [], 8, on_delta=seen.append) == "abc"
     assert seen == [Delta("a", 1, None), Delta("b", 2, None), Delta("c", 3, "stop")]
     assert e.finished.is_set()
+
+
+# --- tokenization is serialized ---------------------------------------------
+
+
+class _RecordingTokenizer:
+    """Notes every time two threads are inside a tokenizer call at once."""
+
+    bos_token = None
+    chat_template = None
+
+    def __init__(self) -> None:
+        self._inside = 0
+        self.overlaps: list[str] = []
+
+    def _busy(self, what: str) -> None:
+        self._inside += 1
+        if self._inside > 1:
+            self.overlaps.append(what)
+        time.sleep(0.005)  # wide enough for every other thread to pile in
+        self._inside -= 1
+
+    def apply_chat_template(self, messages, **kwargs) -> str:
+        self._busy("apply_chat_template")
+        return str(messages)
+
+    def encode(self, text, add_special_tokens=True) -> list[int]:
+        self._busy("encode")
+        return [len(text)]
+
+
+def _stub(monkeypatch, name: str, **attrs) -> None:
+    monkeypatch.setitem(sys.modules, name, types.SimpleNamespace(__name__=name, **attrs))
+
+
+def _hammer_ids(engine, tokenizer: _RecordingTokenizer) -> None:
+    """Tokenize from several threads at once, each with its own text so the
+    PromptMemo never short-circuits the encode."""
+
+    def one(n: int) -> None:
+        engine._ids("full", [{"role": "user", "content": f"message {n}"}], [])
+
+    threads = [threading.Thread(target=one, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert not any(t.is_alive() for t in threads)
+    assert tokenizer.overlaps == [], tokenizer.overlaps
+
+
+def test_lm_tokenization_is_serialized(monkeypatch):
+    """ManagedEngine.count_tokens deliberately skips _gen_lock, and the gateway
+    made that a second caller: a turn tokenizes on a pool thread while Claude
+    Code's count_tokens arrives mid-turn. HF's fast tokenizer mutates shared
+    Rust state on every encode, so the two must not overlap."""
+    from sous.engine.lm import LMEngine
+
+    tokenizer = _RecordingTokenizer()
+    _stub(monkeypatch, "mlx_lm", load=lambda model_id: (object(), tokenizer))
+    _stub(monkeypatch, "mlx_lm.sample_utils", make_sampler=lambda **kw: None)
+    _hammer_ids(LMEngine("test/model"), tokenizer)
+
+
+def test_vlm_tokenization_is_serialized(monkeypatch):
+    """Same contract on the backend the gateway actually runs."""
+    from sous.engine.vlm import VLMEngine
+
+    tokenizer = _RecordingTokenizer()
+    model = types.SimpleNamespace(config=types.SimpleNamespace(model_type="fake"))
+    processor = types.SimpleNamespace(tokenizer=tokenizer)
+    _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+    _stub(monkeypatch, "mlx_vlm.utils", should_add_special_tokens=lambda model_type, proc: True)
+    _hammer_ids(VLMEngine("test/model"), tokenizer)

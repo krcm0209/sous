@@ -73,6 +73,10 @@ def strip_volatile(text: str) -> str:
 def _text_parts(content: object, *, drop_billing: bool) -> list[str]:
     """The text of a string-or-blocks content value; non-text blocks skipped."""
     if isinstance(content, str):
+        # Same drop as the block form below: Claude Code sends the header as a
+        # block today, but a string system prompt is the same per-request noise.
+        if drop_billing and content.startswith(_BILLING_HEADER_PREFIX):
+            return []
         return [content] if content else []
     if not isinstance(content, list):
         raise _invalid("content must be a string or a list of content blocks")
