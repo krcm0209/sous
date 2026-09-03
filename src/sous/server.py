@@ -16,10 +16,13 @@ import time
 from pathlib import Path
 from typing import IO
 
+import anyio
+import uvicorn
 from mcp.server import MCPServer
 
 from sous.config import SousConfig, current_allowlist, load_config, persist_allowlist_entry
 from sous.engine.base import EngineManager, release_mlx_thread_state
+from sous.gateway.routes import mount_gateway
 from sous.tasks import FINISHED_STATES, Task, TaskState, TaskStore
 from sous.toolexec import (
     _is_within,
@@ -358,6 +361,9 @@ def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) 
         """Daemon health: model load state, memory, queue depth, active config."""
         return svc.server_status()
 
+    if config.gateway_enabled:
+        mount_gateway(mcp, engines, config)
+
     return mcp
 
 
@@ -453,6 +459,35 @@ def _install_shutdown_handler(stop: threading.Event) -> None:
         signal.signal(received, handle)
 
 
+# uvicorn owns SIGTERM/SIGINT while it serves: capture_signals swaps sous's
+# handler out and re-raises the signal only after its own shutdown returns,
+# and by default that shutdown waits for every open connection with no bound.
+# A non-streaming gateway turn (Claude Code's retry shape) can hold one for
+# the whole generation timeout, which would defer the command-group kill in
+# _install_shutdown_handler by the same amount. Bound it: streams already
+# cancel themselves on the exit signal (sse-starlette), and a cancelled
+# non-streaming handler leaves its turn draining on the executor thread.
+GRACEFUL_SHUTDOWN_SECONDS = 5
+
+
+def uvicorn_config(app, host: str, port: int, log_level: str = "info") -> uvicorn.Config:
+    return uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level=log_level,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
+    )
+
+
+def serve(mcp: MCPServer, host: str, port: int) -> None:
+    """What `mcp.run(transport="streamable-http")` does, minus the unbounded
+    shutdown wait: the SDK builds this same app and uvicorn config but exposes
+    no graceful-shutdown timeout."""
+    app = mcp.streamable_http_app(host=host)
+    anyio.run(uvicorn.Server(uvicorn_config(app, host, port)).serve)
+
+
 def main() -> None:
     config = load_config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
@@ -481,7 +516,12 @@ def main() -> None:
     )
     worker.start()
     mcp = create_server(store, engines, config)
+    if config.gateway_enabled:
+        print(
+            f"sous: gateway (experimental) serving {', '.join(config.gateway_local_models)} "
+            f"at http://127.0.0.1:{config.server_port}/v1/messages"
+        )
     try:
-        mcp.run(transport="streamable-http", host="127.0.0.1", port=config.server_port)
+        serve(mcp, "127.0.0.1", config.server_port)
     finally:
         stop.set()

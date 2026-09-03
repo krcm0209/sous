@@ -624,3 +624,14 @@ def test_server_status_reports_gateway_config(svc):
         "local_models": ["sous-local"],
         "max_context_tokens": 65536,
     }
+
+
+def test_uvicorn_config_bounds_graceful_shutdown():
+    """uvicorn holds SIGTERM while serving and, unbounded, waits for open
+    connections — a long non-streaming gateway turn would defer sous's own
+    shutdown handler by minutes. The bound is what keeps `sous stop` prompt."""
+    from sous.server import GRACEFUL_SHUTDOWN_SECONDS, uvicorn_config
+
+    cfg = uvicorn_config(object(), "127.0.0.1", 0)
+    assert cfg.timeout_graceful_shutdown == GRACEFUL_SHUTDOWN_SECONDS == 5
+    assert cfg.host == "127.0.0.1"

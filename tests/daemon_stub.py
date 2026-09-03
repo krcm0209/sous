@@ -11,7 +11,7 @@ from pathlib import Path
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
-from sous.server import _acquire_singleton_lock, create_server
+from sous.server import _acquire_singleton_lock, create_server, serve
 from sous.tasks import TaskStore
 from tests.fake_engine import FakeEngine
 
@@ -27,7 +27,7 @@ def main() -> None:
     store = TaskStore(data / "tasks.db")
     engines = EngineManager(cfg, engine_factory=lambda model_id: FakeEngine([]))
     mcp = create_server(store, engines, cfg)
-    mcp.run(transport="streamable-http", host="127.0.0.1", port=port)
+    serve(mcp, "127.0.0.1", port)
 
 
 if __name__ == "__main__":
