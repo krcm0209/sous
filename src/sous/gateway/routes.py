@@ -411,22 +411,49 @@ class Gateway:
 
     def _submit(self, fn, *args) -> asyncio.Future:
         """Submit a turn to the turn pool and tie the pending slot's release
-        to that future's completion, not to anything downstream of it (an
-        awaited result, an SSE body sse-starlette may never iterate). Assumes
-        the caller already holds the slot being released — acquire happens
-        once in messages(), before either branch calls this."""
+        to the concurrent.futures.Future's completion — the turn's REAL
+        completion — not to the asyncio wrapper run_in_executor hands back,
+        and not to anything further downstream (an awaited result, an SSE
+        body sse-starlette may never iterate). Assumes the caller already
+        holds the slot being released — acquire happens once in messages(),
+        before either branch calls this.
+
+        The asyncio wrapper is wrong to hang the callback off: asyncio.run_in_
+        executor's future is `cf`-shaped only via asyncio.wrap_future, and if
+        the caller instead cancels the *request task* awaiting that future,
+        the wrapper future is marked done (cancelled) immediately — while the
+        submitted job keeps running on its executor thread, because cancelling
+        a wrapper never stops a running executor job. The done-callback would
+        then fire, and the slot would be released while the turn is still
+        draining, bypassing MAX_PENDING_TURNS for as long as cancelled
+        requests keep arriving.
+
+        Submitting directly to the concurrent.futures.Future and wrapping it
+        ourselves fixes that: `cf` only completes when the executor job itself
+        finishes, or when `cf.cancel()` succeeds — which is possible only
+        while the job has not started (still queued in the pool). asyncio.
+        wrap_future chains cancellation downward (cancelling the wrapper calls
+        `cf.cancel()`), so a non-streaming request cancelled while its turn is
+        still queued cancels the job outright — it never runs, its
+        done-callback fires on that cancellation, and the slot is released
+        correctly. A request cancelled while its turn is already running
+        leaves the job draining, and the slot is held until the drain ends.
+        Both are the intended semantics.
+
+        `cf.add_done_callback` runs the callback on the completing worker
+        thread (or the cancelling thread, for a queued-and-cancelled job) —
+        threading.BoundedSemaphore.release is safe from either.
+        """
         try:
-            future = asyncio.get_running_loop().run_in_executor(self._turns, fn, *args)
+            cf = self._turns.submit(fn, *args)
         except Exception:
             # Submission itself failed (e.g. the pool refused new work): no
             # future exists to release the slot on completion, so release it
             # here instead of leaking it.
             self._pending.release()
             raise
-        # The slot counts the turn until it actually finishes, not until the
-        # client leaves or a generator body goes un-iterated.
-        future.add_done_callback(lambda _f: self._pending.release())
-        return future
+        cf.add_done_callback(lambda _f: self._pending.release())
+        return asyncio.wrap_future(cf)
 
     async def _stream(
         self,

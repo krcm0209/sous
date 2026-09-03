@@ -4,6 +4,7 @@ whole SSE body after the fact; timing-sensitive behaviour lives in
 test_gateway_http.py against a real server."""
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import threading
@@ -11,6 +12,7 @@ import time
 from pathlib import Path
 
 import httpx
+import pytest
 from mcp.server import MCPServer
 from sse_starlette import EventSourceResponse
 from starlette.requests import Request
@@ -674,3 +676,114 @@ def test_a_stream_never_iterated_still_drains_and_releases_its_slot(tmp_path: Pa
 
     asyncio.run(go())
     assert len(inner.calls) == 1  # the turn drained even though nobody read it
+
+
+def _hand_built_request(body: dict) -> Request:
+    """A Request that never goes through ASGITransport, so the caller can
+    hold the coroutine it drives in an asyncio.Task and cancel that task
+    directly -- httpx's ASGITransport buffers the whole response and gives
+    no hook to cancel mid-flight."""
+    encoded = json.dumps(body).encode()
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": encoded, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "headers": [(b"host", b"127.0.0.1:8383"), (b"content-type", b"application/json")],
+        "query_string": b"",
+    }
+    return Request(scope, receive)
+
+
+def test_cancelling_a_non_streaming_request_keeps_its_slot_until_the_turn_ends(tmp_path: Path):
+    """A client disconnect cancels the request TASK awaiting messages(), not
+    the turn running on its own executor thread -- the pending slot must stay
+    held until that turn actually finishes draining, not until the cancelled
+    task unwinds. RED at 3d068ea: the slot returned to MAX_PENDING_TURNS right
+    after task.cancel(), because the release was tied to the asyncio wrapper
+    future (which a cancelled task completes immediately) instead of to the
+    concurrent.futures.Future backing the still-running generation."""
+    import sous.gateway.routes as routes
+
+    inner = ChunkedFakeEngine(["a|b|c"], delay=0.5)  # ~1.5s to drain, 3 pieces
+    gateway, _app = _gateway_app(tmp_path, inner)
+
+    async def go():
+        request = _hand_built_request(_body(stream=False))
+        task = asyncio.create_task(gateway.messages(request))
+
+        deadline = time.monotonic() + 5
+        while not inner.generate_threads and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert inner.generate_threads  # generation has actually started
+
+        assert gateway._pending._value == routes.MAX_PENDING_TURNS - 1
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Still held: the turn is still draining on the executor thread.
+        assert gateway._pending._value == routes.MAX_PENDING_TURNS - 1
+
+        await asyncio.to_thread(inner.finished.wait, 10)
+        deadline = time.monotonic() + 5
+        while gateway._pending._value != routes.MAX_PENDING_TURNS and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert gateway._pending._value == routes.MAX_PENDING_TURNS
+        assert len(inner.calls) == 1  # the turn ran to completion, draining
+
+    asyncio.run(go())
+
+
+def test_cancelling_a_queued_non_streaming_request_cancels_the_turn(tmp_path: Path):
+    """A turn cancelled while still queued in the pool (never started) must
+    be cancelled outright rather than left to run for a client that is
+    already gone -- asyncio.wrap_future chains the request task's
+    cancellation down to the concurrent.futures.Future's own .cancel(), which
+    succeeds only while the job has not started. This behaviour already held
+    before the slot fix (run_in_executor wraps its future the same way), so
+    this test does not discriminate old code from new; it pins the contract
+    so the queued case cannot regress while the running case above (the one
+    that was broken) is the discriminating test."""
+    import sous.gateway.routes as routes
+
+    inner = FakeEngine(["never"])
+    gateway, _app = _gateway_app(tmp_path, inner)
+
+    # Saturate the turn pool with a single worker occupied by a blocking
+    # dummy job, so the request's own turn sits queued -- not started -- in
+    # the pool, which is the only state cf.cancel() can actually cancel.
+    gateway._turns.shutdown(wait=False, cancel_futures=True)
+    gateway._turns = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    dummy_release = threading.Event()
+    gateway._turns.submit(dummy_release.wait, 5)
+
+    async def go():
+        request = _hand_built_request(_body(stream=False))
+        task = asyncio.create_task(gateway.messages(request))
+        await asyncio.sleep(0.05)  # give the loop a tick to submit and queue
+
+        assert gateway._pending._value == routes.MAX_PENDING_TURNS - 1
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        dummy_release.set()  # let the pool's occupying job finish
+
+        deadline = time.monotonic() + 5
+        while gateway._pending._value != routes.MAX_PENDING_TURNS and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert gateway._pending._value == routes.MAX_PENDING_TURNS
+        assert inner.calls == []  # the turn was cancelled before it ever ran
+
+    asyncio.run(go())
