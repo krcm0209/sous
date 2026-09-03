@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
 import os
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import IO
 
@@ -22,7 +24,7 @@ from mcp.server import MCPServer
 
 from sous.config import SousConfig, current_allowlist, load_config, persist_allowlist_entry
 from sous.engine.base import EngineManager, release_mlx_thread_state
-from sous.gateway.routes import mount_gateway
+from sous.gateway.routes import Gateway, mount_gateway
 from sous.tasks import FINISHED_STATES, Task, TaskState, TaskStore
 from sous.toolexec import (
     _is_within,
@@ -293,7 +295,28 @@ draft, never a merge.
 
 def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) -> MCPServer:
     svc = SousService(store, engines, config)
-    mcp = MCPServer("sous", instructions=_INSTRUCTIONS)
+    # mount_gateway (below) runs after MCPServer(...) is constructed, so the
+    # lifespan closure below needs a late-bound holder for whatever it
+    # mounts — empty when the gateway is disabled, since there is then
+    # nothing for close() to mean.
+    mounted_gateway: list[Gateway] = []
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(_: MCPServer) -> AsyncIterator[None]:
+        try:
+            yield None
+        finally:
+            # Fires on every path that drives the app's ASGI lifespan:
+            # uvicorn's graceful shutdown and its SIGTERM path alike
+            # (capture_signals re-raises SIGTERM only after Server.shutdown()
+            # awaits this shutdown), plus any embedded lifecycle that drives
+            # lifespan. Without it the gateway's session thread stays parked
+            # in _requests.get() and never reaches release_mlx_thread_state()
+            # (ml-explore/mlx#4327) on a non-signal exit.
+            for gateway in mounted_gateway:
+                gateway.close()
+
+    mcp = MCPServer("sous", instructions=_INSTRUCTIONS, lifespan=_lifespan)
 
     # The MCP-facing name deliberately differs from SousService.delegate_task:
     # on surfaces that defer tool schemas, the name is the only signal the
@@ -362,7 +385,7 @@ def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) 
         return svc.server_status()
 
     if config.gateway_enabled:
-        mount_gateway(mcp, engines, config)
+        mounted_gateway.append(mount_gateway(mcp, engines, config))
 
     return mcp
 

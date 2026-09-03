@@ -6,12 +6,16 @@ test_gateway_http.py against a real server."""
 import asyncio
 import json
 import logging
+import threading
+import time
 from pathlib import Path
 
 import httpx
+from mcp.server import MCPServer
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
+from sous.gateway.routes import Gateway, mount_gateway
 from sous.server import create_server
 from sous.tasks import TaskStore
 from tests.fake_engine import ChunkedFakeEngine, FakeEngine
@@ -37,6 +41,21 @@ def _app(tmp_path: Path, engine, **overrides):
     store = TaskStore(tmp_path / "tasks.db")
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
     return create_server(store, engines, cfg).streamable_http_app()
+
+
+def _gateway_app(tmp_path: Path, engine, **overrides) -> tuple[Gateway, object]:
+    """Like _app, but hands back the Gateway too — create_server drops
+    mount_gateway's return value, and Gateway.close() tests need it."""
+    overrides.setdefault("gateway_enabled", True)
+    cfg = SousConfig(
+        data_dir=tmp_path / "data",
+        config_path=tmp_path / "config.toml",
+        **overrides,
+    )
+    engines = EngineManager(cfg, engine_factory=lambda mid: engine)
+    mcp = MCPServer("test")
+    gateway = mount_gateway(mcp, engines, cfg)
+    return gateway, mcp.streamable_http_app()
 
 
 def _request(app, method: str, path: str, body=None, headers=None) -> httpx.Response:
@@ -507,3 +526,46 @@ def test_a_dropped_tool_type_cannot_forge_a_log_line(tmp_path: Path, capsys):
     assert "dropped 1 tool(s)" in err
     assert forged not in err  # the newline was escaped, so the forged line never lands
     assert "\\n" in err
+
+
+# --- app-shutdown cleanup (session thread + executors) -----------------------------
+
+
+def test_close_after_a_completed_turn_stops_the_session_and_the_pools(tmp_path: Path):
+    gateway, app = _gateway_app(tmp_path, FakeEngine(["ok"]))
+    assert _post(app, _body(stream=False)).status_code == 200
+    session = gateway._runner._session
+    assert session is not None and session._thread.is_alive()
+    t0 = time.monotonic()
+    gateway.close()
+    elapsed = time.monotonic() - t0
+    assert elapsed < 2.5  # promptly: nothing here is a running generation to wait out
+    assert not session._thread.is_alive()
+    assert gateway._turns._shutdown and gateway._counts._shutdown
+
+
+def test_close_does_not_touch_a_running_turns_session(tmp_path: Path):
+    """A turn in flight holds TurnRunner._lock; close(timeout=0.5) must give up
+    on it quickly rather than wait out the generation, and must leave the
+    session alone rather than close it out from under the running turn."""
+    entered = threading.Event()
+
+    class Announcing(ChunkedFakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            entered.set()
+            return super().generate(messages, tools, max_tokens, on_delta)
+
+    inner = Announcing(["slow|slow|slow"], delay=0.3)
+    gateway, app = _gateway_app(tmp_path, inner)
+    turn = threading.Thread(target=lambda: _post(app, _body(stream=False)), daemon=True)
+    turn.start()
+    assert entered.wait(5)  # the turn holds TurnRunner._lock and is generating
+    session_before = gateway._runner._session
+    assert session_before is not None
+    t0 = time.monotonic()
+    gateway.close(timeout=0.5)  # must not raise
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.0
+    assert gateway._runner._session is session_before  # untouched: the lock was busy
+    turn.join(10)
+    assert inner.finished.wait(5)

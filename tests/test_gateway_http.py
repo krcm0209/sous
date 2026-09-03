@@ -256,3 +256,39 @@ def test_count_tokens_is_not_blocked_by_a_saturated_turn_pool(tmp_path: Path):
         assert count.status_code == 200, count.text
         assert elapsed < 2.0, f"count_tokens waited {elapsed:.1f}s behind the saturated turn pool"
     assert inner.finished.wait(10)
+
+
+def test_app_shutdown_closes_the_gateway_session_thread(tmp_path: Path, monkeypatch):
+    """End-to-end proof the SDK's lifespan hook actually fires: create_server
+    wires a lifespan that closes the mounted Gateway on the app's ASGI
+    shutdown. Without it the gateway's session thread stays parked in
+    _requests.get() forever and never reaches release_mlx_thread_state()
+    (ml-explore/mlx#4327) on a non-signal exit — this drives the real
+    lifespan (via streamable_http_app(), same as create_server's caller)
+    rather than calling Gateway.close() directly."""
+    import sous.server as server_mod
+
+    captured: list[Gateway] = []
+    real_mount_gateway = server_mod.mount_gateway
+
+    def spy(mcp, engines, cfg):
+        gateway = real_mount_gateway(mcp, engines, cfg)
+        captured.append(gateway)
+        return gateway
+
+    monkeypatch.setattr(server_mod, "mount_gateway", spy)
+    inner = ChunkedFakeEngine(["ok"])
+    with _serve(_app(tmp_path, inner)) as (base, server, thread):
+        r = httpx.post(f"{base}/v1/messages", json=_body(stream=False), timeout=30)
+        assert r.status_code == 200
+        [gateway] = captured
+        session = gateway._runner._session
+        assert session is not None and session._thread.is_alive()
+        server.should_exit = True
+    # _serve's own finally already set should_exit and joined the uvicorn
+    # thread with a generous bound; by the time that join returns, uvicorn's
+    # Server.shutdown() has already awaited the app's ASGI lifespan shutdown
+    # (Server.shutdown -> self.lifespan.shutdown()) — so create_server's
+    # lifespan, and therefore Gateway.close(), has already run.
+    assert not thread.is_alive()
+    assert not session._thread.is_alive()

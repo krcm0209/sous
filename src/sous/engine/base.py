@@ -317,6 +317,15 @@ class GenerationSession:
         with contextlib.suppress(queue.Full):
             self._requests.put_nowait(_CLOSE)
 
+    def join(self, timeout: float) -> bool:
+        """Wait up to `timeout` seconds for the session thread to exit after
+        close(). Never blocks indefinitely: a wedged generation (see the
+        class docstring) never dequeues _CLOSE, and the caller — an app
+        shutdown hook — must not hang on that. Returns whether the thread
+        actually exited."""
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
 
 class EngineManager:
     def __init__(self, config: SousConfig, engine_factory: Callable[[str], Engine] | None = None):

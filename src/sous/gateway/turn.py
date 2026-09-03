@@ -196,6 +196,21 @@ class TurnRunner:
         self._session = None
         self._session_engine = None
 
-    def close(self) -> None:
-        with self._lock:
+    def close(self, timeout: float = 2.0) -> bool:
+        """Best-effort shutdown: drop the session and wait up to `timeout`
+        seconds for its thread to actually exit. Returns False, touching
+        nothing, if the lock is not free within `timeout` — a turn in
+        flight (or a wedged one still holding it from a stalled generation,
+        see GenerationSession's docstring) must never hold up app shutdown.
+        Never blocks longer than `timeout` in total."""
+        deadline = time.monotonic() + timeout
+        if not self._lock.acquire(timeout=timeout):
+            return False
+        try:
+            session = self._session
             self._drop_session()
+            if session is not None:
+                session.join(max(0.0, deadline - time.monotonic()))
+            return True
+        finally:
+            self._lock.release()
