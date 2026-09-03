@@ -131,10 +131,15 @@ def _check_loopback(request: Request) -> None:
     # page: absent (Claude Code, httpx, curl) passes untouched. `null` — a
     # sandboxed frame or a file:// page — has no hostname and is refused.
     origin = request.headers.get("origin")
-    if (
-        origin is not None
-        and (urlsplit(origin).hostname or "").lower() not in _ALLOWED_ORIGIN_HOSTS
-    ):
+    if origin is None:
+        return
+    try:
+        # An unbalanced IPv6 bracket makes urlsplit raise instead of
+        # returning; a malformed Origin is refused like any foreign one.
+        hostname = (urlsplit(origin).hostname or "").lower()
+    except ValueError:
+        hostname = ""
+    if hostname not in _ALLOWED_ORIGIN_HOSTS:
         raise RequestError(403, "permission_error", "the gateway serves loopback origins only")
 
 

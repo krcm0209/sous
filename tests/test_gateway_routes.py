@@ -151,6 +151,19 @@ def test_a_foreign_origin_is_rejected_before_the_model_is_touched(tmp_path: Path
     assert inner.calls == []  # rejected before any generation, streamed or not
 
 
+def test_a_malformed_origin_is_rejected_not_raised(tmp_path: Path):
+    """urlsplit raises ValueError on an unbalanced IPv6 bracket; that must be
+    caught and treated as a foreign origin, not escape as a 500."""
+    inner = FakeEngine(["never"])
+    app = _app(tmp_path, inner)
+    r = _post(app, _body(), headers={"origin": "http://[::1"})
+    assert r.status_code == 403
+    assert r.json()["error"]["type"] == "permission_error"
+    r = _request(app, "HEAD", "/api/hello", headers={"origin": "http://[::1"})
+    assert r.status_code == 403  # HEAD carries no body to assert error.type on
+    assert inner.calls == []  # rejected before any generation
+
+
 def test_loopback_and_absent_origins_pass(tmp_path: Path):
     """Absent Origin is the normal case — Claude Code, httpx and curl send
     none — and a page served from the daemon's own loopback origin is the
