@@ -8,6 +8,7 @@ is not in this path).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -158,6 +159,15 @@ class Gateway:
     def __init__(self, engines: EngineManager, config: SousConfig):
         self._config = config
         self._runner = TurnRunner(engines, config)
+        # Turns get their own pool, never asyncio's default executor. A turn
+        # drains to completion after its client is gone, and asyncio.run's
+        # teardown joins the DEFAULT executor before returning (3.14 waits
+        # THREAD_JOIN_TIMEOUT = 300s for it). A draining turn parked there
+        # would hold uvicorn's Server.run() open for a whole generation, which
+        # defers the daemon's SIGTERM handler — the process-group kill of any
+        # sandboxed command — by exactly the time GRACEFUL_SHUTDOWN_SECONDS
+        # exists to bound. Off that path, the drain outlives the loop harmlessly.
+        self._turns = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="sous-gateway-turn")
 
     async def hello(self, request: Request) -> Response:
         # Claude Code probes HEAD /api/hello at startup (gate 1, O3).
@@ -204,8 +214,13 @@ class Gateway:
                 sep=_SEP,
             )
         try:
-            result = await asyncio.to_thread(
-                self._runner.run, chat.messages, chat.tools, chat.max_tokens, _NullSink()
+            result = await asyncio.get_running_loop().run_in_executor(
+                self._turns,
+                self._runner.run,
+                chat.messages,
+                chat.tools,
+                chat.max_tokens,
+                _NullSink(),
             )
         except Exception as e:  # noqa: BLE001 — every failure becomes an Anthropic error body
             status, error_type, message = _classify(e)
@@ -251,7 +266,7 @@ class Gateway:
             except Exception as e:  # noqa: BLE001 — relayed as an in-band error event
                 sink.put(("error", e))
 
-        loop.run_in_executor(None, turn)
+        loop.run_in_executor(self._turns, turn)
         try:
             yield _PING
             while True:

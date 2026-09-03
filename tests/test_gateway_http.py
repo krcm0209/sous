@@ -177,25 +177,39 @@ def test_a_request_abandoned_while_queued_never_generates(tmp_path: Path):
 
 
 def test_shutdown_is_bounded_while_a_non_streaming_turn_runs(tmp_path: Path):
-    """uvicorn owns SIGTERM while it serves and, unbounded, waits for open
-    connections before sous's own handler runs; a non-streaming gateway turn
-    could hold one for the whole generation timeout. The daemon's uvicorn
-    config bounds that wait, so `sous stop` and launchd restarts stay prompt
-    while the turn itself still drains on its thread."""
-    inner = ChunkedFakeEngine(["slow|slow|slow|slow|slow|slow"], delay=1.0)
-    client = httpx.Client(timeout=30)
+    """uvicorn owns SIGTERM while it serves and, unbounded, waits for every open
+    connection before sous's own handler runs; a non-streaming gateway turn
+    (Claude Code's retry shape) can hold one for the whole generation timeout.
+    Two things bound that wait, and both are load-bearing: the daemon's
+    `timeout_graceful_shutdown`, and the gateway's private turn pool — because
+    `Server.run` is `asyncio.run(...)`, whose teardown joins the DEFAULT
+    executor for up to 300s, so a turn draining there would hold the serving
+    thread for the whole generation no matter what the graceful bound says.
+    The generation runs far longer than the bound to tell the cases apart."""
+    inner = ChunkedFakeEngine(["|".join(["slow"] * 12)], delay=1.0)  # ~12s, vs a 5s bound
+    outcome: list[object] = []
+    client = httpx.Client(timeout=60)
     with _serve(_app(tmp_path, inner)) as (base, server, thread):
 
         def request() -> None:
-            with contextlib.suppress(Exception):  # the connection is cut by the shutdown
-                client.post(f"{base}/v1/messages", json=_body(stream=False))
+            try:
+                outcome.append(
+                    client.post(f"{base}/v1/messages", json=_body(stream=False)).status_code
+                )
+            except Exception as e:  # noqa: BLE001 — any failure is a non-200 outcome
+                outcome.append(type(e).__name__)
 
         threading.Thread(target=request, daemon=True).start()
         _wait_for_generation(inner)
         t0 = time.monotonic()
         server.should_exit = True
-        thread.join(GRACEFUL_SHUTDOWN_SECONDS + 5)
-        assert not thread.is_alive(), "uvicorn waited for the turn instead of bounding the shutdown"
-        assert time.monotonic() - t0 < GRACEFUL_SHUTDOWN_SECONDS + 4
-    assert inner.finished.wait(10)  # the turn still drained to completion
+        thread.join(GRACEFUL_SHUTDOWN_SECONDS + 4)
+        elapsed = time.monotonic() - t0
+        assert not thread.is_alive(), (
+            f"uvicorn waited {elapsed:.1f}s for the turn instead of bounding the shutdown"
+        )
+    assert inner.finished.wait(20)  # the turn still drained to completion, off the loop
+    # The deadline cancels the handler mid-await, which uvicorn reports as a 500;
+    # what matters is that the client is not left holding a completed turn.
+    assert outcome and outcome[0] != 200, outcome
     client.close()
