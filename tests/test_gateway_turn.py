@@ -259,6 +259,45 @@ def test_a_turn_abandoned_while_queued_never_generates(tmp_path: Path):
     assert not runner._lock.locked()
 
 
+def test_close_during_a_turn_drops_the_session_once_the_turn_finishes(tmp_path: Path):
+    """close() giving up on a busy lock must not leak the session thread:
+    the turn holding the lock sees `_closing` in its own finally and drops
+    the session itself when it ends."""
+    entered = threading.Event()
+
+    class Announcing(ChunkedFakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            entered.set()
+            return super().generate(messages, tools, max_tokens, on_delta)
+
+    inner = Announcing(["slow|slow"], delay=0.2)
+    runner, _ = _runner(tmp_path, inner)
+    results: list[TurnResult] = []
+    t = threading.Thread(target=lambda: results.append(runner.run(MSGS, [], 100, RecordingSink())))
+    t.start()
+    assert entered.wait(5)  # t holds the lock and is mid-generation
+    session = runner._session
+    assert session is not None
+
+    started = time.monotonic()
+    assert runner.close(timeout=0.2) is False
+    assert time.monotonic() - started < 2.0  # close gave up quickly, not after the drain
+
+    t.join(5)
+    assert len(results) == 1  # the turn's own result still came back normally
+    assert session.join(5)  # its thread exits on its own, no join from close()
+
+
+def test_a_turn_queued_while_closing_refuses_to_start(tmp_path: Path):
+    inner = FakeEngine(["never"])
+    runner, _ = _runner(tmp_path, inner)
+    runner._closing = True
+    with pytest.raises(GatewayBusy, match="shutting down"):
+        runner.run(MSGS, [], 100, RecordingSink())
+    assert inner.calls == []
+    assert not runner._lock.locked()
+
+
 def test_run_releases_mlx_thread_state_and_touches_the_engine(tmp_path: Path, monkeypatch):
     import sous.gateway.turn as turn
 

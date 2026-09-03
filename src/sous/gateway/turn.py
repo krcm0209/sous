@@ -80,6 +80,11 @@ class TurnRunner:
         # the cache is what turns gate 2's ~200s cold prefill into seconds.
         self._session: GenerationSession | None = None
         self._session_engine: ManagedEngine | None = None
+        # Set once close() has given up on acquiring _lock from a turn in
+        # flight: that turn's own finally then drops the session for it
+        # (see run()'s finally), and any turn still queued on the lock must
+        # refuse to start rather than outlive a gateway that gave up on it.
+        self._closing = False
 
     def run(
         self,
@@ -91,6 +96,13 @@ class TurnRunner:
     ) -> TurnResult:
         if not self._lock.acquire(timeout=self._timeout):
             raise GatewayBusy(f"no generation slot within {self._timeout:.0f}s")
+        if self._closing:
+            # Queued behind another turn while close() was giving up on it;
+            # that other turn's finally already dropped (or will drop) the
+            # session, so this one must not start a new generation on a
+            # gateway that has already been told to shut down.
+            self._lock.release()
+            raise GatewayBusy("gateway is shutting down")
         started = time.monotonic()
         try:
             # The idle sweep runs on the worker's thread, and _gen_lock only
@@ -163,6 +175,14 @@ class TurnRunner:
                 )
         finally:
             self._engines.touch()
+            if self._closing:
+                # close() gave up on this turn's lock and returned False;
+                # nothing else will ever retry the drop, so the turn that
+                # held the lock does it here, while it still owns it. The
+                # session's own thread dequeues _CLOSE and exits on its own
+                # after this — joining it would make a turn thread wait on
+                # shutdown work, which it must never do.
+                self._drop_session()
             self._lock.release()
             # engines.get() may have loaded the model on this thread. Pool
             # threads outlive the call, but the invariant is per thread that
@@ -199,10 +219,15 @@ class TurnRunner:
     def close(self, timeout: float = 2.0) -> bool:
         """Best-effort shutdown: drop the session and wait up to `timeout`
         seconds for its thread to actually exit. Returns False, touching
-        nothing, if the lock is not free within `timeout` — a turn in
+        nothing else, if the lock is not free within `timeout` — a turn in
         flight (or a wedged one still holding it from a stalled generation,
         see GenerationSession's docstring) must never hold up app shutdown.
-        Never blocks longer than `timeout` in total."""
+        `_closing` is set first, unconditionally: when the lock is busy, the
+        turn holding it sees the flag in its own finally and drops the
+        session itself once it finishes, so shutdown mid-turn no longer
+        leaks that session's thread. Never blocks longer than `timeout` in
+        total."""
+        self._closing = True
         deadline = time.monotonic() + timeout
         if not self._lock.acquire(timeout=timeout):
             return False

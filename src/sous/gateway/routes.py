@@ -216,14 +216,16 @@ class Gateway:
     def close(self, timeout: float = 2.0) -> None:
         """Best-effort shutdown, called from the app's lifespan hook. Never
         waits on a draining generation: a turn in flight keeps the runner's
-        lock, so its session and thread are left alone (cancel_futures drops
-        only work that never started; the running turn's own future finishes
-        on its own, off a daemon thread, after the process is asked to exit).
+        lock, so its session and thread are left alone here (cancel_futures
+        drops only work that never started; the running turn's own future
+        finishes on its own, off a daemon thread, after the process is asked
+        to exit) — the running turn drops the session itself when it
+        finishes, once TurnRunner.close has marked the runner as closing.
         """
         closed = self._runner.close(timeout)
         self._turns.shutdown(wait=False, cancel_futures=True)
         self._counts.shutdown(wait=False, cancel_futures=True)
-        _log("closed" if closed else "close skipped: turn in progress")
+        _log("closed" if closed else "close deferred: turn in progress")
 
     async def hello(self, request: Request) -> Response:
         # Claude Code probes HEAD /api/hello at startup (gate 1, O3).
