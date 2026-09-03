@@ -36,6 +36,12 @@ Claude Code use stretches further — evaluate features against that goal.
   config_path/data_dir.
 - `docs/superpowers/**` are point-in-time design/plan records: never edit,
   reformat, or "sync" them with current code (they are also ruff-excluded).
+- Engine `on_delta` callbacks (`engine/base.py:Delta`) fire on the generation
+  thread from inside the decode loop: never block or raise in one, and expect
+  late deltas from a stalled-and-abandoned session.
+- `PrefixCache` refuses its cold retry once any delta has streamed (a retry
+  would replay the turn to the client). That is deliberate, not a missing
+  retry.
 
 ## Security boundary
 
@@ -45,6 +51,11 @@ without it. Odd-looking code is load-bearing (the un-reaped zombie during
 the group kill, EPERM suppression, ctime in the audit) — read the comments
 before touching. Suspected-flaky tests get run in a loop, not judged on one
 pass.
+
+`src/sous/gateway/` is deliberately outside that boundary: it never executes a
+tool (Claude Code does, under its own permissions) and never logs a request
+body or header value. A change that makes it do either needs the spec
+(`docs/superpowers/specs/2026-08-26-hybrid-gateway-design.md`) changed first.
 
 ## Workflow
 
