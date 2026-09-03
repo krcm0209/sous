@@ -196,6 +196,19 @@ def test_invalid_json_and_bad_shapes_are_400s(tmp_path: Path):
     assert r.status_code == 400
 
 
+def test_malformed_tool_properties_is_a_400_and_never_reaches_the_engine(tmp_path: Path):
+    """Pins the shaped-status property end to end: chat_tools rejects a
+    non-object `properties` before ToolSet.from_tools (called after the
+    RequestError handling in routes.py) can turn it into a bare 500."""
+    inner = FakeEngine(["unused"])
+    app = _app(tmp_path, inner)
+    tools = [{"name": "Broken", "input_schema": {"type": "object", "properties": ["a"]}}]
+    r = _post(app, _body(tools=tools))
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"
+    assert inner.calls == []
+
+
 def test_oversized_bodies_are_413_by_header_and_by_actual_size(tmp_path: Path, monkeypatch):
     import sous.gateway.routes as routes
 

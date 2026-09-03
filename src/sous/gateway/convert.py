@@ -269,6 +269,9 @@ def chat_tools(tools: object) -> tuple[list[dict], list[str]]:
             raise _invalid("tools: each client tool needs a name")
         if not isinstance(schema, dict):
             raise _invalid(f"tools: {name} needs an input_schema object")
+        props = schema.get("properties")
+        if props is not None and not isinstance(props, dict):
+            raise _invalid(f"tools: {name} input_schema.properties must be an object")
         out.append(
             {
                 "type": "function",

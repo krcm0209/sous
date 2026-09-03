@@ -366,6 +366,41 @@ def test_client_tool_without_schema_or_name_is_a_400():
         chat_tools([{"input_schema": {"type": "object"}}])
 
 
+@pytest.mark.parametrize("properties", [["a"], "abc"])
+def test_non_object_properties_is_a_400(properties):
+    """`ToolSet.from_tools` does `(parameters.get("properties") or {}).items()`;
+    a non-empty non-object reaches that `.items()` and raises AttributeError
+    instead of the shaped 400 the client needs (routes.py calls from_tools
+    after the RequestError handling, so an unrejected value there is a bare
+    500)."""
+    with pytest.raises(RequestError) as exc:
+        chat_tools(
+            [{"name": "Broken", "input_schema": {"type": "object", "properties": properties}}]
+        )
+    assert exc.value.status == 400
+    assert exc.value.error_type == "invalid_request_error"
+
+
+def test_empty_list_properties_is_also_rejected():
+    """An empty list is falsy and would be harmless downstream, but Anthropic's
+    API requires JSON Schema, where `properties` is an object — so this is a
+    400 too, not a regression."""
+    with pytest.raises(RequestError) as exc:
+        chat_tools([{"name": "Broken", "input_schema": {"type": "object", "properties": []}}])
+    assert exc.value.status == 400
+    assert exc.value.error_type == "invalid_request_error"
+
+
+def test_absent_or_object_properties_still_convert():
+    tools, _ = chat_tools(
+        [
+            {"name": "NoProps", "input_schema": {"type": "object"}},
+            {"name": "ObjProps", "input_schema": {"type": "object", "properties": {}}},
+        ]
+    )
+    assert [t["function"]["name"] for t in tools] == ["NoProps", "ObjProps"]
+
+
 def test_no_tools_is_fine():
     assert chat_tools(None) == ([], [])
 
