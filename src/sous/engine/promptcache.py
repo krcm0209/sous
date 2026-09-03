@@ -8,6 +8,7 @@ a fake cache layer can exercise it. Array copies arrive through an injected
 
 from __future__ import annotations
 
+import threading
 import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -185,6 +186,11 @@ class PrefixCache:
         self.enabled = enabled
         self._cache: list | None = None
         self._held: list[int] = []
+        # The thread whose mlx streams built self._cache (issue #34). A Thread
+        # object, not its ident: idents are recycled after a thread exits, so
+        # an ident could falsely match a later, unrelated thread — a strongly
+        # held Thread object cannot.
+        self._owner: threading.Thread | None = None
         self._epoch = 0
         self._stats = PromptCacheStats()
 
@@ -198,6 +204,7 @@ class PrefixCache:
         self._epoch += 1
         self._cache = None
         self._held = []
+        self._owner = None
         self._stats = PromptCacheStats()
 
     def stats(self) -> dict:
@@ -249,6 +256,14 @@ class PrefixCache:
         self._cache, self._held = None, []
 
         reuse = reuse_length(held, stable_ids) if cache is not None else 0
+        if reuse and self._owner is not threading.current_thread():
+            # The cached arrays live only on the publishing thread's mlx
+            # streams (issue #34); a different session thread (a worker task
+            # vs the gateway's long-lived one) must prefill cold rather than
+            # touch them. Force the same miss path a prefix mismatch takes,
+            # rather than attempt a warm run doomed to the cross-thread mlx
+            # failure that _run's except clause would otherwise have to catch.
+            reuse = 0
         # `cache is not None and reuse` rather than a bare `if reuse`: it is what
         # lets the type checker see `warm` as a plain list in both branches, with
         # no assert and no ignore pragma.
@@ -322,6 +337,7 @@ class PrefixCache:
 
         if epoch == self._epoch:
             self._cache, self._held = warm, list(stable_ids)
+            self._owner = threading.current_thread()
         return text
 
     def _run(

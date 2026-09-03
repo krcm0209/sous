@@ -6,6 +6,7 @@ affects correctness is made here, against fakes.
 
 from __future__ import annotations
 
+import threading
 import weakref
 from typing import cast
 
@@ -633,3 +634,46 @@ def test_a_warm_failure_before_any_delta_still_retries_cold():
         assert pc.generate(STABLE_2, FULL_2, 16, seen.append) == "text"
     assert pc.stats()["cold_retries"] == 1
     assert seen == [Delta("text", 1, "stop")]  # only the retry's delta got out
+
+
+# ---- thread ownership (issue #34) ------------------------------------------
+
+
+def test_a_cache_built_on_another_thread_is_a_cold_miss():
+    """mlx KV-cache arrays are usable only from the thread whose streams
+    created them (issue #34). A cache slot built on thread A must refuse a
+    consumer on any other thread rather than let it touch those arrays."""
+    h = FakeHooks(trimmable=False)
+    pc = PrefixCache(h)
+
+    def on_thread_a() -> None:
+        pc.generate(STABLE_1, FULL_1, 16)
+        pc.generate(STABLE_2, FULL_2, 16)  # strictly extends STABLE_1: reuses
+
+    thread_a = threading.Thread(target=on_thread_a)
+    thread_a.start()
+    thread_a.join()
+
+    # The slot is populated and owned by thread A: the second call above,
+    # still running on thread A, reused the first call's cache.
+    assert pc.stats()["hits"] == 1
+    assert pc.stats()["reused_tokens"] == len(STABLE_1)
+
+    # From the test's own thread — a different thread than the one that built
+    # the cache — call with stable ids that strictly extend the held prefix:
+    # the shape that WOULD reuse if thread ownership weren't checked.
+    stable_3 = [*STABLE_2, 7, 8]
+    full_3 = [*stable_3, 90, 91]
+    pc.generate(stable_3, full_3, 16)
+
+    assert pc.stats()["misses"] == 2  # counted as a miss, not a cross-thread hit
+    assert pc.stats()["reused_tokens"] == len(STABLE_1)  # unchanged
+    assert pc.stats()["cold_retries"] == 0  # cold directly, not via a failed warm attempt
+    assert h.prefilled[-1] == stable_3  # the full stable ids, no reuse offset
+
+    # The slot is now owned by the main thread: a further call from here with
+    # an extending prefix reuses normally.
+    stable_4 = [*stable_3, 9, 10]
+    full_4 = [*stable_4, 90, 91]
+    pc.generate(stable_4, full_4, 16)
+    assert pc.stats()["hits"] == 2
