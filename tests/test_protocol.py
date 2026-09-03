@@ -641,3 +641,57 @@ def test_xml_union_schema_order_wins_over_a_later_stricter_member():
 def test_xml_union_with_no_accepting_member_raises_naming_the_union():
     with pytest.raises(ParseError, match=r"one of integer\|boolean"):
         _grep_call("int_or_bool", "maybe")
+
+
+# --- decoder escapes: every raw_decode/json.loads failure must be a ParseError --
+
+
+def test_json_call_with_a_deeply_nested_argument_raises_parse_error():
+    """A Hermes JSON call whose argument nests ~100k arrays deep blows the
+    C recursion limit inside `_DECODER.raw_decode` with a bare
+    RecursionError, not json.JSONDecodeError — that escaped `finish()`
+    (which catches only ParseError) as a 500 instead of the text fallback."""
+    nested = "[" * 100_000 + "]" * 100_000
+    call = '<tool_call>{"name": "finish", "arguments": {"x": ' + nested + "}}</tool_call>"
+    with pytest.raises(ParseError):
+        parse_tool_calls(call)
+
+
+def test_json_call_with_a_5000_digit_integer_argument_raises_parse_error():
+    """A 5000-digit integer literal exceeds Python's int-from-string digit
+    limit and raises ValueError out of `_DECODER.raw_decode`, not
+    json.JSONDecodeError."""
+    call = '<tool_call>{"name": "finish", "arguments": {"x": ' + "1" * 5000 + "}}</tool_call>"
+    with pytest.raises(ParseError):
+        parse_tool_calls(call)
+
+
+def test_xml_object_parameter_with_deeply_nested_value_raises_parse_error():
+    """The XML `object`/`array` coercion path's `json.loads` call hits the
+    same RecursionError for a deeply nested value; it must not escape
+    `_coerce_member` uncaught."""
+    ts = ToolSet.from_tools(CLIENT_TOOLS, strict=False)
+    nested = "[" * 100_000 + "]" * 100_000
+    text = (
+        "<tool_call>\n<function=Bash>\n"
+        "<parameter=command>\nls\n</parameter>\n"
+        f'<parameter=meta>\n{{"a": {nested}}}\n</parameter>\n'
+        "</function>\n</tool_call>"
+    )
+    with pytest.raises(ParseError):
+        parse_tool_calls(text, ts)
+
+
+def test_xml_integer_parameter_with_5000_digits_still_raises_parse_error():
+    """Regression pin: the XML integer branch already catches ValueError
+    from `int()`'s digit-limit check and must keep doing so."""
+    text = (
+        "<tool_call>\n"
+        "<function=read_file>\n"
+        "<parameter=path>\na.py\n</parameter>\n"
+        f"<parameter=offset>\n{'1' * 5000}\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    with pytest.raises(ParseError):
+        parse_tool_calls(text)

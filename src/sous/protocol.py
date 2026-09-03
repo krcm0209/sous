@@ -237,7 +237,15 @@ def _parse_json_call(text: str, start: int, toolset: ToolSet) -> tuple[ToolCall,
     """Hermes JSON: {"name": ..., "arguments": {...}}. Returns (call, end)."""
     try:
         payload, end = _DECODER.raw_decode(text, start)
-    except json.JSONDecodeError as e:
+    except (ValueError, RecursionError) as e:
+        # ValueError covers json.JSONDecodeError (an ordinary malformed
+        # tool_call); it also covers a 5000+ digit integer literal, which
+        # exceeds Python's int-from-string digit cap. RecursionError is a
+        # pathologically deep argument (~100k nested arrays) blowing the C
+        # decoder's stack. None of these used to be ParseError, so each
+        # escaped parse_tool_calls uncaught — a bare 500 non-streaming, a
+        # truncated SSE stream — instead of the malformed-turn fallback
+        # TurnAssembler.finish only catches ParseError for.
         raise ParseError(f"invalid JSON in tool_call: {e}") from e
     if not isinstance(payload, dict):
         raise ParseError("tool_call payload must be a JSON object")
@@ -356,7 +364,11 @@ def _coerce_member(tool: str, key: str, typ: str, raw: str):
     if typ in ("array", "object"):
         try:
             value = json.loads(raw, parse_constant=_reject_constant, parse_float=_finite_float)
-        except json.JSONDecodeError:
+        except ValueError, RecursionError:
+            # Same escapes as _parse_json_call's raw_decode: ValueError
+            # covers json.JSONDecodeError and an oversized integer literal;
+            # RecursionError is a deeply nested value blowing the C
+            # decoder's stack. Neither used to fail loudly as ParseError.
             raise ParseError(
                 f"parameter {key!r} of {tool} must be a JSON {typ}, got {raw!r}"
             ) from None

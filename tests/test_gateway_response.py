@@ -243,6 +243,18 @@ def test_non_finite_number_argument_comes_back_as_text_with_end_turn():
     json.dumps(a.message(), allow_nan=False)
 
 
+def test_deeply_nested_tool_call_argument_comes_back_as_text_with_end_turn():
+    """A ~100k-deep JSON argument blows the decoder's recursion limit with a
+    bare RecursionError, not json.JSONDecodeError. Before treating every
+    decoder failure as ParseError, this escaped TurnAssembler.finish (which
+    catches only ParseError) instead of falling back to plain text."""
+    nested = "[" * 100_000 + "]" * 100_000
+    raw = '<tool_call>{"name": "Read", "arguments": {"x": ' + nested + "}}</tool_call>"
+    a, _ = _stream([raw])
+    assert a.message()["content"] == [{"type": "text", "text": raw}]
+    assert a.stop_reason == "end_turn"
+
+
 def test_unknown_tool_name_passes_through_as_tool_use():
     text = (
         "<tool_call>\n<function=Imaginary>\n<parameter=x>\n1\n</parameter>\n"
