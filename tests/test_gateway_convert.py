@@ -1,0 +1,428 @@
+"""Anthropic request → chat-template inputs. Pure; every Claude Code
+accommodation from the gateway spec's checklist is pinned here."""
+
+import pytest
+
+from sous.gateway.convert import (
+    ChatRequest,
+    RequestError,
+    chat_messages,
+    chat_tools,
+    parse_count_tokens_request,
+    parse_messages_request,
+    strip_volatile,
+)
+
+READ_TOOL = {
+    "name": "Read",
+    "description": "Read a file",
+    "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+}
+
+
+def _body(**overrides) -> dict:
+    body = {
+        "model": "sous-local",
+        "max_tokens": 32000,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    body.update(overrides)
+    return body
+
+
+# --- system prompt: canonical field, inline system messages, volatile markers --
+
+
+def test_string_system_becomes_the_leading_system_message():
+    out = chat_messages("Be terse.", [{"role": "user", "content": "hi"}])
+    assert out == [{"role": "system", "content": "Be terse."}, {"role": "user", "content": "hi"}]
+
+
+def test_system_blocks_are_joined_and_the_billing_header_block_is_dropped():
+    """Checklist item 4: the x-anthropic-billing-header block carries
+    per-request random values that would defeat the prefix cache."""
+    system = [
+        {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1; cc_is_subagent=true"},
+        {"type": "text", "text": "You are Claude Code.", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "Rules follow."},
+    ]
+    out = chat_messages(system, [{"role": "user", "content": "hi"}])
+    assert out[0] == {"role": "system", "content": "You are Claude Code.\n\nRules follow."}
+
+
+def test_inline_system_messages_fold_into_the_leading_system_message():
+    """Checklist item 1: Claude Code >= 2.1.154 puts system content in
+    messages[] (gate 2 saw a 7.8 KB string there); Qwen's template accepts a
+    system message only at index 0, canonical field first."""
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "task"}]},
+        {"role": "system", "content": "Inline instructions."},
+        {"role": "system", "content": [{"type": "text", "text": "More."}]},
+    ]
+    out = chat_messages([{"type": "text", "text": "Canonical."}], messages)
+    assert out == [
+        {"role": "system", "content": "Canonical.\n\nInline instructions.\n\nMore."},
+        {"role": "user", "content": "task"},
+    ]
+
+
+def test_inline_system_without_a_canonical_field_still_leads():
+    out = chat_messages(
+        None, [{"role": "user", "content": "q"}, {"role": "system", "content": "S"}]
+    )
+    assert out[0] == {"role": "system", "content": "S"}
+
+
+def test_total_tokens_markers_are_stripped_from_system_and_user_text():
+    """Checklist item 3: a freshly decremented copy is appended every request
+    and the stale ones kept — without stripping, no prefix past it is reusable."""
+    marker = "\n\n<total_tokens>15000000 tokens left</total_tokens>"
+    assert strip_volatile("Rules." + marker) == "Rules."
+    assert strip_volatile("a" + marker + marker) == "a"
+    assert strip_volatile("no marker here") == "no marker here"
+    wrapped = "<system-reminder>\n<total_tokens>5 tokens left</total_tokens>\n</system-reminder>"
+    assert strip_volatile("Hi.\n\n" + wrapped) == "Hi."
+    out = chat_messages("Sys." + marker, [{"role": "user", "content": "Hi." + marker}])
+    assert out == [{"role": "system", "content": "Sys."}, {"role": "user", "content": "Hi."}]
+
+
+def test_marker_only_text_after_tool_results_adds_no_user_turn():
+    """Claude Code emits the marker as an attachment after every tool-result
+    batch (bare, or wrapped in a system-reminder). Stripped, nothing remains,
+    and an empty user turn after the tool responses would tell the model the
+    user said nothing."""
+    marker = "<total_tokens>123 tokens left</total_tokens>"
+    for trailer in (marker, f"<system-reminder>\n{marker}\n</system-reminder>"):
+        messages = [
+            {"role": "user", "content": "q"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "A"},
+                    {"type": "text", "text": trailer},
+                ],
+            },
+            {"role": "user", "content": trailer},
+        ]
+        assert chat_messages(None, messages)[2:] == [{"role": "tool", "content": "A"}]
+
+
+def test_tool_result_content_is_not_marker_stripped():
+    """A file the model read may legitimately contain the marker text; only
+    the volatile places Claude Code writes it are stripped."""
+    text = "<total_tokens>5 tokens left</total_tokens>"
+    messages = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": text}],
+        },
+    ]
+    assert chat_messages(None, messages)[-1] == {"role": "tool", "content": text}
+
+
+# --- user turns -------------------------------------------------------------------
+
+
+def test_user_text_blocks_join_with_newlines():
+    out = chat_messages(
+        None,
+        [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}],
+            }
+        ],
+    )
+    assert out == [{"role": "user", "content": "a\nb"}]
+
+
+def test_tool_results_become_tool_messages_in_order_with_text_flushed_first():
+    """Qwen's template matches results to calls by ORDER (it never renders the
+    id) and groups consecutive tool messages into one user turn; text that
+    preceded a result must be its own turn to keep that order."""
+    messages = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Reading."},
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "a"}},
+                {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "b"}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "note before"},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "A"},
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t2",
+                    "content": [{"type": "text", "text": "B1"}, {"type": "text", "text": "B2"}],
+                    "is_error": True,
+                },
+                {"type": "text", "text": "note after"},
+            ],
+        },
+    ]
+    out = chat_messages(None, messages)
+    assert out[1] == {
+        "role": "assistant",
+        "content": "Reading.",
+        "tool_calls": [
+            {"type": "function", "function": {"name": "Read", "arguments": {"file_path": "a"}}},
+            {"type": "function", "function": {"name": "Read", "arguments": {"file_path": "b"}}},
+        ],
+    }
+    assert out[2:] == [
+        {"role": "user", "content": "note before"},
+        {"role": "tool", "content": "A"},
+        {"role": "tool", "content": "B1\nB2"},
+        {"role": "user", "content": "note after"},
+    ]
+
+
+def test_images_and_documents_become_placeholders_and_unknown_blocks_are_skipped():
+    """Checklist item 8: tolerate, never 4xx. sous serves text only."""
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+        {"type": "text", "text": "what is this?"},
+        {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "x"}},
+        {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}},
+        {"type": "something_new_20270101", "payload": 1},
+    ]
+    out = chat_messages(None, [{"role": "user", "content": content}])
+    assert out == [
+        {
+            "role": "user",
+            "content": (
+                "[image omitted: sous serves text only]\nwhat is this?\n"
+                "[document omitted: sous serves text only]"
+            ),
+        }
+    ]
+
+
+def test_empty_user_content_yields_an_empty_user_turn():
+    assert chat_messages(None, [{"role": "user", "content": []}]) == [
+        {"role": "user", "content": ""}
+    ]
+
+
+def test_tool_result_without_content_is_an_empty_tool_message():
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1"}]},
+    ]
+    assert chat_messages(None, messages)[-1] == {"role": "tool", "content": ""}
+
+
+# --- assistant turns --------------------------------------------------------------
+
+
+def test_assistant_thinking_blocks_are_dropped_and_string_input_becomes_empty_args():
+    content = [
+        {"type": "thinking", "thinking": "hmm", "signature": "sig"},
+        {"type": "redacted_thinking", "data": "..."},
+        {"type": "text", "text": "ok"},
+        {"type": "tool_use", "id": "t1", "name": "Bash", "input": "not-a-dict"},
+    ]
+    out = chat_messages(
+        None, [{"role": "user", "content": "q"}, {"role": "assistant", "content": content}]
+    )
+    assert out[1] == {
+        "role": "assistant",
+        "content": "ok",
+        "tool_calls": [{"type": "function", "function": {"name": "Bash", "arguments": {}}}],
+    }
+
+
+def test_assistant_string_content_passes_through():
+    out = chat_messages(
+        None, [{"role": "user", "content": "q"}, {"role": "assistant", "content": "A"}]
+    )
+    assert out[1] == {"role": "assistant", "content": "A"}
+
+
+def test_unknown_role_is_a_400():
+    with pytest.raises(RequestError) as exc:
+        chat_messages(None, [{"role": "tool", "content": "x"}])
+    assert exc.value.status == 400 and exc.value.error_type == "invalid_request_error"
+
+
+def test_non_list_non_string_content_is_a_400():
+    with pytest.raises(RequestError):
+        chat_messages(None, [{"role": "user", "content": {"type": "text", "text": "x"}}])
+
+
+# --- tools ------------------------------------------------------------------------
+
+
+def test_client_tools_convert_to_function_schemas():
+    tools, dropped = chat_tools([READ_TOOL, {"name": "NoDesc", "input_schema": {"type": "object"}}])
+    assert tools == [
+        {
+            "type": "function",
+            "function": {
+                "name": "Read",
+                "description": "Read a file",
+                "parameters": READ_TOOL["input_schema"],
+            },
+        },
+        {
+            "type": "function",
+            "function": {"name": "NoDesc", "description": "", "parameters": {"type": "object"}},
+        },
+    ]
+    assert dropped == []
+
+
+def test_server_side_tools_are_dropped_and_named():
+    """Checklist item 7: anything with a non-custom `type` executes inside
+    Anthropic's API; toolset entries carry no `name` at all."""
+    tools, dropped = chat_tools(
+        [
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+            {"type": "browser_toolset_20260801", "configs": {}},
+            {"type": "custom", **READ_TOOL},
+            READ_TOOL,
+        ]
+    )
+    assert [t["function"]["name"] for t in tools] == ["Read", "Read"]
+    assert dropped == ["web_search_20250305:web_search", "browser_toolset_20260801:"]
+
+
+def test_client_tool_without_schema_or_name_is_a_400():
+    with pytest.raises(RequestError, match="input_schema"):
+        chat_tools([{"name": "Broken"}])
+    with pytest.raises(RequestError, match="name"):
+        chat_tools([{"input_schema": {"type": "object"}}])
+
+
+def test_no_tools_is_fine():
+    assert chat_tools(None) == ([], [])
+
+
+# --- whole requests ---------------------------------------------------------------
+
+
+def test_parse_messages_request_converts_and_ignores_unknown_fields():
+    """Decision 9: thinking, output_config, context_management, metadata and
+    the sampling knobs are accepted and ignored; gate 1 saw all of them."""
+    body = _body(
+        stream=True,
+        system=[{"type": "text", "text": "S"}],
+        tools=[READ_TOOL],
+        thinking={"type": "adaptive", "display": "omitted"},
+        output_config={"effort": "high"},
+        context_management={"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+        metadata={"user_id": "abc"},
+        temperature=1,
+        tool_choice={"type": "auto"},
+        stop_sequences=["x"],
+        totally_new_field=True,
+    )
+    chat = parse_messages_request(body)
+    assert isinstance(chat, ChatRequest)
+    assert chat.model == "sous-local" and chat.stream is True and chat.max_tokens == 32000
+    assert chat.messages == [{"role": "system", "content": "S"}, {"role": "user", "content": "hi"}]
+    assert chat.tools[0]["function"]["name"] == "Read"
+    assert chat.dropped_server_tools == []
+
+
+@pytest.mark.parametrize(
+    ("body", "fragment"),
+    [
+        ([], "JSON object"),
+        (_body(model=""), "model"),
+        (_body(messages=[]), "messages"),
+        (_body(messages=[{"role": "robot", "content": "x"}]), "role"),
+        (_body(messages=["not a dict"]), "role"),
+        (_body(max_tokens=0), "max_tokens"),
+        (_body(max_tokens=True), "max_tokens"),
+        ({k: v for k, v in _body().items() if k != "max_tokens"}, "max_tokens"),
+        (_body(stream="yes"), "stream"),
+        (_body(tools="nope"), "tools"),
+    ],
+)
+def test_parse_messages_request_rejects_bad_shapes_with_400(body, fragment):
+    with pytest.raises(RequestError) as exc:
+        parse_messages_request(body)
+    assert exc.value.status == 400
+    assert exc.value.error_type == "invalid_request_error"
+    assert fragment in exc.value.message
+    assert exc.value.body() == {
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": exc.value.message},
+    }
+
+
+def test_parse_count_tokens_request_needs_no_max_tokens_or_stream():
+    body = {
+        "model": "sous-local",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [READ_TOOL],
+    }
+    chat = parse_count_tokens_request(body)
+    assert chat.stream is False and chat.tools[0]["function"]["name"] == "Read"
+    with pytest.raises(RequestError):
+        parse_count_tokens_request("not an object")
+
+
+def test_gate_capture_shape_converts_cleanly():
+    """The structure gate 1 captured (comment 5440572099 / dump inspection):
+    billing header first in a 3-block system list, cache_control on some
+    blocks, a two-block user turn, then a plain-string inline system message."""
+    body = _body(
+        system=[
+            {
+                "type": "text",
+                "text": (
+                    "x-anthropic-billing-header: cc_version=2.1.238; cc_entrypoint=cli; "
+                    "cc_is_subagent=true"
+                ),
+            },
+            {
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+                "cache_control": {"type": "ephemeral"},
+            },
+            {"type": "text", "text": "Long system prompt.", "cache_control": {"type": "ephemeral"}},
+        ],
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Agent prompt."},
+                    {
+                        "type": "text",
+                        "text": "Environment.",
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ],
+            },
+            {"role": "system", "content": "Inline subagent system text."},
+        ],
+        tools=[READ_TOOL],
+        thinking={"type": "adaptive", "display": "omitted"},
+    )
+    chat = parse_messages_request(body)
+    assert chat.messages == [
+        {
+            "role": "system",
+            "content": (
+                "You are Claude Code, Anthropic's official CLI for Claude.\n\n"
+                "Long system prompt.\n\nInline subagent system text."
+            ),
+        },
+        {"role": "user", "content": "Agent prompt.\nEnvironment."},
+    ]
