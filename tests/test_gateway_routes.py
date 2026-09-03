@@ -12,6 +12,8 @@ from pathlib import Path
 
 import httpx
 from mcp.server import MCPServer
+from sse_starlette import EventSourceResponse
+from starlette.requests import Request
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
@@ -613,3 +615,46 @@ def test_close_does_not_touch_a_running_turns_session(tmp_path: Path):
     assert gateway._runner._session is session_before  # untouched: the lock was busy
     turn.join(10)
     assert inner.finished.wait(5)
+
+
+def test_a_stream_never_iterated_still_drains_and_releases_its_slot(tmp_path: Path):
+    """messages() must submit the turn — and tie the pending slot's release
+    to that future — before it ever returns the EventSourceResponse. Calling
+    self._stream(...) only creates the generator; if nothing ever iterates it
+    (client gone before sse-starlette's first __anext__, or its task group
+    cancelled first), a submission living inside that generator's body would
+    never run and the slot would leak forever."""
+    import sous.gateway.routes as routes
+
+    inner = FakeEngine(["ok"])
+    gateway, _app = _gateway_app(tmp_path, inner)
+    body = json.dumps(_body(stream=True)).encode()
+
+    async def go():
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/messages",
+            "headers": [(b"host", b"127.0.0.1:8383"), (b"content-type", b"application/json")],
+            "query_string": b"",
+        }
+        request = Request(scope, receive)
+        response = await gateway.messages(request)
+        assert isinstance(response, EventSourceResponse)
+        # Never iterate/call response: this is the never-iterated case.
+        deadline = time.monotonic() + 5
+        while gateway._pending._value != routes.MAX_PENDING_TURNS and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert gateway._pending._value == routes.MAX_PENDING_TURNS
+
+    asyncio.run(go())
+    assert len(inner.calls) == 1  # the turn drained even though nobody read it

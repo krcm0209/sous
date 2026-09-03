@@ -313,30 +313,49 @@ class Gateway:
             )
             return _error_response(529, "overloaded_error", "too many turns queued")
         if chat.stream:
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue = asyncio.Queue()
+            sink = _QueueSink(loop, queue)
+            abandoned = threading.Event()
+
+            def turn() -> None:
+                # Completion and failure both travel through the queue, so
+                # the consumer below has exactly one thing to wait on — and a
+                # client that disconnects cancels only that wait, never a
+                # started turn: the thread drains the generation to
+                # completion regardless. Submitted here, before the response
+                # is even constructed, so the slot's lifetime is tied to this
+                # turn running to completion — never to whether sse-starlette
+                # ever iterates the generator's body. A client gone before
+                # the first iteration still gets its turn run to completion
+                # (nothing sets `abandoned` for it, so this is the same
+                # drain-to-completion rule as a disconnect after streaming
+                # starts, now bounded by MAX_PENDING_TURNS either way) and
+                # the slot is released by the done-callback regardless.
+                try:
+                    sink.put(
+                        (
+                            "done",
+                            self._runner.run(
+                                chat.messages, chat.tools, chat.max_tokens, sink, abandoned
+                            ),
+                        )
+                    )
+                except TurnAbandoned:
+                    _log(f"POST /v1/messages model={chat.model} stream=1 abandoned while queued")
+                except Exception as e:  # noqa: BLE001 — relayed as an in-band error event
+                    sink.put(("error", e))
+
+            self._submit(turn)
             return EventSourceResponse(
-                self._stream(chat, assembler),
+                self._stream(chat, assembler, queue, abandoned),
                 ping=PING_INTERVAL_SECONDS,
                 ping_message_factory=lambda: _PING,
                 sep=_SEP,
             )
-        try:
-            future = asyncio.get_running_loop().run_in_executor(
-                self._turns,
-                self._runner.run,
-                chat.messages,
-                chat.tools,
-                chat.max_tokens,
-                _NullSink(),
-            )
-        except Exception:
-            # Submission itself failed (e.g. the pool refused new work): no
-            # future exists to release the slot on completion, so release it
-            # here instead of leaking it.
-            self._pending.release()
-            raise
-        # The slot counts the turn until it actually finishes, not until the
-        # client leaves — a disconnected-but-draining turn must still hold it.
-        future.add_done_callback(lambda _f: self._pending.release())
+        future = self._submit(
+            self._runner.run, chat.messages, chat.tools, chat.max_tokens, _NullSink()
+        )
         try:
             result = await future
         except Exception as e:  # noqa: BLE001 — every failure becomes an Anthropic error body
@@ -356,43 +375,35 @@ class Gateway:
         if model not in self._config.gateway_local_models:
             raise RequestError(404, "not_found_error", f"model: {model}")
 
-    async def _stream(
-        self, chat: ChatRequest, assembler: TurnAssembler
-    ) -> AsyncIterator[ServerSentEvent]:
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue = asyncio.Queue()
-        sink = _QueueSink(loop, queue)
-        abandoned = threading.Event()
-
-        def turn() -> None:
-            # Completion and failure both travel through the queue, so this
-            # generator has exactly one thing to wait on — and a client that
-            # disconnects cancels only the waiting, never a started turn: the
-            # thread drains the generation to completion regardless.
-            try:
-                sink.put(
-                    (
-                        "done",
-                        self._runner.run(
-                            chat.messages, chat.tools, chat.max_tokens, sink, abandoned
-                        ),
-                    )
-                )
-            except TurnAbandoned:
-                _log(f"POST /v1/messages model={chat.model} stream=1 abandoned while queued")
-            except Exception as e:  # noqa: BLE001 — relayed as an in-band error event
-                sink.put(("error", e))
-
+    def _submit(self, fn, *args) -> asyncio.Future:
+        """Submit a turn to the turn pool and tie the pending slot's release
+        to that future's completion, not to anything downstream of it (an
+        awaited result, an SSE body sse-starlette may never iterate). Assumes
+        the caller already holds the slot being released — acquire happens
+        once in messages(), before either branch calls this."""
         try:
-            future = loop.run_in_executor(self._turns, turn)
+            future = asyncio.get_running_loop().run_in_executor(self._turns, fn, *args)
         except Exception:
-            # Submission failed before a future existed to release the slot
-            # on completion — release it here so it is not leaked.
+            # Submission itself failed (e.g. the pool refused new work): no
+            # future exists to release the slot on completion, so release it
+            # here instead of leaking it.
             self._pending.release()
             raise
-        # Released when the turn actually finishes (including draining after
-        # a disconnect below), never when the client merely leaves.
+        # The slot counts the turn until it actually finishes, not until the
+        # client leaves or a generator body goes un-iterated.
         future.add_done_callback(lambda _f: self._pending.release())
+        return future
+
+    async def _stream(
+        self,
+        chat: ChatRequest,
+        assembler: TurnAssembler,
+        queue: asyncio.Queue,
+        abandoned: threading.Event,
+    ) -> AsyncIterator[ServerSentEvent]:
+        # Pure consumer: the turn was already submitted (and the pending slot
+        # already tied to its future) by messages() before this generator was
+        # even constructed — see the comment at that submission site.
         try:
             yield _PING
             while True:
