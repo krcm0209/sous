@@ -118,7 +118,9 @@ async def _read_json(request: Request) -> object:
         raise RequestError(400, "invalid_request_error", "client disconnected mid-body") from None
     try:
         return json.loads(b"".join(chunks))
-    except ValueError:
+    except ValueError, RecursionError:
+        # RecursionError: json.loads on a body nested deeper than the interpreter
+        # stack — well under the byte cap, and malformed all the same.
         raise RequestError(400, "invalid_request_error", "request body is not valid JSON") from None
 
 

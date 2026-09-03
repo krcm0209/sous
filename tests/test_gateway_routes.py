@@ -196,6 +196,16 @@ def test_invalid_json_and_bad_shapes_are_400s(tmp_path: Path):
     assert r.status_code == 400
 
 
+def test_a_deeply_nested_body_is_a_400_not_a_recursion_error(tmp_path: Path):
+    # json.loads raises RecursionError, not ValueError, on this — far under the
+    # byte cap, and it must still come back as a shaped invalid_request_error.
+    inner = FakeEngine(["unused"])
+    r = _request(_app(tmp_path, inner), "POST", "/v1/messages", body=b"[" * 200_000)
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"
+    assert inner.calls == []
+
+
 def test_malformed_tool_properties_is_a_400_and_never_reaches_the_engine(tmp_path: Path):
     """Pins the shaped-status property end to end: chat_tools rejects a
     non-object `properties` before ToolSet.from_tools (called after the

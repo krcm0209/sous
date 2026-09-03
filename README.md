@@ -151,9 +151,10 @@ compares" above argue against, supported only as a way to exercise the
 endpoint, not as a mode. The recipe for that lives in
 [CONTRIBUTING.md](CONTRIBUTING.md#verifying-the-gateway-endpoint).
 
-Because `sous-local` is not a `claude-*` id, Claude Code does not learn its
-context window from the gateway — for that unknown model id it falls back to
-its own default unless `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set. Set it (and
+No gateway response tells Claude Code how large the window is, and `sous-local`
+is not an id it has a built-in size for, so it falls back to its own default
+unless `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set (it honours that variable only
+for non-`claude-*` ids — one reason the served id is honest). Set it (and
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`) to `[gateway].max_context_tokens` in the
 environment that launches Claude Code, or requests eventually exceed the
 server limit and return `400 invalid_request_error: prompt is too long`. The
@@ -248,10 +249,12 @@ enabled = false
 local_models = ["sous-local"]   # model ids served locally; anything else is a 404 for now.
                                 # Never claude-*: Claude Code ignores its context-window
                                 # env vars for those ids (the config rejects them).
-max_context_tokens = 65536      # server-side limit on prompt + reply tokens; values below 49152 are raised to it.
-                                # Claude Code does NOT learn this from the gateway: set CLAUDE_CODE_MAX_CONTEXT_TOKENS
-                                # (and CLAUDE_CODE_AUTO_COMPACT_WINDOW) to the same value in its
-                                # environment, or a long conversation grows past it and fails with "prompt is too long".
+max_context_tokens = 65536      # server-side limit on prompt + reply tokens; positive
+                                # values below 49152 are raised to it. Claude Code does NOT
+                                # learn this from the gateway: set CLAUDE_CODE_MAX_CONTEXT_TOKENS
+                                # (and CLAUDE_CODE_AUTO_COMPACT_WINDOW) to the same value in
+                                # its environment, or a long conversation grows past it and
+                                # fails with "prompt is too long".
 generation_timeout_minutes = 30
 ```
 
