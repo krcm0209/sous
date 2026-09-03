@@ -645,13 +645,39 @@ def test_xml_union_with_no_accepting_member_raises_naming_the_union():
 
 # --- decoder escapes: every raw_decode/json.loads failure must be a ParseError --
 
+from sous.protocol import _MAX_ARGUMENT_DEPTH  # noqa: E402 — grouped with its tests
 
-def test_json_call_with_a_deeply_nested_argument_raises_parse_error():
-    """A Hermes JSON call whose argument nests ~100k arrays deep blows the
-    C recursion limit inside `_DECODER.raw_decode` with a bare
-    RecursionError, not json.JSONDecodeError — that escaped `finish()`
-    (which catches only ParseError) as a 500 instead of the text fallback."""
-    nested = "[" * 100_000 + "]" * 100_000
+
+def test_json_call_with_an_argument_past_the_depth_cap_raises_parse_error():
+    """`RecursionError` is stack-size dependent (a payload that decodes on a
+    big-stack machine would still blow up re-encoding it elsewhere), so the
+    real contract is `_MAX_ARGUMENT_DEPTH`, checked on the whole decoded
+    payload — one level for the payload dict itself, one for its "arguments"
+    value, then the argument's own nesting. `_MAX_ARGUMENT_DEPTH + 1` levels
+    of array nesting clears that +2 envelope with room to spare."""
+    n = _MAX_ARGUMENT_DEPTH + 1
+    nested = "[" * n + "]" * n
+    call = '<tool_call>{"name": "finish", "arguments": {"x": ' + nested + "}}</tool_call>"
+    with pytest.raises(ParseError):
+        parse_tool_calls(call)
+
+
+def test_json_call_with_an_argument_exactly_at_the_depth_cap_parses():
+    """Positive control: the payload dict (depth 1) and its "arguments"
+    dict (depth 2) already spend 2 of the 64 levels, so the argument value
+    itself can nest `_MAX_ARGUMENT_DEPTH - 2` levels deep and still parse —
+    one level more (test above) is the first depth that raises."""
+    n = _MAX_ARGUMENT_DEPTH - 2
+    nested = "[" * n + "]" * n
+    call = '<tool_call>{"name": "finish", "arguments": {"x": ' + nested + "}}</tool_call>"
+    [call_obj] = parse_tool_calls(call)
+    assert call_obj.name == "finish"
+
+
+def test_json_call_with_nested_dicts_past_the_depth_cap_raises_parse_error():
+    """Dicts count toward the depth cap exactly like arrays do."""
+    n = _MAX_ARGUMENT_DEPTH + 1
+    nested = '{"a":' * n + "1" + "}" * n
     call = '<tool_call>{"name": "finish", "arguments": {"x": ' + nested + "}}</tool_call>"
     with pytest.raises(ParseError):
         parse_tool_calls(call)
@@ -666,16 +692,18 @@ def test_json_call_with_a_5000_digit_integer_argument_raises_parse_error():
         parse_tool_calls(call)
 
 
-def test_xml_object_parameter_with_deeply_nested_value_raises_parse_error():
-    """The XML `object`/`array` coercion path's `json.loads` call hits the
-    same RecursionError for a deeply nested value; it must not escape
-    `_coerce_member` uncaught."""
+def test_xml_object_parameter_past_the_depth_cap_raises_parse_error():
+    """The XML `object`/`array` coercion path's `json.loads` call is checked
+    against the same `_MAX_ARGUMENT_DEPTH` cap. Here `_check_depth` sees the
+    decoded value directly (no payload/arguments envelope), so
+    `_MAX_ARGUMENT_DEPTH + 1` levels of nesting is the first depth past it."""
     ts = ToolSet.from_tools(CLIENT_TOOLS, strict=False)
-    nested = "[" * 100_000 + "]" * 100_000
+    n = _MAX_ARGUMENT_DEPTH + 1
+    nested = '{"a":' * n + "1" + "}" * n
     text = (
         "<tool_call>\n<function=Bash>\n"
         "<parameter=command>\nls\n</parameter>\n"
-        f'<parameter=meta>\n{{"a": {nested}}}\n</parameter>\n'
+        f"<parameter=meta>\n{nested}\n</parameter>\n"
         "</function>\n</tool_call>"
     )
     with pytest.raises(ParseError):

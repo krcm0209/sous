@@ -17,7 +17,7 @@ from starlette.requests import Request
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
-from sous.gateway.routes import Gateway, mount_gateway
+from sous.gateway.routes import MAX_BODY_DEPTH, Gateway, mount_gateway
 from sous.server import create_server
 from sous.tasks import TaskStore
 from tests.fake_engine import ChunkedFakeEngine, FakeEngine
@@ -217,14 +217,30 @@ def test_invalid_json_and_bad_shapes_are_400s(tmp_path: Path):
     assert r.status_code == 400
 
 
-def test_a_deeply_nested_body_is_a_400_not_a_recursion_error(tmp_path: Path):
-    # json.loads raises RecursionError, not ValueError, on this — far under the
-    # byte cap, and it must still come back as a shaped invalid_request_error.
+def test_a_body_past_the_depth_cap_is_a_400_not_a_recursion_error(tmp_path: Path):
+    # RecursionError is stack-size dependent, not a reliable "too deep"
+    # signal (a body that decodes here on this machine's stack would still
+    # blow up the chat template's tojson encoder on a smaller one) —
+    # MAX_BODY_DEPTH is the real contract _read_json enforces.
     inner = FakeEngine(["unused"])
-    r = _request(_app(tmp_path, inner), "POST", "/v1/messages", body=b"[" * 200_000)
+    n = MAX_BODY_DEPTH + 1
+    body = ("[" * n + "]" * n).encode()
+    r = _request(_app(tmp_path, inner), "POST", "/v1/messages", body=body)
     assert r.status_code == 400
     assert r.json()["error"]["type"] == "invalid_request_error"
     assert inner.calls == []
+
+
+def test_a_tool_schema_nested_about_ten_levels_still_converts(tmp_path: Path):
+    # Positive control: a schema far deeper than any real client sends still
+    # converts and reaches the engine — the depth cap only bites bodies well
+    # past what chat_tools would ever be handed legitimately.
+    schema: dict = {"type": "string"}
+    for _ in range(10):
+        schema = {"type": "object", "properties": {"nested": schema}}
+    tools = [{"name": "Nested", "input_schema": schema}]
+    r = _post(_app(tmp_path, FakeEngine(["ok"])), _body(tools=tools))
+    assert r.status_code == 200
 
 
 def test_non_json_constants_in_the_body_are_a_400(tmp_path: Path):

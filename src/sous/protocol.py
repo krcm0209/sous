@@ -111,6 +111,35 @@ class ParseError(Exception):
     pass
 
 
+# Anthropic tool inputs are shallow — real schemas nest a handful of levels.
+# `RecursionError` is not a reliable signal for "too deep": whether a given
+# nesting depth overflows Python's C recursion guard depends on the stack
+# size the interpreter happened to start with (8 MB locally, 16 MB on the
+# CI runner), so a payload that decodes fine on a big-stack machine would
+# still blow up later re-encoding it (json.dumps, a streamed partial_json
+# token) on a smaller one. An explicit cap is the only bound that holds on
+# every machine.
+_MAX_ARGUMENT_DEPTH = 64
+
+
+def _check_depth(value: object, limit: int, what: str) -> None:
+    """Iterative depth walk over nested dicts/lists — never recursive, or
+    this would reintroduce the exact stack-size dependence the cap exists to
+    remove. `value` itself is depth 1 when it is a container; a scalar never
+    adds depth and is never itself checked (it has no way to nest further)."""
+    worklist: list[tuple[object, int]] = [(value, 1)]
+    while worklist:
+        obj, depth = worklist.pop()
+        if isinstance(obj, dict):
+            if depth > limit:
+                raise ParseError(f"{what} nested deeper than {limit} levels")
+            worklist.extend((v, depth + 1) for v in obj.values())
+        elif isinstance(obj, list):
+            if depth > limit:
+                raise ParseError(f"{what} nested deeper than {limit} levels")
+            worklist.extend((v, depth + 1) for v in obj)
+
+
 def _reject_constant(name: str) -> None:
     """json's parse_constant hook for NaN/Infinity/-Infinity: without it,
     json.loads silently accepts these non-finite tokens (`float("nan")` and
@@ -240,13 +269,13 @@ def _parse_json_call(text: str, start: int, toolset: ToolSet) -> tuple[ToolCall,
     except (ValueError, RecursionError) as e:
         # ValueError covers json.JSONDecodeError (an ordinary malformed
         # tool_call); it also covers a 5000+ digit integer literal, which
-        # exceeds Python's int-from-string digit cap. RecursionError is a
-        # pathologically deep argument (~100k nested arrays) blowing the C
-        # decoder's stack. None of these used to be ParseError, so each
-        # escaped parse_tool_calls uncaught — a bare 500 non-streaming, a
-        # truncated SSE stream — instead of the malformed-turn fallback
-        # TurnAssembler.finish only catches ParseError for.
+        # exceeds Python's int-from-string digit cap. RecursionError is the
+        # backstop for a payload deeper than the interpreter's stack allows
+        # to even finish decoding — _check_depth below is the real contract
+        # for "too deep", since a stack big enough to decode it would still
+        # let it back out uncaught here.
         raise ParseError(f"invalid JSON in tool_call: {e}") from e
+    _check_depth(payload, _MAX_ARGUMENT_DEPTH, "tool_call arguments")
     if not isinstance(payload, dict):
         raise ParseError("tool_call payload must be a JSON object")
     name = payload.get("name")
@@ -367,11 +396,13 @@ def _coerce_member(tool: str, key: str, typ: str, raw: str):
         except ValueError, RecursionError:
             # Same escapes as _parse_json_call's raw_decode: ValueError
             # covers json.JSONDecodeError and an oversized integer literal;
-            # RecursionError is a deeply nested value blowing the C
-            # decoder's stack. Neither used to fail loudly as ParseError.
+            # RecursionError is the backstop for a value deeper than the
+            # interpreter's stack allows to even finish decoding —
+            # _check_depth below is the real contract for "too deep".
             raise ParseError(
                 f"parameter {key!r} of {tool} must be a JSON {typ}, got {raw!r}"
             ) from None
+        _check_depth(value, _MAX_ARGUMENT_DEPTH, f"parameter {key!r} of {tool}")
         if (typ == "array" and not isinstance(value, list)) or (
             typ == "object" and not isinstance(value, dict)
         ):

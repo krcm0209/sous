@@ -13,7 +13,7 @@ from sous.gateway.response import (
     new_tool_use_id,
     stop_reason,
 )
-from sous.protocol import ToolSet
+from sous.protocol import _MAX_ARGUMENT_DEPTH, ToolSet
 
 TOOLS = ToolSet.from_tools(
     [
@@ -243,12 +243,14 @@ def test_non_finite_number_argument_comes_back_as_text_with_end_turn():
     json.dumps(a.message(), allow_nan=False)
 
 
-def test_deeply_nested_tool_call_argument_comes_back_as_text_with_end_turn():
-    """A ~100k-deep JSON argument blows the decoder's recursion limit with a
-    bare RecursionError, not json.JSONDecodeError. Before treating every
-    decoder failure as ParseError, this escaped TurnAssembler.finish (which
-    catches only ParseError) instead of falling back to plain text."""
-    nested = "[" * 100_000 + "]" * 100_000
+def test_tool_call_argument_past_the_depth_cap_comes_back_as_text_with_end_turn():
+    """An argument nested past `_MAX_ARGUMENT_DEPTH` is a ParseError from
+    `parse_tool_calls`, which TurnAssembler.finish falls back to plain text
+    for — the same path a ParseError from ordinary malformed JSON takes.
+    (This used to be the RecursionError a ~100k-deep argument raised, which
+    is stack-size dependent rather than a real depth contract.)"""
+    n = _MAX_ARGUMENT_DEPTH + 1
+    nested = "[" * n + "]" * n
     raw = '<tool_call>{"name": "Read", "arguments": {"x": ' + nested + "}}</tool_call>"
     a, _ = _stream([raw])
     assert a.message()["content"] == [{"type": "text", "text": raw}]

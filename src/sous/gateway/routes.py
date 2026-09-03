@@ -44,6 +44,13 @@ from sous.protocol import ToolSet
 # Anthropic's own request cap. The MCP transport's 4 MiB limit wraps only the
 # /mcp handler; custom routes get nothing unless they enforce it themselves.
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
+# A schema a real client sends nests a handful of levels. Beyond this the
+# body is hostile or broken either way, and — same reasoning as protocol.py's
+# _MAX_ARGUMENT_DEPTH — a body that decodes here on this machine's stack
+# would still blow up the chat template's tojson encoder re-serializing it on
+# a smaller one. RecursionError is not a reliable "too deep" signal because
+# the C recursion guard is stack-size dependent, not payload-size dependent.
+MAX_BODY_DEPTH = 128
 # Claude Code disconnects when nothing arrives for a while (oMLX saw it on
 # 90k-token prefills). Both official SDKs drop `ping` events in the SSE
 # iterator before their accumulator sees anything, so pings are safe anywhere
@@ -121,6 +128,27 @@ def _finite_float(text: str) -> float:
     return value
 
 
+def _depth_exceeds(value: object, limit: int) -> bool:
+    """Iterative depth walk over nested dicts/lists — never recursive, or
+    this would reintroduce the exact stack-size dependence the cap exists to
+    remove. Kept local to routes.py rather than shared with protocol.py's
+    _check_depth: two tiny iterative loops are cheaper than a cross-module
+    dependency between the gateway and the protocol parser. `value` itself is
+    depth 1 when it is a container; a scalar never adds depth."""
+    worklist: list[tuple[object, int]] = [(value, 1)]
+    while worklist:
+        obj, depth = worklist.pop()
+        if isinstance(obj, dict):
+            if depth > limit:
+                return True
+            worklist.extend((v, depth + 1) for v in obj.values())
+        elif isinstance(obj, list):
+            if depth > limit:
+                return True
+            worklist.extend((v, depth + 1) for v in obj)
+    return False
+
+
 async def _read_json(request: Request) -> object:
     declared = request.headers.get("content-length", "")
     if declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
@@ -142,13 +170,19 @@ async def _read_json(request: Request) -> object:
         # a 500 with a traceback in the daemon log.
         raise RequestError(400, "invalid_request_error", "client disconnected mid-body") from None
     try:
-        return json.loads(
+        body = json.loads(
             b"".join(chunks), parse_constant=_reject_constant, parse_float=_finite_float
         )
     except ValueError, RecursionError:
-        # RecursionError: json.loads on a body nested deeper than the interpreter
-        # stack — well under the byte cap, and malformed all the same.
+        # RecursionError is the backstop for a body deeper than the
+        # interpreter's stack allows to even finish decoding — the
+        # MAX_BODY_DEPTH check below is the real contract for "too deep".
         raise RequestError(400, "invalid_request_error", "request body is not valid JSON") from None
+    if _depth_exceeds(body, MAX_BODY_DEPTH):
+        raise RequestError(
+            400, "invalid_request_error", f"request body nests deeper than {MAX_BODY_DEPTH} levels"
+        )
+    return body
 
 
 def _check_loopback(request: Request) -> None:
