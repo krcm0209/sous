@@ -39,9 +39,11 @@ Claude Code use stretches further — evaluate features against that goal.
 - Engine `on_delta` callbacks (`engine/base.py:Delta`) fire on the generation
   thread from inside the decode loop: never block or raise in one, and expect
   late deltas from a stalled-and-abandoned session.
-- `PrefixCache` refuses its cold retry once any delta has streamed (a retry
-  would replay the turn to the client). That is deliberate, not a missing
-  retry.
+- `PrefixCache` refuses its cold retry once any delta has reached the client
+  (a retry would replay the turn to it). That is deliberate, not a missing
+  retry. A non-streaming turn's `on_delta` is accounting-only and wrapped in
+  `ReplaySafe` (`engine/base.py`), so it still retries cold on a warm-cache
+  failure — nothing was sent that a re-run would send twice.
 
 ## Security boundary
 

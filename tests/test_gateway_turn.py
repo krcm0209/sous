@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from sous.config import SousConfig
-from sous.engine.base import Delta, EngineManager, GenerationStalled
+from sous.engine.base import Delta, EngineManager, GenerationStalled, ReplaySafe
 from sous.gateway.turn import (
     GatewayBusy,
     PromptTooLong,
@@ -19,6 +19,10 @@ from tests.fake_engine import ChunkedFakeEngine, FakeEngine
 
 
 class RecordingSink:
+    # Records deltas the way a client-facing sink would; kept non-replay-safe
+    # so existing tests here keep their pre-ReplaySafe semantics.
+    replay_safe = False
+
     def __init__(self):
         self.started_with: list[int] = []
         self.deltas: list[Delta] = []
@@ -62,6 +66,29 @@ def test_run_streams_deltas_and_reports_real_counts(tmp_path: Path):
     assert sink.started_with == [result.input_tokens]
     assert [d.text for d in sink.deltas] == ["Hel", "lo"]
     assert result.seconds >= 0 and result.cache_hit is False and result.reused_tokens == 0
+
+
+class _ReplaySafeSink(RecordingSink):
+    """A non-streaming sink stand-in: its delta() is accounting-only, never
+    forwarded anywhere a client can see."""
+
+    replay_safe = True
+
+
+def test_a_replay_safe_sink_wraps_on_delta_in_replaysafe(tmp_path: Path):
+    inner = FakeEngine(["ok"])
+    runner, _ = _runner(tmp_path, inner)
+    runner.run(MSGS, [], 4096, _ReplaySafeSink())
+    assert isinstance(inner.on_deltas_seen[-1], ReplaySafe)
+
+
+def test_a_non_replay_safe_sink_passes_on_delta_through_unwrapped(tmp_path: Path):
+    inner = FakeEngine(["ok"])
+    runner, _ = _runner(tmp_path, inner)
+    runner.run(MSGS, [], 4096, RecordingSink())
+    seen = inner.on_deltas_seen[-1]
+    assert not isinstance(seen, ReplaySafe)
+    assert callable(seen)
 
 
 def test_max_tokens_is_clamped_to_the_room_left_in_the_window(tmp_path: Path):

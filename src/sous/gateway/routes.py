@@ -159,6 +159,10 @@ def _frame(event: dict) -> ServerSentEvent:
 class _QueueSink:
     """Relays a turn's progress from its threads onto the event loop's queue."""
 
+    # The queue is drained into SSE events the client is already reading —
+    # a warm-cache failure after any delta cannot be replayed cold.
+    replay_safe = False
+
     def __init__(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue):
         self._loop = loop
         self._queue = queue
@@ -176,6 +180,10 @@ class _QueueSink:
 
 
 class _NullSink:
+    # Non-streaming: no byte of a delta ever reaches the client, so a
+    # warm-cache failure may still be retried cold.
+    replay_safe = True
+
     def started(self, input_tokens: int) -> None: ...
 
     def delta(self, delta: Delta) -> None: ...

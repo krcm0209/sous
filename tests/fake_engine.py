@@ -21,6 +21,9 @@ class FakeEngine:
         # is pinned on these. Thread objects, not idents — idents recycle.
         self.generate_threads: list[threading.Thread] = []
         self.reset_idents: list[int] = []
+        # The on_delta object itself (not called) — pins whether a caller
+        # wrapped it in ReplaySafe (sous.gateway.turn's replay_safe contract).
+        self.on_deltas_seen: list[OnDelta | None] = []
 
     def _take(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:
         self.generate_threads.append(threading.current_thread())
@@ -38,6 +41,7 @@ class FakeEngine:
         max_tokens: int,
         on_delta: OnDelta | None = None,
     ) -> str:
+        self.on_deltas_seen.append(on_delta)
         text = self._take(messages, tools, max_tokens)
         if on_delta is not None:
             # One delta per generation is the minimum streaming contract; tests
@@ -79,6 +83,7 @@ class ChunkedFakeEngine(FakeEngine):
         max_tokens: int,
         on_delta: OnDelta | None = None,
     ) -> str:
+        self.on_deltas_seen.append(on_delta)
         pieces = self._take(messages, tools, max_tokens).split("|")
         for n, piece in enumerate(pieces, start=1):
             if self.delay:

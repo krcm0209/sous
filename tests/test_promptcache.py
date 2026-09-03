@@ -622,6 +622,28 @@ def test_a_warm_failure_after_streamed_deltas_is_not_retried():
     assert len(h.caches) == 1
 
 
+def test_a_replay_safe_warm_failure_after_streamed_deltas_still_retries_cold():
+    """A ReplaySafe on_delta's output never left the process (it is a
+    non-streaming turn's accounting-only callback), so — unlike a bare
+    callback — its emitted deltas do not forbid the cold retry."""
+    from sous.engine.base import ReplaySafe
+
+    seen: list[Delta] = []
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    h.fail_once = True
+    h.stream_before_fail = True
+    with pytest.warns(UserWarning, match="retrying cold"):
+        result = pc.generate(STABLE_2, FULL_2, 16, ReplaySafe(seen.append))
+    assert result == "text"
+    assert pc.stats()["cold_retries"] == 1
+    # Both the failed warm attempt's partial delta and the retry's final one
+    # reached the callback: nothing about ReplaySafe suppresses delivery, it
+    # only tells the cache the deliveries were never forwarded to a client.
+    assert seen == [Delta("partial", 1, None), Delta("text", 1, "stop")]
+
+
 def test_a_warm_failure_before_any_delta_still_retries_cold():
     from sous.engine.base import Delta
 

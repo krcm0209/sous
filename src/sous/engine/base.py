@@ -32,7 +32,23 @@ class Delta:
 
 # Called on the generating thread, inside the decode loop: it must return
 # quickly and must never raise — an exception here fails the generation.
+# Wrapping a callback in ReplaySafe below marks it replay-safe: a warm-cache
+# failure partway through may still be retried cold.
 OnDelta = Callable[[Delta], None]
+
+
+class ReplaySafe:
+    """An on_delta whose output never leaves the process (accounting only),
+    so a failed warm attempt may still be retried cold: nothing was sent
+    that a re-run would send twice."""
+
+    __slots__ = ("fn",)
+
+    def __init__(self, fn: OnDelta) -> None:
+        self.fn = fn
+
+    def __call__(self, delta: Delta) -> None:
+        self.fn(delta)
 
 
 class Engine(Protocol):

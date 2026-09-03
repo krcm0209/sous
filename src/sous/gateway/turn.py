@@ -23,6 +23,7 @@ from sous.engine.base import (
     GenerationSession,
     GenerationStalled,
     ManagedEngine,
+    ReplaySafe,
     release_mlx_thread_state,
 )
 
@@ -34,6 +35,11 @@ class Sink(Protocol):
 
     def started(self, input_tokens: int) -> None: ...
     def delta(self, delta: Delta) -> None: ...
+
+    # True when `delta()` forwards nothing outside the process (accounting
+    # only) — a non-streaming turn's sink, whose deltas the client never
+    # sees, so a warm-cache failure may still be retried cold.
+    replay_safe: bool
 
 
 class PromptTooLong(Exception):
@@ -115,13 +121,18 @@ class TurnRunner:
                     final = delta
                     sink.delta(delta)
 
+                # ReplaySafe tells the prompt cache this callback's output
+                # never reaches a client, so a warm-cache failure may still
+                # be retried cold — true exactly when the sink itself is.
+                callback = ReplaySafe(on_delta) if sink.replay_safe else on_delta
+
                 try:
                     text = session.generate(
                         messages,
                         tools,
                         min(max_tokens, room),
                         timeout=self._timeout,
-                        on_delta=on_delta,
+                        on_delta=callback,
                     )
                 except GenerationStalled:
                     # The session is unusable after a stall (its thread may still

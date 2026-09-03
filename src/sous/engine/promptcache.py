@@ -14,7 +14,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from sous.engine.base import Delta, OnDelta
+from sous.engine.base import Delta, OnDelta, ReplaySafe
 
 
 def reuse_length(cached_ids: Sequence[int], new_ids: Sequence[int]) -> int:
@@ -286,7 +286,11 @@ class PrefixCache:
 
         # A warm attempt that already streamed text cannot be retried: the
         # consumer has forwarded those deltas, and a cold re-run would deliver
-        # the turn a second time. Counting is all the decision below needs.
+        # the turn a second time. An on_delta wrapped in ReplaySafe forwards
+        # nothing outside the process (accounting only, e.g. a non-streaming
+        # turn's delta count) — checked on the ORIGINAL callback, before
+        # _counting wraps it in its own closure.
+        replay_safe = isinstance(on_delta, ReplaySafe)
         emitted = 0
 
         def _counting(sink: OnDelta) -> OnDelta:
@@ -319,7 +323,7 @@ class PrefixCache:
             retry_reason = str(e)
 
         if retry_reason is not None:
-            if emitted:
+            if emitted and not replay_safe:
                 raise RuntimeError(
                     f"warm generation failed after streaming {emitted} delta(s) "
                     f"({retry_reason}); not retrying cold, which would replay the turn"
