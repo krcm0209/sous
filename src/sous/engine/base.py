@@ -216,7 +216,8 @@ class GenerationSession:
     task off the engine meanwhile. _CLOSE deliberately carries no cache
     reset — a late reset from a stale session thread would race the next
     task's cache and stats, the same class of bug as consideration 7. Every
-    reset belongs to the worker thread.
+    reset belongs to the thread that owns the session: the worker thread for
+    tasks, the gateway's turn thread after a stall (`sous.gateway.turn`).
 
     on_delta, when given, fires on this thread from inside the engine's decode
     loop — mid-generation, under _gen_lock. A stalled-and-abandoned generation
