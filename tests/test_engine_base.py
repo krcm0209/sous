@@ -77,7 +77,7 @@ class _BlockingEngine(FakeEngine):
         self.in_flight = 0
         self.overlap = False
 
-    def generate(self, messages, tools, max_tokens):
+    def generate(self, messages, tools, max_tokens, on_delta=None):
         self.in_flight += 1
         if self.in_flight > 1:
             self.overlap = True
@@ -185,7 +185,7 @@ def test_reset_prompt_cache_does_not_wait_for_the_generation_lock():
     release = threading.Event()
 
     class BlockingEngine(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             started.set()
             release.wait(5)
             return "done"
@@ -238,7 +238,7 @@ def test_session_releases_mlx_state_once_on_its_own_thread(monkeypatch):
 
 def test_session_relays_exceptions_and_survives_them():
     class Flaky(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             out = super().generate(messages, tools, max_tokens)
             if out == "boom":
                 raise ValueError("boom")
@@ -266,7 +266,7 @@ def test_stalled_generation_is_abandoned_and_its_late_result_dropped():
     gate = threading.Event()
 
     class Gated(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             gate.wait(10)
             return super().generate(messages, tools, max_tokens)
 
@@ -290,7 +290,7 @@ def test_abandoned_waiter_on_the_lock_never_generates():
     release = threading.Event()
 
     class Wedged(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             entered.set()
             release.wait(10)
             return super().generate(messages, tools, max_tokens)
@@ -324,7 +324,7 @@ def test_close_tolerates_an_undequeued_stalled_request():
     gate = threading.Event()
 
     class Gated(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             gate.wait(10)
             return super().generate(messages, tools, max_tokens)
 
@@ -415,3 +415,44 @@ def test_engine_manager_threads_drafter_config_into_default_factory(monkeypatch)
     EngineManager(cfg).get()
     assert seen["kwargs"]["draft_id"] == "z-lab/drafter"
     assert seen["kwargs"]["draft_block_size"] == 5
+
+
+# ---- streaming deltas (gateway) ---------------------------------------------
+
+
+def test_session_relays_deltas_on_the_session_thread():
+    """Deltas are emitted from inside the engine's decode loop, i.e. on the
+    session thread — the consumer bridges them to wherever it lives."""
+    from sous.engine.base import Delta
+
+    seen: list[tuple[Delta, threading.Thread]] = []
+    inner = FakeEngine(["hello world"])
+    session = ManagedEngine(inner).session()
+    text = session.generate(
+        _msgs(), [], 8, timeout=5, on_delta=lambda d: seen.append((d, threading.current_thread()))
+    )
+    session.close()
+    session._thread.join(5)
+    assert text == "hello world"
+    assert [d for d, _ in seen] == [Delta("hello world", 2, "stop")]
+    assert seen[0][1] is session._thread
+
+
+def test_managed_engine_forwards_on_delta():
+    from sous.engine.base import Delta
+
+    seen: list[Delta] = []
+    managed = ManagedEngine(FakeEngine(["x y z"]))
+    assert managed.generate(_msgs(), [], 8, on_delta=seen.append) == "x y z"
+    assert seen == [Delta("x y z", 3, "stop")]
+
+
+def test_chunked_fake_engine_streams_pieces_with_cumulative_counts():
+    from sous.engine.base import Delta
+    from tests.fake_engine import ChunkedFakeEngine
+
+    seen: list[Delta] = []
+    e = ChunkedFakeEngine(["a|b|c"])
+    assert e.generate(_msgs(), [], 8, on_delta=seen.append) == "abc"
+    assert seen == [Delta("a", 1, None), Delta("b", 2, None), Delta("c", 3, "stop")]
+    assert e.finished.is_set()

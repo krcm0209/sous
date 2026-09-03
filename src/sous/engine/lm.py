@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import cast
 
+from sous.engine.base import Delta, OnDelta
 from sous.engine.promptcache import PrefixCache, PromptMemo
 
 
@@ -103,7 +104,9 @@ class LMEngine:
             model(mx.array(token_ids[i : i + step])[None], cache=cache)
             mx.eval([c.state for c in cache])
 
-    def decode(self, cache: list, token_ids: list[int], max_tokens: int) -> str:
+    def decode(
+        self, cache: list, token_ids: list[int], max_tokens: int, on_delta: OnDelta | None = None
+    ) -> str:
         from mlx_lm import stream_generate
 
         model, tokenizer = self._loaded()
@@ -117,6 +120,8 @@ class LMEngine:
             prompt_cache=cache,
         ):
             chunks.append(r.text)
+            if on_delta is not None:
+                on_delta(Delta(r.text, r.generation_tokens, r.finish_reason))
         return "".join(chunks)
 
     def copy_array(self, a: object) -> object:
@@ -128,13 +133,19 @@ class LMEngine:
 
     # ---- Engine ----------------------------------------------------------
 
-    def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:
+    def generate(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+        on_delta: OnDelta | None = None,
+    ) -> str:
         full_ids = self._ids("full", messages, tools)
         # The stable render is only an anchor for reuse, and PrefixCache discards
         # it when disabled — so computing it would cost a whole extra tokenization
         # per turn for nothing.
         stable_ids = self._ids("stable", messages, tools) if self._cache.enabled else []
-        return self._cache.generate(stable_ids, full_ids, max_tokens)
+        return self._cache.generate(stable_ids, full_ids, max_tokens, on_delta)
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
         return len(self._ids("full", messages, tools))

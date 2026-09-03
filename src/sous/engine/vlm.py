@@ -5,6 +5,7 @@ from __future__ import annotations
 import warnings
 from typing import Any, cast
 
+from sous.engine.base import Delta, OnDelta
 from sous.engine.promptcache import PrefixCache, PromptMemo
 
 
@@ -143,9 +144,11 @@ class VLMEngine:
             input_ids=mx.array(token_ids)[None],
         )
 
-    def decode(self, cache: list, token_ids: list[int], max_tokens: int) -> str:
+    def decode(
+        self, cache: list, token_ids: list[int], max_tokens: int, on_delta: OnDelta | None = None
+    ) -> str:
         import mlx.core as mx
-        from mlx_vlm import generate
+        from mlx_vlm import stream_generate
 
         model, processor = self._loaded()
         # Speculative decoding rides on the decode call only: prefill has no
@@ -161,11 +164,17 @@ class VLMEngine:
             if self._draft is not None
             else {}
         )
+        # generate() resets the tokenizer's shared stopping criteria before
+        # every call and stream_generate does not; mirror it so a criteria
+        # left mutated by another caller cannot change where this turn stops.
+        tokenizer = getattr(processor, "tokenizer", processor)
+        tokenizer.stopping_criteria.reset(model.config.eos_token_id)
+        chunks: list[str] = []
         # prompt_cache plus input_ids, not prompt_cache_state. mlx-vlm primes
         # Qwen mRoPE state before feeding a suffix, and that priming turns out
         # to be bit-identical to no priming for text-only prompts — so sous
         # owns the cache outright rather than driving mlx-vlm's reuse path.
-        result = generate(
+        for r in stream_generate(
             model,
             processor,
             "",
@@ -175,9 +184,15 @@ class VLMEngine:
             prompt_cache=cache,
             input_ids=mx.array(token_ids)[None],
             **draft_kwargs,
-        )
-        # mlx-vlm returns GenerationResult in recent versions; older return str
-        return result.text if hasattr(result, "text") else str(result)
+        ):
+            # Draft rows are the speculator's proposals, not accepted output;
+            # generate() skips them the same way.
+            if r.is_draft:
+                continue
+            chunks.append(r.text)
+            if on_delta is not None:
+                on_delta(Delta(r.text, r.generation_tokens, r.finish_reason))
+        return "".join(chunks)
 
     def copy_array(self, a: object) -> object:
         import mlx.core as mx
@@ -188,13 +203,19 @@ class VLMEngine:
 
     # ---- Engine ----------------------------------------------------------
 
-    def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:
+    def generate(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+        on_delta: OnDelta | None = None,
+    ) -> str:
         full_ids = self._ids("full", messages, tools)
         # The stable render is only an anchor for reuse, and PrefixCache discards
         # it when disabled — so computing it would cost a whole extra tokenization
         # per turn for nothing.
         stable_ids = self._ids("stable", messages, tools) if self._cache.enabled else []
-        return self._cache.generate(stable_ids, full_ids, max_tokens)
+        return self._cache.generate(stable_ids, full_ids, max_tokens, on_delta)
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
         return len(self._ids("full", messages, tools))

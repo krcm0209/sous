@@ -74,3 +74,19 @@ def test_lm_engine_reuses_across_turns():
     assert stats["hits"] == 1, stats
     assert stats["reused_tokens"] > 0
     e.unload()
+
+
+def test_lm_engine_streams_deltas_that_reassemble_the_reply():
+    from sous.engine.base import Delta
+    from sous.engine.lm import LMEngine
+    from sous.protocol import WORKER_TOOLS
+
+    e = LMEngine(TINY)
+    seen: list[Delta] = []
+    msgs = [{"role": "user", "content": "Count from one to five."}]
+    out = e.generate(msgs, WORKER_TOOLS, max_tokens=32, on_delta=seen.append)
+    assert "".join(d.text for d in seen) == out
+    assert [d.output_tokens for d in seen] == sorted(d.output_tokens for d in seen)
+    assert seen[-1].finish_reason in ("stop", "length")
+    assert all(d.finish_reason is None for d in seen[:-1])
+    e.unload()

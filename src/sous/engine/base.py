@@ -8,9 +8,31 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 from sous.config import SousConfig
+
+
+@dataclass(frozen=True)
+class Delta:
+    """One streamed piece of a generation, delivered as the engine produces it.
+
+    `output_tokens` counts everything generated so far, this piece included.
+    `finish_reason` is None until the final piece, then "stop" (the model ended
+    its turn) or "length" (max_tokens was reached). The final piece may carry
+    empty text — the detokenizer's flush — so an empty delta is not "nothing
+    happened".
+    """
+
+    text: str
+    output_tokens: int
+    finish_reason: str | None = None
+
+
+# Called on the generating thread, inside the decode loop: it must return
+# quickly and must never raise — an exception here fails the generation.
+OnDelta = Callable[[Delta], None]
 
 
 class Engine(Protocol):
@@ -20,7 +42,13 @@ class Engine(Protocol):
     @property
     def model_id(self) -> str: ...
 
-    def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str: ...
+    def generate(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+        on_delta: OnDelta | None = None,
+    ) -> str: ...
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int: ...
     def reset_prompt_cache(self) -> None: ...
     def prompt_cache_stats(self) -> dict: ...
@@ -125,9 +153,15 @@ class ManagedEngine:
     def model_id(self) -> str:
         return self._inner.model_id
 
-    def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:
+    def generate(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+        on_delta: OnDelta | None = None,
+    ) -> str:
         with self._gen_lock:
-            return self._inner.generate(messages, tools, max_tokens)
+            return self._inner.generate(messages, tools, max_tokens, on_delta)
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
         return self._inner.count_tokens(messages, tools)
@@ -183,6 +217,11 @@ class GenerationSession:
     reset — a late reset from a stale session thread would race the next
     task's cache and stats, the same class of bug as consideration 7. Every
     reset belongs to the worker thread.
+
+    on_delta, when given, fires on this thread from inside the engine's decode
+    loop — mid-generation, under _gen_lock. A stalled-and-abandoned generation
+    keeps firing it until it ends, so a consumer must tolerate deltas that
+    arrive after generate() has already raised GenerationStalled.
     """
 
     def __init__(self, managed: ManagedEngine):
@@ -225,12 +264,17 @@ class GenerationSession:
             release_mlx_thread_state()
 
     def generate(
-        self, messages: list[dict], tools: list[dict], max_tokens: int, timeout: float
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+        timeout: float,
+        on_delta: OnDelta | None = None,
     ) -> str:
         assert not self._closed and not self._abandoned.is_set(), (
             "session reused after close() or a stall"
         )
-        self._requests.put_nowait((messages, tools, max_tokens))
+        self._requests.put_nowait((messages, tools, max_tokens, on_delta))
         try:
             kind, value = self._replies.get(timeout=timeout)
         except queue.Empty:

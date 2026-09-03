@@ -11,6 +11,7 @@ from typing import cast
 
 import pytest
 
+from sous.engine.base import Delta
 from sous.engine.promptcache import (
     PrefixCache,
     PromptCacheStats,
@@ -237,6 +238,10 @@ class FakeHooks:
         self.trimmable = trimmable
         self.layers = layers
         self.fail_once = fail_once
+        # When a failure is scripted, whether one delta escapes first — the
+        # streaming no-retry rule is decided on exactly that difference.
+        self.stream_before_fail = False
+        self.on_deltas: list = []
         # Injected rather than monkeypatched: assigning over a bound method makes
         # ty report invalid-assignment, and ty checks the tests too.
         self.decode_impl = decode_impl
@@ -262,14 +267,19 @@ class FakeHooks:
         self.prefilled.append(list(token_ids))
         self._advance(cache, len(token_ids))
 
-    def decode(self, cache, token_ids, max_tokens):
+    def decode(self, cache, token_ids, max_tokens, on_delta=None):
+        self.on_deltas.append(on_delta)
         if self.fail_once:
             self.fail_once = False
+            if self.stream_before_fail and on_delta is not None:
+                on_delta(Delta("partial", 1, None))
             raise RuntimeError("boom")
         if self.decode_impl is not None:
             return self.decode_impl(self, cache, token_ids, max_tokens)
         self.decoded.append(list(token_ids))
         self._advance(cache, len(token_ids) + len(self.generated))
+        if on_delta is not None:
+            on_delta(Delta("text", 1, "stop"))
         return "text"
 
     def copy_array(self, a):
@@ -569,3 +579,57 @@ def test_a_late_cold_retry_write_after_reset_does_not_land_on_fresh_counters():
 
     assert calls["n"] == 2  # the failure and its retry both really ran
     assert pc.stats() == PromptCacheStats().as_dict()  # fresh counters, untouched
+
+
+# ---- streaming deltas ----------------------------------------------------------
+
+
+def test_on_delta_reaches_decode_on_every_path():
+    from sous.engine.base import Delta
+
+    seen: list[Delta] = []
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16, seen.append)  # cold
+    pc.generate(STABLE_2, FULL_2, 16, seen.append)  # warm
+    pc.generate(STABLE_2 + [7], FULL_2[:-2] + [7, 90, 91], 16)  # no consumer
+    assert seen == [Delta("text", 1, "stop"), Delta("text", 1, "stop")]
+    # The cache wraps the callback to count emissions, so decode sees a
+    # callable (not the very object) when one was given, and None otherwise.
+    assert [cb is not None for cb in h.on_deltas] == [True, True, False]
+    disabled = PrefixCache(FakeHooks(trimmable=True), enabled=False)
+    disabled.generate(STABLE_1, FULL_1, 16, seen.append)
+    assert len(seen) == 3
+
+
+def test_a_warm_failure_after_streamed_deltas_is_not_retried():
+    """A cold retry would replay text the consumer already forwarded; the
+    failure is surfaced instead, and the counters say no retry happened."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    h.fail_once = True
+    h.stream_before_fail = True
+    with pytest.raises(RuntimeError, match="not retrying cold"):
+        pc.generate(STABLE_2, FULL_2, 16, lambda d: None)
+    assert pc.stats()["cold_retries"] == 0
+    # The warm attempt raised before FakeHooks recorded it and no cold retry
+    # ran: the only decode on record is the first turn's, decode was entered
+    # exactly twice, and no replacement cache was ever built.
+    assert h.decoded == [FULL_1]
+    assert len(h.on_deltas) == 2
+    assert len(h.caches) == 1
+
+
+def test_a_warm_failure_before_any_delta_still_retries_cold():
+    from sous.engine.base import Delta
+
+    seen: list[Delta] = []
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    h.fail_once = True  # raises before emitting anything (stream_before_fail stays False)
+    with pytest.warns(UserWarning, match="retrying cold"):
+        assert pc.generate(STABLE_2, FULL_2, 16, seen.append) == "text"
+    assert pc.stats()["cold_retries"] == 1
+    assert seen == [Delta("text", 1, "stop")]  # only the retry's delta got out

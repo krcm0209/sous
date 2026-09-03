@@ -190,7 +190,7 @@ def test_cancel_after_write_still_reports_files_changed(env):
     task = _start(store, root)
 
     class CancelAfterGen(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             out = super().generate(messages, tools, max_tokens)
             if not self.script:
                 # Flag lands after the final generation, i.e. after turn 1's
@@ -255,7 +255,7 @@ def test_restart_recovery_reports_files_changed_and_transcript(env):
     task = _start(store, root)
 
     class DyingEngine(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             if not self.script:
                 raise KeyboardInterrupt  # simulates the daemon dying mid-task
             return super().generate(messages, tools, max_tokens)
@@ -397,7 +397,7 @@ def test_generation_timeout_at_wall_budget_is_budget_exhausted(env):
     unwedge = threading.Event()
 
     class StallingEngine(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             unwedge.wait(10)  # released by the test AFTER run_task returns
             return FINISH
 
@@ -612,7 +612,7 @@ def test_engine_exception_fails_task_cleanly(env):
     task = _start(store, root)
 
     class ExplodingEngine(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             raise ValueError("boom")
 
     inner = ExplodingEngine([FINISH])
