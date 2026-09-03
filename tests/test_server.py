@@ -612,3 +612,15 @@ def test_status_memory_probe_releases_mlx_thread_state(svc, monkeypatch):
     monkeypatch.setattr(server, "release_mlx_thread_state", lambda: released.append(True))
     service.server_status()
     assert released
+
+
+def test_server_status_reports_gateway_config(svc):
+    """The gateway is off by default and experimental; the MCP-visible status
+    is how a user confirms which model ids the daemon would serve locally."""
+    service, _, _ = svc
+    gw = service.server_status()["config"]["gateway"]
+    assert gw == {
+        "enabled": False,
+        "local_models": ["sous-local"],
+        "max_context_tokens": 65536,
+    }

@@ -235,6 +235,11 @@ class SousService:
                     # THAT the policy is fixed but not what it's fixed to.
                     "max_context_tokens": self.config.max_context_tokens,
                 },
+                "gateway": {
+                    "enabled": self.config.gateway_enabled,
+                    "local_models": list(self.config.gateway_local_models),
+                    "max_context_tokens": self.config.gateway_max_context_tokens,
+                },
             },
         }
 
