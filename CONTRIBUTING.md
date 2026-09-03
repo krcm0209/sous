@@ -108,8 +108,12 @@ single green run proves very little.
 Until the routing half of issue #41 lands, every request that reaches the
 gateway is served locally, so the only way to drive it from Claude Code is a
 *whole-session-local* run. That is a verification setup, not a supported
-mode (see README, "Gateway mode"). With `[gateway].enabled = true` and the
-daemon restarted:
+mode (see README, "Gateway mode"). Set `[gateway].enabled = true` and
+`[gateway].max_context_tokens = 131072`, then restart the daemon. The larger
+window matters: Claude Code's own system prompt and tool schemas already fill
+~40K tokens, and one tool round trip pushes the rendered prompt past 80K, so
+the 65536 default (sized for a subagent's smaller turns) aborts a
+whole-session run with `prompt is too long`.
 
 ```bash
 env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
@@ -118,8 +122,8 @@ env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
   ANTHROPIC_DEFAULT_SONNET_MODEL=sous-local \
   ANTHROPIC_DEFAULT_HAIKU_MODEL=sous-local \
   CLAUDE_CODE_SUBAGENT_MODEL=sous-local \
-  CLAUDE_CODE_MAX_CONTEXT_TOKENS=65536 \
-  CLAUDE_CODE_AUTO_COMPACT_WINDOW=65536 \
+  CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072 \
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW=131072 \
   API_TIMEOUT_MS=3000000 \
   claude --disallowedTools LSP
 ```
@@ -132,8 +136,13 @@ that are not `claude-*`, which is why the served id is honest).
 `API_TIMEOUT_MS` covers model load plus a long prefill; `--disallowedTools
 LSP` keeps a language server from appending its schema mid-session and
 re-prefilling the whole conversation. Watch `~/.sous/daemon.log` for the
-`sous gateway:` lines — the first turn is a cold prefill, later turns should
-report `cache=hit`.
+`sous gateway:` lines. Expect every turn here to report `cache=miss`: a
+whole-session-local run interleaves Claude Code's small background queries
+with the main loop, and the single prompt-cache slot holds only the most
+recent prompt, so each ~80K-token main turn re-prefills from cold (minutes,
+not seconds). That thrash is why the endpoint is built for subagents, whose
+turns run back to back and reuse the slot; keyed slots that would fix the
+whole-session case are a later phase.
 
 (The plan's Task 10 uses this recipe verbatim plus headless flags; keep the two identical.)
 
