@@ -225,6 +225,25 @@ def test_a_deeply_nested_body_is_a_400_not_a_recursion_error(tmp_path: Path):
     assert inner.calls == []
 
 
+def test_non_json_constants_in_the_body_are_a_400(tmp_path: Path):
+    # json.loads accepts NaN/Infinity (and 1e999 → inf) by default; the real
+    # API rejects them, and so must the boundary that decides 400-or-turn.
+    inner = FakeEngine(["unused"])
+    app = _app(tmp_path, inner)
+    for raw in (
+        b'{"model":"sous-local","max_tokens":10,"messages":[{"role":"user","content":"hi"}],'
+        b'"temperature": NaN}',
+        b'{"model":"sous-local","max_tokens":10,"messages":[{"role":"user","content":"hi"}],'
+        b'"top_p": -Infinity}',
+        b'{"model":"sous-local","max_tokens":10,"messages":[{"role":"user","content":"hi"}],'
+        b'"temperature": 1e999}',
+    ):
+        r = _request(app, "POST", "/v1/messages", body=raw)
+        assert r.status_code == 400, raw
+        assert r.json()["error"]["type"] == "invalid_request_error"
+    assert inner.calls == []
+
+
 def test_malformed_tool_properties_is_a_400_and_never_reaches_the_engine(tmp_path: Path):
     """Pins the shaped-status property end to end: chat_tools rejects a
     non-object `properties` before ToolSet.from_tools (called after the

@@ -12,6 +12,7 @@ import concurrent.futures
 import contextlib
 import json
 import logging
+import math
 import sys
 import threading
 from collections.abc import AsyncIterator
@@ -96,6 +97,21 @@ def _classify(exc: Exception) -> tuple[int, str, str]:
     return 500, "api_error", f"generation failed: {exc}"
 
 
+def _reject_constant(name: str) -> None:
+    # json.loads accepts NaN/Infinity/-Infinity by default; the real API does
+    # not, and a body that is not JSON must take the 400 below, not a turn.
+    raise ValueError(f"non-JSON constant {name}")
+
+
+def _finite_float(text: str) -> float:
+    # An overflowing literal (1e999) is an ordinary number to the scanner and
+    # becomes inf — the same non-JSON value by another spelling.
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite number {text}")
+    return value
+
+
 async def _read_json(request: Request) -> object:
     declared = request.headers.get("content-length", "")
     if declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
@@ -117,7 +133,9 @@ async def _read_json(request: Request) -> object:
         # a 500 with a traceback in the daemon log.
         raise RequestError(400, "invalid_request_error", "client disconnected mid-body") from None
     try:
-        return json.loads(b"".join(chunks))
+        return json.loads(
+            b"".join(chunks), parse_constant=_reject_constant, parse_float=_finite_float
+        )
     except ValueError, RecursionError:
         # RecursionError: json.loads on a body nested deeper than the interpreter
         # stack — well under the byte cap, and malformed all the same.
