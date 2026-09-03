@@ -449,11 +449,13 @@ NULLABLE_TOOLS = [
 ]
 
 
-def test_schema_type_keeps_the_null_member_of_a_union():
-    assert _schema_type({"type": ["null", "integer"]}) == "integer|null"
+def test_schema_type_keeps_every_union_member_in_schema_order():
+    assert _schema_type({"type": ["null", "integer"]}) == "null|integer"
     assert _schema_type({"type": ["integer", "null"]}) == "integer|null"
+    assert _schema_type({"type": ["integer", "string"]}) == "integer|string"
+    assert _schema_type({"type": ["string", "integer", "null"]}) == "string|integer|null"
     assert _schema_type({"type": "integer"}) == "integer"
-    assert _schema_type({"type": ["null"]}) == "string|null"
+    assert _schema_type({"type": ["null"]}) == "null"
     assert _schema_type({"enum": ["a"]}) == "string"
 
 
@@ -517,3 +519,58 @@ def test_json_call_passes_a_real_null_through_untouched():
     ts = ToolSet.from_tools(NULLABLE_TOOLS, strict=False)
     text = '<tool_call>{"name": "Search", "arguments": {"query": "x", "limit": null}}</tool_call>'
     assert parse_tool_calls(text, ts) == [ToolCall("Search", {"query": "x", "limit": None})]
+
+
+# --- multi-member (non-nullable) unions ----------------------------------------
+
+MULTI_MEMBER_UNION_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "Grep",
+            "description": "",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "int_or_string": {"type": ["integer", "string"]},
+                    "string_or_int": {"type": ["string", "integer"]},
+                    "int_or_bool": {"type": ["integer", "boolean"]},
+                },
+                "required": [],
+            },
+        },
+    }
+]
+
+
+def _grep_call(param: str, raw: str):
+    ts = ToolSet.from_tools(MULTI_MEMBER_UNION_TOOLS, strict=False)
+    text = (
+        "<tool_call>\n<function=Grep>\n"
+        f"<parameter={param}>\n{raw}\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    [call] = parse_tool_calls(text, ts)
+    return call.arguments[param]
+
+
+def test_xml_union_prefers_a_leading_non_string_member_that_accepts():
+    """`["integer", "string"]` demoted a valid XML call to prose before this
+    fix: only the first union member (`"integer"`) was ever tried, so a
+    genuinely string-shaped argument like `abc` raised instead of falling
+    through to `"string"`."""
+    assert _grep_call("int_or_string", "abc") == "abc"
+    assert _grep_call("int_or_string", "42") == 42
+
+
+def test_xml_union_schema_order_wins_over_a_later_stricter_member():
+    """`["string", "integer"]` tries `"string"` first, so even a numeric-
+    looking value stays a string — schema order, not type specificity,
+    decides."""
+    value = _grep_call("string_or_int", "42")
+    assert value == "42" and isinstance(value, str)
+
+
+def test_xml_union_with_no_accepting_member_raises_naming_the_union():
+    with pytest.raises(ParseError, match=r"one of integer\|boolean"):
+        _grep_call("int_or_bool", "maybe")

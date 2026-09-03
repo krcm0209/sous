@@ -111,19 +111,17 @@ class ParseError(Exception):
 
 
 def _schema_type(prop: object) -> str:
-    """The JSON-schema type coercion should target. A union (`["integer",
-    "null"]`) resolves to its first non-null member, marked `"integer|null"`
-    so `_coerce` knows the literal `null` is a legal value for it rather than
-    a malformed integer; a property without a `type` (enum, anyOf, free-form)
-    stays a raw string."""
+    """The JSON-schema type coercion should target. A union `type` list (e.g.
+    `["integer", "string"]`, `["integer", "null"]`) becomes every member
+    joined by `|` in schema order, so `_coerce` can try each member in turn
+    and prefer the one the schema lists first; a property without a `type`
+    (enum, anyOf, free-form) stays a raw string."""
     if not isinstance(prop, dict):
         return "string"
     typ = prop.get("type", "string")
     if isinstance(typ, list):
-        base = next((t for t in typ if t != "null"), "string")
-        if not isinstance(base, str):
-            base = "string"
-        return f"{base}|null" if "null" in typ else base
+        members = [t for t in typ if isinstance(t, str)]
+        return "|".join(members) if members else "string"
     return typ if isinstance(typ, str) else "string"
 
 
@@ -282,17 +280,35 @@ def _strip_wrapping_newlines(raw: str) -> str:
 
 
 def _coerce(tool: str, key: str, typ: str, raw: str):
-    """Coerce a raw XML-ish parameter value using its declared schema type.
+    """Coerce a raw XML-ish parameter value against its declared schema type.
 
-    Strings stay raw (the template writes them unquoted); non-strings were
-    written via tojson. Failing loudly here beats handing the executor
-    offset="5" — so a `null` is accepted only where the schema is a union
-    with "null" (Claude Code sends several), and rejected everywhere else.
+    `typ` may name a union (`"integer|string"`, `"integer|null"`) — each
+    member is tried in schema order and the first that accepts `raw` wins,
+    matching what a Hermes JSON call would have received untouched (a
+    union's `"string"` member always accepts; its `"null"` member accepts
+    only the literal `null` text). A single-member `typ` coerces directly,
+    with the same error message the pre-union code raised, since a lone
+    type has nothing to fall back to.
     """
-    if typ.endswith("|null"):
+    members = typ.split("|")
+    if len(members) == 1:
+        return _coerce_member(tool, key, members[0], raw)
+    for member in members:
+        try:
+            return _coerce_member(tool, key, member, raw)
+        except ParseError:
+            continue
+    raise ParseError(f"parameter {key!r} of {tool} must be one of {typ}, got {raw!r}")
+
+
+def _coerce_member(tool: str, key: str, typ: str, raw: str):
+    """Coerce `raw` against one union member. Strings stay raw (the template
+    writes them unquoted); non-strings were written via tojson. Failing
+    loudly here beats handing the executor offset="5"."""
+    if typ == "null":
         if raw.strip() == "null":
             return None
-        typ = typ[: -len("|null")]
+        raise ParseError(f"parameter {key!r} of {tool} must be null, got {raw!r}")
     if typ == "integer":
         try:
             return int(raw.strip())
