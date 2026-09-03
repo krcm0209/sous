@@ -23,6 +23,7 @@ character after ``<tool_call>``:
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 
@@ -110,6 +111,15 @@ class ParseError(Exception):
     pass
 
 
+def _reject_constant(name: str) -> None:
+    """json's parse_constant hook for NaN/Infinity/-Infinity: without it,
+    json.loads silently accepts these non-finite tokens (`float("nan")` and
+    friends succeed), and json.dumps later re-emits the invalid `NaN` /
+    `Infinity` literals that break every JSON consumer downstream, including
+    Starlette's JSONResponse (a 500) and a streamed partial_json token."""
+    raise ParseError(f"non-finite number {name!r} is not valid JSON")
+
+
 def _schema_type(prop: object) -> str:
     """The JSON-schema type coercion should target. A union `type` list (e.g.
     `["integer", "string"]`, `["integer", "null"]`) becomes every member
@@ -172,7 +182,7 @@ _OPEN_RE = re.compile(r"<tool_call>\s*")
 _FUNCTION_RE = re.compile(r"<function=([^>\s]+)>")
 _PARAM_RE = re.compile(r"<parameter=([^>\s]+)>")
 _WS_RE = re.compile(r"\s*")
-_DECODER = json.JSONDecoder()
+_DECODER = json.JSONDecoder(parse_constant=_reject_constant)
 
 
 def _skip_ws(text: str, pos: int) -> int:
@@ -325,12 +335,15 @@ def _coerce_member(tool: str, key: str, typ: str, raw: str):
         raise ParseError(f"parameter {key!r} of {tool} must be a boolean, got {raw!r}")
     if typ == "number":
         try:
-            return float(raw.strip())
+            value = float(raw.strip())
         except ValueError:
             raise ParseError(f"parameter {key!r} of {tool} must be a number, got {raw!r}") from None
+        if not math.isfinite(value):
+            raise ParseError(f"parameter {key!r} of {tool} must be a finite number, got {raw!r}")
+        return value
     if typ in ("array", "object"):
         try:
-            value = json.loads(raw)
+            value = json.loads(raw, parse_constant=_reject_constant)
         except json.JSONDecodeError:
             raise ParseError(
                 f"parameter {key!r} of {tool} must be a JSON {typ}, got {raw!r}"

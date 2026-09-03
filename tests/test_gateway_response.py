@@ -214,6 +214,35 @@ def test_unparseable_tool_call_comes_back_as_text_with_end_turn():
     ]
 
 
+def test_non_finite_number_argument_comes_back_as_text_with_end_turn():
+    """A NaN argument must never reach json.dumps(allow_nan=False) — the
+    property Starlette's JSONResponse enforces and the 500 in the bug report
+    violated."""
+    number_tools = ToolSet.from_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"offset": {"type": "number"}},
+                    },
+                },
+            }
+        ],
+        strict=False,
+    )
+    raw = (
+        "<tool_call>\n<function=Read>\n<parameter=offset>\nNaN\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    a, _ = _stream([raw], toolset=number_tools)
+    assert a.message()["content"] == [{"type": "text", "text": raw}]
+    assert a.stop_reason == "end_turn"
+    json.dumps(a.message(), allow_nan=False)
+
+
 def test_unknown_tool_name_passes_through_as_tool_use():
     text = (
         "<tool_call>\n<function=Imaginary>\n<parameter=x>\n1\n</parameter>\n"

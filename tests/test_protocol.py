@@ -412,6 +412,58 @@ def test_json_call_with_non_string_name_raises():
         parse_tool_calls('<tool_call>{"name": 5, "arguments": {}}</tool_call>')
 
 
+# --- non-finite numbers (NaN/Infinity are not valid JSON) ----------------------
+
+
+@pytest.mark.parametrize("raw", ["NaN", "inf", "-Infinity"])
+def test_xml_number_parameter_rejects_non_finite_values(raw):
+    ts = ToolSet.from_tools(CLIENT_TOOLS, strict=False)
+    text = (
+        "<tool_call>\n<function=Read>\n"
+        "<parameter=file_path>\na.py\n</parameter>\n"
+        f"<parameter=offset>\n{raw}\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    with pytest.raises(ParseError, match="finite"):
+        parse_tool_calls(text, ts)
+
+
+def test_xml_number_parameter_still_parses_a_finite_float():
+    ts = ToolSet.from_tools(CLIENT_TOOLS, strict=False)
+    text = (
+        "<tool_call>\n<function=Read>\n"
+        "<parameter=file_path>\na.py\n</parameter>\n"
+        "<parameter=offset>\n1.5\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    [call] = parse_tool_calls(text, ts)
+    assert call.arguments["offset"] == 1.5
+
+
+def test_json_call_with_nan_argument_raises():
+    with pytest.raises(ParseError):
+        parse_tool_calls('<tool_call>{"name": "finish", "arguments": {"x": NaN}}</tool_call>')
+
+
+def test_json_call_with_infinity_nested_in_array_argument_raises():
+    with pytest.raises(ParseError):
+        parse_tool_calls(
+            '<tool_call>{"name": "finish", "arguments": {"x": [1, Infinity]}}</tool_call>'
+        )
+
+
+def test_xml_object_parameter_rejects_non_finite_nested_number():
+    ts = ToolSet.from_tools(CLIENT_TOOLS, strict=False)
+    text = (
+        "<tool_call>\n<function=Bash>\n"
+        "<parameter=command>\nls\n</parameter>\n"
+        '<parameter=meta>\n{"a": NaN}\n</parameter>\n'
+        "</function>\n</tool_call>"
+    )
+    with pytest.raises(ParseError):
+        parse_tool_calls(text, ts)
+
+
 def test_toolset_tolerates_tools_without_properties():
     ts = ToolSet.from_tools(
         [{"type": "function", "function": {"name": "Ping", "parameters": {"type": "object"}}}],
