@@ -191,9 +191,12 @@ What a locally served turn gives up, stated plainly:
   completion (so the next request never waits on a wedged lock); aborting
   mid-generation comes with batching, later.
 
-The gateway logs one line per request to the daemon's stderr — method,
-model, status, token counts, stop reason, cache hit/miss, seconds — and never
-a request body or a header value. Errors are Anthropic-shaped
+Each `/v1/messages` turn logs one metadata-only line to the daemon's
+stderr — method, model, stream flag, status, token counts, stop reason,
+cache hit/miss, seconds — plus one line naming the Anthropic tool *types*
+it dropped, when any. `/api/hello` and `count_tokens` add nothing beyond
+uvicorn's access log; no request body or header value is ever logged.
+Errors are Anthropic-shaped
 (`{"type": "error", "error": {"type": ..., "message": ...}}`); an unknown
 model id is a `404 not_found_error`, an oversized body (over 32 MiB) a
 `413 request_too_large`, and a prompt that fills the window an
