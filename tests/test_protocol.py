@@ -440,6 +440,21 @@ def test_xml_number_parameter_still_parses_a_finite_float():
     assert call.arguments["offset"] == 1.5
 
 
+@pytest.mark.parametrize(
+    "call",
+    [
+        '<tool_call>{"name": "finish", "arguments": {"x": 1e999}}</tool_call>',
+        '<tool_call>{"name": "finish", "arguments": {"x": [1, -1e999]}}</tool_call>',
+        '<tool_call>{"name": "finish", "arguments": {"x": {"y": 1e999}}}</tool_call>',
+    ],
+)
+def test_json_call_with_an_overflowing_literal_raises(call):
+    # 1e999 is a plain numeric literal to the scanner — parse_constant never
+    # sees it — yet float("1e999") is inf, as unserialisable as Infinity.
+    with pytest.raises(ParseError):
+        parse_tool_calls(call)
+
+
 def test_json_call_with_nan_argument_raises():
     with pytest.raises(ParseError):
         parse_tool_calls('<tool_call>{"name": "finish", "arguments": {"x": NaN}}</tool_call>')

@@ -182,7 +182,19 @@ _OPEN_RE = re.compile(r"<tool_call>\s*")
 _FUNCTION_RE = re.compile(r"<function=([^>\s]+)>")
 _PARAM_RE = re.compile(r"<parameter=([^>\s]+)>")
 _WS_RE = re.compile(r"\s*")
-_DECODER = json.JSONDecoder(parse_constant=_reject_constant)
+
+
+def _finite_float(text: str) -> float:
+    """json's parse_float hook: an overflowing literal such as `1e999` is an
+    ordinary number to the scanner (parse_constant never sees it) and becomes
+    `inf`, which is exactly as unserialisable as `Infinity`."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise ParseError(f"non-finite number {text!r} is not valid JSON")
+    return value
+
+
+_DECODER = json.JSONDecoder(parse_constant=_reject_constant, parse_float=_finite_float)
 
 
 def _skip_ws(text: str, pos: int) -> int:
@@ -343,7 +355,7 @@ def _coerce_member(tool: str, key: str, typ: str, raw: str):
         return value
     if typ in ("array", "object"):
         try:
-            value = json.loads(raw, parse_constant=_reject_constant)
+            value = json.loads(raw, parse_constant=_reject_constant, parse_float=_finite_float)
         except json.JSONDecodeError:
             raise ParseError(
                 f"parameter {key!r} of {tool} must be a JSON {typ}, got {raw!r}"
