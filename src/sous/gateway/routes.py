@@ -50,6 +50,15 @@ MAX_REQUEST_BYTES = 32 * 1024 * 1024
 # in the stream — including before message_start, which is where the lock
 # wait, the model load and the prefill all happen.
 PING_INTERVAL_SECONDS = 10
+# The turn pool's executor queue is unbounded: without this, a burst beyond
+# _turns' worker count sits in that queue holding its parsed request while
+# GatewayBusy's timeout has not even started — an untimed wait instead of a
+# real 529. Bounds memory held by queued/draining requests and gives Claude
+# Code's hybrid mode (a handful of subagents at once) a 529 both official
+# SDKs already retry with backoff, instead of hanging until the client gives
+# up. Counts turns running, queued on TurnRunner._lock, or draining after a
+# disconnect (see Gateway._stream) — not just requests in the executor queue.
+MAX_PENDING_TURNS = 8
 
 # A ServerSentEvent carries its own separator (the response-level `sep` only
 # applies to dicts and strings), and its default is "\r\n"; every frame here
@@ -230,6 +239,9 @@ class Gateway:
         self._counts = concurrent.futures.ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="sous-gateway-count"
         )
+        # Read here, not at class-definition time, so tests can monkeypatch
+        # the module constant before building the app.
+        self._pending = threading.BoundedSemaphore(MAX_PENDING_TURNS)
 
     def close(self, timeout: float = 2.0) -> None:
         """Best-effort shutdown, called from the app's lifespan hook. Never
@@ -291,6 +303,15 @@ class Gateway:
         assembler = TurnAssembler(
             new_message_id(), chat.model, ToolSet.from_tools(chat.tools, strict=False)
         )
+        # Acquired as late as possible, right before either branch submits
+        # work, so almost nothing sits between acquire and dispatch — and
+        # what does is guarded below, so a failure there still releases.
+        if not self._pending.acquire(blocking=False):
+            _log(
+                f"POST /v1/messages model={chat.model} stream={int(chat.stream)} "
+                "status=529 error=overloaded_error"
+            )
+            return _error_response(529, "overloaded_error", "too many turns queued")
         if chat.stream:
             return EventSourceResponse(
                 self._stream(chat, assembler),
@@ -299,7 +320,7 @@ class Gateway:
                 sep=_SEP,
             )
         try:
-            result = await asyncio.get_running_loop().run_in_executor(
+            future = asyncio.get_running_loop().run_in_executor(
                 self._turns,
                 self._runner.run,
                 chat.messages,
@@ -307,6 +328,17 @@ class Gateway:
                 chat.max_tokens,
                 _NullSink(),
             )
+        except Exception:
+            # Submission itself failed (e.g. the pool refused new work): no
+            # future exists to release the slot on completion, so release it
+            # here instead of leaking it.
+            self._pending.release()
+            raise
+        # The slot counts the turn until it actually finishes, not until the
+        # client leaves — a disconnected-but-draining turn must still hold it.
+        future.add_done_callback(lambda _f: self._pending.release())
+        try:
+            result = await future
         except Exception as e:  # noqa: BLE001 — every failure becomes an Anthropic error body
             status, error_type, message = _classify(e)
             _log(
@@ -351,7 +383,16 @@ class Gateway:
             except Exception as e:  # noqa: BLE001 — relayed as an in-band error event
                 sink.put(("error", e))
 
-        loop.run_in_executor(self._turns, turn)
+        try:
+            future = loop.run_in_executor(self._turns, turn)
+        except Exception:
+            # Submission failed before a future existed to release the slot
+            # on completion — release it here so it is not leaked.
+            self._pending.release()
+            raise
+        # Released when the turn actually finishes (including draining after
+        # a disconnect below), never when the client merely leaves.
+        future.add_done_callback(lambda _f: self._pending.release())
         try:
             yield _PING
             while True:

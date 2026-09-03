@@ -292,3 +292,44 @@ def test_app_shutdown_closes_the_gateway_session_thread(tmp_path: Path, monkeypa
     # lifespan, and therefore Gateway.close(), has already run.
     assert not thread.is_alive()
     assert not session._thread.is_alive()
+
+
+def test_a_full_queue_answers_529_immediately_and_releases_on_completion(
+    tmp_path: Path, monkeypatch
+):
+    """MAX_PENDING_TURNS bounds admission to the turn pool: a burst beyond it
+    gets a real 529 before any bytes, not an untimed wait behind Gateway._turns'
+    executor queue — and the slot it holds is released only when the turn
+    that holds it actually finishes, not when a later request merely asks."""
+    import sous.gateway.routes as routes
+
+    monkeypatch.setattr(routes, "MAX_PENDING_TURNS", 1)
+    inner = ChunkedFakeEngine(["a|b|c", "third"], delay=1.0)  # first turn ~3s, second scripted
+    with (
+        _serve(_app(tmp_path, inner)) as (base, _server, _thread),
+        httpx.Client(timeout=30) as client,
+    ):
+
+        def first_turn() -> None:
+            with client.stream("POST", f"{base}/v1/messages", json=_body()) as r:
+                list(r.iter_lines())  # drain to completion; never disconnect early
+
+        first = threading.Thread(target=first_turn, daemon=True)
+        first.start()
+        _wait_for_generation(inner)  # the first turn now holds the one pending slot
+
+        t0 = time.monotonic()
+        second = client.post(f"{base}/v1/messages", json=_body(stream=False))
+        elapsed = time.monotonic() - t0
+        assert second.status_code == 529
+        assert second.json()["error"]["type"] == "overloaded_error"
+        assert elapsed < 1.0, f"529 took {elapsed:.2f}s instead of returning immediately"
+
+        assert inner.finished.wait(10), "the first turn never completed"
+        first.join(10)
+
+        third = client.post(f"{base}/v1/messages", json=_body(stream=False))
+        assert third.status_code == 200
+        assert third.json()["content"] == [{"type": "text", "text": "third"}]
+
+    assert len(inner.calls) == 2  # the 529'd request never reached the engine

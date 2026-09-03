@@ -477,6 +477,31 @@ def test_count_tokens(tmp_path: Path):
     )
 
 
+# --- turn admission (MAX_PENDING_TURNS) --------------------------------------------
+
+
+def test_a_full_queue_answers_529_with_an_anthropic_shaped_body(tmp_path: Path, monkeypatch):
+    """Drives the 529 path directly, both streaming and non-streaming:
+    pre-acquiring gateway._pending simulates a turn pool already at
+    MAX_PENDING_TURNS without needing real concurrency — that timing (an
+    immediate 529, then a released slot once the holding turn completes)
+    lives in test_gateway_http.py against a real server."""
+    import sous.gateway.routes as routes
+
+    monkeypatch.setattr(routes, "MAX_PENDING_TURNS", 1)
+    gateway, app = _gateway_app(tmp_path, FakeEngine([]))
+    assert gateway._pending.acquire(blocking=False)  # occupy the one slot this config allows
+    r = _post(app, _body(stream=False))
+    assert r.status_code == 529
+    assert r.json() == {
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": "too many turns queued"},
+    }
+    r = _post(app, _body(stream=True))
+    assert r.status_code == 529
+    assert r.json()["error"]["type"] == "overloaded_error"
+
+
 # --- logging discipline --------------------------------------------------------------------
 
 
