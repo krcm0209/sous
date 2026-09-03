@@ -563,6 +563,45 @@ def test_a_full_queue_answers_529_with_an_anthropic_shaped_body(tmp_path: Path, 
     assert r.json()["error"]["type"] == "overloaded_error"
 
 
+class _CountingEngine(FakeEngine):
+    """Tracks count_tokens calls the same way FakeEngine tracks generate."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.count_calls = 0
+
+    def count_tokens(self, messages, tools):
+        self.count_calls += 1
+        return super().count_tokens(messages, tools)
+
+
+def test_a_full_count_queue_answers_529_and_releases_its_slot(tmp_path: Path, monkeypatch):
+    """Mirrors test_a_full_queue_answers_529_with_an_anthropic_shaped_body for
+    count_tokens: pre-acquiring gateway._pending_counts simulates the counts
+    pool already at MAX_PENDING_COUNTS without needing real concurrency."""
+    import sous.gateway.routes as routes
+
+    monkeypatch.setattr(routes, "MAX_PENDING_COUNTS", 1)
+    inner = _CountingEngine([])
+    gateway, app = _gateway_app(tmp_path, inner)
+    assert gateway._pending_counts.acquire(blocking=False)  # occupy the one slot allowed
+    body = {"model": "sous-local", "messages": [{"role": "user", "content": "hi"}]}
+    r = _post(app, body, path="/v1/messages/count_tokens")
+    assert r.status_code == 529
+    assert r.json() == {
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": "too many token counts queued"},
+    }
+    assert inner.count_calls == 0  # the engine was never reached
+
+    gateway._pending_counts.release()  # the slot a real turn would have released
+    r = _post(app, body, path="/v1/messages/count_tokens")
+    assert r.status_code == 200
+    assert r.json() == {"input_tokens": inner.count_tokens([{"role": "user", "content": "hi"}], [])}
+    # a normal count releases its own slot, back to the configured cap
+    assert gateway._pending_counts._value == 1
+
+
 # --- logging discipline --------------------------------------------------------------------
 
 

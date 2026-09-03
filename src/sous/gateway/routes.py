@@ -66,6 +66,11 @@ PING_INTERVAL_SECONDS = 10
 # up. Counts turns running, queued on TurnRunner._lock, or draining after a
 # disconnect (see Gateway._stream) — not just requests in the executor queue.
 MAX_PENDING_TURNS = 8
+# Same failure mode as MAX_PENDING_TURNS, one pool over: count_tokens' executor
+# queue is unbounded too, and each queued count holds its parsed body (up to
+# 32 MiB) while the 2 _counts workers serialize on the tokenizer. Without this,
+# a burst of counts queues unboundedly instead of getting a timely 529.
+MAX_PENDING_COUNTS = 8
 
 # A ServerSentEvent carries its own separator (the response-level `sep` only
 # applies to dicts and strings), and its default is "\r\n"; every frame here
@@ -282,6 +287,7 @@ class Gateway:
         # Read here, not at class-definition time, so tests can monkeypatch
         # the module constant before building the app.
         self._pending = threading.BoundedSemaphore(MAX_PENDING_TURNS)
+        self._pending_counts = threading.BoundedSemaphore(MAX_PENDING_COUNTS)
 
     def close(self, timeout: float = 2.0) -> None:
         """Best-effort shutdown, called from the app's lifespan hook. Never
@@ -312,9 +318,23 @@ class Gateway:
             self._check_model(chat.model)
         except RequestError as e:
             return JSONResponse(e.body(), status_code=e.status)
+        # Same bounded-admission reasoning as messages()'s self._pending: a
+        # queued count still holds its parsed body while the 2 _counts
+        # workers serialize on the tokenizer, so bound it before any bytes
+        # are touched rather than let the executor queue grow unboundedly.
+        if not self._pending_counts.acquire(blocking=False):
+            _log(
+                f"POST /v1/messages/count_tokens model={chat.model} "
+                "status=529 error=overloaded_error"
+            )
+            return _error_response(529, "overloaded_error", "too many token counts queued")
         try:
-            count = await asyncio.get_running_loop().run_in_executor(
-                self._counts, self._runner.count_tokens, chat.messages, chat.tools
+            count = await self._submit(
+                self._counts,
+                self._pending_counts,
+                self._runner.count_tokens,
+                chat.messages,
+                chat.tools,
             )
         except Exception as e:  # noqa: BLE001 — every failure becomes an Anthropic error body
             return _error_response(*_classify(e))
@@ -386,7 +406,7 @@ class Gateway:
                 except Exception as e:  # noqa: BLE001 — relayed as an in-band error event
                     sink.put(("error", e))
 
-            self._submit(turn)
+            self._submit(self._turns, self._pending, turn)
             return EventSourceResponse(
                 self._stream(chat, assembler, queue, abandoned),
                 ping=PING_INTERVAL_SECONDS,
@@ -394,7 +414,13 @@ class Gateway:
                 sep=_SEP,
             )
         future = self._submit(
-            self._runner.run, chat.messages, chat.tools, chat.max_tokens, _NullSink()
+            self._turns,
+            self._pending,
+            self._runner.run,
+            chat.messages,
+            chat.tools,
+            chat.max_tokens,
+            _NullSink(),
         )
         try:
             result = await future
@@ -415,14 +441,14 @@ class Gateway:
         if model not in self._config.gateway_local_models:
             raise RequestError(404, "not_found_error", f"model: {model}")
 
-    def _submit(self, fn, *args) -> asyncio.Future:
-        """Submit a turn to the turn pool and tie the pending slot's release
-        to the concurrent.futures.Future's completion — the turn's REAL
-        completion — not to the asyncio wrapper run_in_executor hands back,
-        and not to anything further downstream (an awaited result, an SSE
-        body sse-starlette may never iterate). Assumes the caller already
-        holds the slot being released — acquire happens once in messages(),
-        before either branch calls this.
+    def _submit(self, executor, slots, fn, *args) -> asyncio.Future:
+        """Submit a job to `executor` and tie `slots`' release to the
+        concurrent.futures.Future's completion — the job's REAL completion —
+        not to the asyncio wrapper run_in_executor hands back, and not to
+        anything further downstream (an awaited result, an SSE body
+        sse-starlette may never iterate). Assumes the caller already holds
+        the slot being released — acquire happens once before this is
+        called, in messages() for a turn and in count_tokens() for a count.
 
         The asyncio wrapper is wrong to hang the callback off: asyncio.run_in_
         executor's future is `cf`-shaped only via asyncio.wrap_future, and if
@@ -451,14 +477,14 @@ class Gateway:
         threading.BoundedSemaphore.release is safe from either.
         """
         try:
-            cf = self._turns.submit(fn, *args)
+            cf = executor.submit(fn, *args)
         except Exception:
             # Submission itself failed (e.g. the pool refused new work): no
             # future exists to release the slot on completion, so release it
             # here instead of leaking it.
-            self._pending.release()
+            slots.release()
             raise
-        cf.add_done_callback(lambda _f: self._pending.release())
+        cf.add_done_callback(lambda _f: slots.release())
         return asyncio.wrap_future(cf)
 
     async def _stream(
