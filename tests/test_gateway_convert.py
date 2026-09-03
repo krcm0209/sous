@@ -117,13 +117,50 @@ def test_a_marker_with_trailing_space_or_crlf_still_strips():
     assert crlf.startswith("Rules.\r\n")
 
 
+def test_a_marker_only_text_strips_to_nothing_even_with_a_trailing_newline():
+    """MULTILINE `$` matches before the marker's own trailing newline rather
+    than consuming it, so a marker-only text still leaves that newline behind
+    once the marker itself is gone. Left in place it reads to `_user_turns`
+    as a truthy `"\\n"` message and manufactures the blank turn the
+    marker-only suppression exists to prevent."""
+    marker = "<total_tokens>123 tokens left</total_tokens>"
+    assert strip_volatile(marker + "\n") == ""
+    assert strip_volatile(marker + "\r\n") == ""
+    assert strip_volatile(marker + "  \n") == ""
+    assert strip_volatile(marker + "\n\n") == ""
+    # Real text after the marker's line is untouched — only a wholly
+    # whitespace residue collapses.
+    assert strip_volatile(marker + "\nHello") == "\nHello"
+
+
+def test_a_whitespace_only_text_with_no_marker_keeps_its_turn():
+    """The new whitespace-only collapse is reachable only through the marker
+    branch (the function early-returns when no marker is present at all), so
+    a message that is merely blank — never touched the marker path — must
+    come through unchanged."""
+    assert strip_volatile("   ") == "   "
+
+
 def test_marker_only_text_after_tool_results_adds_no_user_turn():
     """Claude Code emits the marker as an attachment after every tool-result
     batch (bare, or wrapped in a system-reminder). Stripped, nothing remains,
     and an empty user turn after the tool responses would tell the model the
-    user said nothing."""
+    user said nothing. A trailing newline (or CRLF, or trailing spaces before
+    one) is how Claude Code actually terminates the attachment, and MULTILINE
+    `$` matches before that newline rather than consuming it — it must not
+    survive as a lone-newline user turn either."""
     marker = "<total_tokens>123 tokens left</total_tokens>"
-    for trailer in (marker, f"<system-reminder>\n{marker}\n</system-reminder>"):
+    wrapped = f"<system-reminder>\n{marker}\n</system-reminder>"
+    trailers = (
+        marker,
+        wrapped,
+        marker + "\n",
+        marker + "\r\n",
+        marker + "  \n",
+        marker + "\n\n",
+        wrapped + "\n",
+    )
+    for trailer in trailers:
         messages = [
             {"role": "user", "content": "q"},
             {

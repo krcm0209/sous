@@ -83,7 +83,12 @@ class ChatRequest:
 def strip_volatile(text: str) -> str:
     if "<total_tokens>" not in text:
         return text
-    return _EMPTY_REMINDER_RE.sub("", _TOTAL_TOKENS_RE.sub("", text))
+    result = _EMPTY_REMINDER_RE.sub("", _TOTAL_TOKENS_RE.sub("", text))
+    # MULTILINE `$` matches before the marker's own trailing newline rather
+    # than consuming it, so a marker-only text still leaves that newline (or
+    # CRLF) behind; collapse a wholly-whitespace residue so `_user_turns`
+    # doesn't manufacture a blank turn from it.
+    return "" if not result.strip() else result
 
 
 def _text_parts(content: object, *, drop_billing: bool) -> list[str]:
