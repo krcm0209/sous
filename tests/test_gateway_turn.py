@@ -194,7 +194,14 @@ def test_turns_are_serialized(tmp_path: Path):
     a = threading.Thread(target=go, args=("a",))
     b = threading.Thread(target=go, args=("b",))
     a.start()
-    time.sleep(0.05)
+    # Wait for a handshake, not a fixed sleep: a has entered generation (and
+    # so holds the runner lock) once it shows up in generate_threads. A sleep
+    # here raced the scheduler — under delay, b could take the lock first and
+    # the ["a", "b"] assertion below would fail intermittently.
+    deadline = time.monotonic() + 5
+    while not inner.generate_threads and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert inner.generate_threads
     b.start()
     a.join(5)
     b.join(5)
