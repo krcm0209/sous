@@ -269,3 +269,155 @@ def test_xml_unterminated_parameter_raises():
 def test_tool_call_with_unrecognized_payload_raises():
     with pytest.raises(ParseError):
         parse_tool_calls("<tool_call>garbage</tool_call>")
+
+
+# --- request-scoped tool sets (gateway) ----------------------------------------
+
+from sous.protocol import WORKER_TOOLSET, ToolSet  # noqa: E402 — grouped with its tests
+
+CLIENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "Read",
+            "description": "Read a file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "offset": {"type": "number"},
+                    "limit": {"type": ["integer", "null"]},
+                    "mode": {"enum": ["a", "b"]},
+                },
+                "required": ["file_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "TodoWrite",
+            "description": "",
+            "parameters": {
+                "type": "object",
+                "properties": {"todos": {"type": "array", "items": {"type": "object"}}},
+                "required": ["todos"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "description": "",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "run_in_background": {"type": "boolean"},
+                    "meta": {"type": "object"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+]
+
+
+def test_default_toolset_is_the_strict_worker_set():
+    assert WORKER_TOOLSET.names == EXPECTED_TOOLS
+    assert WORKER_TOOLSET.strict is True
+    assert WORKER_TOOLSET.param_types["read_file"]["offset"] == "integer"
+    assert WORKER_TOOLSET.param_types["list_dir"] == {"path": "string"}
+
+
+def test_request_scoped_toolset_accepts_client_tool_names():
+    ts = ToolSet.from_tools(CLIENT_TOOLS, strict=False)
+    text = '<tool_call>{"name": "Read", "arguments": {"file_path": "a.py"}}</tool_call>'
+    assert parse_tool_calls(text, ts) == [ToolCall("Read", {"file_path": "a.py"})]
+
+
+def test_strict_request_scoped_toolset_rejects_worker_names():
+    ts = ToolSet.from_tools(CLIENT_TOOLS, strict=True)
+    with pytest.raises(ParseError, match="unknown tool"):
+        parse_tool_calls('<tool_call>{"name": "read_file", "arguments": {}}</tool_call>', ts)
+
+
+def test_non_strict_toolset_passes_unknown_names_through_untyped():
+    """Claude Code answers a hallucinated tool with its own tool-not-found
+    result, which the model can recover from; ending the turn here could not
+    be undone. With no schema to coerce against, every value stays a string."""
+    ts = ToolSet.from_tools(CLIENT_TOOLS, strict=False)
+    text = (
+        "<tool_call>\n<function=Imaginary>\n<parameter=count>\n5\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    assert parse_tool_calls(text, ts) == [ToolCall("Imaginary", {"count": "5"})]
+
+
+def test_xml_number_union_and_untyped_parameters_coerce_from_the_client_schema():
+    ts = ToolSet.from_tools(CLIENT_TOOLS, strict=False)
+    text = (
+        "<tool_call>\n<function=Read>\n"
+        "<parameter=file_path>\na.py\n</parameter>\n"
+        "<parameter=offset>\n10\n</parameter>\n"
+        "<parameter=limit>\n20\n</parameter>\n"
+        "<parameter=mode>\na\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    [call] = parse_tool_calls(text, ts)
+    assert call.arguments == {"file_path": "a.py", "offset": 10.0, "limit": 20, "mode": "a"}
+    assert isinstance(call.arguments["limit"], int)
+
+
+def test_xml_array_and_object_parameters_parse_as_json():
+    ts = ToolSet.from_tools(CLIENT_TOOLS, strict=False)
+    text = (
+        "<tool_call>\n<function=TodoWrite>\n"
+        '<parameter=todos>\n[{"content": "x", "status": "pending"}]\n</parameter>\n'
+        "</function>\n</tool_call>\n"
+        "<tool_call>\n<function=Bash>\n"
+        "<parameter=command>\nls\n</parameter>\n"
+        '<parameter=meta>\n{"a": [1, 2]}\n</parameter>\n'
+        "<parameter=run_in_background>\ntrue\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    calls = parse_tool_calls(text, ts)
+    assert calls[0].arguments == {"todos": [{"content": "x", "status": "pending"}]}
+    assert calls[1].arguments == {"command": "ls", "meta": {"a": [1, 2]}, "run_in_background": True}
+
+
+def test_xml_malformed_array_parameter_raises():
+    ts = ToolSet.from_tools(CLIENT_TOOLS, strict=False)
+    text = (
+        "<tool_call>\n<function=TodoWrite>\n<parameter=todos>\nnot json\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    with pytest.raises(ParseError, match="todos"):
+        parse_tool_calls(text, ts)
+
+
+def test_xml_wrong_json_shape_for_array_parameter_raises():
+    ts = ToolSet.from_tools(CLIENT_TOOLS, strict=False)
+    text = (
+        '<tool_call>\n<function=TodoWrite>\n<parameter=todos>\n{"not": "a list"}\n'
+        "</parameter>\n</function>\n</tool_call>"
+    )
+    with pytest.raises(ParseError, match="array"):
+        parse_tool_calls(text, ts)
+
+
+def test_json_call_with_non_string_name_raises():
+    with pytest.raises(ParseError):
+        parse_tool_calls('<tool_call>{"name": 5, "arguments": {}}</tool_call>')
+
+
+def test_toolset_tolerates_tools_without_properties():
+    ts = ToolSet.from_tools(
+        [{"type": "function", "function": {"name": "Ping", "parameters": {"type": "object"}}}],
+        strict=True,
+    )
+    assert ts.param_types == {"Ping": {}}
+    assert parse_tool_calls("<tool_call>\n<function=Ping>\n</function>\n</tool_call>", ts) == [
+        ToolCall("Ping", {})
+    ]
