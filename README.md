@@ -243,7 +243,7 @@ min_tokens = 8192  # auto: never shrink the window below this
 retention = 200
 
 [gateway]
-# EXPERIMENTAL — see "Gateway mode" below. Serve Claude Code from the local
+# EXPERIMENTAL — see "Gateway mode" above. Serve Claude Code from the local
 # model over an Anthropic-compatible /v1/messages on the same port.
 enabled = false
 local_models = ["sous-local"]   # model ids served locally; anything else is a 404 for now.
@@ -425,8 +425,9 @@ that Qwen3 emits and the hermes JSON format used by other MLX models.
   prompt cache, drops Anthropic server-side and built-in tool types (the ones
   that carry no client-supplied schema), ignores request-level sampling and
   thinking, and finishes a turn even after the client hangs up.
-  It serves *every* request that reaches it locally; routing frontier models
-  upstream (the hybrid in issue #41) is not built yet.
+  It serves the model ids in `[gateway].local_models` locally and answers
+  every other id with `404 not_found_error`; routing those upstream (the
+  hybrid in issue #41) is not built yet.
 
 ## Development
 
