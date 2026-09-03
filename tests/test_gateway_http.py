@@ -3,6 +3,7 @@ model is silent, and a client that hangs up mid-stream. httpx's in-process
 transport buffers whole responses, so these run uvicorn on a loopback port in
 a thread — same stack as the daemon, no subprocess."""
 
+import concurrent.futures
 import contextlib
 import json
 import socket
@@ -14,9 +15,11 @@ from pathlib import Path
 import httpx
 import pytest
 import uvicorn
+from mcp.server import MCPServer
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
+from sous.gateway.routes import Gateway, mount_gateway
 from sous.server import GRACEFUL_SHUTDOWN_SECONDS, create_server, uvicorn_config
 from sous.tasks import TaskStore
 from tests.fake_engine import ChunkedFakeEngine
@@ -36,6 +39,18 @@ def _app(tmp_path: Path, engine):
     )
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
     return create_server(TaskStore(tmp_path / "tasks.db"), engines, cfg).streamable_http_app()
+
+
+def _gateway_app(tmp_path: Path, engine) -> tuple[Gateway, object]:
+    """Like _app, but hands back the Gateway too — create_server drops
+    mount_gateway's return value, and reaching gateway._turns needs it."""
+    cfg = SousConfig(
+        data_dir=tmp_path / "data", config_path=tmp_path / "config.toml", gateway_enabled=True
+    )
+    engines = EngineManager(cfg, engine_factory=lambda mid: engine)
+    mcp = MCPServer("test")
+    gateway = mount_gateway(mcp, engines, cfg)
+    return gateway, mcp.streamable_http_app()
 
 
 @contextlib.contextmanager
@@ -215,3 +230,29 @@ def test_shutdown_is_bounded_while_a_non_streaming_turn_runs(tmp_path: Path):
     # what matters is that the client is not left holding a completed turn.
     assert outcome and outcome[0] != 200, outcome
     client.close()
+
+
+def test_count_tokens_is_not_blocked_by_a_saturated_turn_pool(tmp_path: Path):
+    """count_tokens never takes TurnRunner._lock, so it must not queue behind
+    a turn parked in the turns pool waiting on that lock — that separation is
+    exactly what count_tokens's own dedicated pool buys. Shrinking _turns to
+    one worker and filling it with a slow generation makes the failure mode
+    reproducible: put count_tokens back on _turns and this times out instead
+    of returning quickly."""
+    inner = ChunkedFakeEngine(["a slow reply"], delay=3.0)  # one piece, ~3s generation
+    gateway, app = _gateway_app(tmp_path, inner)
+    gateway._turns = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    count_body = {"model": "sous-local", "messages": [{"role": "user", "content": "hi"}]}
+    with (
+        _serve(app) as (base, _server, _thread),
+        httpx.Client(timeout=30) as client,
+    ):
+        with client.stream("POST", f"{base}/v1/messages", json=_body()) as r:
+            assert r.status_code == 200
+            _wait_for_generation(inner)  # the pool's one worker is now busy generating
+            t0 = time.monotonic()
+            count = client.post(f"{base}/v1/messages/count_tokens", json=count_body)
+            elapsed = time.monotonic() - t0
+        assert count.status_code == 200, count.text
+        assert elapsed < 2.0, f"count_tokens waited {elapsed:.1f}s behind the saturated turn pool"
+    assert inner.finished.wait(10)

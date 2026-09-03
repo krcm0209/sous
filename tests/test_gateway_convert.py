@@ -98,6 +98,16 @@ def test_total_tokens_markers_are_stripped_from_system_and_user_text():
     assert out == [{"role": "system", "content": "Sys."}, {"role": "user", "content": "Hi."}]
 
 
+def test_an_inline_marker_mention_survives_but_an_own_line_marker_still_strips():
+    """The regex is line-anchored: Claude Code always emits the real marker on
+    a line of its own, so anchoring keeps every real shape stripped while
+    leaving a user's inline mention of the marker text (e.g. asking what it
+    means) alone."""
+    inline = "please explain what <total_tokens>5 tokens left</total_tokens> means here"
+    assert strip_volatile(inline) == inline
+    assert strip_volatile("A\n\n<total_tokens>9 tokens left</total_tokens>\n\nB") == "A\n\nB"
+
+
 def test_marker_only_text_after_tool_results_adds_no_user_turn():
     """Claude Code emits the marker as an attachment after every tool-result
     batch (bare, or wrapped in a system-reminder). Stripped, nothing remains,
@@ -198,9 +208,34 @@ def test_tool_results_become_tool_messages_in_order_with_text_flushed_first():
     assert out[2:] == [
         {"role": "user", "content": "note before"},
         {"role": "tool", "content": "A"},
-        {"role": "tool", "content": "B1\nB2"},
+        {"role": "tool", "content": "[tool error]\nB1\nB2"},
         {"role": "user", "content": "note after"},
     ]
+
+
+def test_is_error_absent_or_false_produces_no_marker():
+    """Only `is_error` exactly `True` marks a failure; a successful result (the
+    field absent, or explicitly False) renders unmarked."""
+    for is_error in (None, False):
+        content: dict = {"type": "tool_result", "tool_use_id": "t1", "content": "A"}
+        if is_error is not None:
+            content["is_error"] = is_error
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "user", "content": [content]},
+        ]
+        assert chat_messages(None, messages)[-1] == {"role": "tool", "content": "A"}
+
+
+def test_is_error_with_empty_text_is_the_marker_alone():
+    messages = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": True}],
+        },
+    ]
+    assert chat_messages(None, messages)[-1] == {"role": "tool", "content": "[tool error]"}
 
 
 def test_images_and_documents_become_placeholders_and_unknown_blocks_are_skipped():

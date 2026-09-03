@@ -31,9 +31,15 @@ _BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 
 # Claude Code appends a freshly decremented copy of this marker on every
 # request and keeps the stale ones (oMLX measured full ~60k-token re-prefills
-# per turn until it was stripped). Nothing downstream reads it. The regex is
-# oMLX's, verbatim: it eats up to two preceding newlines with the marker.
-_TOTAL_TOKENS_RE = re.compile(r"\n{0,2}<total_tokens>\d+ tokens left</total_tokens>")
+# per turn until it was stripped). Nothing downstream reads it. The core
+# pattern is oMLX's, verbatim; the MULTILINE line-anchoring (^...$) is ours —
+# Claude Code always emits the marker on a line of its own (a standalone
+# system-prompt line, a marker-only text block after tool results, or its own
+# line inside a <system-reminder>), so anchoring keeps the prefix-stability
+# benefit for every real shape while leaving a user's inline mention of the
+# marker text alone. It still eats up to two preceding newlines with the
+# marker.
+_TOTAL_TOKENS_RE = re.compile(r"(?m)\n{0,2}^<total_tokens>\d+ tokens left</total_tokens>$")
 # One of Claude Code's assembly paths wraps that marker in a system-reminder;
 # stripping the marker leaves the hollow shell, which goes too.
 _EMPTY_REMINDER_RE = re.compile(r"\n{0,2}<system-reminder>\s*</system-reminder>")
@@ -166,7 +172,14 @@ def _user_turns(content: object) -> list[dict]:
             # before a result must be its own turn to keep the sequence.
             recognized = True
             flush()
-            out.append({"role": "tool", "content": _tool_result_text(block.get("content"))})
+            text = _tool_result_text(block.get("content"))
+            if block.get("is_error") is True:
+                # Without this, a failed and a successful tool execution render
+                # identically to the local model; exactly `True` per the
+                # Anthropic field (anything else, including absent, is not an
+                # error).
+                text = f"[tool error]\n{text}" if text else "[tool error]"
+            out.append({"role": "tool", "content": text})
         elif kind in ("image", "document"):
             recognized = True
             texts.append(_OMITTED.format(kind=kind))

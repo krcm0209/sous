@@ -195,6 +195,13 @@ class Gateway:
         # test drives it, it is: the pool is what lets that test observe the
         # graceful bound instead of the drain.
         self._turns = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="sous-gateway-turn")
+        # count_tokens never takes TurnRunner._lock, so it must never queue
+        # behind a turn parked waiting on that lock inside a saturated _turns
+        # pool. A dedicated pool also keeps it off asyncio's default executor
+        # — a count can load the model, seconds of work on a large prompt.
+        self._counts = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="sous-gateway-count"
+        )
 
     async def hello(self, request: Request) -> Response:
         # Claude Code probes HEAD /api/hello at startup (gate 1, O3).
@@ -213,7 +220,7 @@ class Gateway:
             return JSONResponse(e.body(), status_code=e.status)
         try:
             count = await asyncio.get_running_loop().run_in_executor(
-                self._turns, self._runner.count_tokens, chat.messages, chat.tools
+                self._counts, self._runner.count_tokens, chat.messages, chat.tools
             )
         except Exception as e:  # noqa: BLE001 — every failure becomes an Anthropic error body
             return _error_response(*_classify(e))
