@@ -328,6 +328,20 @@ def test_non_streaming_message_equals_the_streamed_one(split):
     assert b.message()["content"][0] == {"type": "text", "text": "Let me look."}
 
 
+def test_many_small_deltas_assemble_without_duplication():
+    """Regression for O(n^2) string concatenation while streaming (feed,
+    _emit_text and the splitter's tail all used to grow one immutable string
+    per delta). Thousands of tiny deltas must still assemble to exactly their
+    concatenation, and `finish` seeing that same full text must emit no
+    duplicate text — chunks joined once, not copied on every delta."""
+    pieces = ["x" * 50] * 2000
+    expected = "".join(pieces)
+    a, events = _stream(pieces)
+    assert a.message()["content"] == [{"type": "text", "text": expected}]
+    streamed = "".join(e["delta"]["text"] for e in events if e["type"] == "content_block_delta")
+    assert streamed == expected
+
+
 def test_message_shape():
     a, _ = _stream(["ok"])
     m = a.message()

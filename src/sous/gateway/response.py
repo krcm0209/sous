@@ -56,11 +56,14 @@ class TextSplitter:
     def __init__(self) -> None:
         self._pending = ""
         self._started = False
-        self._tail = ""  # from the first <tool_call> on; feed() never emits it
+        # From the first <tool_call> on; feed() never emits it. Chunks, not
+        # one string grown by `+=` on every delta — the tail is only ever
+        # read whole, in finish().
+        self._tail: list[str] = []
 
     def feed(self, text: str) -> str:
         if self._tail:
-            self._tail += text
+            self._tail.append(text)
             return ""
         self._pending += text
         if not self._started:
@@ -71,7 +74,7 @@ class TextSplitter:
             # if the call turns out unparseable, the raw text is returned
             # verbatim, blank lines included.
             out = self._pending[:idx].rstrip()
-            self._tail = self._pending[len(out) :]
+            self._tail = [self._pending[len(out) :]]
             self._pending = ""
         else:
             tag = _tag_prefix_len(self._pending)
@@ -84,8 +87,9 @@ class TextSplitter:
 
     def finish(self) -> str:
         """Everything not yet emitted: held text plus the raw tool-call tail."""
-        out = self._pending + self._tail
-        self._pending = self._tail = ""
+        out = self._pending + "".join(self._tail)
+        self._pending = ""
+        self._tail = []
         return out if self._started else out.lstrip()
 
 
@@ -109,9 +113,15 @@ class TurnAssembler:
         self.stop_reason = "end_turn"
         self._toolset = toolset
         self._splitter = TextSplitter()
-        self._fed = ""
+        self._fed_len = 0  # cumulative length of delta text fed; never the text itself
         self._blocks: list[dict] = []
         self._text_index: int | None = None
+        # Chunks of the one text block's content, joined once when read
+        # (message()) rather than grown by `+=` on every delta. The slot
+        # persists past _close_text (which clears _text_index) so message()
+        # can still find it.
+        self._text_chunks: list[str] = []
+        self._text_block_index: int | None = None
 
     def start(self, input_tokens: int) -> list[dict]:
         self.input_tokens = input_tokens
@@ -132,7 +142,7 @@ class TurnAssembler:
         ]
 
     def feed(self, delta: Delta) -> list[dict]:
-        self._fed += delta.text
+        self._fed_len += len(delta.text)
         self.output_tokens = max(self.output_tokens, delta.output_tokens)
         return self._emit_text(self._splitter.feed(delta.text))
 
@@ -141,9 +151,9 @@ class TurnAssembler:
         deltas did not carry (all of it, on the non-streaming path) is fed
         first so both paths see identical text."""
         events: list[dict] = []
-        if len(text) > len(self._fed):
-            events += self._emit_text(self._splitter.feed(text[len(self._fed) :]))
-            self._fed = text
+        if len(text) > self._fed_len:
+            events += self._emit_text(self._splitter.feed(text[self._fed_len :]))
+            self._fed_len = len(text)
         self.output_tokens = max(self.output_tokens, output_tokens)
         remainder = self._splitter.finish()
         calls: list[ToolCall] | None
@@ -205,6 +215,7 @@ class TurnAssembler:
         return events
 
     def message(self) -> dict:
+        self._materialize_text()
         return {
             "id": self.message_id,
             "type": "message",
@@ -224,7 +235,7 @@ class TurnAssembler:
             return []
         events: list[dict] = []
         if self._text_index is None:
-            self._text_index = len(self._blocks)
+            self._text_index = self._text_block_index = len(self._blocks)
             self._blocks.append({"type": "text", "text": ""})
             events.append(
                 {
@@ -233,7 +244,7 @@ class TurnAssembler:
                     "content_block": {"type": "text", "text": ""},
                 }
             )
-        self._blocks[self._text_index]["text"] += text
+        self._text_chunks.append(text)
         events.append(
             {
                 "type": "content_block_delta",
@@ -248,3 +259,9 @@ class TurnAssembler:
             return []
         index, self._text_index = self._text_index, None
         return [{"type": "content_block_stop", "index": index}]
+
+    def _materialize_text(self) -> None:
+        """Join the text block's chunks once, on read, instead of growing one
+        string by `+=` on every delta (O(n^2) copying on the event loop)."""
+        if self._text_block_index is not None:
+            self._blocks[self._text_block_index]["text"] = "".join(self._text_chunks)
