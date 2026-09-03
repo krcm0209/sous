@@ -151,7 +151,13 @@ def _depth_exceeds(value: object, limit: int) -> bool:
 
 async def _read_json(request: Request) -> object:
     declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
+    # isdecimal, not isdigit: "²" is a digit to str but not to int(), and a
+    # 5000-digit value trips int()'s digit limit — either would be a bare
+    # ValueError here, outside the shaped-error handling. Anything longer
+    # than the cap's own digit count is oversized without converting it.
+    if declared.isdecimal() and (
+        len(declared) > len(str(MAX_REQUEST_BYTES)) or int(declared) > MAX_REQUEST_BYTES
+    ):
         raise RequestError(
             413, "request_too_large", f"request body exceeds {MAX_REQUEST_BYTES} bytes"
         )

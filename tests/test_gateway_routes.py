@@ -277,6 +277,47 @@ def test_malformed_tool_properties_is_a_400_and_never_reaches_the_engine(tmp_pat
     assert inner.calls == []
 
 
+def test_unconvertible_content_length_values_never_raise(tmp_path: Path):
+    """int() rejects a decimal string past its digit limit, and "²" is a
+    digit to str.isdigit but not to int(); either used to escape the header
+    check as a bare ValueError before the shaped-error handling."""
+    inner = FakeEngine(["ok"])
+    gateway, app = _gateway_app(tmp_path, inner)
+    r = _post(app, _body(), headers={"content-length": "9" * 5000})
+    assert r.status_code == 413 and r.json()["error"]["type"] == "request_too_large"
+
+    # "²" cannot go through httpx (non-ASCII header), so hand-build the ASGI
+    # request the way Starlette would deliver it (latin-1 header bytes).
+    body = json.dumps(_body()).encode()
+
+    async def go():
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/messages",
+            "headers": [
+                (b"host", b"127.0.0.1:8383"),
+                (b"content-type", b"application/json"),
+                (b"content-length", "²".encode("latin-1")),
+            ],
+            "query_string": b"",
+        }
+        return await gateway.messages(Request(scope, receive))
+
+    response = asyncio.run(go())
+    assert response.status_code == 200  # the header is ignored, not a 500
+    assert len(inner.calls) == 1
+
+
 def test_oversized_bodies_are_413_by_header_and_by_actual_size(tmp_path: Path, monkeypatch):
     import sous.gateway.routes as routes
 
