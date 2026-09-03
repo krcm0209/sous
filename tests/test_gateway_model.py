@@ -4,15 +4,16 @@ the prompt cache through the gateway-owned session."""
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import httpx
 import pytest
+from mcp.server import MCPServer
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
-from sous.server import create_server
-from sous.tasks import TaskStore
+from sous.gateway.routes import mount_gateway
 
 pytestmark = pytest.mark.model
 
@@ -51,7 +52,14 @@ def test_real_model_streams_a_well_formed_turn_and_reuses_the_cache(tmp_path: Pa
         data_dir=tmp_path / "data", config_path=tmp_path / "config.toml", gateway_enabled=True
     )
     engines = EngineManager(cfg, engine_factory=lambda mid: LMEngine(TINY, prompt_cache=True))
-    app = create_server(TaskStore(tmp_path / "tasks.db"), engines, cfg).streamable_http_app()
+    # Same construction as tests/test_gateway_routes.py::_gateway_app: it hands
+    # back the mounted Gateway so its real MLX GenerationSession can be closed
+    # below. ASGITransport drives no lifespan, so create_server(...).app()
+    # alone never runs Gateway.close() — the session's thread would stay
+    # parked and never reach release_mlx_thread_state() (see CLAUDE.md).
+    mcp = MCPServer("test")
+    gateway = mount_gateway(mcp, engines, cfg)
+    app = mcp.streamable_http_app()
     tool = {
         "name": "echo",
         "description": "Echo a word back",
@@ -64,39 +72,45 @@ def test_real_model_streams_a_well_formed_turn_and_reuses_the_cache(tmp_path: Pa
         "tools": [tool],
         "messages": [{"role": "user", "content": "Say the word banana and nothing else."}],
     }
-    r = _post(app, first)
-    assert r.status_code == 200
-    events = _events(r.text)
-    kinds = [e for e, _ in events]
-    assert kinds[0] == "ping" and kinds[1] == "message_start"
-    assert [k for k in kinds if k != "ping"][-1] == "message_stop"  # a late ping may trail it
-    start = events[1][1]["message"]
-    assert start["usage"]["input_tokens"] > 0
-    delta = next(d for e, d in events if e == "message_delta")
-    assert delta["usage"]["output_tokens"] > 0
-    assert delta["delta"]["stop_reason"] in ("end_turn", "max_tokens", "tool_use")
-    indices = [d["index"] for e, d in events if e == "content_block_start"]
-    assert indices == list(range(len(indices)))
+    try:
+        r = _post(app, first)
+        assert r.status_code == 200
+        events = _events(r.text)
+        kinds = [e for e, _ in events]
+        assert kinds[0] == "ping" and kinds[1] == "message_start"
+        assert [k for k in kinds if k != "ping"][-1] == "message_stop"  # a late ping may trail
+        start = events[1][1]["message"]
+        assert start["usage"]["input_tokens"] > 0
+        delta = next(d for e, d in events if e == "message_delta")
+        assert delta["usage"]["output_tokens"] > 0
+        assert delta["delta"]["stop_reason"] in ("end_turn", "max_tokens", "tool_use")
+        indices = [d["index"] for e, d in events if e == "content_block_start"]
+        assert indices == list(range(len(indices)))
 
-    # Turn 2 extends turn 1's conversation: the gateway's long-lived session
-    # keeps the KV cache, so this must be a prefix-cache hit.
-    reply_text = "".join(
-        d["delta"]["text"]
-        for e, d in events
-        if e == "content_block_delta" and d["delta"]["type"] == "text_delta"
-    )
-    second = {
-        **first,
-        "stream": False,
-        "messages": first["messages"]
-        + [
-            {"role": "assistant", "content": reply_text or "banana"},
-            {"role": "user", "content": "Now say kiwi and nothing else."},
-        ],
-    }
-    r2 = _post(app, second)
-    assert r2.status_code == 200
-    assert r2.json()["usage"]["input_tokens"] > start["usage"]["input_tokens"]
-    stats = engines.get().prompt_cache_stats()
-    assert stats["hits"] >= 1, stats
+        # Turn 2 extends turn 1's conversation: the gateway's long-lived
+        # session keeps the KV cache, so this must be a prefix-cache hit.
+        reply_text = "".join(
+            d["delta"]["text"]
+            for e, d in events
+            if e == "content_block_delta" and d["delta"]["type"] == "text_delta"
+        )
+        second = {
+            **first,
+            "stream": False,
+            "messages": first["messages"]
+            + [
+                {"role": "assistant", "content": reply_text or "banana"},
+                {"role": "user", "content": "Now say kiwi and nothing else."},
+            ],
+        }
+        r2 = _post(app, second)
+        assert r2.status_code == 200
+        assert r2.json()["usage"]["input_tokens"] > start["usage"]["input_tokens"]
+        stats = engines.get().prompt_cache_stats()
+        assert stats["hits"] >= 1, stats
+    finally:
+        t0 = time.monotonic()
+        gateway.close()
+        assert time.monotonic() - t0 < 2.5  # bounded: no turn is in flight here
+        assert gateway._runner._session is None
     engines.get().unload()
