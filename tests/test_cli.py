@@ -581,6 +581,20 @@ def test_claude_argv_appends_the_lsp_opt_out_unless_the_user_chose_their_own():
         ["--disallowed-tools=Foo"],
     ):
         assert claude_argv(["-p", "x", *own]) == ["-p", "x", *own]
+    # After a `--` the same text is a prompt, not an option Claude Code will
+    # parse, so it cannot be the user choosing their own opt-out.
+    assert claude_argv(["--", "--disallowedTools"]) == [
+        "--disallowedTools",
+        "LSP",
+        "--",
+        "--disallowedTools",
+    ]
+    assert claude_argv(["--disallowedTools", "X", "--", "y"]) == [
+        "--disallowedTools",
+        "X",
+        "--",
+        "y",
+    ]
 
 
 def test_claude_env_sets_the_gateway_variables_and_nothing_credential_shaped(tmp_path):

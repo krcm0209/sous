@@ -40,14 +40,14 @@ def claude_argv(user_args: list[str]) -> list[str]:
     the conversation) unless they chose their own. Appended, never prepended:
     the option is variadic, so ahead of a positional prompt it would swallow
     the prompt as a tool name. Ahead of a `--`, which ends Claude Code's
-    option parsing, if there is one."""
-    for arg in user_args:
+    option parsing, if there is one — and only the arguments before that `--`
+    can be the user's own choice, since anything after it is literal text
+    (`sous claude -- --disallowedTools` asks for that prompt, not that flag)."""
+    end = user_args.index("--") if "--" in user_args else len(user_args)
+    for arg in user_args[:end]:
         if arg in _DISALLOWED_FLAGS or arg.startswith(tuple(f"{f}=" for f in _DISALLOWED_FLAGS)):
             return list(user_args)
-    if "--" in user_args:
-        end = user_args.index("--")
-        return [*user_args[:end], *_LSP_OFF, *user_args[end:]]
-    return [*user_args, *_LSP_OFF]
+    return [*user_args[:end], *_LSP_OFF, *user_args[end:]]
 
 
 def claude_env(config: SousConfig, base: Mapping[str, str]) -> dict[str, str]:
