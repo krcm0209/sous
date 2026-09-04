@@ -138,6 +138,29 @@ async def _wait_for_disconnect(request: Request, uploaded: asyncio.Event) -> Non
             return
 
 
+async def _settle(
+    send: asyncio.Future[httpx.Response], watch: asyncio.Future[None]
+) -> httpx.Response | None:
+    """The outcome of the send-vs-disconnect race: the upstream's response, or
+    None once the client is gone.
+
+    Decided on the watcher rather than on the send, because
+    `asyncio.wait(FIRST_COMPLETED)` reports every task that finished in the
+    same turn — and when both did, the disconnect is the fact that matters.
+    The watcher has consumed the one `http.disconnect` the ASGI channel will
+    ever deliver, so nothing downstream could learn the client left: a
+    StreamingResponse built on a response that arrived in that same turn would
+    never be cancelled, and its upstream would go on generating. Close it here
+    instead. A send that failed loses to the disconnect for the same reason —
+    the client is not there to be told.
+    """
+    if watch.done() and not watch.cancelled():
+        if send.done() and not send.cancelled() and send.exception() is None:
+            await send.result().aclose()
+        return None
+    return send.result()
+
+
 async def _relay(response: httpx.Response) -> AsyncIterator[bytes]:
     try:
         async for chunk in response.aiter_raw():
@@ -227,12 +250,13 @@ class Upstream:
             send = asyncio.ensure_future(self._client.send(upstream_request, stream=True))
             watch = asyncio.ensure_future(_wait_for_disconnect(request, uploaded))
             try:
-                done, _ = await asyncio.wait({send, watch}, return_when=asyncio.FIRST_COMPLETED)
-                if send not in done:
+                await asyncio.wait({send, watch}, return_when=asyncio.FIRST_COMPLETED)
+                settled = await _settle(send, watch)
+                if settled is None:
                     # Nobody reads this; it keeps the daemon's own log line
                     # honest about how the request ended.
                     return _error(499, "client disconnected before the upstream answered")
-                response = send.result()
+                response = settled
             finally:
                 # The watcher must be gone before the StreamingResponse below
                 # is returned: Starlette's own listen_for_disconnect takes over

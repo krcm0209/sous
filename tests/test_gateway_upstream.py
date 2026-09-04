@@ -15,7 +15,14 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
-from sous.gateway.upstream import TIMEOUT, VIA, Upstream, request_headers, response_headers
+from sous.gateway.upstream import (
+    TIMEOUT,
+    VIA,
+    Upstream,
+    _settle,
+    request_headers,
+    response_headers,
+)
 from tests.fake_upstream import METHODS, FakeUpstream
 
 
@@ -452,3 +459,56 @@ def test_aclose_closes_the_client():
     upstream = FakeUpstream().upstream()
     asyncio.run(upstream.aclose())
     assert upstream._client.is_closed
+
+
+def test_a_disconnect_that_lands_with_the_upstreams_headers_still_wins():
+    """asyncio.wait(FIRST_COMPLETED) reports every task that finished in the
+    same turn. When both did, the disconnect is the fact that matters: the
+    watcher has already consumed the one http.disconnect the ASGI channel will
+    deliver, so a StreamingResponse returned here could never learn the client
+    left and its upstream stream would keep generating. Driven through _settle
+    with already-completed futures because a real race is not reproducible."""
+
+    class Closes(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def __aiter__(self):
+            yield b""
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    async def go():
+        loop = asyncio.get_running_loop()
+
+        # Both done: the disconnect wins and the arrived response is closed,
+        # so the upstream stops generating instead of streaming into nothing.
+        stream = Closes()
+        send = loop.create_future()
+        send.set_result(httpx.Response(200, stream=stream))
+        watch = loop.create_future()
+        watch.set_result(None)
+        assert await _settle(send, watch) is None
+        assert stream.closed
+
+        # The client is gone, so its 499 wins over whatever the send failed with.
+        send = loop.create_future()
+        send.set_exception(httpx.ConnectError("secret-detail"))
+        watch = loop.create_future()
+        watch.set_result(None)
+        assert await _settle(send, watch) is None
+
+        # Only the send finished: the response is handed back open, to relay.
+        stream = Closes()
+        response = httpx.Response(200, stream=stream)
+        send = loop.create_future()
+        send.set_result(response)
+        watch = loop.create_future()
+        try:
+            assert await _settle(send, watch) is response
+            assert not stream.closed
+        finally:
+            watch.cancel()
+
+    asyncio.run(go())
