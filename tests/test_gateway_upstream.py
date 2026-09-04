@@ -190,6 +190,41 @@ def test_bodiless_requests_send_no_body_framing():
         assert "transfer-encoding" not in names and "content-length" not in names, seen
 
 
+def test_upstream_cookies_are_never_stored_or_replayed():
+    """httpx's client keeps a cookie jar: left alone, it eats every upstream
+    Set-Cookie (Cloudflare's __cf_bm on any Anthropic response) and adds a
+    Cookie header to the NEXT forwarded request — one the client never sent,
+    and shared across every local client the daemon serves."""
+    fake = FakeUpstream()
+    fake.reply = Response(
+        b'{"upstream": true}',
+        media_type="application/json",
+        headers={"set-cookie": "__cf_bm=abc; Path=/"},
+    )
+    upstream = fake.upstream()
+    app = _proxy_app(upstream, buffered=True)
+    first = _send(app, "POST", "/v1/messages", content=b"{}")
+    second = _send(app, "POST", "/v1/messages", content=b"{}")
+    names = [n for n, _ in fake.requests[1]["headers"]]
+    assert "cookie" not in names, fake.requests[1]["headers"]
+    # The relay itself is untouched: the client still sees what the upstream set.
+    assert first.headers["set-cookie"] == "__cf_bm=abc; Path=/"
+    assert second.headers["set-cookie"] == "__cf_bm=abc; Path=/"
+    asyncio.run(upstream.aclose())
+
+
+def test_a_clients_own_cookie_header_passes_through():
+    """Refusing to store cookies must not stop forwarding one: a Cookie the
+    client sent is an ordinary end-to-end header."""
+    fake = FakeUpstream()
+    upstream = fake.upstream()
+    app = _proxy_app(upstream, buffered=True)
+    _send(app, "POST", "/v1/messages", headers=[("cookie", "mine=1")], content=b"{}")
+    (seen,) = fake.requests
+    assert ("cookie", "mine=1") in seen["headers"]
+    asyncio.run(upstream.aclose())
+
+
 # --- response fidelity --------------------------------------------------------------
 
 

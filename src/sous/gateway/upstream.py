@@ -11,6 +11,7 @@ environment — trust_env is off).
 
 from __future__ import annotations
 
+import http.cookiejar
 from collections.abc import AsyncIterator
 from urllib.parse import quote
 
@@ -148,6 +149,14 @@ class Upstream:
             # overrides this per request.
             headers={"accept-encoding": "identity"},
         )
+        # httpx has no "no cookies" switch: its jar stores every upstream
+        # Set-Cookie (Cloudflare sets __cf_bm on Anthropic responses) and adds
+        # a Cookie header to later requests — one the client never sent, and
+        # shared by every local client this one daemon serves. An empty
+        # allowed_domains policy is the documented way to make a jar refuse
+        # everything; a Cookie the client did send still crosses as the
+        # ordinary end-to-end header it is.
+        self._client.cookies.jar.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
 
     @property
     def host(self) -> str:
