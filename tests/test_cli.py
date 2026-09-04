@@ -635,6 +635,7 @@ def test_claude_env_sets_the_gateway_variables_and_nothing_credential_shaped():
     )
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9999"
     assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "sous-fast"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] == "1"
     assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
     assert env["API_TIMEOUT_MS"] == "3000000"
     assert env["PATH"] == "/usr/bin" and env["HOME"] == "/Users/x"
@@ -661,12 +662,14 @@ def test_claude_execs_claude_with_the_gateway_environment(tmp_path, capsys, monk
     assert argv == ["/opt/bin/claude", "-p", "hi", "--disallowedTools", "LSP"]
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8383"
     assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "sous-local"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] == "1"
     assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "65536"
     assert env["API_TIMEOUT_MS"] == "3000000"
     assert "ANTHROPIC_API_KEY" not in env and "ANTHROPIC_AUTH_TOKEN" not in env
     err = capsys.readouterr().err
     assert "ANTHROPIC_BASE_URL=http://127.0.0.1:8383" in err
     assert "CLAUDE_CODE_SUBAGENT_MODEL=sous-local" in err
+    assert "CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1" in err
     assert "warning" not in err
 
 
