@@ -1,9 +1,10 @@
-"""sous CLI: serve / status / wait / stop / mcp / install- and uninstall-launchd."""
+"""sous CLI: serve / status / wait / stop / mcp / claude / install- and uninstall-launchd."""
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import http.client
 import math
 import os
 import plistlib
@@ -13,11 +14,132 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
-from sous.config import load_config
+from sous.config import SousConfig, load_config
 
 LABEL = "com.sous.daemon"
+
+# What `sous claude` sets, and — as important — what it never sets. Either
+# credential variable switches Claude Code from the subscription login to
+# API-credit billing (the load-bearing #41 fact); the tier variables would pull
+# the main loop onto the local model. oMLX's launcher sets all of them because
+# it never forwards anything; sous forwards the main loop, so it must not.
+_CREDENTIAL_VARS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+_DISALLOWED_FLAGS = ("--disallowedTools", "--disallowed-tools")
+_LSP_OFF = ["--disallowedTools", "LSP"]
+# Model load plus a long prefill: minutes, not the SDK's default.
+_API_TIMEOUT_MS = "3000000"
+_PROBE_TIMEOUT_SECONDS = 15.0
+
+
+def claude_argv(user_args: list[str]) -> list[str]:
+    """The user's arguments plus `--disallowedTools LSP` (a language server
+    connecting mid-session appends its schema to every request and re-prefills
+    the conversation) unless they chose their own. Appended, never prepended:
+    the option is variadic, so ahead of a positional prompt it would swallow
+    the prompt as a tool name. Ahead of a `--`, which ends Claude Code's
+    option parsing, if there is one."""
+    for arg in user_args:
+        if arg in _DISALLOWED_FLAGS or arg.startswith(tuple(f"{f}=" for f in _DISALLOWED_FLAGS)):
+            return list(user_args)
+    if "--" in user_args:
+        end = user_args.index("--")
+        return [*user_args[:end], *_LSP_OFF, *user_args[end:]]
+    return [*user_args, *_LSP_OFF]
+
+
+def claude_env(config: SousConfig, base: Mapping[str, str]) -> dict[str, str]:
+    """The inherited environment plus the four variables the gateway needs.
+
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS is honoured only for non-claude-* ids, so
+    it sizes the local subagent's window and leaves the main loop alone.
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW is deliberately NOT set: it is global
+    ("the minimum of this setting and your model's maximum context window",
+    per Claude Code's own /config copy), so pinning it to the local window
+    would make the frontier main loop compact far too early. The subagent's
+    threshold is already bounded by its window.
+    """
+    env = dict(base)
+    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{config.server_port}"
+    env["CLAUDE_CODE_SUBAGENT_MODEL"] = config.gateway_local_models[0]
+    env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(config.gateway_max_context_tokens)
+    env["API_TIMEOUT_MS"] = _API_TIMEOUT_MS
+    return env
+
+
+def _probe_gateway(port: int) -> tuple[int, bool] | None:
+    """(status, did the gateway forward it?) for HEAD /api/hello, or None when
+    nothing is listening. A forwarded answer — or the forwarder's own error —
+    carries `Via: 1.1 sous`; the daemon's own "no such route" 404 does not.
+    stdlib http.client on purpose: the CLI should not pay for an async HTTP
+    client to run `sous status`."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=_PROBE_TIMEOUT_SECONDS)
+    try:
+        conn.request("HEAD", "/api/hello")
+        response = conn.getresponse()
+        return response.status, "sous" in (response.getheader("via") or "")
+    except OSError, http.client.HTTPException:
+        return None
+    finally:
+        conn.close()
+
+
+def _cmd_claude(user_args: list[str]) -> None:
+    """Replace this process with Claude Code pointed at the gateway."""
+    config = load_config()
+    if not config.gateway_enabled:
+        print(
+            f"sous claude: the gateway is off; set [gateway].enabled = true in "
+            f"{config.config_path} and restart the daemon",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    exe = shutil.which("claude")
+    if exe is None:
+        print("sous claude: `claude` is not on PATH; install Claude Code first", file=sys.stderr)
+        raise SystemExit(1)
+    probe = _probe_gateway(config.server_port)
+    if probe is None:
+        print(
+            f"sous claude: no daemon on 127.0.0.1:{config.server_port}; start it with: "
+            "sous serve   (or: sous install-launchd)",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    status, forwarded = probe
+    if status == 404 and not forwarded:
+        print(
+            "sous claude: the daemon is running without the gateway (started before "
+            "[gateway].enabled was set?); restart it and try again",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if status >= 500:
+        print(
+            f"sous claude: warning: the gateway could not reach its upstream just now "
+            f"(HTTP {status}); launching anyway — Claude Code will say if it persists",
+            file=sys.stderr,
+        )
+    for var in _CREDENTIAL_VARS:
+        if os.environ.get(var):
+            print(
+                f"sous claude: warning: {var} is set, so Claude Code will bill the main loop "
+                "to API credits instead of your subscription; unset it to use the login",
+                file=sys.stderr,
+            )
+    env = claude_env(config, os.environ)
+    print(
+        f"sous claude: ANTHROPIC_BASE_URL={env['ANTHROPIC_BASE_URL']} "
+        f"CLAUDE_CODE_SUBAGENT_MODEL={env['CLAUDE_CODE_SUBAGENT_MODEL']} "
+        f"CLAUDE_CODE_MAX_CONTEXT_TOKENS={env['CLAUDE_CODE_MAX_CONTEXT_TOKENS']} "
+        f"API_TIMEOUT_MS={env['API_TIMEOUT_MS']}",
+        file=sys.stderr,
+    )
+    # exec, not a subprocess: the TTY, the signals and the exit code are
+    # Claude Code's own from here on.
+    os.execve(exe, [exe, *claude_argv(user_args)], env)
 
 
 def launchd_plist(sous_executable: str, log_dir: Path) -> str:
@@ -313,6 +435,13 @@ def _arg_timeout(text: str) -> float:
 
 
 def main(argv: list[str] | None = None) -> None:
+    raw = sys.argv[1:] if argv is None else argv
+    if raw[:1] == ["claude"]:
+        # Before argparse: every argument after `claude` is Claude Code's,
+        # including a leading `-p` or `--help`, which argparse.REMAINDER would
+        # reject as an unknown option of ours.
+        _cmd_claude(raw[1:])
+        return
     parser = argparse.ArgumentParser(prog="sous", description="local MLX sous-chef for Claude")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="run the daemon (MCP over HTTP on 127.0.0.1)")
@@ -330,7 +459,12 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("mcp", help="bridge stdio to the daemon (for stdio-only MCP clients)")
     sub.add_parser("install-launchd", help="install start-at-login LaunchAgent")
     sub.add_parser("uninstall-launchd", help="remove the start-at-login LaunchAgent")
-    args = parser.parse_args(argv)
+    sub.add_parser(
+        "claude",
+        help="launch Claude Code against the gateway: subagents local, main loop upstream "
+        "(every following argument passes through to claude)",
+    )
+    args = parser.parse_args(raw)
     if args.command == "serve":
         from sous.server import main as serve_main
 
