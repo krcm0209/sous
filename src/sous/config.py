@@ -7,6 +7,7 @@ import tomllib
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import tomlkit
 
@@ -56,13 +57,25 @@ _KNOWN = {
     "commands": {"allowlist", "timeout_seconds", "approval_timeout_minutes"},
     "context": {"mode", "fraction", "min_tokens"},
     "tasks": {"retention"},
-    "gateway": {"enabled", "local_models", "max_context_tokens", "generation_timeout_minutes"},
+    "gateway": {
+        "enabled",
+        "local_models",
+        "max_context_tokens",
+        "generation_timeout_minutes",
+        "upstream_url",
+    },
 }
 
 # Claude Code refuses to run against a model advertising less than 48K of
 # context (oMLX gates on the same 48 * 1024). A smaller gateway window would
 # never be used, so the config clamps up to this instead of serving it.
 GATEWAY_MIN_CONTEXT_TOKENS = 48 * 1024
+# Where the gateway forwards every request it does not serve itself.
+GATEWAY_DEFAULT_UPSTREAM = "https://api.anthropic.com"
+# Plaintext is tolerated only this far: the forwarded requests carry the
+# user's OAuth token, and an http:// upstream anywhere else would put it on
+# the wire in the clear.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 @dataclass(frozen=True)
@@ -114,6 +127,7 @@ class SousConfig:
     gateway_local_models: tuple[str, ...] = ("sous-local",)
     gateway_max_context_tokens: int = 65536
     gateway_generation_timeout_minutes: int = 30
+    gateway_upstream_url: str = GATEWAY_DEFAULT_UPSTREAM
     data_dir: Path = DEFAULT_DATA_DIR
     config_path: Path = DEFAULT_CONFIG_PATH
 
@@ -271,6 +285,39 @@ def _gateway_values(gateway: dict) -> tuple[bool, tuple[str, ...], int, int]:
     return enabled, tuple(models), window, timeout
 
 
+def _upstream_url(gateway: dict) -> str:
+    """The forwarding target as an origin — scheme + host[:port] and nothing
+    else. A path or query would silently change what is forwarded; userinfo
+    would be a credential sous stored; http is allowed only to loopback."""
+    value = gateway.get("upstream_url", GATEWAY_DEFAULT_UPSTREAM)
+    if isinstance(value, str):
+        try:
+            parts = urlsplit(value)
+        except ValueError:
+            # An unbalanced IPv6 bracket makes urlsplit raise rather than return.
+            parts = None
+        if (
+            parts is not None
+            and parts.hostname
+            and parts.username is None
+            and parts.password is None
+            and parts.path in ("", "/")
+            and not parts.query
+            and not parts.fragment
+            and (
+                parts.scheme == "https"
+                or (parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS)
+            )
+        ):
+            return f"{parts.scheme}://{parts.netloc}"
+    warnings.warn(
+        f"sous config: [gateway].upstream_url {value!r} must be an https origin with no "
+        f"path (plain http only for a loopback host); using {GATEWAY_DEFAULT_UPSTREAM}",
+        stacklevel=3,
+    )
+    return GATEWAY_DEFAULT_UPSTREAM
+
+
 def load_config(config_path: Path | None = None) -> SousConfig:
     path = config_path or DEFAULT_CONFIG_PATH
     raw = _read_toml(path)
@@ -282,9 +329,8 @@ def load_config(config_path: Path | None = None) -> SousConfig:
     context = _section(raw, "context")
     context_mode, context_fraction, context_min_tokens = _context_values(context)
     tasks = _section(raw, "tasks")
-    gateway_enabled, gateway_models, gateway_window, gateway_timeout = _gateway_values(
-        _section(raw, "gateway")
-    )
+    gateway = _section(raw, "gateway")
+    gateway_enabled, gateway_models, gateway_window, gateway_timeout = _gateway_values(gateway)
     return SousConfig(
         server_port=server.get("port", 8383),
         model_id=model.get("id", "mlx-community/Qwen3.8-27B-4bit"),
@@ -309,6 +355,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         gateway_local_models=gateway_models,
         gateway_max_context_tokens=gateway_window,
         gateway_generation_timeout_minutes=gateway_timeout,
+        gateway_upstream_url=_upstream_url(gateway),
         data_dir=(path.parent if path.parent != Path(".") else DEFAULT_DATA_DIR),
         config_path=path,
     )

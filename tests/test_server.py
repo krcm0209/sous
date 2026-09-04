@@ -623,6 +623,7 @@ def test_server_status_reports_gateway_config(svc):
         "enabled": False,
         "local_models": ["sous-local"],
         "max_context_tokens": 65536,
+        "upstream_url": "https://api.anthropic.com",
     }
 
 

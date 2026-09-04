@@ -244,6 +244,7 @@ class SousService:
                     "enabled": self.config.gateway_enabled,
                     "local_models": list(self.config.gateway_local_models),
                     "max_context_tokens": self.config.gateway_max_context_tokens,
+                    "upstream_url": self.config.gateway_upstream_url,
                 },
             },
         }
@@ -546,7 +547,8 @@ def main() -> None:
     if config.gateway_enabled:
         print(
             f"sous: gateway (experimental) serving {', '.join(config.gateway_local_models)} "
-            f"at http://127.0.0.1:{config.server_port}/v1/messages"
+            f"at http://127.0.0.1:{config.server_port}/v1/messages; "
+            f"everything else is forwarded to {config.gateway_upstream_url}"
         )
     try:
         serve(mcp, "127.0.0.1", config.server_port)
