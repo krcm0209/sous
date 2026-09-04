@@ -37,6 +37,10 @@ dependencies = [
     # Same rule as the sse-starlette block below: server.serve imports anyio
     # directly, so it belongs here even though mcp already pulls it in.
     "anyio>=4",
+    # The gateway's upstream forwarder (src/sous/gateway/upstream.py) imports
+    # it directly. huggingface-hub already pulls it in, but a direct import
+    # must be a direct dependency — same rule as sse-starlette below.
+    "httpx>=0.28",
     "huggingface-hub",
     "mcp>=2.0,<3",
     # mlx >= 0.32.1 requires every thread that touched mlx to call
@@ -68,7 +72,6 @@ packages = ["src/sous"]
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28",
     "pytest>=8",
     "pytest-asyncio>=1.4.0",
     "pyyaml>=6.0.3",
