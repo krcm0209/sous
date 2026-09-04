@@ -57,7 +57,8 @@ Anything that breaks a guarantee in the
   from anything but a loopback client; a request body, header value or query
   string reaching a log at any level, including debug; a credential being
   stored, or sent anywhere but the configured upstream; a forwarded request
-  altered beyond `Host` and the hop-by-hop headers; a locally served turn
+  altered beyond `Host`, the hop-by-hop headers and a buffered body's
+  recomputed `Content-Length`; a locally served turn
   executing a tool (the gateway returns `tool_use` blocks and never runs one).
 
 ## What isn't

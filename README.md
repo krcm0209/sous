@@ -176,7 +176,9 @@ Forwarding is a plain HTTP/1.1 pass-through to `[gateway].upstream_url`
 (default `https://api.anthropic.com`): the request body goes up byte for
 byte; `Authorization`, `anthropic-beta`, `anthropic-version` and every header
 sous does not recognise travel unmodified; only `Host` and the hop-by-hop
-headers change, and responses carry the upstream's headers minus the
+headers change — and, on the two Messages routes whose body sous had to read,
+`Content-Length` is recomputed from the exact bytes — and responses carry the
+upstream's headers minus the
 hop-by-hop set, plus a `Via: 1.1 sous`, with `Date` and `Server` being the
 daemon's own rather than the upstream's. sous stores no
 credential — it never sees a token it did not receive to forward — honours
