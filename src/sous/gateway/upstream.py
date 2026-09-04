@@ -11,6 +11,7 @@ environment — trust_env is off).
 
 from __future__ import annotations
 
+import asyncio
 import http.cookiejar
 from collections.abc import AsyncIterator
 from urllib.parse import quote
@@ -110,6 +111,32 @@ def _error(status: int, message: str) -> JSONResponse:
     )
 
 
+async def _tracked(stream: AsyncIterator[bytes], uploaded: asyncio.Event) -> AsyncIterator[bytes]:
+    """The client's body, plus a flag raised once nothing more will be read
+    from the ASGI receive channel — see _wait_for_disconnect."""
+    try:
+        async for chunk in stream:
+            yield chunk
+    finally:
+        uploaded.set()
+
+
+async def _wait_for_disconnect(request: Request, uploaded: asyncio.Event) -> None:
+    """Return once the client has hung up.
+
+    Waits for the upload first because `request.stream()` is still pulling the
+    body out of `receive()` while it runs, and a second concurrent `receive()`
+    would steal chunks from it. Once the body is up (or was buffered by the
+    caller, or there is none), `receive()` can only ever produce the
+    disconnect: uvicorn has nothing else left to deliver on this request.
+    """
+    await uploaded.wait()
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return
+
+
 async def _relay(response: httpx.Response) -> AsyncIterator[bytes]:
     try:
         async for chunk in response.aiter_raw():
@@ -172,13 +199,16 @@ class Upstream:
         (the routes that had to look inside it) or None to stream the client's
         body through untouched. Never raises: every failure of the forwarding
         itself is an Anthropic-shaped error carrying Via."""
+        uploaded = asyncio.Event()
         content: bytes | AsyncIterator[bytes] | None
         if body is not None:
             content = body
+            uploaded.set()
         elif _has_body(request):
-            content = request.stream()
+            content = _tracked(request.stream(), uploaded)
         else:
             content = None
+            uploaded.set()
         try:
             upstream_request = self._client.build_request(
                 request.method,
@@ -186,7 +216,31 @@ class Upstream:
                 headers=request_headers(request.headers.raw, drop_content_length=body is not None),
                 content=content,
             )
-            response = await self._client.send(upstream_request, stream=True)
+            # Waiting for the upstream's headers can take the whole read
+            # timeout (10 minutes: Anthropic streams pings while it thinks).
+            # A client that gives up meanwhile — Claude Code's own timeout, a
+            # Ctrl-C — must take the upstream request with it, so race the
+            # send against the disconnect instead of only awaiting it.
+            send = asyncio.ensure_future(self._client.send(upstream_request, stream=True))
+            watch = asyncio.ensure_future(_wait_for_disconnect(request, uploaded))
+            try:
+                done, _ = await asyncio.wait({send, watch}, return_when=asyncio.FIRST_COMPLETED)
+                if send not in done:
+                    # Nobody reads this; it keeps the daemon's own log line
+                    # honest about how the request ended.
+                    return _error(499, "client disconnected before the upstream answered")
+                response = send.result()
+            finally:
+                # The watcher must be gone before the StreamingResponse below
+                # is returned: Starlette's own listen_for_disconnect takes over
+                # receive() from there. Cancelling the send matters on the two
+                # paths where it is still running — the disconnect above, and
+                # this whole handler being cancelled — because httpx closes the
+                # upstream connection when it unwinds, which is the point.
+                watch.cancel()
+                if not send.done():
+                    send.cancel()
+                await asyncio.gather(send, watch, return_exceptions=True)
         except httpx.InvalidURL, UnicodeDecodeError:
             # Building the URL is inside the try because neither of these is an
             # httpx.HTTPError, so both would escape the "never raises" contract.

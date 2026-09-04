@@ -41,13 +41,23 @@ def _send(app, method: str, path: str, headers=None, content=None) -> httpx.Resp
     return asyncio.run(go())
 
 
-def _hand_built_request(headers: list[tuple[bytes, bytes]], **scope) -> Request:
+def _hand_built_request(
+    headers: list[tuple[bytes, bytes]], messages: list[dict] | None = None, **scope
+) -> Request:
     """A Request no HTTP client could produce for us: an exact header list with
-    nothing an outer client would add of its own, or a request target uvicorn's
-    h11 would 400 before it ever became an ASGI scope."""
+    nothing an outer client would add of its own, a request target uvicorn's
+    h11 would 400 before it ever became an ASGI scope, or a scripted ASGI
+    receive channel."""
+    queue = list(messages or [{"type": "http.request", "body": b"", "more_body": False}])
 
     async def receive():
-        return {"type": "http.request", "body": b"", "more_body": False}
+        if not queue:
+            # What a real server does once the body is delivered and the client
+            # is still there: block until it hangs up. Returning another
+            # message instead would busy-loop anything watching for a
+            # disconnect.
+            await asyncio.Event().wait()
+        return queue.pop(0)
 
     return Request(
         {
@@ -393,6 +403,30 @@ def test_nothing_the_client_did_not_send_is_added():
     assert response.status_code == 200
     (seen,) = fake.requests
     assert dict(seen["headers"]) == {"host": "upstream.test", "x-only": "1"}
+    asyncio.run(upstream.aclose())
+
+
+def test_a_client_that_leaves_mid_body_is_a_400_not_a_raise():
+    """The other half of forward()'s never-raises contract, and the reason the
+    body is streamed inside the send task rather than awaited inline: Starlette
+    raises ClientDisconnect out of request.stream() when the client goes away
+    mid-upload, and that has to come back through the race as an error
+    response, not out of forward()."""
+    fake = FakeUpstream()
+    upstream = fake.upstream()
+    request = _hand_built_request(
+        [(b"host", b"127.0.0.1:8383"), (b"content-length", b"10")],
+        [
+            {"type": "http.request", "body": b"12345", "more_body": True},
+            {"type": "http.disconnect"},
+        ],
+        method="POST",
+        path="/v1/messages",
+    )
+    response = asyncio.run(upstream.forward(request, None))
+    assert response.status_code == 400
+    assert json.loads(bytes(response.body))["error"]["message"] == "client disconnected mid-body"
+    assert response.headers["via"] == VIA
     asyncio.run(upstream.aclose())
 
 

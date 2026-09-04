@@ -131,12 +131,25 @@ def _fake_upstream_app(record: dict) -> Starlette:
     """A stand-in for api.anthropic.com over a real socket: /v1/messages
     streams two SSE frames a second apart (or, with record["hold"], frames
     every 0.2 s until the connection drops) and notes when its generator is
-    closed; /api/hello answers 200. Records the headers it saw."""
+    closed; /api/hello answers 200. Records the headers it saw.
+
+    With record["delay_headers"] it answers nothing for 5 s — the shape of a
+    real upstream thinking — while watching for the gateway to drop the
+    connection, so a test can see whether a client leaving early reaches this
+    far."""
     record["closed"] = threading.Event()
+    record["gateway_hung_up"] = threading.Event()
 
     async def messages(request: Request) -> Response:
         record["headers"] = dict(request.headers)
         record["body"] = await request.body()
+        if record.get("delay_headers"):
+            for _ in range(50):
+                if await request.is_disconnected():
+                    record["gateway_hung_up"].set()
+                    return Response(status_code=499)
+                await asyncio.sleep(0.1)
+            return Response(status_code=200)
 
         async def frames():
             try:
@@ -450,6 +463,35 @@ def test_a_client_that_hangs_up_closes_the_upstream_stream(tmp_path: Path):
                 if line == "event: ping":
                     break  # hang up mid-stream
         assert record["closed"].wait(10), "the upstream stream was never closed"
+
+
+def test_a_client_that_leaves_before_the_upstream_answers_is_not_left_billing(
+    tmp_path: Path, capsys
+):
+    """A forwarded request can wait up to the 600 s read timeout for the
+    upstream's headers. If the client gives up first (Claude Code's own
+    timeout, or Ctrl-C), nothing downstream notices unless the forwarder
+    watches for the disconnect while it waits — and the upstream keeps
+    generating, and billing, for an answer nobody will read."""
+    record: dict = {"delay_headers": True}
+    with (
+        _serve(_fake_upstream_app(record)) as (upstream_base, _us, _ut),
+        _serve(_app(tmp_path, ChunkedFakeEngine([]), upstream_url=upstream_base)) as (base, _s, _t),
+        httpx.Client(timeout=httpx.Timeout(0.4, connect=5)) as client,
+    ):
+        with pytest.raises(httpx.ReadTimeout):
+            client.post(f"{base}/v1/messages", json=_upstream_body())
+        # Within ~3 s of the client leaving, not at the fake's own 5 s mark
+        # (which would mean nothing but its own reply ended the wait).
+        assert record["gateway_hung_up"].wait(3), "the upstream was left generating"
+        err = ""
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            err += capsys.readouterr().err  # readouterr drains, so accumulate
+            if "status=499" in err:
+                break
+            time.sleep(0.05)
+        assert "upstream POST /v1/messages" in err and "status=499" in err, err
 
 
 def test_an_unreachable_upstream_is_a_prompt_502_and_the_local_model_still_serves(tmp_path: Path):
