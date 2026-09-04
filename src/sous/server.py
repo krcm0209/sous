@@ -512,6 +512,13 @@ def uvicorn_config(app, host: str, port: int, log_level: str = "info") -> uvicor
         host=host,
         port=port,
         log_level=log_level,
+        # uvicorn's access log prints the raw request target for every
+        # response — query string included — at INFO, which is the level the
+        # daemon runs at. The gateway's catch-all forwards whatever Claude Code
+        # puts in one, and nothing of value is lost by silencing it: the
+        # gateway writes its own bounded metadata line per forwarded request,
+        # and the MCP transport never had a query string worth logging.
+        access_log=False,
         timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
     )
 

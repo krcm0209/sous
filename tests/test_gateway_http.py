@@ -77,13 +77,18 @@ def _gateway_app(tmp_path: Path, engine) -> tuple[Gateway, object]:
 
 
 @contextlib.contextmanager
-def _serve(app) -> Iterator[tuple[str, uvicorn.Server, threading.Thread]]:
+def _serve(
+    app, log_level: str = "warning"
+) -> Iterator[tuple[str, uvicorn.Server, threading.Thread]]:
     """Run the ASGI app under uvicorn in a thread, with the daemon's own
     uvicorn configuration so the graceful-shutdown bound under test is the
     real one. Yields the base URL, the server (off the main thread its
-    should_exit flag is the only stop switch) and the serving thread."""
+    should_exit flag is the only stop switch) and the serving thread.
+
+    Quiet by default so a failing test's output is its own; `log_level` is for
+    the one test that needs the daemon's real INFO level."""
     port = _free_port()
-    server = uvicorn.Server(uvicorn_config(app, "127.0.0.1", port, log_level="warning"))
+    server = uvicorn.Server(uvicorn_config(app, "127.0.0.1", port, log_level=log_level))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     deadline = time.monotonic() + 20
@@ -511,6 +516,29 @@ def test_an_unreachable_upstream_is_a_prompt_502_and_the_local_model_still_serve
         r = client.post(f"{base}/v1/messages", json=_body(stream=False))
         assert r.status_code == 200
         assert r.json()["content"] == [{"type": "text", "text": "local"}]
+
+
+def test_the_real_server_never_logs_a_request_target(tmp_path: Path, capsys):
+    """uvicorn's access log prints the raw request target — query string and
+    all — for every response, at INFO, which is the level the daemon runs at.
+    The catch-all now carries whatever Claude Code puts in a query string, so
+    that log has to be off. Nothing else in the suite would catch it: the
+    in-process tests bypass uvicorn entirely and _serve is otherwise quiet.
+
+    Proved through the stream rather than a log handler: uvicorn asks
+    `uvicorn.access.hasHandlers()` per connection to decide whether to log at
+    all, so attaching a collecting handler to that logger would switch the
+    access log back on — and it does not propagate to root, so a handler there
+    would see nothing either way.
+    """
+    with (
+        _serve(_app(tmp_path, ChunkedFakeEngine([])), log_level="info") as (base, _s, _t),
+        httpx.Client(timeout=30) as client,
+    ):
+        assert client.get(f"{base}/api/oauth/usage?token=QUERY-CANARY").status_code == 200
+    captured = capsys.readouterr()
+    assert "QUERY-CANARY" not in captured.out, captured.out
+    assert "QUERY-CANARY" not in captured.err, captured.err
 
 
 def test_app_shutdown_closes_the_upstream_client(tmp_path: Path):

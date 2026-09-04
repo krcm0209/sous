@@ -176,7 +176,9 @@ Forwarding is a plain HTTP/1.1 pass-through to `[gateway].upstream_url`
 (default `https://api.anthropic.com`): the request body goes up byte for
 byte; `Authorization`, `anthropic-beta`, `anthropic-version` and every header
 sous does not recognise travel unmodified; only `Host` and the hop-by-hop
-headers change, and responses gain a `Via: 1.1 sous`. sous stores no
+headers change, and responses carry the upstream's headers minus the
+hop-by-hop set, plus a `Via: 1.1 sous`, with `Date` and `Server` being the
+daemon's own rather than the upstream's. sous stores no
 credential — it never sees a token it did not receive to forward — honours
 no `HTTPS_PROXY` or `~/.netrc`, follows no redirect, and retries nothing
 (Claude Code retries). When the upstream is unreachable, forwarded requests
@@ -228,9 +230,10 @@ daemon's stderr — method, model, stream flag, status, token counts, stop
 reason, cache hit/miss, seconds — plus one line naming the Anthropic tool
 *types* it dropped, when any. Each forwarded request logs one line too:
 `upstream`, method, path, the model id when the body named one, the
-upstream's status, and seconds to its headers. Nothing else is logged — not a
-request body, not a header value, not a query string, not a response — at
-any level. Errors sous produces itself are Anthropic-shaped
+upstream's status, and seconds to its headers. The daemon also disables
+uvicorn's access log, which would otherwise print every request target —
+query string included — at INFO. Nothing else is logged — not a request body,
+not a header value, not a query string, not a response — at any level. Errors sous produces itself are Anthropic-shaped
 (`{"type": "error", "error": {"type": ..., "message": ...}}`): an oversized
 body (over 32 MiB) on `/v1/messages` is a `413 request_too_large`, a prompt
 that fills the local window an `invalid_request_error` saying `prompt is too

@@ -47,7 +47,8 @@ Claude Code use stretches further — evaluate features against that goal.
 - The gateway forwards every request it does not serve (`gateway/upstream.py`)
   as a transparent proxy: never re-serialize a forwarded body, never add or
   alter an end-to-end header (only `Host`, the hop-by-hop set and a buffered
-  body's `Content-Length` change; responses gain only `Via`), never turn
+  body's `Content-Length` change; responses lose the hop-by-hop set and gain
+  `Via`, with uvicorn's own `Date`/`Server` replacing the upstream's), never turn
   `trust_env` on. The routing predicate is the decoded body's `model` after
   stripping one trailing `[…]` suffix; a body that does not decode is the
   upstream's, not a 400. Any third-party library that enters the gateway's
