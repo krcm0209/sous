@@ -134,6 +134,15 @@ def _log_token(value: object, limit: int) -> str:
     return "-"
 
 
+def _model_label(chat: ChatRequest) -> str:
+    # Routing matches the suffix-stripped id against config, but chat.model
+    # keeps the id exactly as the client sent it — client text, not config
+    # text, since `_MODEL_SUFFIX_RE` accepts anything between the brackets.
+    # Bound it like any other client-controlled string before it reaches a
+    # log line; the response echo (TurnAssembler) keeps the raw id.
+    return _log_token(chat.model, _LOG_ID_CHARS)
+
+
 def _classify(exc: Exception) -> tuple[int, str, str]:
     """(status, error type, message) for a failure while turning."""
     if isinstance(exc, PromptTooLong):
@@ -401,7 +410,7 @@ class Gateway:
         # are touched rather than let the executor queue grow unboundedly.
         if not self._pending_counts.acquire(blocking=False):
             _log(
-                f"POST /v1/messages/count_tokens model={chat.model} "
+                f"POST /v1/messages/count_tokens model={_model_label(chat)} "
                 "status=529 error=overloaded_error"
             )
             return _error_response(529, "overloaded_error", "too many token counts queued")
@@ -453,7 +462,7 @@ class Gateway:
         # what does is guarded below, so a failure there still releases.
         if not self._pending.acquire(blocking=False):
             _log(
-                f"POST /v1/messages model={chat.model} stream={int(chat.stream)} "
+                f"POST /v1/messages model={_model_label(chat)} stream={int(chat.stream)} "
                 "status=529 error=overloaded_error"
             )
             return _error_response(529, "overloaded_error", "too many turns queued")
@@ -487,7 +496,10 @@ class Gateway:
                         )
                     )
                 except TurnAbandoned:
-                    _log(f"POST /v1/messages model={chat.model} stream=1 abandoned while queued")
+                    _log(
+                        f"POST /v1/messages model={_model_label(chat)} stream=1 "
+                        "abandoned while queued"
+                    )
                 except Exception as e:  # noqa: BLE001 — relayed as an in-band error event
                     sink.put(("error", e))
 
@@ -512,7 +524,8 @@ class Gateway:
         except Exception as e:  # noqa: BLE001 — every failure becomes an Anthropic error body
             status, error_type, message = _classify(e)
             _log(
-                f"POST /v1/messages model={chat.model} stream=0 status={status} error={error_type}"
+                f"POST /v1/messages model={_model_label(chat)} stream=0 "
+                f"status={status} error={error_type}"
             )
             return _error_response(status, error_type, message)
         assembler.start(result.input_tokens)
@@ -596,7 +609,7 @@ class Gateway:
                 else:
                     status, error_type, message = _classify(value)
                     _log(
-                        f"POST /v1/messages model={chat.model} stream=1 status=200 "
+                        f"POST /v1/messages model={_model_label(chat)} stream=1 status=200 "
                         f"error={error_type}"
                     )
                     yield _frame(
@@ -613,7 +626,7 @@ class Gateway:
         self, chat: ChatRequest, result: TurnResult, assembler: TurnAssembler, *, stream: bool
     ) -> None:
         _log(
-            f"POST /v1/messages model={chat.model} stream={int(stream)} status=200 "
+            f"POST /v1/messages model={_model_label(chat)} stream={int(stream)} status=200 "
             f"input_tokens={result.input_tokens} output_tokens={result.output_tokens} "
             f"stop={assembler.stop_reason} cache={'hit' if result.cache_hit else 'miss'} "
             f"reused_tokens={result.reused_tokens} seconds={result.seconds:.1f}"

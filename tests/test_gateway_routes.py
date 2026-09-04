@@ -1130,3 +1130,28 @@ def test_aclose_shuts_the_upstream_client_too(tmp_path: Path):
     gateway, _ = _gateway_app(tmp_path, FakeEngine([]), upstream=upstream)
     asyncio.run(gateway.aclose())
     assert upstream._client.is_closed
+
+
+def test_a_claimed_model_id_cannot_forge_or_bloat_a_log_line(tmp_path: Path, capsys):
+    """Suffix stripping matches the predicate on `sous-local`, but chat.model
+    keeps the id exactly as the client sent it — client text, not config
+    text. A newline or a 100-char id inside the stripped bracket must not
+    reach a log line unbounded, the way a forwarded id already can't."""
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine(["ok", "ok"]), upstream=fake.upstream())
+    forged = "sous-local[\nsous gateway: FORGED status=200]"
+    oversized = "sous-local[" + "A" * 100 + "]"
+    for raw_id in (forged, oversized):
+        r = _post(app, _body(model=raw_id))
+        assert r.status_code == 200
+        assert r.json()["content"] == [{"type": "text", "text": "ok"}]
+        assert r.json()["model"] == raw_id
+    assert fake.requests == []
+    err = capsys.readouterr().err
+    assert "FORGED" not in err
+    lines = [line for line in err.splitlines() if line.startswith("sous gateway:")]
+    assert lines, "expected at least one log line"
+    for line in lines:
+        assert len(line) < 200, line
+        if "model=" in line:
+            assert "model=-" in line, line
