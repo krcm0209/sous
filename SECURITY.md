@@ -3,7 +3,9 @@
 sous runs a local model in an autonomous tool loop against your source tree.
 Its sandbox — path confinement, the command allowlist, environment scrubbing,
 the process-group kill — is the security boundary, and bugs in it are worth
-reporting.
+reporting. In gateway mode (off by default) it also carries your Claude Code
+subscription credential to Anthropic's API on every forwarded request;
+leaking, storing or misrouting it is equally worth reporting.
 
 ## Supported versions
 
@@ -49,6 +51,15 @@ Anything that breaks a guarantee in the
   approval it should have required.
 - **The MCP endpoint** — it binds to `127.0.0.1`; reachability beyond that, or
   anything exploitable through it, is in scope.
+- **The gateway** (`[gateway].enabled = true`) — it binds to `127.0.0.1` and
+  refuses foreign `Host`/`Origin` values; it forwards Claude Code's own
+  `Authorization` header to `[gateway].upstream_url`. In scope: reachability
+  from anything but a loopback client; a request body, header value or query
+  string reaching a log at any level, including debug; a credential being
+  stored, or sent anywhere but the configured upstream; a forwarded request
+  altered beyond `Host`, the hop-by-hop headers and a buffered body's
+  recomputed `Content-Length`; a locally served turn
+  executing a tool (the gateway returns `tool_use` blocks and never runs one).
 
 ## What isn't
 
@@ -70,6 +81,15 @@ reporting the README:
 - **The model producing wrong, low-quality, or malicious-looking code.** That
   is the expected failure mode the human review step exists for. Review the
   diff.
+- **Gateway mode bypasses the sandbox by design.** A turn the gateway serves
+  locally returns `tool_use` blocks that Claude Code executes under its own
+  permission rules; `toolexec.py` is not in that path, and a weaker model
+  inherits whatever permissiveness you configured for frontier subagents.
+  The mitigation is positioning — subagents only by default, an experimental
+  label — not code.
+- **A plaintext upstream on loopback.** `[gateway].upstream_url` accepts
+  `http://` for `127.0.0.1`, `localhost` and `::1` so tests and local
+  front-ends can sit in between; that traffic never leaves the machine.
 
 If you think one of these is worse in practice than the README claims — for
 instance a *reliable* way to reach the double-fork escape from an ordinary

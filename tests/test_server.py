@@ -623,6 +623,7 @@ def test_server_status_reports_gateway_config(svc):
         "enabled": False,
         "local_models": ["sous-local"],
         "max_context_tokens": 65536,
+        "upstream_url": "https://api.anthropic.com",
     }
 
 
@@ -635,3 +636,6 @@ def test_uvicorn_config_bounds_graceful_shutdown():
     cfg = uvicorn_config(object(), "127.0.0.1", 0)
     assert cfg.timeout_graceful_shutdown == GRACEFUL_SHUTDOWN_SECONDS == 5
     assert cfg.host == "127.0.0.1"
+    # uvicorn's access log prints the raw request target, query string
+    # included, at INFO — the daemon's own level.
+    assert cfg.access_log is False

@@ -359,6 +359,7 @@ def test_gateway_section_overrides_every_key_without_warnings(tmp_path: Path):
         'local_models = ["sous-local", "sous-fast"]\n'
         "max_context_tokens = 131072\n"
         "generation_timeout_minutes = 5\n"
+        'upstream_url = "http://127.0.0.1:9000"\n'
     )
     with warnings.catch_warnings():
         warnings.simplefilter("error")
@@ -367,6 +368,7 @@ def test_gateway_section_overrides_every_key_without_warnings(tmp_path: Path):
     assert cfg.gateway_local_models == ("sous-local", "sous-fast")
     assert cfg.gateway_max_context_tokens == 131072
     assert cfg.gateway_generation_timeout_minutes == 5
+    assert cfg.gateway_upstream_url == "http://127.0.0.1:9000"
 
 
 def test_gateway_window_below_the_floor_clamps_up_with_a_warning(tmp_path: Path):
@@ -391,6 +393,7 @@ def test_gateway_bad_values_degrade_to_defaults_with_warnings(tmp_path: Path):
         "local_models = []\n"
         "max_context_tokens = -1\n"
         "generation_timeout_minutes = 0\n"
+        "upstream_url = 7\n"
     )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -399,8 +402,15 @@ def test_gateway_bad_values_degrade_to_defaults_with_warnings(tmp_path: Path):
     assert cfg.gateway_local_models == ("sous-local",)
     assert cfg.gateway_max_context_tokens == 65536
     assert cfg.gateway_generation_timeout_minutes == 30
+    assert cfg.gateway_upstream_url == "https://api.anthropic.com"
     messages = " ".join(str(w.message) for w in caught)
-    for key in ("enabled", "local_models", "max_context_tokens", "generation_timeout_minutes"):
+    for key in (
+        "enabled",
+        "local_models",
+        "max_context_tokens",
+        "generation_timeout_minutes",
+        "upstream_url",
+    ):
         assert key in messages, key
 
 
@@ -428,3 +438,59 @@ def test_gateway_local_models_rejects_claude_ids(tmp_path: Path):
     assert any(
         "local_models" in str(w.message) and "claude" in str(w.message).lower() for w in caught
     )
+
+
+def test_gateway_upstream_defaults_to_the_anthropic_api(tmp_path: Path):
+    from sous.config import GATEWAY_DEFAULT_UPSTREAM
+
+    cfg = load_config(tmp_path / "nope.toml")
+    assert cfg.gateway_upstream_url == GATEWAY_DEFAULT_UPSTREAM == "https://api.anthropic.com"
+
+
+def test_gateway_upstream_accepts_https_origins_and_loopback_http(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    for raw, expected in (
+        ("https://gateway.example.com", "https://gateway.example.com"),
+        ("https://gateway.example.com:8443/", "https://gateway.example.com:8443"),
+        ("http://127.0.0.1:9000", "http://127.0.0.1:9000"),
+        ("http://localhost:9000/", "http://localhost:9000"),
+        ("http://[::1]:9000", "http://[::1]:9000"),
+        ("https://[::1]:8443", "https://[::1]:8443"),
+    ):
+        p.write_text(f'[gateway]\nupstream_url = "{raw}"\n')
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert load_config(p).gateway_upstream_url == expected, raw
+
+
+def test_gateway_upstream_rejects_anything_that_is_not_a_bare_origin(tmp_path: Path):
+    """Forwarded requests carry the user's OAuth token: a plaintext upstream
+    anywhere but loopback would put it on the wire in the clear, and a path,
+    query or userinfo would silently change what gets forwarded."""
+    p = tmp_path / "config.toml"
+    for raw in (
+        '"http://gateway.example.com"',
+        '"https://api.anthropic.com/v1"',
+        '"https://api.anthropic.com/?x=1"',
+        '"https://user:pw@api.anthropic.com"',
+        '"https://api.anthropic.com#frag"',
+        '"ftp://api.anthropic.com"',
+        '"api.anthropic.com"',
+        '"http://[::1"',
+        '"https://api.anthropic.com:abc"',
+        '"https://api.anthropic.com:99999"',
+        # Shape-valid, but not a host httpx can build a URL from (a control
+        # character) or one that could ever resolve (a space, an underscore).
+        # These used to pass validation and raise httpx.InvalidURL out of
+        # Upstream.__init__ instead — killing the daemon at boot.
+        '"https://api anthropic.com"',
+        '"https://api.anthropic.com\\u0001"',
+        '"https://ap_i.anthropic.com"',
+        "42",
+    ):
+        p.write_text(f"[gateway]\nupstream_url = {raw}\n")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            cfg = load_config(p)
+        assert cfg.gateway_upstream_url == "https://api.anthropic.com", raw
+        assert any("upstream_url" in str(w.message) for w in caught), raw
