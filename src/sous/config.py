@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 import tomllib
 import warnings
@@ -285,6 +286,34 @@ def _gateway_values(gateway: dict) -> tuple[bool, tuple[str, ...], int, int]:
     return enabled, tuple(models), window, timeout
 
 
+# A registered name (letters, digits, dots, hyphens — RFC 3986's reg-name as
+# the DNS world actually spells it) or an IPv6 literal with its brackets
+# already stripped by urlsplit.
+_HOSTNAME = re.compile(r"[A-Za-z0-9.-]+")
+_IPV6_LITERAL = re.compile(r"[0-9A-Fa-f:.]+")
+
+
+def _is_buildable_origin(hostname: str, origin: str) -> bool:
+    """Whether httpx will accept this origin, checked here rather than
+    discovered at boot: urlsplit's shape checks pass things httpx.URL refuses
+    (a control character in the host is `httpx.InvalidURL`) or silently
+    percent-encodes into a name that can never resolve (a space), and either
+    way `Upstream.__init__` would raise out of daemon startup — a launchd
+    KeepAlive restart loop — instead of the warn-and-default this validator
+    exists to give."""
+    if not (_HOSTNAME.fullmatch(hostname) or _IPV6_LITERAL.fullmatch(hostname)):
+        return False
+    # Function-local: config.py is imported by every CLI verb, and none of the
+    # ones that never forward anything should pay for importing httpx.
+    import httpx
+
+    try:
+        httpx.URL(origin)
+    except httpx.InvalidURL:
+        return False
+    return True
+
+
 def _upstream_url(gateway: dict) -> str:
     """The forwarding target as an origin — scheme + host[:port] and nothing
     else. A path or query would silently change what is forwarded; userinfo
@@ -314,7 +343,9 @@ def _upstream_url(gateway: dict) -> str:
                 or (parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS)
             )
         ):
-            return f"{parts.scheme}://{parts.netloc}"
+            candidate = f"{parts.scheme}://{parts.netloc}"
+            if _is_buildable_origin(parts.hostname, candidate):
+                return candidate
     warnings.warn(
         f"sous config: [gateway].upstream_url {value!r} must be an https origin with no "
         f"path (plain http only for a loopback host); using {GATEWAY_DEFAULT_UPSTREAM}",

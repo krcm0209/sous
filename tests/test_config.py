@@ -455,6 +455,7 @@ def test_gateway_upstream_accepts_https_origins_and_loopback_http(tmp_path: Path
         ("http://127.0.0.1:9000", "http://127.0.0.1:9000"),
         ("http://localhost:9000/", "http://localhost:9000"),
         ("http://[::1]:9000", "http://[::1]:9000"),
+        ("https://[::1]:8443", "https://[::1]:8443"),
     ):
         p.write_text(f'[gateway]\nupstream_url = "{raw}"\n')
         with warnings.catch_warnings():
@@ -478,6 +479,13 @@ def test_gateway_upstream_rejects_anything_that_is_not_a_bare_origin(tmp_path: P
         '"http://[::1"',
         '"https://api.anthropic.com:abc"',
         '"https://api.anthropic.com:99999"',
+        # Shape-valid, but not a host httpx can build a URL from (a control
+        # character) or one that could ever resolve (a space, an underscore).
+        # These used to pass validation and raise httpx.InvalidURL out of
+        # Upstream.__init__ instead — killing the daemon at boot.
+        '"https://api anthropic.com"',
+        '"https://api.anthropic.com\\u0001"',
+        '"https://ap_i.anthropic.com"',
         "42",
     ):
         p.write_text(f"[gateway]\nupstream_url = {raw}\n")
