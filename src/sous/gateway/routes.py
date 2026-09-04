@@ -646,6 +646,14 @@ def mount_gateway(
     # made. Here rather than at import, because server.py imports this module
     # unconditionally and a disabled gateway must not reconfigure a logger.
     logging.getLogger("sse_starlette").setLevel(logging.INFO)
+    # Same rule, one layer down: httpx logs "HTTP Request: <method> <full URL>"
+    # at INFO — the upstream URL including its query string — and httpcore
+    # logs response header values verbatim at DEBUG. Neither is hypothetical
+    # at INFO: MCPServer.__init__ calls the SDK's configure_logging("INFO"),
+    # which basicConfig's a stderr handler onto the root logger, so both reach
+    # the daemon log unless pinned above where they say those things.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     gateway = Gateway(engines, config, upstream)
     mcp.custom_route("/v1/messages", methods=["POST"])(gateway.messages)
     mcp.custom_route("/v1/messages/count_tokens", methods=["POST"])(gateway.count_tokens)

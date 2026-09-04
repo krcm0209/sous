@@ -8,6 +8,7 @@ import concurrent.futures
 import contextlib
 import json
 import logging
+import sys
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -1096,6 +1097,28 @@ def test_an_oversized_body_is_refused_before_forwarding(tmp_path: Path):
     assert fake.requests == []
 
 
+@contextlib.contextmanager
+def _root_stderr_logging():
+    """The logging setup the real daemon runs with. MCPServer.__init__ calls
+    the SDK's configure_logging("INFO"), which basicConfig's a RichHandler onto
+    the *root* logger — so anything any library logs lands on the daemon's
+    stderr next to sous' own print() lines. Under pytest the logging plugin has
+    already attached a root handler, so that basicConfig no-ops and a
+    capsys-only assertion cannot see the leak at all. Built inside the test so
+    the handler binds to capsys' replacement stderr; DEBUG because that is
+    where httpcore logs response header values."""
+    handler = logging.StreamHandler(sys.stderr)
+    root = logging.getLogger()
+    previous = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    try:
+        yield
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(previous)
+
+
 def test_forwarding_logs_one_bounded_metadata_line_and_never_a_body_header_or_query(
     tmp_path: Path, capsys
 ):
@@ -1104,11 +1127,12 @@ def test_forwarding_logs_one_bounded_metadata_line_and_never_a_body_header_or_qu
     raw = json.dumps(
         _body(model="claude-opus-5", messages=[{"role": "user", "content": "BODY-CANARY"}])
     ).encode()
-    _post(app, raw, headers={"authorization": "Bearer HEADER-CANARY"})
-    _request(app, "GET", "/api/oauth/usage?token=QUERY-CANARY")
-    _post(app, b'{"model": "x y"}')
-    _post(app, json.dumps(_body(model="m" * 65)).encode())
-    _post(app, b"not json")
+    with _root_stderr_logging():
+        _post(app, raw, headers={"authorization": "Bearer HEADER-CANARY"})
+        _request(app, "GET", "/api/oauth/usage?token=QUERY-CANARY")
+        _post(app, b'{"model": "x y"}')
+        _post(app, json.dumps(_body(model="m" * 65)).encode())
+        _post(app, b"not json")
     err = capsys.readouterr().err
     lines = [line for line in err.splitlines() if line.startswith("sous gateway: upstream")]
     assert lines[0].startswith(
