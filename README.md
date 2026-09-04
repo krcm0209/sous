@@ -292,7 +292,8 @@ enabled = false
 local_models = ["sous-local"]   # model ids served locally; every other id is forwarded upstream.
                                 # Never claude-*: Claude Code ignores its context-window
                                 # env vars for those ids (the config rejects them).
-upstream_url = "https://api.anthropic.com"  # where non-local requests go: an https origin, no path.
+upstream_url = "https://api.anthropic.com"  # where non-local requests go: an https origin, no path,
+                                            # ASCII hostname or IP literal.
                                             # Plain http is accepted for a loopback host only.
 max_context_tokens = 65536      # server-side limit on prompt + reply tokens for local turns;
                                 # positive values below 49152 are raised to it. `sous claude`

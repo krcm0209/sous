@@ -303,8 +303,11 @@ def _is_buildable_origin(hostname: str, origin: str) -> bool:
     exists to give."""
     if not (_HOSTNAME.fullmatch(hostname) or _IPV6_LITERAL.fullmatch(hostname)):
         return False
-    # Function-local: config.py is imported by every CLI verb, and none of the
-    # ones that never forward anything should pay for importing httpx.
+    # Function-local so `import sous.config` itself stays cheap; load_config()
+    # does reach here for every valid upstream_url, so each CLI invocation
+    # pays httpx's ~45 ms import once. Acceptable for a command-line tool —
+    # the alternative, skipping the check while the gateway is disabled,
+    # would let a bad value sit unnoticed until the day it is enabled.
     import httpx
 
     try:
