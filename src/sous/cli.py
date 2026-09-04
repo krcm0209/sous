@@ -27,6 +27,16 @@ LABEL = "com.sous.daemon"
 # the main loop onto the local model. oMLX's launcher sets all of them because
 # it never forwards anything; sous forwards the main loop, so it must not.
 _CREDENTIAL_VARS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+# Not set here, but inherited from the shell if the user exported one — the
+# whole-session recipe in CONTRIBUTING does exactly that — and then Claude Code
+# runs that tier of the MAIN loop on the local model instead of upstream, which
+# is the hybrid this launcher exists to set up. Warned about, never stripped:
+# the user's environment is the user's, same ruling as _CREDENTIAL_VARS.
+_TIER_VARS = (
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
 _DISALLOWED_FLAGS = ("--disallowedTools", "--disallowed-tools")
 _LSP_OFF = ["--disallowedTools", "LSP"]
 # Model load plus a long prefill: minutes, not the SDK's default.
@@ -142,6 +152,15 @@ def _cmd_claude(user_args: list[str]) -> None:
             print(
                 f"sous claude: warning: {var} is set, so Claude Code will bill the main loop "
                 "to API credits instead of your subscription; unset it to use the login",
+                file=sys.stderr,
+            )
+    for var in _TIER_VARS:
+        # The value is a model id, not a secret, and it is the whole point of
+        # the warning: the user has to recognise their own leftover export.
+        if value := os.environ.get(var):
+            print(
+                f"sous claude: warning: {var}={value} is set in your shell, so that tier of "
+                "the main loop will not run upstream; unset it for a hybrid session",
                 file=sys.stderr,
             )
     env = claude_env(config, os.environ)

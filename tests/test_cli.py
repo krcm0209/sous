@@ -559,7 +559,12 @@ def _claude_setup(tmp_path, monkeypatch, *, probe=(200, True), **overrides):
         cli.shutil, "which", lambda name: "/opt/bin/claude" if name == "claude" else None
     )
     monkeypatch.setattr(cli, "_probe_gateway", lambda port: probe)
-    for var in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "API_TIMEOUT_MS"):
+    for var in (
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "API_TIMEOUT_MS",
+        *cli._TIER_VARS,
+    ):
         monkeypatch.delenv(var, raising=False)
     calls: list[tuple] = []
     monkeypatch.setattr(os, "execve", lambda exe, argv, env: calls.append((exe, argv, env)))
@@ -679,6 +684,27 @@ def test_claude_warns_about_a_credential_variable_but_still_launches(tmp_path, c
     assert "warning" in err and "ANTHROPIC_API_KEY" in err and "API credits" in err
     assert "sk-ant-api03-canary" not in err
     assert calls[0][2]["ANTHROPIC_API_KEY"] == "sk-ant-api03-canary"  # untouched, not unset
+
+
+def test_claude_warns_about_an_inherited_tier_variable_but_still_launches(
+    tmp_path, capsys, monkeypatch
+):
+    """Same ruling as the credential variables: the user's environment is the
+    user's. A leftover export from the whole-session recipe in CONTRIBUTING is
+    exactly this case, so name the variable and its value (a model id, not a
+    secret) and say what it costs — then launch."""
+    from sous import cli
+
+    _, calls = _claude_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "sous-local")
+    cli.main(["claude"])
+    assert len(calls) == 1
+    err = capsys.readouterr().err
+    assert "warning" in err
+    assert "ANTHROPIC_DEFAULT_SONNET_MODEL" in err and "sous-local" in err
+    assert "hybrid" in err
+    # Warned about, never stripped: the export is the user's to keep.
+    assert calls[0][2]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "sous-local"
 
 
 def test_claude_refuses_when_the_gateway_is_disabled(tmp_path, capsys, monkeypatch):

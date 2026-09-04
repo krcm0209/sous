@@ -166,7 +166,9 @@ and re-prefills the conversation). It sets **no** `ANTHROPIC_AUTH_TOKEN`,
 variable switches Claude Code from your subscription login to API-credit
 billing, and the tier variables would pull the main loop onto the local
 model. If your shell already exports a credential variable, `sous claude`
-warns and launches anyway — that is your billing decision, not sous's. It
+warns and launches anyway — that is your billing decision, not sous's (the
+same for an inherited `ANTHROPIC_DEFAULT_*_MODEL`, which would pull that tier
+off the upstream). It
 also leaves `CLAUDE_CODE_AUTO_COMPACT_WINDOW` alone: that setting is global,
 and pinning it to the local window would make the frontier main loop compact
 far too early; the subagent's window is bounded by
