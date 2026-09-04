@@ -5,6 +5,7 @@ real socket shows (incremental relay, hang-ups) is in test_gateway_http.py."""
 
 import asyncio
 import gzip
+import sys
 
 import httpx
 from starlette.applications import Starlette
@@ -12,7 +13,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
-from sous.gateway.upstream import VIA, Upstream, request_headers, response_headers
+from sous.gateway.upstream import TIMEOUT, VIA, Upstream, request_headers, response_headers
 from tests.fake_upstream import METHODS, FakeUpstream
 
 
@@ -257,6 +258,34 @@ def test_an_upstream_timeout_is_a_504():
     assert r.status_code == 504
     assert r.json()["error"] == {"type": "api_error", "message": "upstream upstream.test timed out"}
     assert r.headers["via"] == VIA
+
+
+def test_client_never_adds_a_credential_or_follows_a_redirect():
+    """These are the module's actual security boundary, not just the docstring's
+    claim of one, and none of the other tests in this file would fail if any
+    were flipped: trust_env=False keeps a stray ~/.netrc or HTTPS_PROXY from
+    ever seeing the OAuth bearer token this process forwards; follow_redirects
+    =False stops httpx from replaying Authorization to whatever a 3xx names,
+    which only the real client should ever decide to do; the identity
+    accept-encoding keeps httpx from asking for gzip on the client's behalf,
+    so _relay never hands back compressed bytes to a client that never said
+    it could decompress them; TIMEOUT and the connection limits are exactly
+    the values the module's own comments justify."""
+    upstream = FakeUpstream().upstream()
+    client = upstream._client
+    assert client.trust_env is False
+    assert client.follow_redirects is False
+    assert client.headers["accept-encoding"] == "identity"
+    assert client.timeout == TIMEOUT
+    assert httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=None) == TIMEOUT
+    # FakeUpstream forces httpx.ASGITransport (no socket, no connection pool),
+    # so the pool's own limits are checked against a real-transport client
+    # instead. httpx.Limits(max_connections=None, ...) reaches httpcore as
+    # sys.maxsize, not None -- httpcore itself makes that substitution -- so
+    # that is what an unbounded pool asserts here.
+    pool = Upstream("https://upstream.test")._client._transport._pool  # ty: ignore[unresolved-attribute]
+    assert pool._max_connections == sys.maxsize
+    assert pool._max_keepalive_connections == 20
 
 
 def test_aclose_closes_the_client():
