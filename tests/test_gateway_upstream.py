@@ -9,6 +9,7 @@ import json
 import sys
 
 import httpx
+import pytest
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
@@ -295,6 +296,30 @@ def test_repeated_response_headers_survive():
     app = _proxy_app(fake.upstream(), buffered=True)
     r = _send(app, "POST", "/v1/messages", content=b"{}")
     assert r.headers.get_list("set-cookie") == ["a=1", "b=2"]
+
+
+def test_a_mid_body_upstream_failure_breaks_the_relay_instead_of_ending_it_cleanly():
+    """A chunked body (an SSE stream) declares no length, so ending it cleanly
+    when the upstream dies mid-body hands the client a complete, valid,
+    silently truncated response — an SSE stream missing message_stop looks
+    exactly like a finished one. The error must reach uvicorn, which then
+    aborts the connection without the terminating chunk."""
+
+    class Dies(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"event: ping\n\n"
+            raise httpx.ReadError("boom")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=Dies(), headers={"content-type": "text/event-stream"})
+
+    upstream = Upstream("https://upstream.test", transport=httpx.MockTransport(handler))
+    app = _proxy_app(upstream, buffered=True)
+    # ASGITransport re-raises whatever the app raised, which is how a caller
+    # sees the abort that a real uvicorn turns into a broken connection.
+    with pytest.raises(httpx.ReadError):
+        _send(app, "POST", "/v1/messages", content=b"{}")
+    asyncio.run(upstream.aclose())
 
 
 # --- failures of the forwarding itself -------------------------------------------------

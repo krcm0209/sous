@@ -114,11 +114,14 @@ async def _relay(response: httpx.Response) -> AsyncIterator[bytes]:
     try:
         async for chunk in response.aiter_raw():
             yield chunk
-    except httpx.HTTPError:
-        # Headers are already on the wire, so this can only end the body
-        # early; uvicorn closes the connection short of the declared length
-        # and the client sees a truncated response, which is the truth.
-        return
+        # An upstream failure mid-body is deliberately NOT caught: the headers
+        # are already on the wire, and returning here would let Starlette end
+        # the body normally — on a chunked response (any SSE stream) that is a
+        # complete, valid, silently truncated answer, and an SSE stream missing
+        # message_stop looks exactly like a finished one. Propagating instead
+        # makes uvicorn abort the connection without the terminating chunk, so
+        # the client sees a broken response and retries. uvicorn logs the
+        # exception; the traceback carries no header or body value.
     finally:
         # Also reached when the client hangs up: Starlette cancels the
         # streaming task, and inside a cancelled scope an await is skipped
