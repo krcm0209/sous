@@ -389,7 +389,10 @@ class Gateway:
         model = body.get("model") if isinstance(body, dict) else None
         if not isinstance(model, str):
             return None, "-"
-        if _MODEL_SUFFIX_RE.sub("", model, count=1) in self._config.gateway_local_models:
+        # Exact first, then suffix-stripped: a configured id may itself end in
+        # brackets, and stripping alone would make it permanently unroutable.
+        local = self._config.gateway_local_models
+        if model in local or _MODEL_SUFFIX_RE.sub("", model, count=1) in local:
             return body, model
         return None, _log_token(model, _LOG_ID_CHARS)
 

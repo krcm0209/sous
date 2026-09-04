@@ -974,6 +974,26 @@ def test_local_ids_match_with_a_bracketed_beta_suffix(tmp_path: Path):
     ]
 
 
+def test_a_configured_id_that_itself_ends_in_brackets_matches_exactly(tmp_path: Path):
+    """Suffix stripping must not make a configured id unroutable: `model[prod]`
+    in local_models is served locally, with or without a further beta suffix,
+    while the stripped-down `model` is nobody's local id and goes upstream."""
+    fake = FakeUpstream()
+    app = _app(
+        tmp_path,
+        FakeEngine(["ok", "ok"]),
+        upstream=fake.upstream(),
+        gateway_local_models=("sous-local", "model[prod]"),
+    )
+    for served in ("model[prod]", "model[prod][1m]"):
+        r = _post(app, _body(model=served))
+        assert r.status_code == 200, served
+        assert r.json()["model"] == served
+    assert fake.requests == []
+    _post(app, _body(model="model"))
+    assert [json.loads(s["body"])["model"] for s in fake.requests] == ["model"]
+
+
 def test_bodies_the_gateway_cannot_claim_are_the_upstreams_to_judge(tmp_path: Path):
     """Not JSON, not an object, no string model, strict-decoder rejects: none
     of these can name a local model, so the upstream answers in its own words."""
