@@ -44,6 +44,13 @@ Claude Code use stretches further — evaluate features against that goal.
   retry. A non-streaming turn's `on_delta` is accounting-only and wrapped in
   `ReplaySafe` (`engine/base.py`), so it still retries cold on a warm-cache
   failure — nothing was sent that a re-run would send twice.
+- The gateway forwards every request it does not serve (`gateway/upstream.py`)
+  as a transparent proxy: never re-serialize a forwarded body, never add or
+  alter an end-to-end header (only `Host`, the hop-by-hop set and a buffered
+  body's `Content-Length` change; responses gain only `Via`), never turn
+  `trust_env` on. The routing predicate is the decoded body's `model` after
+  stripping one trailing `[…]` suffix; a body that does not decode is the
+  upstream's, not a 400.
 
 ## Security boundary
 
@@ -56,7 +63,10 @@ pass.
 
 `src/sous/gateway/` is deliberately outside that boundary: it never executes a
 tool (Claude Code does, under its own permissions) and never logs a request
-body or header value. A change that makes it do either needs the spec
+body, header value or query string. It forwards the client's credentials to
+`[gateway].upstream_url` and nowhere else, and stores none. `sous claude`
+(`cli.py`) never sets `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` or a tier
+variable. A change that makes any of these otherwise needs the spec
 (`docs/superpowers/specs/2026-08-26-hybrid-gateway-design.md`) changed first.
 
 ## Workflow

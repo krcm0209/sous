@@ -105,15 +105,18 @@ single green run proves very little.
 
 ## Verifying the gateway endpoint
 
-Until the routing half of issue #41 lands, every request that reaches the
-gateway is served locally, so the only way to drive it from Claude Code is a
-*whole-session-local* run. That is a verification setup, not a supported
-mode (see README, "Gateway mode"). Set `[gateway].enabled = true` and
-`[gateway].max_context_tokens = 131072`, then restart the daemon. The larger
-window matters: Claude Code's own system prompt and tool schemas already fill
-~40K tokens, and one tool round trip pushes the rendered prompt past 80K, so
-the 65536 default (sized for a subagent's smaller turns) aborts a
-whole-session run with `prompt is too long`.
+The supported way to drive the gateway from Claude Code is `sous claude`
+(README, "Gateway mode"): the main loop goes upstream on your subscription
+and only Task-tool subagents reach the local model. To exercise the *local*
+endpoint on every turn instead, run a *whole-session-local* session — every
+tier pinned to `sous-local`. That is a verification setup, not a supported
+mode. Set `[gateway].enabled = true` and `[gateway].max_context_tokens =
+131072`, restart the daemon, and stay online: `/api/hello` and Claude Code's
+other base-URL calls are forwarded to the real API even when every model
+turn is local. The larger window matters: Claude Code's own system prompt
+and tool schemas already fill ~40K tokens, and one tool round trip pushes
+the rendered prompt past 80K, so the 65536 default (sized for a subagent's
+smaller turns) aborts a whole-session run with `prompt is too long`.
 
 ```bash
 env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
@@ -129,10 +132,14 @@ env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
 ```
 
 Do **not** set `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`: either one
-switches Claude Code from your subscription login to API-credit billing the
-moment traffic goes upstream again. The two context variables must match
+switches Claude Code from your subscription login to API-credit billing for
+everything that goes upstream — here the startup probe and telemetry, in
+hybrid mode the whole main loop. The two context variables must match
 `[gateway].max_context_tokens` (Claude Code honours them only for model ids
-that are not `claude-*`, which is why the served id is honest).
+that are not `claude-*`, which is why the served id is honest). Setting
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` is right *here*, where every model is
+local, and wrong in hybrid mode — `sous claude` leaves it unset because the
+setting is global and would cap the frontier main loop.
 `API_TIMEOUT_MS` covers model load plus a long prefill; `--disallowedTools
 LSP` keeps a language server from appending its schema mid-session and
 re-prefilling the whole conversation. Watch `~/.sous/daemon.log` for the
@@ -144,7 +151,12 @@ not seconds). That thrash is why the endpoint is built for subagents, whose
 turns run back to back and reuse the slot; keyed slots that would fix the
 whole-session case are a later phase.
 
-(The plan's Task 10 uses this recipe verbatim plus headless flags; keep the two identical.)
+To verify *forwarding* rather than the endpoint, `sous claude` plus
+`~/.sous/daemon.log` is enough: every forwarded request logs an `upstream
+<METHOD> <path> model=<id> status=<code>` line, every local turn a `POST
+/v1/messages model=sous-local ...` line. A hybrid session should show the
+main loop's `claude-*` requests forwarded and only the subagent's requests
+served locally.
 
 ## Questions
 
