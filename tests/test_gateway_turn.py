@@ -1,0 +1,350 @@
+"""One gateway turn on the shared engine: serialized, drained, session reuse."""
+
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+from sous.config import SousConfig
+from sous.engine.base import Delta, EngineManager, GenerationStalled, ReplaySafe
+from sous.gateway.turn import (
+    GatewayBusy,
+    PromptTooLong,
+    TurnAbandoned,
+    TurnResult,
+    TurnRunner,
+)
+from tests.fake_engine import ChunkedFakeEngine, FakeEngine
+
+
+class RecordingSink:
+    # Records deltas the way a client-facing sink would; kept non-replay-safe
+    # so existing tests here keep their pre-ReplaySafe semantics.
+    replay_safe = False
+
+    def __init__(self):
+        self.started_with: list[int] = []
+        self.deltas: list[Delta] = []
+        self.threads: set[threading.Thread] = set()
+
+    def started(self, input_tokens: int) -> None:
+        self.started_with.append(input_tokens)
+        self.threads.add(threading.current_thread())
+
+    def delta(self, delta: Delta) -> None:
+        self.deltas.append(delta)
+        self.threads.add(threading.current_thread())
+
+
+def _cfg(tmp_path: Path, **overrides) -> SousConfig:
+    overrides.setdefault("gateway_enabled", True)
+    return SousConfig(
+        data_dir=tmp_path / "data",
+        config_path=tmp_path / "config.toml",
+        **overrides,
+    )
+
+
+def _runner(tmp_path: Path, inner, **overrides) -> tuple[TurnRunner, EngineManager]:
+    engines = EngineManager(_cfg(tmp_path, **overrides), engine_factory=lambda mid: inner)
+    return TurnRunner(engines, _cfg(tmp_path, **overrides)), engines
+
+
+MSGS = [{"role": "user", "content": "hello"}]
+
+
+def test_run_streams_deltas_and_reports_real_counts(tmp_path: Path):
+    inner = ChunkedFakeEngine(["Hel|lo"])
+    runner, _ = _runner(tmp_path, inner)
+    sink = RecordingSink()
+    result = runner.run(MSGS, [], 4096, sink)
+    assert isinstance(result, TurnResult)
+    assert result.text == "Hello"
+    assert result.input_tokens == inner.count_tokens(MSGS, [])
+    assert result.output_tokens == 2 and result.finish_reason == "stop"
+    assert sink.started_with == [result.input_tokens]
+    assert [d.text for d in sink.deltas] == ["Hel", "lo"]
+    assert result.seconds >= 0 and result.cache_hit is False and result.reused_tokens == 0
+
+
+class _ReplaySafeSink(RecordingSink):
+    """A non-streaming sink stand-in: its delta() is accounting-only, never
+    forwarded anywhere a client can see."""
+
+    replay_safe = True
+
+
+def test_a_replay_safe_sink_wraps_on_delta_in_replaysafe(tmp_path: Path):
+    inner = FakeEngine(["ok"])
+    runner, _ = _runner(tmp_path, inner)
+    runner.run(MSGS, [], 4096, _ReplaySafeSink())
+    assert isinstance(inner.on_deltas_seen[-1], ReplaySafe)
+
+
+def test_a_non_replay_safe_sink_passes_on_delta_through_unwrapped(tmp_path: Path):
+    inner = FakeEngine(["ok"])
+    runner, _ = _runner(tmp_path, inner)
+    runner.run(MSGS, [], 4096, RecordingSink())
+    seen = inner.on_deltas_seen[-1]
+    assert not isinstance(seen, ReplaySafe)
+    assert callable(seen)
+
+
+def test_max_tokens_is_clamped_to_the_room_left_in_the_window(tmp_path: Path):
+    inner = FakeEngine(["ok"])
+    runner, _ = _runner(tmp_path, inner)
+    # 100_000 > the 65536 window: with a request that already fits, the test
+    # would be vacuous (Claude Code's 32000 fits comfortably).
+    runner.run(MSGS, [], 100_000, RecordingSink())
+    room = runner._window - inner.count_tokens(MSGS, [])
+    assert inner.max_tokens_seen == [room]
+    inner.script.append("ok")
+    runner.run(MSGS, [], 10, RecordingSink())
+    assert inner.max_tokens_seen[-1] == 10
+
+
+def test_prompt_that_fills_the_window_is_rejected_before_generating(tmp_path: Path):
+    inner = FakeEngine(["never"])
+    runner, _ = _runner(tmp_path, inner)  # window 65536; FakeEngine counts len/4
+    sink = RecordingSink()
+    with pytest.raises(PromptTooLong) as exc:
+        runner.run([{"role": "user", "content": "x" * 300_000}], [], 100, sink)
+    assert exc.value.window == 65536 and exc.value.tokens >= 65536
+    assert "prompt is too long" in str(exc.value)
+    assert sink.started_with == [] and inner.calls == []
+
+
+def test_all_turns_share_one_session_thread_so_the_prompt_cache_can_survive(tmp_path: Path):
+    inner = FakeEngine(["a", "b"])
+    runner, _ = _runner(tmp_path, inner)
+    runner.run(MSGS, [], 100, RecordingSink())
+    runner.run(MSGS, [], 100, RecordingSink())
+    assert inner.generate_threads[0] is inner.generate_threads[1]
+    assert inner.resets == 0  # unlike run_task, a turn never resets the cache
+    runner.close()
+
+
+def test_a_reloaded_engine_gets_a_fresh_session(tmp_path: Path):
+    """After an idle unload the next get() builds a new ManagedEngine; the old
+    session's thread would call into weights that are gone."""
+    made: list[FakeEngine] = []
+
+    def factory(mid):
+        e = FakeEngine(["a", "b"])
+        made.append(e)
+        return e
+
+    cfg = _cfg(tmp_path, idle_unload_minutes=0)
+    engines = EngineManager(cfg, engine_factory=factory)
+    runner = TurnRunner(engines, cfg)
+    runner.run(MSGS, [], 100, RecordingSink())
+    first_session = runner._session
+    assert first_session is not None
+    time.sleep(0.01)
+    assert engines.unload_if_idle() is True
+    runner.run(MSGS, [], 100, RecordingSink())
+    assert len(made) == 2 and made[1].calls  # second turn ran on the new engine
+    assert runner._session is not first_session
+    first_session._thread.join(5)
+    assert not first_session._thread.is_alive()
+
+
+def test_a_running_turn_pins_the_engine_against_the_idle_unload(tmp_path: Path):
+    """count_tokens runs before anything takes _gen_lock and takes seconds on
+    a real 80K prompt. The worker sweeps unload_if_idle() from its own thread
+    every 0.5s, so with a 0-minute idle threshold it would free the weights
+    mid-count and the turn would then generate on an unloaded engine."""
+    counting = threading.Event()
+    gate = threading.Event()
+
+    class SlowCount(FakeEngine):
+        def count_tokens(self, messages, tools):
+            counting.set()
+            gate.wait(10)
+            return super().count_tokens(messages, tools)
+
+    inner = SlowCount(["ok"])
+    runner, engines = _runner(tmp_path, inner, idle_unload_minutes=0)
+    results: list[TurnResult] = []
+    t = threading.Thread(target=lambda: results.append(runner.run(MSGS, [], 100, RecordingSink())))
+    t.start()
+    try:
+        assert counting.wait(5)
+        time.sleep(0.01)  # let the 0-minute idle threshold elapse
+        assert engines.unload_if_idle() is False
+        assert engines.status()["loaded"] is True
+        assert inner.unloaded is False
+    finally:
+        gate.set()
+    t.join(5)
+    assert not t.is_alive()
+    assert len(results) == 1 and results[0].text == "ok"
+
+
+def test_turns_are_serialized(tmp_path: Path):
+    inner = ChunkedFakeEngine(["one|two", "three"], delay=0.2)
+    runner, _ = _runner(tmp_path, inner)
+    order: list[str] = []
+
+    def go(label):
+        runner.run(MSGS, [], 100, RecordingSink())
+        order.append(label)
+
+    a = threading.Thread(target=go, args=("a",))
+    b = threading.Thread(target=go, args=("b",))
+    a.start()
+    # Wait for a handshake, not a fixed sleep: a has entered generation (and
+    # so holds the runner lock) once it shows up in generate_threads. A sleep
+    # here raced the scheduler — under delay, b could take the lock first and
+    # the ["a", "b"] assertion below would fail intermittently.
+    deadline = time.monotonic() + 5
+    while not inner.generate_threads and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert inner.generate_threads
+    b.start()
+    a.join(5)
+    b.join(5)
+    assert order == ["a", "b"]
+    assert len(inner.generate_threads) == 2
+
+
+def test_busy_gateway_gives_up_after_the_timeout(tmp_path: Path):
+    entered = threading.Event()
+
+    class Announcing(ChunkedFakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            entered.set()  # t is past session.generate(timeout=...) by now
+            return super().generate(messages, tools, max_tokens, on_delta)
+
+    inner = Announcing(["slow|slow|slow"], delay=0.3)
+    runner, _ = _runner(tmp_path, inner)
+    t = threading.Thread(target=runner.run, args=(MSGS, [], 100, RecordingSink()))
+    t.start()
+    assert entered.wait(5)  # t holds the gateway lock and is generating
+    # Config is minutes-granular; the waiter needs a sub-second bound. Set it
+    # only now, after t captured the long timeout for its own generation.
+    runner._timeout = 0.2
+    with pytest.raises(GatewayBusy):
+        runner.run(MSGS, [], 100, RecordingSink())
+    t.join(5)
+    assert inner.finished.wait(5)
+
+
+def test_a_stall_drops_the_session_and_the_next_turn_gets_a_new_one(tmp_path: Path):
+    gate = threading.Event()
+
+    class Gated(FakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            gate.wait(10)
+            return super().generate(messages, tools, max_tokens, on_delta)
+
+    inner = Gated(["late", "fresh"])
+    runner, _ = _runner(tmp_path, inner)
+    runner._timeout = 0.1
+    with pytest.raises(GenerationStalled):
+        runner.run(MSGS, [], 100, RecordingSink())
+    assert runner._session is None
+    assert inner.resets == 1  # the abandoned thread's cache must never be adopted
+    gate.set()  # the stalled thread finishes and releases the engine lock
+    time.sleep(0.2)
+    runner._timeout = 5
+    assert runner.run(MSGS, [], 100, RecordingSink()).text == "fresh"
+    assert inner.generate_threads[0] is not inner.generate_threads[1]
+
+
+def test_a_turn_abandoned_while_queued_never_generates(tmp_path: Path):
+    """Drain-to-completion covers a generation that started. One whose client
+    left while it was still waiting for the lock must not start."""
+    inner = FakeEngine(["never"])
+    runner, _ = _runner(tmp_path, inner)
+    gone = threading.Event()
+    gone.set()
+    with pytest.raises(TurnAbandoned):
+        runner.run(MSGS, [], 100, RecordingSink(), abandoned=gone)
+    assert inner.calls == []
+    assert not runner._lock.locked()
+
+
+def test_close_during_a_turn_drops_the_session_once_the_turn_finishes(tmp_path: Path):
+    """close() giving up on a busy lock must not leak the session thread:
+    the turn holding the lock sees `_closing` in its own finally and drops
+    the session itself when it ends."""
+    entered = threading.Event()
+
+    class Announcing(ChunkedFakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            entered.set()
+            return super().generate(messages, tools, max_tokens, on_delta)
+
+    inner = Announcing(["slow|slow"], delay=0.2)
+    runner, _ = _runner(tmp_path, inner)
+    results: list[TurnResult] = []
+    t = threading.Thread(target=lambda: results.append(runner.run(MSGS, [], 100, RecordingSink())))
+    t.start()
+    assert entered.wait(5)  # t holds the lock and is mid-generation
+    session = runner._session
+    assert session is not None
+
+    started = time.monotonic()
+    assert runner.close(timeout=0.2) is False
+    assert time.monotonic() - started < 2.0  # close gave up quickly, not after the drain
+
+    t.join(5)
+    assert len(results) == 1  # the turn's own result still came back normally
+    assert session.join(5)  # its thread exits on its own, no join from close()
+
+
+def test_a_turn_queued_while_closing_refuses_to_start(tmp_path: Path):
+    inner = FakeEngine(["never"])
+    runner, _ = _runner(tmp_path, inner)
+    runner._closing = True
+    with pytest.raises(GatewayBusy, match="shutting down"):
+        runner.run(MSGS, [], 100, RecordingSink())
+    assert inner.calls == []
+    assert not runner._lock.locked()
+
+
+def test_run_releases_mlx_thread_state_and_touches_the_engine(tmp_path: Path, monkeypatch):
+    import sous.gateway.turn as turn
+
+    released: list[bool] = []
+    monkeypatch.setattr(turn, "release_mlx_thread_state", lambda: released.append(True))
+    inner = FakeEngine(["ok"])
+    runner, engines = _runner(tmp_path, inner)
+    runner.run(MSGS, [], 100, RecordingSink())
+    assert released == [True]
+    idle = engines.status()["idle_seconds"]
+    assert idle is not None and idle < 1.0
+
+
+def test_count_tokens_uses_the_engine_and_releases(tmp_path: Path, monkeypatch):
+    import sous.gateway.turn as turn
+
+    released: list[bool] = []
+    monkeypatch.setattr(turn, "release_mlx_thread_state", lambda: released.append(True))
+    inner = FakeEngine([])
+    runner, _ = _runner(tmp_path, inner)
+    assert runner.count_tokens(MSGS, []) == inner.count_tokens(MSGS, [])
+    assert released == [True]
+
+
+def test_cache_hit_is_reported_from_the_engines_counters(tmp_path: Path):
+    inner = FakeEngine(["a", "b"])
+    inner.stats = {"hits": 0, "reused_tokens": 0}
+    runner, _ = _runner(tmp_path, inner)
+
+    # Simulate the engine's stats moving during the second turn.
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 2:
+            inner.stats = {"hits": 1, "reused_tokens": 900}
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    first = runner.run(MSGS, [], 100, RecordingSink())
+    second = runner.run(MSGS, [], 100, RecordingSink())
+    assert (first.cache_hit, first.reused_tokens) == (False, 0)
+    assert (second.cache_hit, second.reused_tokens) == (True, 900)

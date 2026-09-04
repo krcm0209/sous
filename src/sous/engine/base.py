@@ -8,9 +8,47 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 from sous.config import SousConfig
+
+
+@dataclass(frozen=True)
+class Delta:
+    """One streamed piece of a generation, delivered as the engine produces it.
+
+    `output_tokens` counts everything generated so far, this piece included.
+    `finish_reason` is None until the final piece, then "stop" (the model ended
+    its turn) or "length" (max_tokens was reached). The final piece may carry
+    empty text — the detokenizer's flush — so an empty delta is not "nothing
+    happened".
+    """
+
+    text: str
+    output_tokens: int
+    finish_reason: str | None = None
+
+
+# Called on the generating thread, inside the decode loop: it must return
+# quickly and must never raise — an exception here fails the generation.
+# Wrapping a callback in ReplaySafe below marks it replay-safe: a warm-cache
+# failure partway through may still be retried cold.
+OnDelta = Callable[[Delta], None]
+
+
+class ReplaySafe:
+    """An on_delta whose output never leaves the process (accounting only),
+    so a failed warm attempt may still be retried cold: nothing was sent
+    that a re-run would send twice."""
+
+    __slots__ = ("fn",)
+
+    def __init__(self, fn: OnDelta) -> None:
+        self.fn = fn
+
+    def __call__(self, delta: Delta) -> None:
+        self.fn(delta)
 
 
 class Engine(Protocol):
@@ -20,7 +58,13 @@ class Engine(Protocol):
     @property
     def model_id(self) -> str: ...
 
-    def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str: ...
+    def generate(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+        on_delta: OnDelta | None = None,
+    ) -> str: ...
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int: ...
     def reset_prompt_cache(self) -> None: ...
     def prompt_cache_stats(self) -> dict: ...
@@ -125,9 +169,15 @@ class ManagedEngine:
     def model_id(self) -> str:
         return self._inner.model_id
 
-    def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:
+    def generate(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+        on_delta: OnDelta | None = None,
+    ) -> str:
         with self._gen_lock:
-            return self._inner.generate(messages, tools, max_tokens)
+            return self._inner.generate(messages, tools, max_tokens, on_delta)
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
         return self._inner.count_tokens(messages, tools)
@@ -166,7 +216,9 @@ class GenerationSession:
     design spec), and every thread that touched mlx must call
     release_mlx_thread_state() before it exits (ml-explore/mlx#4327). A fresh
     thread per generation therefore killed the prompt cache every turn; one
-    thread per task lets turn N+1 reuse turn N's cache.
+    thread per task lets turn N+1 reuse turn N's cache. The cache slot itself
+    now records which thread built it, so a session on any other thread gets
+    a cold miss instead of touching those arrays.
 
     The loop re-checks `_abandoned` while it HOLDS _gen_lock: a request whose
     task gave up while still queued on the lock exits instead of running
@@ -182,7 +234,13 @@ class GenerationSession:
     task off the engine meanwhile. _CLOSE deliberately carries no cache
     reset — a late reset from a stale session thread would race the next
     task's cache and stats, the same class of bug as consideration 7. Every
-    reset belongs to the worker thread.
+    reset belongs to the thread that owns the session: the worker thread for
+    tasks, the gateway's turn thread after a stall (`sous.gateway.turn`).
+
+    on_delta, when given, fires on this thread from inside the engine's decode
+    loop — mid-generation, under _gen_lock. A stalled-and-abandoned generation
+    keeps firing it until it ends, so a consumer must tolerate deltas that
+    arrive after generate() has already raised GenerationStalled.
     """
 
     def __init__(self, managed: ManagedEngine):
@@ -217,20 +275,27 @@ class GenerationSession:
                 if self._abandoned.is_set():
                     return
                 self._replies.put_nowait(reply)
-                # A parked thread must not pin the reply: an ("err", e) entry
-                # holds the whole generation frame — KV cache included —
-                # through the traceback.
-                del reply
+                # A parked thread must not pin either end of the exchange: an
+                # ("err", e) reply holds the whole generation frame — KV cache
+                # included — through the traceback, and a gateway request holds
+                # its on_delta closure and through it the client's queue and
+                # event loop, for as long as the thread waits for the next one.
+                del reply, req
         finally:
             release_mlx_thread_state()
 
     def generate(
-        self, messages: list[dict], tools: list[dict], max_tokens: int, timeout: float
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+        timeout: float,
+        on_delta: OnDelta | None = None,
     ) -> str:
         assert not self._closed and not self._abandoned.is_set(), (
             "session reused after close() or a stall"
         )
-        self._requests.put_nowait((messages, tools, max_tokens))
+        self._requests.put_nowait((messages, tools, max_tokens, on_delta))
         try:
             kind, value = self._replies.get(timeout=timeout)
         except queue.Empty:
@@ -252,6 +317,15 @@ class GenerationSession:
         with contextlib.suppress(queue.Full):
             self._requests.put_nowait(_CLOSE)
 
+    def join(self, timeout: float) -> bool:
+        """Wait up to `timeout` seconds for the session thread to exit after
+        close(). Never blocks indefinitely: a wedged generation (see the
+        class docstring) never dequeues _CLOSE, and the caller — an app
+        shutdown hook — must not hang on that. Returns whether the thread
+        actually exited."""
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
 
 class EngineManager:
     def __init__(self, config: SousConfig, engine_factory: Callable[[str], Engine] | None = None):
@@ -270,6 +344,7 @@ class EngineManager:
         self._lock = threading.Lock()
         self._engine: ManagedEngine | None = None
         self._last_used: float | None = None
+        self._leases = 0
 
     def get(self) -> ManagedEngine:
         with self._lock:
@@ -282,13 +357,33 @@ class EngineManager:
         with self._lock:
             self._last_used = time.monotonic()
 
+    @contextlib.contextmanager
+    def lease(self):
+        """Pin the loaded engine for the caller's whole span of use.
+
+        _gen_lock only covers generate(). A gateway turn holds the engine from
+        get() through count_tokens() — seconds on a large prompt — before
+        anything takes that lock, and the idle sweep runs on a different
+        thread (the worker's loop), so it could free the weights in between.
+        The worker never needed one: it sweeps on the same thread that runs
+        its tasks, serially.
+        """
+        with self._lock:
+            self._leases += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._leases -= 1
+
     def unload_if_idle(self) -> bool:
         with self._lock:
             if self._engine is None or self._last_used is None:
                 return False
-            if self._engine.generation_in_flight():
+            if self._engine.generation_in_flight() or self._leases:
                 # Never free the model weights under an active (possibly
-                # abandoned-as-stalled) generation.
+                # abandoned-as-stalled) generation, nor under a caller that is
+                # holding this engine across calls that take no _gen_lock.
                 return False
             idle = time.monotonic() - self._last_used
             if idle > self._config.idle_unload_minutes * 60:

@@ -184,3 +184,23 @@ def test_incompatible_drafter_never_materializes_bf16():
     peak_gb = mx.get_peak_memory() / 1e9
     assert peak_gb < 3.0, f"peak {peak_gb:.2f} GB — drafter bf16 was materialized"
     e.unload()
+
+
+def test_vlm_engine_streams_deltas_that_reassemble_the_reply():
+    from sous.engine.base import Delta
+    from sous.engine.vlm import VLMEngine
+    from sous.protocol import WORKER_TOOLS
+
+    e = VLMEngine(TINY_VLM)
+    seen: list[Delta] = []
+    msgs = [{"role": "user", "content": "Count from one to five."}]
+    out = e.generate(msgs, WORKER_TOOLS, max_tokens=32, on_delta=seen.append)
+    assert "".join(d.text for d in seen) == out
+    assert seen[-1].finish_reason in ("stop", "length")
+    assert all(d.finish_reason is None for d in seen[:-1])
+    assert [d.output_tokens for d in seen] == sorted(d.output_tokens for d in seen)
+    # mlx-vlm yields every token and then a flush result: on an EOS stop the
+    # loop breaks before yielding, so the flush carries len(seen); on a
+    # max_tokens finish it repeats the last count, len(seen) - 1.
+    assert seen[-1].output_tokens in (len(seen), len(seen) - 1)
+    e.unload()

@@ -5,6 +5,8 @@ behind, so they exercise the guards without downloading a real MLX model —
 the model-marked engine tests cannot run in CI.
 """
 
+import threading
+
 import pytest
 
 from sous.engine.lm import LMEngine
@@ -21,6 +23,7 @@ def _unloaded_lm() -> LMEngine:
     engine._model = None
     engine._tokenizer = None
     engine._memo = PromptMemo()
+    engine._tokenize_lock = threading.Lock()
     engine._cache = PrefixCache(engine, enabled=True)
     return engine
 
@@ -33,6 +36,7 @@ def _unloaded_vlm() -> VLMEngine:
     engine._model = None
     engine._processor = None
     engine._memo = PromptMemo()
+    engine._tokenize_lock = threading.Lock()
     engine._cache = PrefixCache(engine, enabled=True)
     return engine
 

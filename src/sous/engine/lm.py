@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 from typing import cast
 
+from sous.engine.base import Delta, OnDelta
 from sous.engine.promptcache import PrefixCache, PromptMemo
 
 
@@ -25,6 +27,7 @@ class LMEngine:
         self._model, self._tokenizer = load(model_id)  # ty: ignore[invalid-assignment]
         self._sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
         self._memo = PromptMemo()
+        self._tokenize_lock = threading.Lock()
         self._cache = PrefixCache(self, enabled=prompt_cache)
 
     def _loaded(self) -> tuple:
@@ -54,26 +57,32 @@ class LMEngine:
     def _ids(self, slot: str, messages: list[dict], tools: list[dict]) -> list[int]:
         """Tokenize a render once per turn. The two slots are the stable render
         and the full prompt; count_tokens and generate both read them."""
-        _, tokenizer = self._loaded()
-        text = self._prompt(messages, tools, generation=slot == "full")
-        cached = self._memo.get(slot, text)
-        if cached is not None:
-            return cached
-        # mlx_lm.generate's stream_generate (mlx_lm/generate.py:691-694) only
-        # adds special tokens when the tokenizer has no bos_token, or the
-        # prompt doesn't already start with it — because the chat template
-        # usually emits BOS itself. Before this cache existed, sous handed
-        # stream_generate a string and got this for free; encoding ids
-        # ourselves has to replicate the same rule explicitly, mirroring
-        # VLMEngine._encode's should_add_special_tokens for the same model.
-        # A mismatch would not fail loudly — it would silently duplicate BOS
-        # on every turn for any model whose template already emits it (e.g.
-        # Llama-3, Gemma, Mistral MLX conversions).
-        bos = getattr(tokenizer, "bos_token", None)
-        add_special = bos is None or not text.startswith(bos)
-        ids = list(tokenizer.encode(text, add_special_tokens=add_special))
-        self._memo.put(slot, text, ids)
-        return ids
+        # One lock for every tokenization: HF's fast tokenizer mutates shared
+        # Rust state on each encode (set_truncation_and_padding), and since the
+        # gateway there are two callers — a turn on a pool thread and Claude
+        # Code's count_tokens, which it sends mid-turn. Not _gen_lock: that
+        # would queue a token count behind a whole generation.
+        with self._tokenize_lock:
+            _, tokenizer = self._loaded()
+            text = self._prompt(messages, tools, generation=slot == "full")
+            cached = self._memo.get(slot, text)
+            if cached is not None:
+                return cached
+            # mlx_lm.generate's stream_generate (mlx_lm/generate.py:691-694) only
+            # adds special tokens when the tokenizer has no bos_token, or the
+            # prompt doesn't already start with it — because the chat template
+            # usually emits BOS itself. Before this cache existed, sous handed
+            # stream_generate a string and got this for free; encoding ids
+            # ourselves has to replicate the same rule explicitly, mirroring
+            # VLMEngine._encode's should_add_special_tokens for the same model.
+            # A mismatch would not fail loudly — it would silently duplicate BOS
+            # on every turn for any model whose template already emits it (e.g.
+            # Llama-3, Gemma, Mistral MLX conversions).
+            bos = getattr(tokenizer, "bos_token", None)
+            add_special = bos is None or not text.startswith(bos)
+            ids = list(tokenizer.encode(text, add_special_tokens=add_special))
+            self._memo.put(slot, text, ids)
+            return ids
 
     # ---- CacheHooks ------------------------------------------------------
 
@@ -103,7 +112,9 @@ class LMEngine:
             model(mx.array(token_ids[i : i + step])[None], cache=cache)
             mx.eval([c.state for c in cache])
 
-    def decode(self, cache: list, token_ids: list[int], max_tokens: int) -> str:
+    def decode(
+        self, cache: list, token_ids: list[int], max_tokens: int, on_delta: OnDelta | None = None
+    ) -> str:
         from mlx_lm import stream_generate
 
         model, tokenizer = self._loaded()
@@ -117,6 +128,8 @@ class LMEngine:
             prompt_cache=cache,
         ):
             chunks.append(r.text)
+            if on_delta is not None:
+                on_delta(Delta(r.text, r.generation_tokens, r.finish_reason))
         return "".join(chunks)
 
     def copy_array(self, a: object) -> object:
@@ -128,13 +141,19 @@ class LMEngine:
 
     # ---- Engine ----------------------------------------------------------
 
-    def generate(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:
+    def generate(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+        on_delta: OnDelta | None = None,
+    ) -> str:
         full_ids = self._ids("full", messages, tools)
         # The stable render is only an anchor for reuse, and PrefixCache discards
         # it when disabled — so computing it would cost a whole extra tokenization
         # per turn for nothing.
         stable_ids = self._ids("stable", messages, tools) if self._cache.enabled else []
-        return self._cache.generate(stable_ids, full_ids, max_tokens)
+        return self._cache.generate(stable_ids, full_ids, max_tokens, on_delta)
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
         return len(self._ids("full", messages, tools))

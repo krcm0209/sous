@@ -1344,17 +1344,22 @@ name = "sous-mcp"
 version = "0.5.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "huggingface-hub" },
     { name = "mcp" },
     { name = "mlx" },
     { name = "mlx-lm" },
     { name = "mlx-vlm" },
     { name = "psutil" },
+    { name = "sse-starlette" },
+    { name = "starlette" },
     { name = "tomlkit" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "httpx" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pyyaml" },
@@ -1364,17 +1369,22 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4" },
     { name = "huggingface-hub" },
     { name = "mcp", specifier = ">=2.0,<3" },
     { name = "mlx", specifier = ">=0.31" },
     { name = "mlx-lm", specifier = ">=0.31" },
     { name = "mlx-vlm", specifier = ">=0.6.16" },
     { name = "psutil", specifier = ">=7" },
+    { name = "sse-starlette", specifier = ">=3.4" },
+    { name = "starlette", specifier = ">=1.6" },
     { name = "tomlkit", specifier = ">=0.13" },
+    { name = "uvicorn", specifier = ">=0.31" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "httpx", specifier = ">=0.28" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },

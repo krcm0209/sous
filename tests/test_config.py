@@ -335,3 +335,96 @@ def test_speculative_block_size_zero_and_ge_two_accepted(tmp_path: Path):
         cfg = load_config(p)
     assert cfg.speculative_block_size == 0
     assert not [w for w in caught if "speculative_block_size" in str(w.message)]
+
+
+# --- [gateway] -----------------------------------------------------------------
+
+
+def test_gateway_defaults_are_off_and_above_the_claude_code_floor(tmp_path: Path):
+    from sous.config import GATEWAY_MIN_CONTEXT_TOKENS
+
+    cfg = load_config(tmp_path / "nope.toml")
+    assert cfg.gateway_enabled is False
+    assert cfg.gateway_local_models == ("sous-local",)
+    assert cfg.gateway_max_context_tokens == 65536
+    assert cfg.gateway_max_context_tokens >= GATEWAY_MIN_CONTEXT_TOKENS == 49152
+    assert cfg.gateway_generation_timeout_minutes == 30
+
+
+def test_gateway_section_overrides_every_key_without_warnings(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        "[gateway]\n"
+        "enabled = true\n"
+        'local_models = ["sous-local", "sous-fast"]\n'
+        "max_context_tokens = 131072\n"
+        "generation_timeout_minutes = 5\n"
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cfg = load_config(p)
+    assert cfg.gateway_enabled is True
+    assert cfg.gateway_local_models == ("sous-local", "sous-fast")
+    assert cfg.gateway_max_context_tokens == 131072
+    assert cfg.gateway_generation_timeout_minutes == 5
+
+
+def test_gateway_window_below_the_floor_clamps_up_with_a_warning(tmp_path: Path):
+    """Claude Code refuses models under 48K of context, so a smaller window can
+    only be a misjudged floor: serve the floor, not the default, and say so."""
+    from sous.config import GATEWAY_MIN_CONTEXT_TOKENS
+
+    p = tmp_path / "config.toml"
+    p.write_text("[gateway]\nmax_context_tokens = 32768\n")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(p)
+    assert cfg.gateway_max_context_tokens == GATEWAY_MIN_CONTEXT_TOKENS
+    assert any("floor" in str(w.message) for w in caught)
+
+
+def test_gateway_bad_values_degrade_to_defaults_with_warnings(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        "[gateway]\n"
+        'enabled = "yes"\n'
+        "local_models = []\n"
+        "max_context_tokens = -1\n"
+        "generation_timeout_minutes = 0\n"
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(p)
+    assert cfg.gateway_enabled is False
+    assert cfg.gateway_local_models == ("sous-local",)
+    assert cfg.gateway_max_context_tokens == 65536
+    assert cfg.gateway_generation_timeout_minutes == 30
+    messages = " ".join(str(w.message) for w in caught)
+    for key in ("enabled", "local_models", "max_context_tokens", "generation_timeout_minutes"):
+        assert key in messages, key
+
+
+def test_gateway_local_models_rejects_non_string_entries(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text('[gateway]\nlocal_models = ["ok", 3]\n')
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(p)
+    assert cfg.gateway_local_models == ("sous-local",)
+    assert any("local_models" in str(w.message) for w in caught)
+
+
+def test_gateway_local_models_rejects_claude_ids(tmp_path: Path):
+    """Claude Code ignores CLAUDE_CODE_MAX_CONTEXT_TOKENS for ids that
+    canonicalize to claude-*, so an impersonating id silently forfeits the
+    window control the gateway depends on — the spec makes honest ids
+    mandatory, not preferable."""
+    p = tmp_path / "config.toml"
+    p.write_text('[gateway]\nlocal_models = ["sous-local", "Claude-haiku-4-5"]\n')
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(p)
+    assert cfg.gateway_local_models == ("sous-local",)
+    assert any(
+        "local_models" in str(w.message) and "claude" in str(w.message).lower() for w in caught
+    )
