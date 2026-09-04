@@ -3,6 +3,7 @@ model is silent, and a client that hangs up mid-stream. httpx's in-process
 transport buffers whole responses, so these run uvicorn on a loopback port in
 a thread — same stack as the daemon, no subprocess."""
 
+import asyncio
 import concurrent.futures
 import contextlib
 import json
@@ -16,13 +17,19 @@ import httpx
 import pytest
 import uvicorn
 from mcp.server import MCPServer
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import Response, StreamingResponse
+from starlette.routing import Route
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
 from sous.gateway.routes import Gateway, mount_gateway
+from sous.gateway.upstream import Upstream
 from sous.server import GRACEFUL_SHUTDOWN_SECONDS, create_server, uvicorn_config
 from sous.tasks import TaskStore
 from tests.fake_engine import ChunkedFakeEngine
+from tests.fake_upstream import FakeUpstream
 
 pytestmark = pytest.mark.slow
 
@@ -33,12 +40,28 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _app(tmp_path: Path, engine):
+def _app(
+    tmp_path: Path,
+    engine,
+    upstream_url: str | None = None,
+    upstream: Upstream | None = None,
+):
+    """`upstream_url` points [gateway].upstream_url at a fake served by _serve
+    (a loopback http origin the config accepts); tests that forward nothing
+    get an in-process fake so no Gateway in this file can ever reach the
+    network."""
     cfg = SousConfig(
-        data_dir=tmp_path / "data", config_path=tmp_path / "config.toml", gateway_enabled=True
+        data_dir=tmp_path / "data",
+        config_path=tmp_path / "config.toml",
+        gateway_enabled=True,
+        gateway_upstream_url=upstream_url or "https://api.anthropic.com",
     )
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
-    return create_server(TaskStore(tmp_path / "tasks.db"), engines, cfg).streamable_http_app()
+    if upstream_url is None and upstream is None:
+        upstream = FakeUpstream().upstream()
+    return create_server(
+        TaskStore(tmp_path / "tasks.db"), engines, cfg, upstream=upstream
+    ).streamable_http_app()
 
 
 def _gateway_app(tmp_path: Path, engine) -> tuple[Gateway, object]:
@@ -102,6 +125,46 @@ def _frames(lines: Iterator[str]) -> Iterator[tuple[str, dict | None]]:
         elif line == "" and event is not None:
             yield event, data
             event = data = None
+
+
+def _fake_upstream_app(record: dict) -> Starlette:
+    """A stand-in for api.anthropic.com over a real socket: /v1/messages
+    streams two SSE frames a second apart (or, with record["hold"], frames
+    every 0.2 s until the connection drops) and notes when its generator is
+    closed; /api/hello answers 200. Records the headers it saw."""
+    record["closed"] = threading.Event()
+
+    async def messages(request: Request) -> Response:
+        record["headers"] = dict(request.headers)
+        record["body"] = await request.body()
+
+        async def frames():
+            try:
+                yield b"event: message_start\ndata: {}\n\n"
+                if record.get("hold"):
+                    while True:
+                        await asyncio.sleep(0.2)
+                        yield b"event: ping\ndata: {}\n\n"
+                await asyncio.sleep(1.0)
+                yield b"event: message_stop\ndata: {}\n\n"
+            finally:
+                record["closed"].set()
+
+        return StreamingResponse(frames(), media_type="text/event-stream")
+
+    async def hello(request: Request) -> Response:
+        return Response(status_code=200)
+
+    return Starlette(
+        routes=[
+            Route("/v1/messages", messages, methods=["POST"]),
+            Route("/api/hello", hello, methods=["GET", "HEAD"]),
+        ]
+    )
+
+
+def _upstream_body() -> dict:
+    return {"model": "claude-opus-5", "max_tokens": 64, "stream": True, "messages": []}
 
 
 def test_pings_keep_flowing_while_the_model_is_silent(tmp_path: Path, monkeypatch):
@@ -332,3 +395,92 @@ def test_a_full_queue_answers_529_immediately_and_releases_on_completion(
         assert third.json()["content"] == [{"type": "text", "text": "third"}]
 
     assert len(inner.calls) == 2  # the 529'd request never reached the engine
+
+
+# --- forwarding (Phase 2) ---------------------------------------------------------------
+
+
+def test_a_forwarded_stream_is_relayed_as_it_arrives(tmp_path: Path):
+    """The relay must not buffer: the first upstream frame reaches the client
+    before the upstream's one-second pause ends. Headers cross intact and the
+    Host is the upstream's own."""
+    record: dict = {}
+    with (
+        _serve(_fake_upstream_app(record)) as (upstream_base, _us, _ut),
+        _serve(_app(tmp_path, ChunkedFakeEngine([]), upstream_url=upstream_base)) as (base, _s, _t),
+        httpx.Client(timeout=30) as client,
+    ):
+        t0 = time.monotonic()
+        with client.stream(
+            "POST",
+            f"{base}/v1/messages",
+            json=_upstream_body(),
+            headers={
+                "authorization": "Bearer sk-ant-oat01-canary",
+                "anthropic-beta": "oauth-2025-04-20",
+            },
+        ) as r:
+            assert r.status_code == 200
+            assert r.headers["via"] == "1.1 sous"
+            assert r.headers["content-type"].startswith("text/event-stream")
+            lines = r.iter_lines()
+            first = next(line for line in lines if line.startswith("event: "))
+            assert first == "event: message_start"
+            assert time.monotonic() - t0 < 0.9, "the first frame was held back"
+            rest = list(lines)
+        assert "event: message_stop" in rest
+        assert client.head(f"{base}/api/hello").status_code == 200
+    assert record["headers"]["authorization"] == "Bearer sk-ant-oat01-canary"
+    assert record["headers"]["anthropic-beta"] == "oauth-2025-04-20"
+    assert record["headers"]["host"] == upstream_base.removeprefix("http://")
+    assert json.loads(record["body"]) == _upstream_body()
+
+
+def test_a_client_that_hangs_up_closes_the_upstream_stream(tmp_path: Path):
+    """Without the shielded close in the relay, an abandoned forwarded stream
+    keeps the upstream generating (and billing) until its read timeout."""
+    record: dict = {"hold": True}
+    with (
+        _serve(_fake_upstream_app(record)) as (upstream_base, _us, _ut),
+        _serve(_app(tmp_path, ChunkedFakeEngine([]), upstream_url=upstream_base)) as (base, _s, _t),
+        httpx.Client(timeout=30) as client,
+    ):
+        with client.stream("POST", f"{base}/v1/messages", json=_upstream_body()) as r:
+            for line in r.iter_lines():
+                if line == "event: ping":
+                    break  # hang up mid-stream
+        assert record["closed"].wait(10), "the upstream stream was never closed"
+
+
+def test_an_unreachable_upstream_is_a_prompt_502_and_the_local_model_still_serves(tmp_path: Path):
+    dead = f"http://127.0.0.1:{_free_port()}"
+    with (
+        _serve(_app(tmp_path, ChunkedFakeEngine(["local"]), upstream_url=dead)) as (base, _s, _t),
+        httpx.Client(timeout=30) as client,
+    ):
+        t0 = time.monotonic()
+        r = client.head(f"{base}/api/hello")
+        assert r.status_code == 502
+        assert r.headers["via"] == "1.1 sous"
+        assert time.monotonic() - t0 < 5
+        r = client.post(f"{base}/v1/messages", json=_upstream_body())
+        assert r.status_code == 502
+        assert r.json()["error"]["type"] == "api_error"
+        r = client.post(f"{base}/v1/messages", json=_body(stream=False))
+        assert r.status_code == 200
+        assert r.json()["content"] == [{"type": "text", "text": "local"}]
+
+
+def test_app_shutdown_closes_the_upstream_client(tmp_path: Path):
+    """The lifespan hook that closes the gateway (Phase 1) now also closes the
+    forwarder's connection pool — through the real ASGI lifespan, not by
+    calling aclose() directly."""
+    upstream = Upstream("https://api.anthropic.com")
+    with _serve(_app(tmp_path, ChunkedFakeEngine(["ok"]), upstream=upstream)) as (base, server, _t):
+        assert (
+            httpx.post(f"{base}/v1/messages", json=_body(stream=False), timeout=30).status_code
+            == 200
+        )
+        assert not upstream._client.is_closed
+        server.should_exit = True
+    assert upstream._client.is_closed
