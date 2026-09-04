@@ -159,8 +159,8 @@ disagree, and uses the daemon's values. Then it replaces itself with
 | Variable | Value | Why |
 |---|---|---|
 | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8383` | one endpoint; the gateway routes on the requested model id |
-| `CLAUDE_CODE_SUBAGENT_MODEL` | `sous-local` (the first `local_models` entry the daemon reports) | pins every Task-tool subagent to the local model; the main loop keeps its `claude-*` id |
-| `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` | `1` | Claude Code 2.1.26x treats `CLAUDE_CODE_SUBAGENT_MODEL` as a default that a built-in agent's own `model:` (Explore, for one) overrides; this makes it apply to every subagent |
+| `CLAUDE_CODE_SUBAGENT_MODEL` | `sous-local` (the first `local_models` entry the daemon reports) | the default model for Task-tool subagents; the main loop keeps its `claude-*` id |
+| `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` | `1` | the override: since Claude Code 2.1.26x a built-in agent's own `model:` (Explore, for one) or a per-spawn model beats the default above; this applies the default to every subagent regardless |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | the daemon's `max_context_tokens` | Claude Code has no built-in size for `sous-local`; it honours this variable only for non-`claude-*` ids, so the main loop is unaffected |
 | `API_TIMEOUT_MS` | `3000000` | a cold model load plus a long prefill takes minutes |
 
