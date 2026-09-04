@@ -1,5 +1,9 @@
 """Worker-facing tool schemas and the tool-call parser.
 
+A parsed call's name is validated against a `ToolSet` — `WORKER_TOOLSET` by
+default, or the request's own tools in the gateway, which parses calls
+against whatever tool set Claude Code sent rather than the worker's eight.
+
 Two wire formats are accepted, distinguished by the first non-space
 character after ``<tool_call>``:
 
@@ -19,6 +23,7 @@ character after ``<tool_call>``:
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 
@@ -101,24 +106,124 @@ WORKER_TOOLS: list[dict] = [
     ),
 ]
 
-TOOL_NAMES = {t["function"]["name"] for t in WORKER_TOOLS}
 
-# Declared parameter types per tool. The XML-ish format writes string
-# arguments raw and non-string arguments via tojson, so the schema is the
-# only way to know that e.g. read_file's offset must become an int.
-_PARAM_TYPES: dict[str, dict[str, str]] = {
-    t["function"]["name"]: {
-        key: prop.get("type", "string")
-        for key, prop in t["function"]["parameters"]["properties"].items()
-    }
-    for t in WORKER_TOOLS
-}
+class ParseError(Exception):
+    pass
+
+
+# Anthropic tool inputs are shallow — real schemas nest a handful of levels.
+# `RecursionError` is not a reliable signal for "too deep": whether a given
+# nesting depth overflows Python's C recursion guard depends on the stack
+# size the interpreter happened to start with (8 MB locally, 16 MB on the
+# CI runner), so a payload that decodes fine on a big-stack machine would
+# still blow up later re-encoding it (json.dumps, a streamed partial_json
+# token) on a smaller one. An explicit cap is the only bound that holds on
+# every machine.
+_MAX_ARGUMENT_DEPTH = 64
+
+
+def _check_depth(value: object, limit: int, what: str) -> None:
+    """Iterative depth walk over nested dicts/lists — never recursive, or
+    this would reintroduce the exact stack-size dependence the cap exists to
+    remove. `value` itself is depth 1 when it is a container; a scalar never
+    adds depth and is never itself checked (it has no way to nest further)."""
+    worklist: list[tuple[object, int]] = [(value, 1)]
+    while worklist:
+        obj, depth = worklist.pop()
+        if isinstance(obj, dict):
+            if depth > limit:
+                raise ParseError(f"{what} nested deeper than {limit} levels")
+            worklist.extend((v, depth + 1) for v in obj.values())
+        elif isinstance(obj, list):
+            if depth > limit:
+                raise ParseError(f"{what} nested deeper than {limit} levels")
+            worklist.extend((v, depth + 1) for v in obj)
+
+
+def _reject_constant(name: str) -> None:
+    """json's parse_constant hook for NaN/Infinity/-Infinity: without it,
+    json.loads silently accepts these non-finite tokens (`float("nan")` and
+    friends succeed), and json.dumps later re-emits the invalid `NaN` /
+    `Infinity` literals that break every JSON consumer downstream, including
+    Starlette's JSONResponse (a 500) and a streamed partial_json token."""
+    raise ParseError(f"non-finite number {name!r} is not valid JSON")
+
+
+def _schema_type(prop: object) -> str:
+    """The JSON-schema type coercion should target. A union `type` list (e.g.
+    `["integer", "string"]`, `["integer", "null"]`) becomes every member
+    joined by `|` in schema order, so `_coerce` can try each member in turn
+    and prefer the one the schema lists first; a property without a `type`
+    (enum, anyOf, free-form) stays a raw string."""
+    if not isinstance(prop, dict):
+        return "string"
+    typ = prop.get("type", "string")
+    if isinstance(typ, list):
+        members = [t for t in typ if isinstance(t, str)]
+        return "|".join(members) if members else "string"
+    return typ if isinstance(typ, str) else "string"
+
+
+@dataclass(frozen=True)
+class ToolSet:
+    """The tools one generation may call, and how to type their arguments.
+
+    The XML-ish format writes string arguments raw and everything else via
+    tojson, so the schema is the only way to know that e.g. read_file's offset
+    must become an int — hence the per-tool parameter types.
+
+    `strict` is the worker's contract: a name outside the set is a malformed
+    turn, handled by FORMAT_REMINDER. The gateway is not strict — Claude Code
+    answers a hallucinated tool with its own tool-not-found result, which the
+    model can recover from, whereas ending the turn here could not be undone.
+    An unknown tool then coerces nothing: every parameter stays a string.
+    """
+
+    names: frozenset[str]
+    param_types: dict[str, dict[str, str]]
+    strict: bool = True
+
+    @classmethod
+    def from_tools(cls, tools: list[dict], *, strict: bool = True) -> ToolSet:
+        param_types = {
+            t["function"]["name"]: {
+                key: _schema_type(prop)
+                for key, prop in (
+                    (t["function"].get("parameters") or {}).get("properties") or {}
+                ).items()
+            }
+            for t in tools
+        }
+        return cls(frozenset(param_types), param_types, strict)
+
+    def check(self, name: str) -> dict[str, str]:
+        """Parameter types for `name`; ParseError when strict and unknown."""
+        if name in self.param_types:
+            return self.param_types[name]
+        if self.strict:
+            raise ParseError(f"unknown tool: {name!r}")
+        return {}
+
+
+WORKER_TOOLSET = ToolSet.from_tools(WORKER_TOOLS)
 
 _OPEN_RE = re.compile(r"<tool_call>\s*")
 _FUNCTION_RE = re.compile(r"<function=([^>\s]+)>")
 _PARAM_RE = re.compile(r"<parameter=([^>\s]+)>")
 _WS_RE = re.compile(r"\s*")
-_DECODER = json.JSONDecoder()
+
+
+def _finite_float(text: str) -> float:
+    """json's parse_float hook: an overflowing literal such as `1e999` is an
+    ordinary number to the scanner (parse_constant never sees it) and becomes
+    `inf`, which is exactly as unserialisable as `Infinity`."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise ParseError(f"non-finite number {text!r} is not valid JSON")
+    return value
+
+
+_DECODER = json.JSONDecoder(parse_constant=_reject_constant, parse_float=_finite_float)
 
 
 def _skip_ws(text: str, pos: int) -> int:
@@ -132,26 +237,22 @@ def _skip_ws(text: str, pos: int) -> int:
     return match.end()
 
 
-class ParseError(Exception):
-    pass
-
-
 @dataclass
 class ToolCall:
     name: str
     arguments: dict
 
 
-def parse_tool_calls(text: str) -> list[ToolCall]:
+def parse_tool_calls(text: str, toolset: ToolSet = WORKER_TOOLSET) -> list[ToolCall]:
     calls: list[ToolCall] = []
     pos = 0
     while (match := _OPEN_RE.search(text, pos)) is not None:
         start = match.end()
         first = text[start : start + 1]
         if first == "{":
-            call, pos = _parse_json_call(text, start)
+            call, pos = _parse_json_call(text, start, toolset)
         elif first == "<":
-            call, pos = _parse_xml_call(text, start)
+            call, pos = _parse_xml_call(text, start, toolset)
         else:
             raise ParseError(
                 "tool_call must contain a JSON object or a <function=...> "
@@ -161,24 +262,33 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
     return calls
 
 
-def _parse_json_call(text: str, start: int) -> tuple[ToolCall, int]:
+def _parse_json_call(text: str, start: int, toolset: ToolSet) -> tuple[ToolCall, int]:
     """Hermes JSON: {"name": ..., "arguments": {...}}. Returns (call, end)."""
     try:
         payload, end = _DECODER.raw_decode(text, start)
-    except json.JSONDecodeError as e:
+    except (ValueError, RecursionError) as e:
+        # ValueError covers json.JSONDecodeError (an ordinary malformed
+        # tool_call); it also covers a 5000+ digit integer literal, which
+        # exceeds Python's int-from-string digit cap. RecursionError is the
+        # backstop for a payload deeper than the interpreter's stack allows
+        # to even finish decoding — _check_depth below is the real contract
+        # for "too deep", since a stack big enough to decode it would still
+        # let it back out uncaught here.
         raise ParseError(f"invalid JSON in tool_call: {e}") from e
+    _check_depth(payload, _MAX_ARGUMENT_DEPTH, "tool_call arguments")
     if not isinstance(payload, dict):
         raise ParseError("tool_call payload must be a JSON object")
     name = payload.get("name")
-    if name not in TOOL_NAMES:
-        raise ParseError(f"unknown tool: {name!r}")
+    if not isinstance(name, str) or not name:
+        raise ParseError(f"tool_call name must be a non-empty string, got {name!r}")
+    toolset.check(name)
     arguments = payload.get("arguments", {})
     if not isinstance(arguments, dict):
         raise ParseError("tool_call arguments must be a JSON object")
     return ToolCall(name, arguments), end
 
 
-def _parse_xml_call(text: str, start: int) -> tuple[ToolCall, int]:
+def _parse_xml_call(text: str, start: int, toolset: ToolSet) -> tuple[ToolCall, int]:
     """Qwen3 XML-ish: <function=NAME><parameter=KEY>...</parameter></function>.
 
     Returns (call, end) where end is past the closing </tool_call> so tag
@@ -188,9 +298,7 @@ def _parse_xml_call(text: str, start: int) -> tuple[ToolCall, int]:
     if fn is None:
         raise ParseError("expected <function=NAME> after <tool_call>")
     name = fn.group(1)
-    if name not in TOOL_NAMES:
-        raise ParseError(f"unknown tool: {name!r}")
-    param_types = _PARAM_TYPES[name]
+    param_types = toolset.check(name)
 
     arguments: dict = {}
     pos = fn.end()
@@ -231,12 +339,35 @@ def _strip_wrapping_newlines(raw: str) -> str:
 
 
 def _coerce(tool: str, key: str, typ: str, raw: str):
-    """Coerce a raw XML-ish parameter value using its declared schema type.
+    """Coerce a raw XML-ish parameter value against its declared schema type.
 
-    Strings stay raw (the template writes them unquoted); non-strings were
-    written via tojson. Failing loudly here beats handing the executor
-    offset="5".
+    `typ` may name a union (`"integer|string"`, `"integer|null"`) — each
+    member is tried in schema order and the first that accepts `raw` wins,
+    matching what a Hermes JSON call would have received untouched (a
+    union's `"string"` member always accepts; its `"null"` member accepts
+    only the literal `null` text). A single-member `typ` coerces directly,
+    with the same error message the pre-union code raised, since a lone
+    type has nothing to fall back to.
     """
+    members = typ.split("|")
+    if len(members) == 1:
+        return _coerce_member(tool, key, members[0], raw)
+    for member in members:
+        try:
+            return _coerce_member(tool, key, member, raw)
+        except ParseError:
+            continue
+    raise ParseError(f"parameter {key!r} of {tool} must be one of {typ}, got {raw!r}")
+
+
+def _coerce_member(tool: str, key: str, typ: str, raw: str):
+    """Coerce `raw` against one union member. Strings stay raw (the template
+    writes them unquoted); non-strings were written via tojson. Failing
+    loudly here beats handing the executor offset="5"."""
+    if typ == "null":
+        if raw.strip() == "null":
+            return None
+        raise ParseError(f"parameter {key!r} of {tool} must be null, got {raw!r}")
     if typ == "integer":
         try:
             return int(raw.strip())
@@ -253,7 +384,28 @@ def _coerce(tool: str, key: str, typ: str, raw: str):
         raise ParseError(f"parameter {key!r} of {tool} must be a boolean, got {raw!r}")
     if typ == "number":
         try:
-            return float(raw.strip())
+            value = float(raw.strip())
         except ValueError:
             raise ParseError(f"parameter {key!r} of {tool} must be a number, got {raw!r}") from None
+        if not math.isfinite(value):
+            raise ParseError(f"parameter {key!r} of {tool} must be a finite number, got {raw!r}")
+        return value
+    if typ in ("array", "object"):
+        try:
+            value = json.loads(raw, parse_constant=_reject_constant, parse_float=_finite_float)
+        except ValueError, RecursionError:
+            # Same escapes as _parse_json_call's raw_decode: ValueError
+            # covers json.JSONDecodeError and an oversized integer literal;
+            # RecursionError is the backstop for a value deeper than the
+            # interpreter's stack allows to even finish decoding —
+            # _check_depth below is the real contract for "too deep".
+            raise ParseError(
+                f"parameter {key!r} of {tool} must be a JSON {typ}, got {raw!r}"
+            ) from None
+        _check_depth(value, _MAX_ARGUMENT_DEPTH, f"parameter {key!r} of {tool}")
+        if (typ == "array" and not isinstance(value, list)) or (
+            typ == "object" and not isinstance(value, dict)
+        ):
+            raise ParseError(f"parameter {key!r} of {tool} must be a JSON {typ}, got {raw!r}")
+        return value
     return raw

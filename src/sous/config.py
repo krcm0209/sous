@@ -56,7 +56,13 @@ _KNOWN = {
     "commands": {"allowlist", "timeout_seconds", "approval_timeout_minutes"},
     "context": {"mode", "fraction", "min_tokens"},
     "tasks": {"retention"},
+    "gateway": {"enabled", "local_models", "max_context_tokens", "generation_timeout_minutes"},
 }
+
+# Claude Code refuses to run against a model advertising less than 48K of
+# context (oMLX gates on the same 48 * 1024). A smaller gateway window would
+# never be used, so the config clamps up to this instead of serving it.
+GATEWAY_MIN_CONTEXT_TOKENS = 48 * 1024
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,15 @@ class SousConfig:
     context_mode: str = "fixed"
     context_fraction: float = 0.8
     context_min_tokens: int = 8192
+    # Anthropic-compatible endpoint on the daemon (issue #41), off by default
+    # and experimental. It serves Claude Code with the local model and never
+    # touches the toolexec sandbox: Claude Code executes the tools under its
+    # own permission system. The window is the gateway's own — Claude Code's
+    # prompts are far larger than the worker's, and the worker's cap stays put.
+    gateway_enabled: bool = False
+    gateway_local_models: tuple[str, ...] = ("sous-local",)
+    gateway_max_context_tokens: int = 65536
+    gateway_generation_timeout_minutes: int = 30
     data_dir: Path = DEFAULT_DATA_DIR
     config_path: Path = DEFAULT_CONFIG_PATH
 
@@ -191,6 +206,71 @@ def _speculative_block_size(model: dict) -> int:
     return value
 
 
+def _gateway_values(gateway: dict) -> tuple[bool, tuple[str, ...], int, int]:
+    """Validated [gateway] values, each degrading to its default with a
+    warning — except the window, which is clamped UP to the Claude Code floor:
+    a smaller value can only be a misjudged floor, and the floor is the
+    closest thing to what the user asked for that would actually work."""
+    enabled = gateway.get("enabled", False)
+    if not isinstance(enabled, bool):
+        warnings.warn(
+            f"sous config: [gateway].enabled {enabled!r} must be true or false; using false",
+            stacklevel=3,
+        )
+        enabled = False
+    models = gateway.get("local_models", ["sous-local"])
+    if (
+        not isinstance(models, list)
+        or not models
+        or not all(isinstance(m, str) and m for m in models)
+    ):
+        warnings.warn(
+            f"sous config: [gateway].local_models {models!r} must be a non-empty list of "
+            "model ids; using ['sous-local']",
+            stacklevel=3,
+        )
+        models = ["sous-local"]
+    # Spec: honest ids are mandatory. Claude Code ignores
+    # CLAUDE_CODE_MAX_CONTEXT_TOKENS for any id that canonicalizes to claude-*
+    # and trusts its built-in window instead, so an impersonating id silently
+    # forfeits the window control the gateway relies on (and, once routing
+    # lands, would pull real Claude traffic onto the local model). Substring,
+    # not prefix: canonicalization strips provider prefixes, and no honest
+    # local id has any reason to contain the word at all.
+    if any("claude" in m.lower() for m in models):
+        warnings.warn(
+            f"sous config: [gateway].local_models {models!r} impersonates a Claude model; "
+            "Claude Code ignores its context-window env vars for claude-* ids, so use an "
+            "honest id like 'sous-local'; using ['sous-local']",
+            stacklevel=3,
+        )
+        models = ["sous-local"]
+    window = gateway.get("max_context_tokens", 65536)
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        warnings.warn(
+            f"sous config: [gateway].max_context_tokens {window!r} must be a positive "
+            "integer; using 65536",
+            stacklevel=3,
+        )
+        window = 65536
+    elif window < GATEWAY_MIN_CONTEXT_TOKENS:
+        warnings.warn(
+            f"sous config: [gateway].max_context_tokens {window} is below Claude Code's "
+            f"{GATEWAY_MIN_CONTEXT_TOKENS}-token floor; using {GATEWAY_MIN_CONTEXT_TOKENS}",
+            stacklevel=3,
+        )
+        window = GATEWAY_MIN_CONTEXT_TOKENS
+    timeout = gateway.get("generation_timeout_minutes", 30)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        warnings.warn(
+            f"sous config: [gateway].generation_timeout_minutes {timeout!r} must be a "
+            "positive integer; using 30",
+            stacklevel=3,
+        )
+        timeout = 30
+    return enabled, tuple(models), window, timeout
+
+
 def load_config(config_path: Path | None = None) -> SousConfig:
     path = config_path or DEFAULT_CONFIG_PATH
     raw = _read_toml(path)
@@ -202,6 +282,9 @@ def load_config(config_path: Path | None = None) -> SousConfig:
     context = _section(raw, "context")
     context_mode, context_fraction, context_min_tokens = _context_values(context)
     tasks = _section(raw, "tasks")
+    gateway_enabled, gateway_models, gateway_window, gateway_timeout = _gateway_values(
+        _section(raw, "gateway")
+    )
     return SousConfig(
         server_port=server.get("port", 8383),
         model_id=model.get("id", "mlx-community/Qwen3.8-27B-4bit"),
@@ -222,6 +305,10 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         context_mode=context_mode,
         context_fraction=context_fraction,
         context_min_tokens=context_min_tokens,
+        gateway_enabled=gateway_enabled,
+        gateway_local_models=gateway_models,
+        gateway_max_context_tokens=gateway_window,
+        gateway_generation_timeout_minutes=gateway_timeout,
         data_dir=(path.parent if path.parent != Path(".") else DEFAULT_DATA_DIR),
         config_path=path,
     )

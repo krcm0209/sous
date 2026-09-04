@@ -34,6 +34,9 @@ classifiers = [
     "Topic :: Software Development :: Code Generators",
 ]
 dependencies = [
+    # Same rule as the sse-starlette block below: server.serve imports anyio
+    # directly, so it belongs here even though mcp already pulls it in.
+    "anyio>=4",
     "huggingface-hub",
     "mcp>=2.0,<3",
     # mlx >= 0.32.1 requires every thread that touched mlx to call
@@ -45,7 +48,14 @@ dependencies = [
     "mlx-lm>=0.31",
     "mlx-vlm>=0.6.16",
     "psutil>=7",
+    # The gateway (src/sous/gateway) and server.serve import these directly.
+    # mcp already pulls all three in, but a direct import must be a direct
+    # dependency: mcp is free to drop or swap them in a minor release and
+    # lockfile drift would hide it.
+    "sse-starlette>=3.4",
+    "starlette>=1.6",
     "tomlkit>=0.13",
+    "uvicorn>=0.31",
 ]
 
 [build-system]
@@ -58,6 +68,7 @@ packages = ["src/sous"]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28",
     "pytest>=8",
     "pytest-asyncio>=1.4.0",
     "pyyaml>=6.0.3",

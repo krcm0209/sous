@@ -8,10 +8,13 @@ a fake cache layer can exercise it. Array copies arrive through an injected
 
 from __future__ import annotations
 
+import threading
 import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+from sous.engine.base import Delta, OnDelta, ReplaySafe
 
 
 def reuse_length(cached_ids: Sequence[int], new_ids: Sequence[int]) -> int:
@@ -158,7 +161,9 @@ class CacheHooks(Protocol):
 
     def new_cache(self) -> list: ...
     def prefill(self, cache: list, token_ids: list[int]) -> None: ...
-    def decode(self, cache: list, token_ids: list[int], max_tokens: int) -> str: ...
+    def decode(
+        self, cache: list, token_ids: list[int], max_tokens: int, on_delta: OnDelta | None
+    ) -> str: ...
     def copy_array(self, a: object) -> object: ...
 
 
@@ -181,6 +186,11 @@ class PrefixCache:
         self.enabled = enabled
         self._cache: list | None = None
         self._held: list[int] = []
+        # The thread whose mlx streams built self._cache (issue #34). A Thread
+        # object, not its ident: idents are recycled after a thread exits, so
+        # an ident could falsely match a later, unrelated thread — a strongly
+        # held Thread object cannot.
+        self._owner: threading.Thread | None = None
         self._epoch = 0
         self._stats = PromptCacheStats()
 
@@ -194,15 +204,22 @@ class PrefixCache:
         self._epoch += 1
         self._cache = None
         self._held = []
+        self._owner = None
         self._stats = PromptCacheStats()
 
     def stats(self) -> dict:
         return self._stats.as_dict()
 
-    def generate(self, stable_ids: list[int], full_ids: list[int], max_tokens: int) -> str:
+    def generate(
+        self,
+        stable_ids: list[int],
+        full_ids: list[int],
+        max_tokens: int,
+        on_delta: OnDelta | None = None,
+    ) -> str:
         hooks = self._hooks
         if not self.enabled:
-            return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens)
+            return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens, on_delta)
 
         # `_run`'s anchor (`len(stable_ids)`) only means what it assumes: that
         # `full_ids` is the stable render plus a generation-only suffix, true
@@ -222,7 +239,7 @@ class PrefixCache:
                 "plus a generation suffix; decoding cold this turn",
                 stacklevel=2,
             )
-            return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens)
+            return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens, on_delta)
 
         epoch = self._epoch
         # Bind the stats object itself, not self._stats, and write through
@@ -239,6 +256,14 @@ class PrefixCache:
         self._cache, self._held = None, []
 
         reuse = reuse_length(held, stable_ids) if cache is not None else 0
+        if reuse and self._owner is not threading.current_thread():
+            # The cached arrays live only on the publishing thread's mlx
+            # streams (issue #34); a different session thread (a worker task
+            # vs the gateway's long-lived one) must prefill cold rather than
+            # touch them. Force the same miss path a prefix mismatch takes,
+            # rather than attempt a warm run doomed to the cross-thread mlx
+            # failure that _run's except clause would otherwise have to catch.
+            reuse = 0
         # `cache is not None and reuse` rather than a bare `if reuse`: it is what
         # lets the type checker see `warm` as a plain list in both branches, with
         # no assert and no ignore pragma.
@@ -259,6 +284,25 @@ class PrefixCache:
         # which is exactly the doubling the spec promises never happens.
         cache = None
 
+        # A warm attempt that already streamed text cannot be retried: the
+        # consumer has forwarded those deltas, and a cold re-run would deliver
+        # the turn a second time. An on_delta wrapped in ReplaySafe forwards
+        # nothing outside the process (accounting only, e.g. a non-streaming
+        # turn's delta count) — checked on the ORIGINAL callback, before
+        # _counting wraps it in its own closure.
+        replay_safe = isinstance(on_delta, ReplaySafe)
+        emitted = 0
+
+        def _counting(sink: OnDelta) -> OnDelta:
+            def relay(delta: Delta) -> None:
+                nonlocal emitted
+                emitted += 1
+                sink(delta)
+
+            return relay
+
+        relay = _counting(on_delta) if on_delta is not None else None
+
         # `text` gets a real value on every reachable path below, but not one
         # a flow analysis can prove without correlating `retry_reason` back to
         # which branch of the try/except ran — so it starts bound here rather
@@ -266,7 +310,7 @@ class PrefixCache:
         text = ""
         retry_reason: str | None = None
         try:
-            text = self._run(stats, warm, stable_ids, full_ids, reuse, max_tokens)
+            text = self._run(stats, warm, stable_ids, full_ids, reuse, max_tokens, relay)
         except Exception as e:
             if reuse == 0:
                 raise
@@ -279,6 +323,11 @@ class PrefixCache:
             retry_reason = str(e)
 
         if retry_reason is not None:
+            if emitted and not replay_safe:
+                raise RuntimeError(
+                    f"warm generation failed after streaming {emitted} delta(s) "
+                    f"({retry_reason}); not retrying cold, which would replay the turn"
+                )
             # An optimization bug must never fail a task; decide_context sets
             # the same rule for auto sizing. Only a warm attempt is retried, so
             # a genuine engine error still surfaces at once.
@@ -288,10 +337,11 @@ class PrefixCache:
                 stacklevel=2,
             )
             warm = hooks.new_cache()
-            text = self._run(stats, warm, stable_ids, full_ids, 0, max_tokens)
+            text = self._run(stats, warm, stable_ids, full_ids, 0, max_tokens, relay)
 
         if epoch == self._epoch:
             self._cache, self._held = warm, list(stable_ids)
+            self._owner = threading.current_thread()
         return text
 
     def _run(
@@ -302,6 +352,7 @@ class PrefixCache:
         full_ids: list[int],
         reuse: int,
         max_tokens: int,
+        on_delta: OnDelta | None,
     ) -> str:
         hooks = self._hooks
         anchor = len(stable_ids)
@@ -309,7 +360,7 @@ class PrefixCache:
             # Everything rewinds, so prefill and decode fuse into one pass and
             # the generation block plus the generated tokens are simply trimmed
             # back off afterwards.
-            text = hooks.decode(cache, list(full_ids[reuse:]), max_tokens)
+            text = hooks.decode(cache, list(full_ids[reuse:]), max_tokens, on_delta)
             trim_to(cache, anchor)
             return text
         # A recurrent layer cannot rewind, so stop at the anchor, record it,
@@ -317,6 +368,6 @@ class PrefixCache:
         hooks.prefill(cache, list(stable_ids[reuse:]))
         snap, nbytes = snapshot(cache, hooks.copy_array)
         stats.snapshot_bytes = nbytes
-        text = hooks.decode(cache, list(full_ids[anchor:]), max_tokens)
+        text = hooks.decode(cache, list(full_ids[anchor:]), max_tokens, on_delta)
         restore(cache, snap, hooks.copy_array)
         return text

@@ -1,5 +1,7 @@
+import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -63,6 +65,24 @@ def test_no_unload_when_fresh():
     assert mgr.status()["loaded"] is True
 
 
+def test_a_lease_holds_off_the_idle_unload():
+    """A gateway turn holds the engine across count_tokens and generate, and
+    only the latter takes _gen_lock. Without a lease the unload sweep would
+    free the weights under the tokenizer pass."""
+    mgr, created = _manager(idle_minutes=0)
+    mgr.get()
+    time.sleep(0.01)
+    assert mgr.unload_if_idle() is True  # baseline: idle 0 unloads at once
+    mgr.get()
+    time.sleep(0.01)
+    with mgr.lease():
+        assert mgr.unload_if_idle() is False
+        assert mgr.status()["loaded"] is True
+        assert created[1].unloaded is False
+    assert mgr.unload_if_idle() is True  # lease gone → the sweep proceeds
+    assert created[1].unloaded is True
+
+
 def test_status_when_never_loaded():
     mgr, _ = _manager()
     s = mgr.status()
@@ -77,7 +97,7 @@ class _BlockingEngine(FakeEngine):
         self.in_flight = 0
         self.overlap = False
 
-    def generate(self, messages, tools, max_tokens):
+    def generate(self, messages, tools, max_tokens, on_delta=None):
         self.in_flight += 1
         if self.in_flight > 1:
             self.overlap = True
@@ -185,7 +205,7 @@ def test_reset_prompt_cache_does_not_wait_for_the_generation_lock():
     release = threading.Event()
 
     class BlockingEngine(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             started.set()
             release.wait(5)
             return "done"
@@ -238,7 +258,7 @@ def test_session_releases_mlx_state_once_on_its_own_thread(monkeypatch):
 
 def test_session_relays_exceptions_and_survives_them():
     class Flaky(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             out = super().generate(messages, tools, max_tokens)
             if out == "boom":
                 raise ValueError("boom")
@@ -266,7 +286,7 @@ def test_stalled_generation_is_abandoned_and_its_late_result_dropped():
     gate = threading.Event()
 
     class Gated(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             gate.wait(10)
             return super().generate(messages, tools, max_tokens)
 
@@ -290,7 +310,7 @@ def test_abandoned_waiter_on_the_lock_never_generates():
     release = threading.Event()
 
     class Wedged(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             entered.set()
             release.wait(10)
             return super().generate(messages, tools, max_tokens)
@@ -324,7 +344,7 @@ def test_close_tolerates_an_undequeued_stalled_request():
     gate = threading.Event()
 
     class Gated(FakeEngine):
-        def generate(self, messages, tools, max_tokens):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
             gate.wait(10)
             return super().generate(messages, tools, max_tokens)
 
@@ -332,14 +352,14 @@ def test_close_tolerates_an_undequeued_stalled_request():
     session = ManagedEngine(inner).session()
     # Occupy the thread inside generate, then fill the queue behind its back —
     # the exact state a stalled, never-dequeued request leaves behind.
-    session._requests.put_nowait((_msgs(), [], 8))
+    session._requests.put_nowait((_msgs(), [], 8, None))
     for _ in range(1000):
         if session._requests.empty():
             break
         time.sleep(0.005)
     else:
         pytest.fail("session thread never dequeued the first request")
-    session._requests.put_nowait((_msgs(), [], 8))  # the undequeued stalled request
+    session._requests.put_nowait((_msgs(), [], 8, None))  # the undequeued stalled request
     session._abandoned.set()  # what generate() does when it times out
     session.close()  # must not raise queue.Full
     gate.set()
@@ -356,7 +376,7 @@ def test_close_unleaks_an_idle_thread_holding_an_unconsumed_reply():
     inner = FakeEngine(["a"])
     session = ManagedEngine(inner).session()
     # Drive the loop directly: a reply lands, but no caller consumes it.
-    session._requests.put_nowait((_msgs(), [], 8))
+    session._requests.put_nowait((_msgs(), [], 8, None))
     for _ in range(1000):
         if not session._replies.empty():
             break
@@ -415,3 +435,119 @@ def test_engine_manager_threads_drafter_config_into_default_factory(monkeypatch)
     EngineManager(cfg).get()
     assert seen["kwargs"]["draft_id"] == "z-lab/drafter"
     assert seen["kwargs"]["draft_block_size"] == 5
+
+
+# ---- streaming deltas (gateway) ---------------------------------------------
+
+
+def test_session_relays_deltas_on_the_session_thread():
+    """Deltas are emitted from inside the engine's decode loop, i.e. on the
+    session thread — the consumer bridges them to wherever it lives."""
+    from sous.engine.base import Delta
+
+    seen: list[tuple[Delta, threading.Thread]] = []
+    inner = FakeEngine(["hello world"])
+    session = ManagedEngine(inner).session()
+    text = session.generate(
+        _msgs(), [], 8, timeout=5, on_delta=lambda d: seen.append((d, threading.current_thread()))
+    )
+    session.close()
+    session._thread.join(5)
+    assert text == "hello world"
+    assert [d for d, _ in seen] == [Delta("hello world", 2, "stop")]
+    assert seen[0][1] is session._thread
+
+
+def test_managed_engine_forwards_on_delta():
+    from sous.engine.base import Delta
+
+    seen: list[Delta] = []
+    managed = ManagedEngine(FakeEngine(["x y z"]))
+    assert managed.generate(_msgs(), [], 8, on_delta=seen.append) == "x y z"
+    assert seen == [Delta("x y z", 3, "stop")]
+
+
+def test_chunked_fake_engine_streams_pieces_with_cumulative_counts():
+    from sous.engine.base import Delta
+    from tests.fake_engine import ChunkedFakeEngine
+
+    seen: list[Delta] = []
+    e = ChunkedFakeEngine(["a|b|c"])
+    assert e.generate(_msgs(), [], 8, on_delta=seen.append) == "abc"
+    assert seen == [Delta("a", 1, None), Delta("b", 2, None), Delta("c", 3, "stop")]
+    assert e.finished.is_set()
+
+
+# --- tokenization is serialized ---------------------------------------------
+
+
+class _RecordingTokenizer:
+    """Notes every time two threads are inside a tokenizer call at once."""
+
+    bos_token = None
+    chat_template = None
+
+    def __init__(self) -> None:
+        self._inside = 0
+        self.overlaps: list[str] = []
+
+    def _busy(self, what: str) -> None:
+        self._inside += 1
+        if self._inside > 1:
+            self.overlaps.append(what)
+        time.sleep(0.005)  # wide enough for every other thread to pile in
+        self._inside -= 1
+
+    def apply_chat_template(self, messages, **kwargs) -> str:
+        self._busy("apply_chat_template")
+        return str(messages)
+
+    def encode(self, text, add_special_tokens=True) -> list[int]:
+        self._busy("encode")
+        return [len(text)]
+
+
+def _stub(monkeypatch, name: str, **attrs) -> None:
+    monkeypatch.setitem(sys.modules, name, types.SimpleNamespace(__name__=name, **attrs))
+
+
+def _hammer_ids(engine, tokenizer: _RecordingTokenizer) -> None:
+    """Tokenize from several threads at once, each with its own text so the
+    PromptMemo never short-circuits the encode."""
+
+    def one(n: int) -> None:
+        engine._ids("full", [{"role": "user", "content": f"message {n}"}], [])
+
+    threads = [threading.Thread(target=one, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert not any(t.is_alive() for t in threads)
+    assert tokenizer.overlaps == [], tokenizer.overlaps
+
+
+def test_lm_tokenization_is_serialized(monkeypatch):
+    """ManagedEngine.count_tokens deliberately skips _gen_lock, and the gateway
+    made that a second caller: a turn tokenizes on a pool thread while Claude
+    Code's count_tokens arrives mid-turn. HF's fast tokenizer mutates shared
+    Rust state on every encode, so the two must not overlap."""
+    from sous.engine.lm import LMEngine
+
+    tokenizer = _RecordingTokenizer()
+    _stub(monkeypatch, "mlx_lm", load=lambda model_id: (object(), tokenizer))
+    _stub(monkeypatch, "mlx_lm.sample_utils", make_sampler=lambda **kw: None)
+    _hammer_ids(LMEngine("test/model"), tokenizer)
+
+
+def test_vlm_tokenization_is_serialized(monkeypatch):
+    """Same contract on the backend the gateway actually runs."""
+    from sous.engine.vlm import VLMEngine
+
+    tokenizer = _RecordingTokenizer()
+    model = types.SimpleNamespace(config=types.SimpleNamespace(model_type="fake"))
+    processor = types.SimpleNamespace(tokenizer=tokenizer)
+    _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+    _stub(monkeypatch, "mlx_vlm.utils", should_add_special_tokens=lambda model_type, proc: True)
+    _hammer_ids(VLMEngine("test/model"), tokenizer)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
 import os
@@ -13,13 +14,17 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import IO
 
+import anyio
+import uvicorn
 from mcp.server import MCPServer
 
 from sous.config import SousConfig, current_allowlist, load_config, persist_allowlist_entry
 from sous.engine.base import EngineManager, release_mlx_thread_state
+from sous.gateway.routes import Gateway, mount_gateway
 from sous.tasks import FINISHED_STATES, Task, TaskState, TaskStore
 from sous.toolexec import (
     _is_within,
@@ -235,6 +240,11 @@ class SousService:
                     # THAT the policy is fixed but not what it's fixed to.
                     "max_context_tokens": self.config.max_context_tokens,
                 },
+                "gateway": {
+                    "enabled": self.config.gateway_enabled,
+                    "local_models": list(self.config.gateway_local_models),
+                    "max_context_tokens": self.config.gateway_max_context_tokens,
+                },
             },
         }
 
@@ -285,7 +295,28 @@ draft, never a merge.
 
 def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) -> MCPServer:
     svc = SousService(store, engines, config)
-    mcp = MCPServer("sous", instructions=_INSTRUCTIONS)
+    # mount_gateway (below) runs after MCPServer(...) is constructed, so the
+    # lifespan closure below needs a late-bound holder for whatever it
+    # mounts — empty when the gateway is disabled, since there is then
+    # nothing for close() to mean.
+    mounted_gateway: list[Gateway] = []
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(_: MCPServer) -> AsyncIterator[None]:
+        try:
+            yield None
+        finally:
+            # Fires on every path that drives the app's ASGI lifespan:
+            # uvicorn's graceful shutdown and its SIGTERM path alike
+            # (capture_signals re-raises SIGTERM only after Server.shutdown()
+            # awaits this shutdown), plus any embedded lifecycle that drives
+            # lifespan. Without it the gateway's session thread stays parked
+            # in _requests.get() and never reaches release_mlx_thread_state()
+            # (ml-explore/mlx#4327) on a non-signal exit.
+            for gateway in mounted_gateway:
+                gateway.close()
+
+    mcp = MCPServer("sous", instructions=_INSTRUCTIONS, lifespan=_lifespan)
 
     # The MCP-facing name deliberately differs from SousService.delegate_task:
     # on surfaces that defer tool schemas, the name is the only signal the
@@ -352,6 +383,9 @@ def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) 
     def server_status() -> dict:
         """Daemon health: model load state, memory, queue depth, active config."""
         return svc.server_status()
+
+    if config.gateway_enabled:
+        mounted_gateway.append(mount_gateway(mcp, engines, config))
 
     return mcp
 
@@ -448,6 +482,39 @@ def _install_shutdown_handler(stop: threading.Event) -> None:
         signal.signal(received, handle)
 
 
+# uvicorn owns SIGTERM/SIGINT while it serves: capture_signals swaps sous's
+# handler out and re-raises the signal only after its own shutdown returns,
+# and by default that shutdown waits for every open connection with no bound.
+# A non-streaming gateway turn (Claude Code's retry shape) can hold one for
+# the whole generation timeout, which would defer the command-group kill in
+# _install_shutdown_handler by the same amount. Bound it: streams already
+# cancel themselves on the exit signal (sse-starlette), and a cancelled
+# non-streaming handler leaves its turn draining on the executor thread.
+# This is the whole of the shutdown story in the daemon: capture_signals
+# re-raises SIGTERM inside the serve() coroutine, so _install_shutdown_handler
+# os._exit()s from there — anyio.run's teardown, and any thread pool it would
+# join on the way out, is never reached.
+GRACEFUL_SHUTDOWN_SECONDS = 5
+
+
+def uvicorn_config(app, host: str, port: int, log_level: str = "info") -> uvicorn.Config:
+    return uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level=log_level,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
+    )
+
+
+def serve(mcp: MCPServer, host: str, port: int) -> None:
+    """What `mcp.run(transport="streamable-http")` does, minus the unbounded
+    shutdown wait: the SDK builds this same app and uvicorn config but exposes
+    no graceful-shutdown timeout."""
+    app = mcp.streamable_http_app(host=host)
+    anyio.run(uvicorn.Server(uvicorn_config(app, host, port)).serve)
+
+
 def main() -> None:
     config = load_config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
@@ -476,7 +543,12 @@ def main() -> None:
     )
     worker.start()
     mcp = create_server(store, engines, config)
+    if config.gateway_enabled:
+        print(
+            f"sous: gateway (experimental) serving {', '.join(config.gateway_local_models)} "
+            f"at http://127.0.0.1:{config.server_port}/v1/messages"
+        )
     try:
-        mcp.run(transport="streamable-http", host="127.0.0.1", port=config.server_port)
+        serve(mcp, "127.0.0.1", config.server_port)
     finally:
         stop.set()

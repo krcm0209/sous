@@ -6,11 +6,13 @@ affects correctness is made here, against fakes.
 
 from __future__ import annotations
 
+import threading
 import weakref
 from typing import cast
 
 import pytest
 
+from sous.engine.base import Delta
 from sous.engine.promptcache import (
     PrefixCache,
     PromptCacheStats,
@@ -237,6 +239,10 @@ class FakeHooks:
         self.trimmable = trimmable
         self.layers = layers
         self.fail_once = fail_once
+        # When a failure is scripted, whether one delta escapes first — the
+        # streaming no-retry rule is decided on exactly that difference.
+        self.stream_before_fail = False
+        self.on_deltas: list = []
         # Injected rather than monkeypatched: assigning over a bound method makes
         # ty report invalid-assignment, and ty checks the tests too.
         self.decode_impl = decode_impl
@@ -262,14 +268,19 @@ class FakeHooks:
         self.prefilled.append(list(token_ids))
         self._advance(cache, len(token_ids))
 
-    def decode(self, cache, token_ids, max_tokens):
+    def decode(self, cache, token_ids, max_tokens, on_delta=None):
+        self.on_deltas.append(on_delta)
         if self.fail_once:
             self.fail_once = False
+            if self.stream_before_fail and on_delta is not None:
+                on_delta(Delta("partial", 1, None))
             raise RuntimeError("boom")
         if self.decode_impl is not None:
             return self.decode_impl(self, cache, token_ids, max_tokens)
         self.decoded.append(list(token_ids))
         self._advance(cache, len(token_ids) + len(self.generated))
+        if on_delta is not None:
+            on_delta(Delta("text", 1, "stop"))
         return "text"
 
     def copy_array(self, a):
@@ -569,3 +580,122 @@ def test_a_late_cold_retry_write_after_reset_does_not_land_on_fresh_counters():
 
     assert calls["n"] == 2  # the failure and its retry both really ran
     assert pc.stats() == PromptCacheStats().as_dict()  # fresh counters, untouched
+
+
+# ---- streaming deltas ----------------------------------------------------------
+
+
+def test_on_delta_reaches_decode_on_every_path():
+    from sous.engine.base import Delta
+
+    seen: list[Delta] = []
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16, seen.append)  # cold
+    pc.generate(STABLE_2, FULL_2, 16, seen.append)  # warm
+    pc.generate(STABLE_2 + [7], FULL_2[:-2] + [7, 90, 91], 16)  # no consumer
+    assert seen == [Delta("text", 1, "stop"), Delta("text", 1, "stop")]
+    # The cache wraps the callback to count emissions, so decode sees a
+    # callable (not the very object) when one was given, and None otherwise.
+    assert [cb is not None for cb in h.on_deltas] == [True, True, False]
+    disabled = PrefixCache(FakeHooks(trimmable=True), enabled=False)
+    disabled.generate(STABLE_1, FULL_1, 16, seen.append)
+    assert len(seen) == 3
+
+
+def test_a_warm_failure_after_streamed_deltas_is_not_retried():
+    """A cold retry would replay text the consumer already forwarded; the
+    failure is surfaced instead, and the counters say no retry happened."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    h.fail_once = True
+    h.stream_before_fail = True
+    with pytest.raises(RuntimeError, match="not retrying cold"):
+        pc.generate(STABLE_2, FULL_2, 16, lambda d: None)
+    assert pc.stats()["cold_retries"] == 0
+    # The warm attempt raised before FakeHooks recorded it and no cold retry
+    # ran: the only decode on record is the first turn's, decode was entered
+    # exactly twice, and no replacement cache was ever built.
+    assert h.decoded == [FULL_1]
+    assert len(h.on_deltas) == 2
+    assert len(h.caches) == 1
+
+
+def test_a_replay_safe_warm_failure_after_streamed_deltas_still_retries_cold():
+    """A ReplaySafe on_delta's output never left the process (it is a
+    non-streaming turn's accounting-only callback), so — unlike a bare
+    callback — its emitted deltas do not forbid the cold retry."""
+    from sous.engine.base import ReplaySafe
+
+    seen: list[Delta] = []
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    h.fail_once = True
+    h.stream_before_fail = True
+    with pytest.warns(UserWarning, match="retrying cold"):
+        result = pc.generate(STABLE_2, FULL_2, 16, ReplaySafe(seen.append))
+    assert result == "text"
+    assert pc.stats()["cold_retries"] == 1
+    # Both the failed warm attempt's partial delta and the retry's final one
+    # reached the callback: nothing about ReplaySafe suppresses delivery, it
+    # only tells the cache the deliveries were never forwarded to a client.
+    assert seen == [Delta("partial", 1, None), Delta("text", 1, "stop")]
+
+
+def test_a_warm_failure_before_any_delta_still_retries_cold():
+    from sous.engine.base import Delta
+
+    seen: list[Delta] = []
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    h.fail_once = True  # raises before emitting anything (stream_before_fail stays False)
+    with pytest.warns(UserWarning, match="retrying cold"):
+        assert pc.generate(STABLE_2, FULL_2, 16, seen.append) == "text"
+    assert pc.stats()["cold_retries"] == 1
+    assert seen == [Delta("text", 1, "stop")]  # only the retry's delta got out
+
+
+# ---- thread ownership (issue #34) ------------------------------------------
+
+
+def test_a_cache_built_on_another_thread_is_a_cold_miss():
+    """mlx KV-cache arrays are usable only from the thread whose streams
+    created them (issue #34). A cache slot built on thread A must refuse a
+    consumer on any other thread rather than let it touch those arrays."""
+    h = FakeHooks(trimmable=False)
+    pc = PrefixCache(h)
+
+    def on_thread_a() -> None:
+        pc.generate(STABLE_1, FULL_1, 16)
+        pc.generate(STABLE_2, FULL_2, 16)  # strictly extends STABLE_1: reuses
+
+    thread_a = threading.Thread(target=on_thread_a)
+    thread_a.start()
+    thread_a.join()
+
+    # The slot is populated and owned by thread A: the second call above,
+    # still running on thread A, reused the first call's cache.
+    assert pc.stats()["hits"] == 1
+    assert pc.stats()["reused_tokens"] == len(STABLE_1)
+
+    # From the test's own thread — a different thread than the one that built
+    # the cache — call with stable ids that strictly extend the held prefix:
+    # the shape that WOULD reuse if thread ownership weren't checked.
+    stable_3 = [*STABLE_2, 7, 8]
+    full_3 = [*stable_3, 90, 91]
+    pc.generate(stable_3, full_3, 16)
+
+    assert pc.stats()["misses"] == 2  # counted as a miss, not a cross-thread hit
+    assert pc.stats()["reused_tokens"] == len(STABLE_1)  # unchanged
+    assert pc.stats()["cold_retries"] == 0  # cold directly, not via a failed warm attempt
+    assert h.prefilled[-1] == stable_3  # the full stable ids, no reuse offset
+
+    # The slot is now owned by the main thread: a further call from here with
+    # an extending prefix reuses normally.
+    stable_4 = [*stable_3, 9, 10]
+    full_4 = [*stable_4, 90, 91]
+    pc.generate(stable_4, full_4, 16)
+    assert pc.stats()["hits"] == 2
