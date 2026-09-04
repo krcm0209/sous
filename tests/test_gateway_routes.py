@@ -1052,6 +1052,24 @@ def test_the_catch_all_does_not_shadow_the_mcp_transport(tmp_path: Path):
     assert fake.requests == []
 
 
+def test_the_catch_all_redirects_the_mcp_path_with_a_trailing_slash(tmp_path: Path):
+    """The SDK's Route("/mcp") is exact, so before the catch-all existed
+    Starlette's redirect_slashes answered POST /mcp/ with a 307. The catch-all
+    matches it too, and forwarding it would put an MCP client's JSON-RPC body
+    (paths, file contents) on the wire to Anthropic — so the redirect stays."""
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
+    body = b'{"jsonrpc": "2.0", "method": "ping", "id": 1}'
+    r = _request(app, "POST", "/mcp/", body=body)
+    assert r.status_code == 307
+    assert r.headers["location"].endswith("/mcp")
+    assert "via" not in r.headers
+    r = _request(app, "POST", "/mcp//?x=1", body=body)
+    assert r.status_code == 307
+    assert r.headers["location"].endswith("/mcp?x=1")
+    assert fake.requests == []
+
+
 def test_forwarded_requests_are_loopback_only_too(tmp_path: Path):
     fake = FakeUpstream()
     app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())

@@ -25,7 +25,7 @@ from urllib.parse import urlsplit
 from mcp.server import MCPServer
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.requests import ClientDisconnect, Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from sous.config import SousConfig
 from sous.engine.base import Delta, EngineManager, GenerationStalled
@@ -111,6 +111,13 @@ _MODEL_SUFFIX_RE = re.compile(r"\[[^\[\]]*\]$")
 # printable, space-free token is logged as "-".
 _LOG_ID_CHARS = 64
 _LOG_PATH_CHARS = 80
+
+# Where the SDK mounts the MCP transport: `streamable_http_path`, whose default
+# is "/mcp" in mcp/server/mcpserver/server.py's streamable_http_app (server.py
+# calls it without overriding). It is an exact Route, so a trailing slash never
+# matched it — Starlette's redirect_slashes used to answer /mcp/ with a 307,
+# and the catch-all below now matches it instead. See Gateway.passthrough.
+_MCP_PATH = "/mcp"
 
 
 def _log(message: str) -> None:
@@ -359,6 +366,14 @@ class Gateway:
             _check_loopback(request)
         except RequestError as e:
             return JSONResponse(e.body(), status_code=e.status)
+        # /mcp/ is the MCP transport's path, not the upstream's: forwarding it
+        # would put an MCP client's JSON-RPC body on the wire to Anthropic.
+        # Give back exactly what Starlette's redirect_slashes gave before this
+        # catch-all shadowed it — a 307, which preserves the method and body.
+        path = request.url.path
+        if path != _MCP_PATH and path.rstrip("/") == _MCP_PATH:
+            query = request.url.query
+            return RedirectResponse(f"{_MCP_PATH}?{query}" if query else _MCP_PATH, status_code=307)
         return await self._forward(request, None, "-")
 
     def _route(self, raw: bytes) -> tuple[object | None, str]:
