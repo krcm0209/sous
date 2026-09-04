@@ -143,12 +143,14 @@ class Upstream:
             # the client did not send, and must never route the ones it did
             # send anywhere but the configured origin.
             trust_env=False,
-            # httpx would otherwise ask for gzip on the client's behalf, and
-            # the raw bytes relayed back would be compressed for a client that
-            # never said it could decompress them. A client that does say so
-            # overrides this per request.
-            headers={"accept-encoding": "identity"},
         )
+        # httpx's default headers (accept, accept-encoding, connection,
+        # user-agent) are added to every request that did not carry them, so
+        # the upstream would see a request described as httpx's rather than as
+        # the client made it — including a gzip it never asked for, whose raw
+        # relayed bytes it could not decompress. Nothing is lost by not asking:
+        # a server does not compress for a client that sent no Accept-Encoding.
+        self._client.headers.clear()
         # httpx has no "no cookies" switch: its jar stores every upstream
         # Set-Cookie (Cloudflare sets __cf_bm on Anthropic responses) and adds
         # a Cookie header to later requests — one the client never sent, and

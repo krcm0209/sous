@@ -40,6 +40,33 @@ def _send(app, method: str, path: str, headers=None, content=None) -> httpx.Resp
     return asyncio.run(go())
 
 
+def _hand_built_request(headers: list[tuple[bytes, bytes]], **scope) -> Request:
+    """A Request no HTTP client could produce for us: an exact header list with
+    nothing an outer client would add of its own, or a request target uvicorn's
+    h11 would 400 before it ever became an ASGI scope."""
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/api/hello",
+            "query_string": b"",
+            "root_path": "",
+            "headers": headers,
+            "client": ("127.0.0.1", 1234),
+            "server": ("127.0.0.1", 8383),
+            **scope,
+        },
+        receive,
+    )
+
+
 def _failing_upstream(exc: Exception) -> Upstream:
     def raise_it(request: httpx.Request) -> httpx.Response:
         raise exc
@@ -302,16 +329,17 @@ def test_client_never_adds_a_credential_or_follows_a_redirect():
     were flipped: trust_env=False keeps a stray ~/.netrc or HTTPS_PROXY from
     ever seeing the OAuth bearer token this process forwards; follow_redirects
     =False stops httpx from replaying Authorization to whatever a 3xx names,
-    which only the real client should ever decide to do; the identity
-    accept-encoding keeps httpx from asking for gzip on the client's behalf,
-    so _relay never hands back compressed bytes to a client that never said
-    it could decompress them; TIMEOUT and the connection limits are exactly
-    the values the module's own comments justify."""
+    which only the real client should ever decide to do; the empty default
+    header set keeps httpx from asking for gzip on the client's behalf (so
+    _relay never hands back compressed bytes to a client that never said it
+    could decompress them) or identifying the request as anything but what the
+    client sent; TIMEOUT and the connection limits are exactly the values the
+    module's own comments justify."""
     upstream = FakeUpstream().upstream()
     client = upstream._client
     assert client.trust_env is False
     assert client.follow_redirects is False
-    assert client.headers["accept-encoding"] == "identity"
+    assert list(client.headers.items()) == []
     assert client.timeout == TIMEOUT
     assert httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=None) == TIMEOUT
     # FakeUpstream forces httpx.ASGITransport (no socket, no connection pool),
@@ -327,6 +355,22 @@ def test_client_never_adds_a_credential_or_follows_a_redirect():
     asyncio.run(upstream.aclose())
 
 
+def test_nothing_the_client_did_not_send_is_added():
+    """The upstream must see the client's headers and nothing else: httpx's
+    own defaults (accept, user-agent, accept-encoding, connection) would
+    describe the request as httpx's rather than as the client made it. Hand
+    built rather than sent through a client, because any real client adds its
+    own defaults and the point here is what SOUS adds."""
+    fake = FakeUpstream()
+    upstream = fake.upstream()
+    request = _hand_built_request([(b"host", b"127.0.0.1:8383"), (b"x-only", b"1")])
+    response = asyncio.run(upstream.forward(request, None))
+    assert response.status_code == 200
+    (seen,) = fake.requests
+    assert dict(seen["headers"]) == {"host": "upstream.test", "x-only": "1"}
+    asyncio.run(upstream.aclose())
+
+
 def test_a_non_ascii_request_target_is_a_400_not_a_raise():
     """forward()'s contract is that it never raises. Building the upstream URL
     is part of that: a non-ASCII raw_path makes httpx.URL raise
@@ -336,27 +380,7 @@ def test_a_non_ascii_request_target_is_a_400_not_a_raise():
     """
     fake = FakeUpstream()
     upstream = fake.upstream()
-
-    async def receive():
-        return {"type": "http.request", "body": b"", "more_body": False}
-
-    request = Request(
-        {
-            "type": "http",
-            "asgi": {"version": "3.0"},
-            "http_version": "1.1",
-            "method": "GET",
-            "scheme": "http",
-            "path": "/\udcff",
-            "raw_path": b"/\xff",
-            "query_string": b"",
-            "root_path": "",
-            "headers": [(b"host", b"127.0.0.1:8383")],
-            "client": ("127.0.0.1", 1234),
-            "server": ("127.0.0.1", 8383),
-        },
-        receive,
-    )
+    request = _hand_built_request([(b"host", b"127.0.0.1:8383")], path="/\udcff", raw_path=b"/\xff")
     response = asyncio.run(upstream.forward(request, None))
     assert response.status_code == 400
     assert response.headers["via"] == VIA
