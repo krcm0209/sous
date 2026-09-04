@@ -110,13 +110,14 @@ The supported way to drive the gateway from Claude Code is `sous claude`
 and only Task-tool subagents reach the local model. To exercise the *local*
 endpoint on every turn instead, run a *whole-session-local* session — every
 tier pinned to `sous-local`. That is a verification setup, not a supported
-mode. Set `[gateway].enabled = true` and `[gateway].max_context_tokens =
-131072`, restart the daemon, and stay online: `/api/hello` and Claude Code's
-other base-URL calls are forwarded to the real API even when every model
-turn is local. The larger window matters: Claude Code's own system prompt
-and tool schemas already fill ~40K tokens, and one tool round trip pushes
-the rendered prompt past 80K, so the 65536 default (sized for a subagent's
-smaller turns) aborts a whole-session run with `prompt is too long`.
+mode. Set `[gateway].enabled = true`, restart the daemon, and stay online:
+`/api/hello` and Claude Code's other base-URL calls are forwarded to the
+real API even when every model turn is local. The whole-session recipe
+relies on the gateway's 131072-token default window: Claude Code's own
+system prompt and tool schemas already fill ~40K tokens, and one tool round
+trip pushes the rendered prompt past 80K, so a smaller window — sized for a
+subagent's smaller turns — aborts a whole-session run with `prompt is too
+long`.
 
 ```bash
 env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \

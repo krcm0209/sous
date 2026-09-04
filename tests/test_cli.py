@@ -547,7 +547,7 @@ def _status(**gateway) -> dict:
             "gateway": {
                 "enabled": True,
                 "local_models": ["sous-local"],
-                "max_context_tokens": 65536,
+                "max_context_tokens": 131072,
                 "upstream_url": "https://api.anthropic.com",
                 **gateway,
             }
@@ -663,7 +663,7 @@ def test_claude_execs_claude_with_the_gateway_environment(tmp_path, capsys, monk
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8383"
     assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "sous-local"
     assert env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] == "1"
-    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "65536"
+    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
     assert env["API_TIMEOUT_MS"] == "3000000"
     assert "ANTHROPIC_API_KEY" not in env and "ANTHROPIC_AUTH_TOKEN" not in env
     err = capsys.readouterr().err
@@ -846,7 +846,7 @@ def test_daemon_status_reads_the_real_daemons_gateway_config(tmp_path):
     assert status["config"]["gateway"] == {
         "enabled": True,
         "local_models": ["sous-local"],
-        "max_context_tokens": 65536,
+        "max_context_tokens": 131072,
         "upstream_url": "https://api.anthropic.com",
     }
     # Nothing listening on that port any more.

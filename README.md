@@ -302,12 +302,15 @@ local_models = ["sous-local"]   # model ids served locally; every other id is fo
 upstream_url = "https://api.anthropic.com"  # where non-local requests go: an https origin, no path,
                                             # ASCII hostname or IP literal.
                                             # Plain http is accepted for a loopback host only.
-max_context_tokens = 65536      # server-side limit on prompt + reply tokens for local turns;
-                                # positive values below 49152 are raised to it. `sous claude`
-                                # sets CLAUDE_CODE_MAX_CONTEXT_TOKENS to the running daemon's
-                                # value of this (restart it after an edit); without
-                                # the launcher, set it yourself or a long subagent conversation
-                                # grows past it and fails with "prompt is too long".
+max_context_tokens = 131072     # server-side limit on prompt + reply tokens for local turns;
+                                # a Claude Code subagent's prompt — its agent prompt plus the
+                                # session's tool schemas — is ~50-58K tokens before it does
+                                # anything, and it asks for 32K of output; 65536 was too small
+                                # in practice. Positive values below 49152 are raised to it.
+                                # `sous claude` sets CLAUDE_CODE_MAX_CONTEXT_TOKENS to the
+                                # running daemon's value of this (restart it after an edit);
+                                # without the launcher, set it yourself or a long subagent
+                                # conversation grows past it and fails with "prompt is too long".
 generation_timeout_minutes = 30
 ```
 
