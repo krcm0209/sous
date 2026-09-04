@@ -25,6 +25,7 @@ from mcp.server import MCPServer
 from sous.config import SousConfig, current_allowlist, load_config, persist_allowlist_entry
 from sous.engine.base import EngineManager, release_mlx_thread_state
 from sous.gateway.routes import Gateway, mount_gateway
+from sous.gateway.upstream import Upstream
 from sous.tasks import FINISHED_STATES, Task, TaskState, TaskStore
 from sous.toolexec import (
     _is_within,
@@ -294,7 +295,13 @@ draft, never a merge.
 """
 
 
-def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) -> MCPServer:
+def create_server(
+    store: TaskStore,
+    engines: EngineManager,
+    config: SousConfig,
+    *,
+    upstream: Upstream | None = None,
+) -> MCPServer:
     svc = SousService(store, engines, config)
     # mount_gateway (below) runs after MCPServer(...) is constructed, so the
     # lifespan closure below needs a late-bound holder for whatever it
@@ -313,9 +320,10 @@ def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) 
             # awaits this shutdown), plus any embedded lifecycle that drives
             # lifespan. Without it the gateway's session thread stays parked
             # in _requests.get() and never reaches release_mlx_thread_state()
-            # (ml-explore/mlx#4327) on a non-signal exit.
+            # (ml-explore/mlx#4327) on a non-signal exit — and the upstream
+            # forwarder's connection pool is closed with it.
             for gateway in mounted_gateway:
-                gateway.close()
+                await gateway.aclose()
 
     mcp = MCPServer("sous", instructions=_INSTRUCTIONS, lifespan=_lifespan)
 
@@ -386,7 +394,7 @@ def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) 
         return svc.server_status()
 
     if config.gateway_enabled:
-        mounted_gateway.append(mount_gateway(mcp, engines, config))
+        mounted_gateway.append(mount_gateway(mcp, engines, config, upstream=upstream))
 
     return mcp
 

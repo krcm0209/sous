@@ -161,7 +161,6 @@ def test_non_streaming_over_a_real_socket(tmp_path: Path):
         assert r.status_code == 200
         assert r.json()["content"] == [{"type": "text", "text": "hello world"}]
         assert r.json()["usage"]["output_tokens"] == 2
-        assert client.head(f"{base}/api/hello").status_code == 200
 
 
 def test_a_request_abandoned_while_queued_never_generates(tmp_path: Path):
@@ -271,8 +270,8 @@ def test_app_shutdown_closes_the_gateway_session_thread(tmp_path: Path, monkeypa
     captured: list[Gateway] = []
     real_mount_gateway = server_mod.mount_gateway
 
-    def spy(mcp, engines, cfg):
-        gateway = real_mount_gateway(mcp, engines, cfg)
+    def spy(mcp, engines, cfg, **kw):
+        gateway = real_mount_gateway(mcp, engines, cfg, **kw)
         captured.append(gateway)
         return gateway
 

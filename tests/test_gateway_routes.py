@@ -5,10 +5,12 @@ test_gateway_http.py against a real server."""
 
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import logging
 import threading
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
@@ -23,6 +25,7 @@ from sous.gateway.routes import MAX_BODY_DEPTH, Gateway, mount_gateway
 from sous.server import create_server
 from sous.tasks import TaskStore
 from tests.fake_engine import ChunkedFakeEngine, FakeEngine
+from tests.fake_upstream import FakeUpstream
 
 READ_TOOL = {
     "name": "Read",
@@ -35,7 +38,10 @@ XML_CALL = (
 )
 
 
-def _app(tmp_path: Path, engine, **overrides):
+def _app(tmp_path: Path, engine, upstream=None, **overrides):
+    """The daemon's app with the gateway on. Every forward goes to `upstream`
+    (a FakeUpstream's .upstream()) — never to the network; a fresh, unobserved
+    fake when the test does not care what was forwarded."""
     overrides.setdefault("gateway_enabled", True)
     cfg = SousConfig(
         data_dir=tmp_path / "data",
@@ -44,10 +50,11 @@ def _app(tmp_path: Path, engine, **overrides):
     )
     store = TaskStore(tmp_path / "tasks.db")
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
-    return create_server(store, engines, cfg).streamable_http_app()
+    upstream = upstream or FakeUpstream().upstream()
+    return create_server(store, engines, cfg, upstream=upstream).streamable_http_app()
 
 
-def _gateway_app(tmp_path: Path, engine, **overrides) -> tuple[Gateway, object]:
+def _gateway_app(tmp_path: Path, engine, upstream=None, **overrides) -> tuple[Gateway, object]:
     """Like _app, but hands back the Gateway too — create_server drops
     mount_gateway's return value, and Gateway.close() tests need it."""
     overrides.setdefault("gateway_enabled", True)
@@ -58,7 +65,8 @@ def _gateway_app(tmp_path: Path, engine, **overrides) -> tuple[Gateway, object]:
     )
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
     mcp = MCPServer("test")
-    gateway = mount_gateway(mcp, engines, cfg)
+    upstream = upstream or FakeUpstream().upstream()
+    gateway = mount_gateway(mcp, engines, cfg, upstream=upstream)
     return gateway, mcp.streamable_http_app()
 
 
@@ -81,6 +89,26 @@ def _request(app, method: str, path: str, body=None, headers=None) -> httpx.Resp
 
 def _post(app, body, path="/v1/messages", headers=None) -> httpx.Response:
     return _request(app, "POST", path, body, headers)
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(app) -> AsyncIterator[None]:
+    """Drives the app's ASGI lifespan around a block. httpx's ASGITransport
+    does not (a real server does), and the MCP transport's session manager
+    starts nowhere else — without it /mcp only ever raises."""
+    receive: asyncio.Queue = asyncio.Queue()
+    send: asyncio.Queue = asyncio.Queue()
+    task = asyncio.create_task(
+        app({"type": "lifespan", "asgi": {"version": "3.0"}}, receive.get, send.put)
+    )
+    await receive.put({"type": "lifespan.startup"})
+    assert (await send.get())["type"] == "lifespan.startup.complete"
+    try:
+        yield
+    finally:
+        await receive.put({"type": "lifespan.shutdown"})
+        assert (await send.get())["type"] == "lifespan.shutdown.complete"
+        await task
 
 
 def _body(**overrides) -> dict:
@@ -111,10 +139,19 @@ def _events(text: str) -> list[tuple[str, dict]]:
 # --- probes and routing -------------------------------------------------------------
 
 
-def test_hello_answers_head_and_get(tmp_path: Path):
-    app = _app(tmp_path, FakeEngine([]))
-    assert _request(app, "HEAD", "/api/hello").status_code == 200
-    assert _request(app, "GET", "/api/hello").status_code == 200
+def test_hello_is_forwarded_upstream(tmp_path: Path):
+    """Claude Code probes /api/hello at startup (gate 1, O3). Phase 1 answered
+    it locally; with routing in place the real API answers, through sous."""
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
+    for method in ("HEAD", "GET"):
+        r = _request(app, method, "/api/hello")
+        assert r.status_code == 200
+        assert r.headers["via"] == "1.1 sous"
+    assert [(s["method"], s["path"]) for s in fake.requests] == [
+        ("HEAD", "/api/hello"),
+        ("GET", "/api/hello"),
+    ]
 
 
 def test_routes_are_absent_when_the_gateway_is_disabled(tmp_path: Path):
@@ -123,17 +160,31 @@ def test_routes_are_absent_when_the_gateway_is_disabled(tmp_path: Path):
     assert _post(app, _body()).status_code == 404
 
 
-def test_unknown_model_is_an_anthropic_shaped_404(tmp_path: Path):
-    """Phase 2 forwards these upstream; until then the client hears exactly
-    what the real API says for an unknown model, and gate 1 showed the main
-    loop recovers from that."""
-    app = _app(tmp_path, FakeEngine([]))
-    r = _post(app, _body(model="claude-opus-5"))
-    assert r.status_code == 404
-    assert r.json() == {
-        "type": "error",
-        "error": {"type": "not_found_error", "message": "model: claude-opus-5"},
-    }
+def test_a_non_local_model_is_forwarded_byte_for_byte(tmp_path: Path):
+    """The routing predicate: anything not in [gateway].local_models is the
+    upstream's request. The body goes up exactly as received (whitespace and
+    all — the gateway must never re-serialize what it forwards) and the
+    credential travels with it."""
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
+    raw = json.dumps(_body(model="claude-opus-5"), indent=3).encode()
+    r = _post(
+        app,
+        raw,
+        headers={
+            "authorization": "Bearer sk-ant-oat01-canary",
+            "anthropic-beta": "oauth-2025-04-20,claude-code-20250219",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json() == {"upstream": True}
+    assert r.headers["via"] == "1.1 sous"
+    (seen,) = fake.requests
+    assert (seen["method"], seen["path"]) == ("POST", "/v1/messages")
+    assert seen["body"] == raw
+    headers = dict(seen["headers"])
+    assert headers["authorization"] == "Bearer sk-ant-oat01-canary"
+    assert headers["anthropic-beta"] == "oauth-2025-04-20,claude-code-20250219"
 
 
 def test_configured_local_models_are_all_served(tmp_path: Path):
@@ -209,24 +260,27 @@ def test_loopback_and_absent_origins_pass(tmp_path: Path):
 # --- request validation ---------------------------------------------------------------
 
 
-def test_invalid_json_and_bad_shapes_are_400s(tmp_path: Path):
+def test_bad_shapes_in_a_claimed_body_are_400s(tmp_path: Path):
+    """Undecodable JSON and a body that is not an object cannot name a local
+    model, so routing hands those to the upstream to word its own refusal (see
+    the routing tests below). What still lands here is a body that claims a
+    local model and is wrong about everything else."""
     app = _app(tmp_path, FakeEngine([]))
-    r = _post(app, b"{not json")
-    assert r.status_code == 400 and r.json()["error"]["type"] == "invalid_request_error"
     r = _post(app, _body(max_tokens=0))
     assert r.status_code == 400 and "max_tokens" in r.json()["error"]["message"]
-    r = _post(app, [1, 2, 3])
-    assert r.status_code == 400
+    r = _post(app, _body(messages="not a list"))
+    assert r.status_code == 400 and r.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_a_body_past_the_depth_cap_is_a_400_not_a_recursion_error(tmp_path: Path):
     # RecursionError is stack-size dependent, not a reliable "too deep"
     # signal (a body that decodes here on this machine's stack would still
     # blow up the chat template's tojson encoder on a smaller one) —
-    # MAX_BODY_DEPTH is the real contract _read_json enforces.
+    # MAX_BODY_DEPTH is the real contract _check_depth enforces on a claimed
+    # body. Raw bytes, so the decode itself is what has to survive the depth.
     inner = FakeEngine(["unused"])
     n = MAX_BODY_DEPTH + 1
-    body = ("[" * n + "]" * n).encode()
+    body = b'{"model":"sous-local","max_tokens":10,"messages":' + b"[" * n + b"]" * n + b"}"
     r = _request(_app(tmp_path, inner), "POST", "/v1/messages", body=body)
     assert r.status_code == 400
     assert r.json()["error"]["type"] == "invalid_request_error"
@@ -245,11 +299,15 @@ def test_a_tool_schema_nested_about_ten_levels_still_converts(tmp_path: Path):
     assert r.status_code == 200
 
 
-def test_non_json_constants_in_the_body_are_a_400(tmp_path: Path):
+def test_non_json_constants_in_the_body_never_reach_the_engine(tmp_path: Path):
     # json.loads accepts NaN/Infinity (and 1e999 → inf) by default; the real
-    # API rejects them, and so must the boundary that decides 400-or-turn.
+    # API rejects them, and so must the boundary that decides forward-or-turn.
+    # A body the strict decoder cannot read is a body that cannot name a local
+    # model, so the refusal is the upstream's to word — what is pinned here is
+    # that the local model never sees one of these, whatever the id says.
     inner = FakeEngine(["unused"])
-    app = _app(tmp_path, inner)
+    fake = FakeUpstream()
+    app = _app(tmp_path, inner, upstream=fake.upstream())
     for raw in (
         b'{"model":"sous-local","max_tokens":10,"messages":[{"role":"user","content":"hi"}],'
         b'"temperature": NaN}',
@@ -258,9 +316,10 @@ def test_non_json_constants_in_the_body_are_a_400(tmp_path: Path):
         b'{"model":"sous-local","max_tokens":10,"messages":[{"role":"user","content":"hi"}],'
         b'"temperature": 1e999}',
     ):
+        fake.requests.clear()
         r = _request(app, "POST", "/v1/messages", body=raw)
-        assert r.status_code == 400, raw
-        assert r.json()["error"]["type"] == "invalid_request_error"
+        assert r.status_code == 200 and r.headers["via"] == "1.1 sous", raw
+        assert fake.requests[0]["body"] == raw
     assert inner.calls == []
 
 
@@ -532,10 +591,11 @@ def test_count_tokens(tmp_path: Path):
     assert r.json() == {
         "input_tokens": inner.count_tokens([{"role": "user", "content": "hello world"}], [])
     }
-    assert (
-        _post(app, {**body, "model": "claude-x"}, path="/v1/messages/count_tokens").status_code
-        == 404
-    )
+    fake = FakeUpstream()
+    app = _app(tmp_path, inner, upstream=fake.upstream())
+    r = _post(app, {**body, "model": "claude-x"}, path="/v1/messages/count_tokens")
+    assert r.status_code == 200 and r.headers["via"] == "1.1 sous"
+    assert fake.requests[0]["path"] == "/v1/messages/count_tokens"
 
 
 # --- turn admission (MAX_PENDING_TURNS) --------------------------------------------
@@ -885,3 +945,188 @@ def test_cancelling_a_queued_non_streaming_request_cancels_the_turn(tmp_path: Pa
         assert inner.calls == []  # the turn was cancelled before it ever ran
 
     asyncio.run(go())
+
+
+# --- routing (Phase 2) ---------------------------------------------------------------
+
+
+def test_local_ids_match_with_a_bracketed_beta_suffix(tmp_path: Path):
+    """Claude Code sends `sous-local[1m]` on one startup query (the 1M-context
+    beta suffix, seen live in the Phase 1 exit). It is served locally and the
+    id is echoed as sent; only one suffix, at the very end, is stripped."""
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine(["ok", "ok"]), upstream=fake.upstream())
+    r = _post(app, _body(model="sous-local[1m]"))
+    assert r.status_code == 200
+    assert r.json()["model"] == "sous-local[1m]"
+    assert r.json()["content"] == [{"type": "text", "text": "ok"}]
+    assert fake.requests == []
+    _post(app, _body(model="sous-local[1m][x]"))
+    _post(app, _body(model="[1m]sous-local"))
+    assert [json.loads(s["body"])["model"] for s in fake.requests] == [
+        "sous-local[1m][x]",
+        "[1m]sous-local",
+    ]
+
+
+def test_bodies_the_gateway_cannot_claim_are_the_upstreams_to_judge(tmp_path: Path):
+    """Not JSON, not an object, no string model, strict-decoder rejects: none
+    of these can name a local model, so the upstream answers in its own words."""
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
+    for raw in (
+        b"not json",
+        b'{"model": 5}',
+        b'{"messages": []}',
+        b'{"model": "sous-local", "n": NaN}',
+        b"[" * 200 + b"]" * 200,
+    ):
+        fake.requests.clear()
+        r = _post(app, raw)
+        assert r.status_code == 200 and r.headers["via"] == "1.1 sous", raw
+        assert fake.requests[0]["body"] == raw
+
+
+def test_a_claimed_body_is_still_validated_locally(tmp_path: Path):
+    """Routing does not loosen Phase 1: a body that names sous-local but is
+    otherwise wrong gets sous's own 400, and never goes upstream."""
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
+    r = _post(app, {"model": "sous-local", "max_tokens": 10})
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"
+    deep: object = "x"
+    for _ in range(MAX_BODY_DEPTH + 5):
+        deep = [deep]
+    r = _post(app, {**_body(), "metadata": deep})
+    assert r.status_code == 400
+    assert "nests deeper" in r.json()["error"]["message"]
+    assert fake.requests == []
+
+
+def test_everything_else_streams_through_with_method_query_and_body(tmp_path: Path):
+    """Claude Code 2.1.247 calls /api/oauth/usage, /api/event_logging/v2/batch
+    and more on its base URL; a method the local routes lack (GET
+    /v1/messages) falls through to the same catch-all."""
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
+    assert _request(app, "GET", "/api/oauth/usage?scope=all").status_code == 200
+    assert _request(app, "HEAD", "/api/hello").status_code == 200
+    assert (
+        _request(app, "POST", "/api/event_logging/v2/batch", body=b'{"events": []}').status_code
+        == 200
+    )
+    assert _request(app, "GET", "/v1/messages").status_code == 200
+    assert _request(app, "DELETE", "/api/frame/deploy/direct").status_code == 200
+    assert [(s["method"], s["path"], s["query"]) for s in fake.requests] == [
+        ("GET", "/api/oauth/usage", "scope=all"),
+        ("HEAD", "/api/hello", ""),
+        ("POST", "/api/event_logging/v2/batch", ""),
+        ("GET", "/v1/messages", ""),
+        ("DELETE", "/api/frame/deploy/direct", ""),
+    ]
+    assert fake.requests[2]["body"] == b'{"events": []}'
+    assert _request(app, "GET", "/").headers["via"] == "1.1 sous"
+
+
+def test_the_catch_all_does_not_shadow_the_mcp_transport(tmp_path: Path):
+    """The SDK mounts custom routes after /mcp, so the MCP transport answers
+    its own path — never the upstream. Its JSON-RPC refusal of a session-less
+    ping is the proof: the fake upstream answers 200 {"upstream": true}."""
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
+
+    async def go():
+        async with _lifespan(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://127.0.0.1:8383"
+            ) as client:
+                return await client.post("/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1})
+
+    r = asyncio.run(go())
+    assert r.status_code == 400
+    assert r.json()["jsonrpc"] == "2.0"
+    assert "via" not in r.headers
+    assert fake.requests == []
+
+
+def test_forwarded_requests_are_loopback_only_too(tmp_path: Path):
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
+    assert (
+        _request(app, "GET", "/api/oauth/usage", headers={"host": "evil.example"}).status_code
+        == 403
+    )
+    assert (
+        _request(
+            app, "GET", "/api/oauth/usage", headers={"origin": "https://evil.example"}
+        ).status_code
+        == 403
+    )
+    assert (
+        _post(app, _body(model="claude-opus-5"), headers={"host": "evil.example"}).status_code
+        == 403
+    )
+    assert (
+        _post(
+            app,
+            _body(model="claude-opus-5"),
+            path="/v1/messages/count_tokens",
+            headers={"origin": "null"},
+        ).status_code
+        == 403
+    )
+    assert fake.requests == []
+
+
+def test_an_oversized_body_is_refused_before_forwarding(tmp_path: Path):
+    """The 32 MiB cap is Anthropic's own, so refusing here changes nothing the
+    client would see — and a forwarded body is buffered, so it must be bounded."""
+    import sous.gateway.routes as routes
+
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
+    r = _post(
+        app,
+        _body(model="claude-opus-5"),
+        headers={"content-length": str(routes.MAX_REQUEST_BYTES + 1)},
+    )
+    assert r.status_code == 413 and r.json()["error"]["type"] == "request_too_large"
+    assert fake.requests == []
+
+
+def test_forwarding_logs_one_bounded_metadata_line_and_never_a_body_header_or_query(
+    tmp_path: Path, capsys
+):
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
+    raw = json.dumps(
+        _body(model="claude-opus-5", messages=[{"role": "user", "content": "BODY-CANARY"}])
+    ).encode()
+    _post(app, raw, headers={"authorization": "Bearer HEADER-CANARY"})
+    _request(app, "GET", "/api/oauth/usage?token=QUERY-CANARY")
+    _post(app, b'{"model": "x y"}')
+    _post(app, json.dumps(_body(model="m" * 65)).encode())
+    _post(app, b"not json")
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if line.startswith("sous gateway: upstream")]
+    assert lines[0].startswith(
+        "sous gateway: upstream POST /v1/messages model=claude-opus-5 status=200 seconds="
+    )
+    assert lines[1].startswith(
+        "sous gateway: upstream GET /api/oauth/usage model=- status=200 seconds="
+    )
+    assert lines[2].startswith("sous gateway: upstream POST /v1/messages model=- status=200")
+    assert lines[3].startswith("sous gateway: upstream POST /v1/messages model=- status=200")
+    assert lines[4].startswith("sous gateway: upstream POST /v1/messages model=- status=200")
+    assert len(lines) == 5
+    for canary in ("BODY-CANARY", "HEADER-CANARY", "QUERY-CANARY", "x y", "m" * 65):
+        assert canary not in err, canary
+
+
+def test_aclose_shuts_the_upstream_client_too(tmp_path: Path):
+    upstream = FakeUpstream().upstream()
+    gateway, _ = _gateway_app(tmp_path, FakeEngine([]), upstream=upstream)
+    asyncio.run(gateway.aclose())
+    assert upstream._client.is_closed

@@ -2,7 +2,9 @@
 
 Never logs a request body or a header value. Never executes a tool: tool_use
 blocks go back to Claude Code, whose permission system runs them (toolexec.py
-is not in this path).
+is not in this path). Requests for any other model — and every path it has no
+route for — are forwarded to [gateway].upstream_url by gateway/upstream.py,
+byte for byte.
 """
 
 from __future__ import annotations
@@ -13,8 +15,10 @@ import contextlib
 import json
 import logging
 import math
+import re
 import sys
 import threading
+import time
 from collections.abc import AsyncIterator
 from urllib.parse import urlsplit
 
@@ -39,6 +43,7 @@ from sous.gateway.turn import (
     TurnResult,
     TurnRunner,
 )
+from sous.gateway.upstream import Upstream
 from sous.protocol import ToolSet
 
 # Anthropic's own request cap. The MCP transport's 4 MiB limit wraps only the
@@ -96,6 +101,17 @@ _ALLOWED_ORIGIN_HOSTS = ("127.0.0.1", "localhost", "::1")
 _LOG_TYPES = 8
 _LOG_TYPE_CHARS = 64
 
+# Claude Code appends a bracketed beta suffix to a model id on some requests
+# (`sous-local[1m]` for the 1M-context beta, seen live in the Phase 1 exit);
+# the id inside is what routing matches. One suffix, at the very end, no
+# nesting — anything else is a different id.
+_MODEL_SUFFIX_RE = re.compile(r"\[[^\[\]]*\]$")
+# Bounds for the two identifiers a forwarded request contributes to its log
+# line. Both are client-controlled strings, so anything that is not a short,
+# printable, space-free token is logged as "-".
+_LOG_ID_CHARS = 64
+_LOG_PATH_CHARS = 80
+
 
 def _log(message: str) -> None:
     print(f"sous gateway: {message}", file=sys.stderr, flush=True)
@@ -105,6 +121,17 @@ def _error_response(status: int, error_type: str, message: str) -> JSONResponse:
     return JSONResponse(
         {"type": "error", "error": {"type": error_type, "message": message}}, status_code=status
     )
+
+
+def _log_token(value: object, limit: int) -> str:
+    if (
+        isinstance(value, str)
+        and 0 < len(value) <= limit
+        and value.isprintable()
+        and not any(c.isspace() for c in value)
+    ):
+        return value
+    return "-"
 
 
 def _classify(exc: Exception) -> tuple[int, str, str]:
@@ -154,7 +181,7 @@ def _depth_exceeds(value: object, limit: int) -> bool:
     return False
 
 
-async def _read_json(request: Request) -> object:
+async def _read_body(request: Request) -> bytes:
     declared = request.headers.get("content-length", "")
     # isdecimal, not isdigit: "²" is a digit to str but not to int(), and a
     # 5000-digit value trips int()'s digit limit — either would be a bare
@@ -180,20 +207,24 @@ async def _read_json(request: Request) -> object:
         # Nobody will read this response; it exists so the disconnect is not
         # a 500 with a traceback in the daemon log.
         raise RequestError(400, "invalid_request_error", "client disconnected mid-body") from None
+    return b"".join(chunks)
+
+
+def _decode_json(raw: bytes) -> object:
     try:
-        body = json.loads(
-            b"".join(chunks), parse_constant=_reject_constant, parse_float=_finite_float
-        )
+        return json.loads(raw, parse_constant=_reject_constant, parse_float=_finite_float)
     except ValueError, RecursionError:
         # RecursionError is the backstop for a body deeper than the
-        # interpreter's stack allows to even finish decoding — the
-        # MAX_BODY_DEPTH check below is the real contract for "too deep".
+        # interpreter's stack allows to even finish decoding — _check_depth
+        # is the real contract for "too deep".
         raise RequestError(400, "invalid_request_error", "request body is not valid JSON") from None
+
+
+def _check_depth(body: object) -> None:
     if _depth_exceeds(body, MAX_BODY_DEPTH):
         raise RequestError(
             400, "invalid_request_error", f"request body nests deeper than {MAX_BODY_DEPTH} levels"
         )
-    return body
 
 
 def _check_loopback(request: Request) -> None:
@@ -262,7 +293,9 @@ class _NullSink:
 
 
 class Gateway:
-    def __init__(self, engines: EngineManager, config: SousConfig):
+    def __init__(
+        self, engines: EngineManager, config: SousConfig, upstream: Upstream | None = None
+    ):
         self._config = config
         self._runner = TurnRunner(engines, config)
         # Turns get their own pool, never asyncio's default executor. A turn
@@ -288,6 +321,7 @@ class Gateway:
         # the module constant before building the app.
         self._pending = threading.BoundedSemaphore(MAX_PENDING_TURNS)
         self._pending_counts = threading.BoundedSemaphore(MAX_PENDING_COUNTS)
+        self._upstream = upstream or Upstream(config.gateway_upstream_url)
 
     def close(self, timeout: float = 2.0) -> None:
         """Best-effort shutdown, called from the app's lifespan hook. Never
@@ -303,19 +337,62 @@ class Gateway:
         self._counts.shutdown(wait=False, cancel_futures=True)
         _log("closed" if closed else "close deferred: turn in progress")
 
-    async def hello(self, request: Request) -> Response:
-        # Claude Code probes HEAD /api/hello at startup (gate 1, O3).
+    async def aclose(self) -> None:
+        """close() plus the upstream client; what the app's lifespan awaits."""
+        self.close()
+        await self._upstream.aclose()
+
+    async def passthrough(self, request: Request) -> Response:
+        """Everything the gateway has no route of its own for — /api/hello,
+        /api/oauth/usage, event logging, whatever Claude Code adds next —
+        streams through to the upstream untouched."""
         try:
             _check_loopback(request)
         except RequestError as e:
             return JSONResponse(e.body(), status_code=e.status)
-        return Response(status_code=200)
+        return await self._forward(request, None, "-")
+
+    def _route(self, raw: bytes) -> tuple[object | None, str]:
+        """(decoded body, model) when the body names a model served here;
+        (None, model-for-the-log) when it is the upstream's — including a body
+        that does not decode or names no model: those are the upstream's to
+        judge, in its own words. Only a claimed body is ever re-serialized, so
+        only a claimed body gets the depth check (in the caller)."""
+        try:
+            body = _decode_json(raw)
+        except RequestError:
+            return None, "-"
+        model = body.get("model") if isinstance(body, dict) else None
+        if not isinstance(model, str):
+            return None, "-"
+        if _MODEL_SUFFIX_RE.sub("", model, count=1) in self._config.gateway_local_models:
+            return body, model
+        return None, _log_token(model, _LOG_ID_CHARS)
+
+    async def _forward(self, request: Request, body: bytes | None, model: str) -> Response:
+        started = time.monotonic()
+        response = await self._upstream.forward(request, body)
+        # `seconds` is time to the upstream's headers — for a stream, the body
+        # is still flowing when this line is written.
+        _log(
+            f"upstream {request.method} {_log_token(request.url.path, _LOG_PATH_CHARS)} "
+            f"model={model} status={response.status_code} "
+            f"seconds={time.monotonic() - started:.1f}"
+        )
+        return response
 
     async def count_tokens(self, request: Request) -> Response:
         try:
             _check_loopback(request)
-            chat = parse_count_tokens_request(await _read_json(request))
-            self._check_model(chat.model)
+            raw = await _read_body(request)
+        except RequestError as e:
+            return JSONResponse(e.body(), status_code=e.status)
+        body, model = self._route(raw)
+        if body is None:
+            return await self._forward(request, raw, model)
+        try:
+            _check_depth(body)
+            chat = parse_count_tokens_request(body)
         except RequestError as e:
             return JSONResponse(e.body(), status_code=e.status)
         # Same bounded-admission reasoning as messages()'s self._pending: a
@@ -343,8 +420,16 @@ class Gateway:
     async def messages(self, request: Request) -> Response:
         try:
             _check_loopback(request)
-            chat = parse_messages_request(await _read_json(request))
-            self._check_model(chat.model)
+            raw = await _read_body(request)
+        except RequestError as e:
+            _log(f"POST /v1/messages status={e.status} error={e.error_type}")
+            return JSONResponse(e.body(), status_code=e.status)
+        body, model = self._route(raw)
+        if body is None:
+            return await self._forward(request, raw, model)
+        try:
+            _check_depth(body)
+            chat = parse_messages_request(body)
         except RequestError as e:
             _log(f"POST /v1/messages status={e.status} error={e.error_type}")
             return JSONResponse(e.body(), status_code=e.status)
@@ -434,12 +519,6 @@ class Gateway:
         assembler.finish(result.text, result.output_tokens, result.finish_reason)
         self._log_turn(chat, result, assembler, stream=False)
         return JSONResponse(assembler.message())
-
-    def _check_model(self, model: str) -> None:
-        # Phase 2 forwards other models upstream; until then they are simply
-        # not served here, in the vocabulary the client already understands.
-        if model not in self._config.gateway_local_models:
-            raise RequestError(404, "not_found_error", f"model: {model}")
 
     def _submit(self, executor, slots, fn, *args) -> asyncio.Future:
         """Submit a job to `executor` and tie `slots`' release to the
@@ -541,7 +620,9 @@ class Gateway:
         )
 
 
-def mount_gateway(mcp: MCPServer, engines: EngineManager, config: SousConfig) -> Gateway:
+def mount_gateway(
+    mcp: MCPServer, engines: EngineManager, config: SousConfig, *, upstream: Upstream | None = None
+) -> Gateway:
     """Register the Anthropic-compatible routes on the daemon's Starlette app.
     custom_route adds bare routes: no auth (loopback only, like /mcp), no
     body limit (enforced above), no DNS-rebinding check (the /mcp transport's
@@ -552,8 +633,14 @@ def mount_gateway(mcp: MCPServer, engines: EngineManager, config: SousConfig) ->
     # made. Here rather than at import, because server.py imports this module
     # unconditionally and a disabled gateway must not reconfigure a logger.
     logging.getLogger("sse_starlette").setLevel(logging.INFO)
-    gateway = Gateway(engines, config)
+    gateway = Gateway(engines, config, upstream)
     mcp.custom_route("/v1/messages", methods=["POST"])(gateway.messages)
     mcp.custom_route("/v1/messages/count_tokens", methods=["POST"])(gateway.count_tokens)
-    mcp.custom_route("/api/hello", methods=["GET", "HEAD"])(gateway.hello)
+    # Registered last and matched last: the SDK appends custom routes after
+    # its /mcp mount, so this can never shadow the MCP transport — and a
+    # method the two routes above do not take (GET /v1/messages) falls
+    # through to here and gets the upstream's own answer for it.
+    mcp.custom_route(
+        "/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+    )(gateway.passthrough)
     return gateway
