@@ -476,6 +476,8 @@ def test_gateway_upstream_rejects_anything_that_is_not_a_bare_origin(tmp_path: P
         '"ftp://api.anthropic.com"',
         '"api.anthropic.com"',
         '"http://[::1"',
+        '"https://api.anthropic.com:abc"',
+        '"https://api.anthropic.com:99999"',
         "42",
     ):
         p.write_text(f"[gateway]\nupstream_url = {raw}\n")

@@ -293,6 +293,11 @@ def _upstream_url(gateway: dict) -> str:
     if isinstance(value, str):
         try:
             parts = urlsplit(value)
+            # urlsplit parses the port lazily, so ":abc" and ":99999" both
+            # leave a valid-looking hostname behind and would be accepted here
+            # only to raise httpx.InvalidURL out of Upstream.__init__ — i.e. to
+            # kill the daemon at boot instead of warning and defaulting.
+            _ = parts.port
         except ValueError:
             # An unbalanced IPv6 bracket makes urlsplit raise rather than return.
             parts = None

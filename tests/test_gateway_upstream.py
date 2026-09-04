@@ -5,6 +5,7 @@ real socket shows (incremental relay, hang-ups) is in test_gateway_http.py."""
 
 import asyncio
 import gzip
+import json
 import sys
 
 import httpx
@@ -283,9 +284,50 @@ def test_client_never_adds_a_credential_or_follows_a_redirect():
     # instead. httpx.Limits(max_connections=None, ...) reaches httpcore as
     # sys.maxsize, not None -- httpcore itself makes that substitution -- so
     # that is what an unbounded pool asserts here.
-    pool = Upstream("https://upstream.test")._client._transport._pool  # ty: ignore[unresolved-attribute]
+    real = Upstream("https://upstream.test")
+    pool = real._client._transport._pool  # ty: ignore[unresolved-attribute]
     assert pool._max_connections == sys.maxsize
     assert pool._max_keepalive_connections == 20
+    asyncio.run(real.aclose())
+    asyncio.run(upstream.aclose())
+
+
+def test_a_non_ascii_request_target_is_a_400_not_a_raise():
+    """forward()'s contract is that it never raises. Building the upstream URL
+    is part of that: a non-ASCII raw_path makes httpx.URL raise
+    UnicodeDecodeError, which is not an httpx.HTTPError and would escape.
+    Driven through a hand-built scope because no HTTP client will send this —
+    uvicorn's h11 400s a non-ASCII target before it ever becomes an ASGI scope.
+    """
+    fake = FakeUpstream()
+    upstream = fake.upstream()
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/\udcff",
+            "raw_path": b"/\xff",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"host", b"127.0.0.1:8383")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("127.0.0.1", 8383),
+        },
+        receive,
+    )
+    response = asyncio.run(upstream.forward(request, None))
+    assert response.status_code == 400
+    assert response.headers["via"] == VIA
+    assert json.loads(bytes(response.body))["error"]["message"] == "malformed request target"
+    assert fake.requests == []
+    asyncio.run(upstream.aclose())
 
 
 def test_aclose_closes_the_client():

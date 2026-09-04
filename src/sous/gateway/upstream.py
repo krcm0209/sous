@@ -165,14 +165,20 @@ class Upstream:
             content = request.stream()
         else:
             content = None
-        upstream_request = self._client.build_request(
-            request.method,
-            self._base.copy_with(raw_path=_target_path(request)),
-            headers=request_headers(request.headers.raw, drop_content_length=body is not None),
-            content=content,
-        )
         try:
+            upstream_request = self._client.build_request(
+                request.method,
+                self._base.copy_with(raw_path=_target_path(request)),
+                headers=request_headers(request.headers.raw, drop_content_length=body is not None),
+                content=content,
+            )
             response = await self._client.send(upstream_request, stream=True)
+        except httpx.InvalidURL, UnicodeDecodeError:
+            # Building the URL is inside the try because neither of these is an
+            # httpx.HTTPError, so both would escape the "never raises" contract.
+            # Unreachable through uvicorn: h11 rejects a non-ASCII request
+            # target with its own 400 before it ever becomes an ASGI scope.
+            return _error(400, "malformed request target")
         except httpx.TimeoutException:
             return _error(504, f"upstream {self.host} timed out")
         except httpx.HTTPError as e:
