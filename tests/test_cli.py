@@ -725,13 +725,19 @@ def test_claude_launches_with_a_warning_when_the_upstream_is_down(tmp_path, caps
     assert "warning" in err and "upstream" in err
 
 
-def test_claude_launches_against_a_phase_1_daemon(tmp_path, monkeypatch):
-    """A local 200 without Via is a daemon that still answers hello itself."""
+def test_claude_refuses_a_daemon_that_answers_hello_itself(tmp_path, capsys, monkeypatch):
+    """A Phase 2 gateway answers /api/hello only through its forwarder, so every
+    reply it gives carries Via. A 200 without one is a pre-routing daemon that
+    would 404 every frontier-model request — the advertised hybrid session
+    could not start its main loop at all, so refuse rather than launch."""
     from sous import cli
 
     _, calls = _claude_setup(tmp_path, monkeypatch, probe=(200, False))
-    cli.main(["claude"])
-    assert len(calls) == 1
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["claude"])
+    assert exc.value.code == 1 and calls == []
+    err = capsys.readouterr().err
+    assert "reinstall" in err or "restart" in err
 
 
 def test_claude_refuses_without_the_claude_binary(tmp_path, capsys, monkeypatch):

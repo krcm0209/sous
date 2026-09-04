@@ -71,8 +71,10 @@ def claude_env(config: SousConfig, base: Mapping[str, str]) -> dict[str, str]:
 
 def _probe_gateway(port: int) -> tuple[int, bool] | None:
     """(status, did the gateway forward it?) for HEAD /api/hello, or None when
-    nothing is listening. A forwarded answer — or the forwarder's own error —
-    carries `Via: 1.1 sous`; the daemon's own "no such route" 404 does not.
+    nothing is listening. A routing gateway forwards everything it does not
+    serve itself, so every answer it can give this probe — the upstream's, or
+    the forwarder's own 502/504 — carries `Via: 1.1 sous`. Any reply without
+    one came from a daemon answering /api/hello itself, whatever its status.
     stdlib http.client on purpose: the CLI should not pay for an async HTTP
     client to run `sous status`."""
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=_PROBE_TIMEOUT_SECONDS)
@@ -109,12 +111,25 @@ def _cmd_claude(user_args: list[str]) -> None:
         )
         raise SystemExit(1)
     status, forwarded = probe
-    if status == 404 and not forwarded:
-        print(
-            "sous claude: the daemon is running without the gateway (started before "
-            "[gateway].enabled was set?); restart it and try again",
-            file=sys.stderr,
-        )
+    # No Via means the daemon answered /api/hello itself, and a gateway that
+    # routes never does: it forwards everything it does not serve, so even its
+    # own 502/504 carries one. Whatever the status, this daemon would 404 every
+    # frontier-model request, which is the main loop of the session about to be
+    # launched — refuse instead of advertising a hybrid session that cannot run.
+    if not forwarded:
+        if status == 404:
+            print(
+                "sous claude: the daemon is running without the gateway (started before "
+                "[gateway].enabled was set?); restart it and try again",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"sous claude: the daemon answered /api/hello itself (HTTP {status}) — that is "
+                "a pre-routing gateway that would 404 every frontier-model request; reinstall "
+                "sous and restart the daemon",
+                file=sys.stderr,
+            )
         raise SystemExit(1)
     if status >= 500:
         print(
