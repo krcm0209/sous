@@ -235,6 +235,35 @@ def test_bodiless_requests_send_no_body_framing():
         assert "transfer-encoding" not in names and "content-length" not in names, seen
 
 
+def test_a_bodiless_post_is_forwarded_without_invented_framing():
+    """httpx frames a POST/PUT/PATCH built with content=None as
+    `Content-Length: 0`. The client did not send that header, and a proxy
+    forwards what it received — the recomputed length belongs only to the two
+    Messages routes that buffered a body. Hand built: a real client would add
+    the very framing under test."""
+    fake = FakeUpstream()
+    upstream = fake.upstream()
+    request = _hand_built_request(
+        [(b"host", b"127.0.0.1:8383"), (b"x-only", b"1")],
+        method="POST",
+        path="/api/event_logging/v2/batch",
+    )
+    response = asyncio.run(upstream.forward(request, None))
+    assert response.status_code == 200
+    (seen,) = fake.requests
+    assert dict(seen["headers"]) == {"host": "upstream.test", "x-only": "1"}
+    # The other direction of the same rule: a client that DID declare an empty
+    # body keeps its header — dropping it would be inventing too.
+    declared = _hand_built_request(
+        [(b"host", b"127.0.0.1:8383"), (b"content-length", b"0")],
+        method="POST",
+        path="/api/event_logging/v2/batch",
+    )
+    assert asyncio.run(upstream.forward(declared, None)).status_code == 200
+    assert dict(fake.requests[1]["headers"]) == {"host": "upstream.test", "content-length": "0"}
+    asyncio.run(upstream.aclose())
+
+
 def test_upstream_cookies_are_never_stored_or_replayed():
     """httpx's client keeps a cookie jar: left alone, it eats every upstream
     Set-Cookie (Cloudflare's __cf_bm on any Anthropic response) and adds a

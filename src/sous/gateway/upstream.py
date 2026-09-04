@@ -242,6 +242,14 @@ class Upstream:
                 headers=request_headers(request.headers.raw, drop_content_length=body is not None),
                 content=content,
             )
+            if content is None and "content-length" not in request.headers:
+                # httpx frames a bodiless POST/PUT/PATCH as `Content-Length: 0`
+                # of its own accord. A proxy forwards what it received, and the
+                # only recomputed length in this module belongs to the two
+                # Messages routes that buffered a body. h11 puts a request with
+                # no framing at all on the wire quite happily — a request with
+                # no body needs none.
+                upstream_request.headers.pop("content-length", None)
             # Waiting for the upstream's headers can take the whole read
             # timeout (10 minutes: Anthropic streams pings while it thinks).
             # A client that gives up meanwhile — Claude Code's own timeout, a

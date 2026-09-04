@@ -173,10 +173,18 @@ def _fake_upstream_app(record: dict) -> Starlette:
     async def hello(request: Request) -> Response:
         return Response(status_code=200)
 
+    async def batch(request: Request) -> Response:
+        # A bodiless catch-all POST, so h11 on the gateway's side has to frame
+        # (or not frame) it for real; the ASGI transport never puts bytes on a
+        # wire and cannot show that.
+        record["batch_headers"] = dict(request.headers)
+        return Response(status_code=204)
+
     return Starlette(
         routes=[
             Route("/v1/messages", messages, methods=["POST"]),
             Route("/api/hello", hello, methods=["GET", "HEAD"]),
+            Route("/api/event_logging/v2/batch", batch, methods=["POST"]),
         ]
     )
 
@@ -452,6 +460,25 @@ def test_a_forwarded_stream_is_relayed_as_it_arrives(tmp_path: Path):
     assert record["headers"]["anthropic-beta"] == "oauth-2025-04-20"
     assert record["headers"]["host"] == upstream_base.removeprefix("http://")
     assert json.loads(record["body"]) == _upstream_body()
+
+
+def test_a_bodiless_post_crosses_the_wire_without_invented_framing(tmp_path: Path):
+    """The header-fidelity unit test's real-socket half: h11 must actually put
+    a POST on the wire with neither Content-Length nor Transfer-Encoding when
+    the client sent neither. httpx would have added `Content-Length: 0`."""
+    record: dict = {}
+    with (
+        _serve(_fake_upstream_app(record)) as (upstream_base, _us, _ut),
+        _serve(_app(tmp_path, ChunkedFakeEngine([]), upstream_url=upstream_base)) as (base, _s, _t),
+        httpx.Client(timeout=30) as client,
+    ):
+        # httpx would frame a bodiless POST itself, so hand h11 a request with
+        # no framing headers at all — the shape the gateway must pass through.
+        request = client.build_request("POST", f"{base}/api/event_logging/v2/batch")
+        request.headers.pop("content-length", None)
+        assert client.send(request).status_code == 204
+    seen = record["batch_headers"]
+    assert "content-length" not in seen and "transfer-encoding" not in seen, seen
 
 
 def test_a_client_that_hangs_up_closes_the_upstream_stream(tmp_path: Path):
