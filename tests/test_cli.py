@@ -535,9 +535,30 @@ def test_wait_timeout_zero_is_an_immediate_probe(tmp_path, capsys, monkeypatch):
 # --- sous claude ---------------------------------------------------------------------
 
 
-def _claude_setup(tmp_path, monkeypatch, *, probe=(200, True), **overrides):
-    """A gateway-enabled config, a `claude` on PATH, a daemon that answers the
-    probe, and an execve that records instead of replacing the process."""
+_DEFAULT_STATUS = object()
+
+
+def _status(**gateway) -> dict:
+    """What the running daemon reports about itself — the shape of
+    SousService.server_status()["config"]["gateway"], which is what the
+    launcher reads instead of trusting the config file."""
+    return {
+        "config": {
+            "gateway": {
+                "enabled": True,
+                "local_models": ["sous-local"],
+                "max_context_tokens": 65536,
+                "upstream_url": "https://api.anthropic.com",
+                **gateway,
+            }
+        }
+    }
+
+
+def _claude_setup(tmp_path, monkeypatch, *, status=_DEFAULT_STATUS, **overrides):
+    """A gateway-enabled config file, a `claude` on PATH, a daemon that answers
+    server_status, and an execve that records instead of replacing the
+    process. `status=None` is a daemon that does not answer at all."""
     import os
 
     from sous import cli
@@ -558,7 +579,8 @@ def _claude_setup(tmp_path, monkeypatch, *, probe=(200, True), **overrides):
     monkeypatch.setattr(
         cli.shutil, "which", lambda name: "/opt/bin/claude" if name == "claude" else None
     )
-    monkeypatch.setattr(cli, "_probe_gateway", lambda port: probe)
+    answer = _status() if status is _DEFAULT_STATUS else status
+    monkeypatch.setattr(cli, "_daemon_status", lambda port: answer)
     for var in (
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_API_KEY",
@@ -602,19 +624,15 @@ def test_claude_argv_appends_the_lsp_opt_out_unless_the_user_chose_their_own():
     ]
 
 
-def test_claude_env_sets_the_gateway_variables_and_nothing_credential_shaped(tmp_path):
+def test_claude_env_sets_the_gateway_variables_and_nothing_credential_shaped():
     from sous.cli import claude_env
-    from sous.config import SousConfig
 
-    cfg = SousConfig(
-        server_port=9999,
-        data_dir=tmp_path,
-        config_path=tmp_path / "c.toml",
-        gateway_enabled=True,
-        gateway_local_models=("sous-fast", "sous-local"),
-        gateway_max_context_tokens=131072,
+    env = claude_env(
+        9999,
+        ["sous-fast", "sous-local"],
+        131072,
+        {"PATH": "/usr/bin", "API_TIMEOUT_MS": "5", "HOME": "/Users/x"},
     )
-    env = claude_env(cfg, {"PATH": "/usr/bin", "API_TIMEOUT_MS": "5", "HOME": "/Users/x"})
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9999"
     assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "sous-fast"
     assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
@@ -707,63 +725,67 @@ def test_claude_warns_about_an_inherited_tier_variable_but_still_launches(
     assert calls[0][2]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "sous-local"
 
 
-def test_claude_refuses_when_the_gateway_is_disabled(tmp_path, capsys, monkeypatch):
+def test_claude_refuses_when_the_running_daemon_has_the_gateway_off(tmp_path, capsys, monkeypatch):
+    """The file says enabled; the daemon says off. The daemon's startup
+    snapshot is the truth — a file edited since it started changes nothing
+    until it restarts."""
     from sous import cli
 
-    _, calls = _claude_setup(tmp_path, monkeypatch, gateway_enabled=False)
+    _, calls = _claude_setup(tmp_path, monkeypatch, status=_status(enabled=False))
     with pytest.raises(SystemExit) as exc:
         cli.main(["claude"])
     assert exc.value.code == 1 and calls == []
-    assert "[gateway]" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "[gateway]" in err and "restart" in err
 
 
-def test_claude_refuses_when_no_daemon_listens(tmp_path, capsys, monkeypatch):
+def test_claude_refuses_when_no_daemon_answers(tmp_path, capsys, monkeypatch):
     from sous import cli
 
-    _, calls = _claude_setup(tmp_path, monkeypatch, probe=None)
+    _, calls = _claude_setup(tmp_path, monkeypatch, status=None)
     with pytest.raises(SystemExit) as exc:
         cli.main(["claude"])
     assert exc.value.code == 1 and calls == []
     assert "sous serve" in capsys.readouterr().err
 
 
-def test_claude_refuses_a_daemon_running_without_the_gateway(tmp_path, capsys, monkeypatch):
-    """A 404 with no Via is the daemon's own "no such route": the config was
-    edited but the daemon was not restarted."""
+def test_claude_refuses_a_pre_routing_daemon(tmp_path, capsys, monkeypatch):
+    """A Phase 1 daemon reports its gateway without an upstream_url: it serves
+    the local model and 404s everything else, so the main loop of the session
+    about to be launched could not run at all."""
     from sous import cli
 
-    _, calls = _claude_setup(tmp_path, monkeypatch, probe=(404, False))
+    status = _status()
+    del status["config"]["gateway"]["upstream_url"]
+    _, calls = _claude_setup(tmp_path, monkeypatch, status=status)
     with pytest.raises(SystemExit) as exc:
         cli.main(["claude"])
     assert exc.value.code == 1 and calls == []
-    assert "restart" in capsys.readouterr().err
+    assert "reinstall" in capsys.readouterr().err
 
 
-def test_claude_launches_with_a_warning_when_the_upstream_is_down(tmp_path, capsys, monkeypatch):
-    """A 5xx carrying Via came from the gateway's forwarder: the gateway is up,
-    the network is not. Claude Code's own error is the truth, so launch."""
+def test_claude_uses_the_daemons_values_and_says_so_when_the_file_disagrees(
+    tmp_path, capsys, monkeypatch
+):
+    """Pinning subagents to an id the running daemon would forward upstream is
+    the whole failure this replaces: the env comes from the daemon, and the
+    drift from the file is reported rather than silently applied."""
     from sous import cli
 
-    _, calls = _claude_setup(tmp_path, monkeypatch, probe=(502, True))
+    _, calls = _claude_setup(
+        tmp_path,
+        monkeypatch,
+        status=_status(local_models=["sous-fast"], max_context_tokens=131072),
+        gateway_local_models=("sous-local",),
+        gateway_max_context_tokens=65536,
+    )
     cli.main(["claude"])
-    assert len(calls) == 1
+    [(_exe, _argv, env)] = calls
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "sous-fast"
+    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
     err = capsys.readouterr().err
-    assert "warning" in err and "upstream" in err
-
-
-def test_claude_refuses_a_daemon_that_answers_hello_itself(tmp_path, capsys, monkeypatch):
-    """A Phase 2 gateway answers /api/hello only through its forwarder, so every
-    reply it gives carries Via. A 200 without one is a pre-routing daemon that
-    would 404 every frontier-model request — the advertised hybrid session
-    could not start its main loop at all, so refuse rather than launch."""
-    from sous import cli
-
-    _, calls = _claude_setup(tmp_path, monkeypatch, probe=(200, False))
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["claude"])
-    assert exc.value.code == 1 and calls == []
-    err = capsys.readouterr().err
-    assert "reinstall" in err or "restart" in err
+    assert "local_models" in err and "max_context_tokens" in err
+    assert "restart" in err
 
 
 def test_claude_refuses_without_the_claude_binary(tmp_path, capsys, monkeypatch):
@@ -777,33 +799,52 @@ def test_claude_refuses_without_the_claude_binary(tmp_path, capsys, monkeypatch)
     assert "PATH" in capsys.readouterr().err
 
 
-def test_probe_gateway_reads_status_and_via_over_a_real_socket():
-    import http.server
+@pytest.mark.slow
+def test_daemon_status_reads_the_real_daemons_gateway_config(tmp_path):
+    """The launcher's one source of truth, against the real server: an MCP
+    call to server_status over streamable HTTP, and None when nothing is
+    listening."""
+    import contextlib
+    from collections.abc import Iterator
 
-    from sous.cli import _probe_gateway
+    import uvicorn
 
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_HEAD(self):
-            status, via = self.server.answer  # ty: ignore[unresolved-attribute]
-            self.send_response(status)
-            if via:
-                self.send_header("Via", "1.1 sous")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+    from sous.cli import _daemon_status
+    from sous.config import SousConfig
+    from sous.engine.base import EngineManager
+    from sous.server import create_server, uvicorn_config
+    from sous.tasks import TaskStore
+    from tests.fake_engine import FakeEngine
 
-        def log_message(self, *args):  # ty: ignore[invalid-method-override]
-            pass
+    @contextlib.contextmanager
+    def serve(app, port: int) -> Iterator[None]:
+        server = uvicorn.Server(uvicorn_config(app, "127.0.0.1", port, log_level="warning"))
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 20
+        while not server.started and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert server.started, "uvicorn never started"
+        try:
+            yield
+        finally:
+            server.should_exit = True
+            thread.join(20)
 
+    cfg = SousConfig(
+        data_dir=tmp_path / "data", config_path=tmp_path / "c.toml", gateway_enabled=True
+    )
+    engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
+    app = create_server(TaskStore(tmp_path / "tasks.db"), engines, cfg).streamable_http_app()
     port = _free_cli_port()
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        server.answer = (502, True)  # ty: ignore[unresolved-attribute]
-        assert _probe_gateway(port) == (502, True)
-        server.answer = (404, False)  # ty: ignore[unresolved-attribute]
-        assert _probe_gateway(port) == (404, False)
-    finally:
-        server.shutdown()
-        server.server_close()
-    assert _probe_gateway(port) is None
+    with serve(app, port):
+        status = _daemon_status(port)
+    assert status is not None
+    assert status["config"]["gateway"] == {
+        "enabled": True,
+        "local_models": ["sous-local"],
+        "max_context_tokens": 65536,
+        "upstream_url": "https://api.anthropic.com",
+    }
+    # Nothing listening on that port any more.
+    assert _daemon_status(port) is None

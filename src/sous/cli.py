@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import http.client
+import json
 import math
 import os
 import plistlib
@@ -14,10 +14,10 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from sous.config import SousConfig, load_config
+from sous.config import load_config
 
 LABEL = "com.sous.daemon"
 
@@ -41,7 +41,9 @@ _DISALLOWED_FLAGS = ("--disallowedTools", "--disallowed-tools")
 _LSP_OFF = ["--disallowedTools", "LSP"]
 # Model load plus a long prefill: minutes, not the SDK's default.
 _API_TIMEOUT_MS = "3000000"
-_PROBE_TIMEOUT_SECONDS = 15.0
+# Nothing about server_status is slow: it reads the queue counts and the
+# config snapshot, and never touches the model.
+_STATUS_TIMEOUT_SECONDS = 15.0
 
 
 def claude_argv(user_args: list[str]) -> list[str]:
@@ -60,8 +62,17 @@ def claude_argv(user_args: list[str]) -> list[str]:
     return [*user_args[:end], *_LSP_OFF, *user_args[end:]]
 
 
-def claude_env(config: SousConfig, base: Mapping[str, str]) -> dict[str, str]:
+def claude_env(
+    port: int,
+    local_models: Sequence[str],
+    max_context_tokens: int,
+    base: Mapping[str, str],
+) -> dict[str, str]:
     """The inherited environment plus the four variables the gateway needs.
+
+    The gateway values are the RUNNING daemon's (see _daemon_status), not the
+    config file's: pinning subagents to an id the daemon does not serve would
+    send every one of them upstream.
 
     CLAUDE_CODE_MAX_CONTEXT_TOKENS is honoured only for non-claude-* ids, so
     it sizes the local subagent's window and leaves the main loop alone.
@@ -72,79 +83,136 @@ def claude_env(config: SousConfig, base: Mapping[str, str]) -> dict[str, str]:
     threshold is already bounded by its window.
     """
     env = dict(base)
-    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{config.server_port}"
-    env["CLAUDE_CODE_SUBAGENT_MODEL"] = config.gateway_local_models[0]
-    env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(config.gateway_max_context_tokens)
+    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+    env["CLAUDE_CODE_SUBAGENT_MODEL"] = local_models[0]
+    env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(max_context_tokens)
     env["API_TIMEOUT_MS"] = _API_TIMEOUT_MS
     return env
 
 
-def _probe_gateway(port: int) -> tuple[int, bool] | None:
-    """(status, did the gateway forward it?) for HEAD /api/hello, or None when
-    nothing is listening. A routing gateway forwards everything it does not
-    serve itself, so every answer it can give this probe — the upstream's, or
-    the forwarder's own 502/504 — carries `Via: 1.1 sous`. Any reply without
-    one came from a daemon answering /api/hello itself, whatever its status.
-    stdlib http.client on purpose: the CLI should not pay for an async HTTP
-    client to run `sous status`."""
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=_PROBE_TIMEOUT_SECONDS)
-    try:
-        conn.request("HEAD", "/api/hello")
-        response = conn.getresponse()
-        return response.status, "sous" in (response.getheader("via") or "")
-    except OSError, http.client.HTTPException:
+def _failure_names(exc: BaseException) -> list[str]:
+    """The class names of what actually failed, flattened out of the
+    ExceptionGroup an anyio task group raises. Names only: an exception's
+    message can carry the URL it was building."""
+    if isinstance(exc, BaseExceptionGroup):
+        return [name for sub in exc.exceptions for name in _failure_names(sub)]
+    return [type(exc).__name__]
+
+
+async def _server_status(port: int) -> dict:
+    # Imports are function-local so only `sous claude` pays for them: an async
+    # MCP client is a lot of module to load for `sous status`.
+    import anyio
+    import mcp
+    from mcp.client.streamable_http import streamable_http_client
+
+    with anyio.fail_after(_STATUS_TIMEOUT_SECONDS):
+        async with (
+            streamable_http_client(f"http://127.0.0.1:{port}/mcp") as (read, write),
+            mcp.ClientSession(read, write) as session,
+        ):
+            await session.initialize()
+            result = await session.call_tool("server_status", {})
+    structured = getattr(result, "structured_content", None)
+    if isinstance(structured, dict):
+        return structured
+    # mcp 2.1 leaves structured_content unset for this tool, so the dict the
+    # tool returned arrives JSON-encoded in the first text content block.
+    for block in getattr(result, "content", ()):
+        if isinstance(text := getattr(block, "text", None), str):
+            return json.loads(text)
+    raise ValueError("server_status answered with no text content")
+
+
+def _daemon_status(port: int) -> dict | None:
+    """What the daemon on `port` reports about itself, or None if it does not
+    answer.
+
+    The config FILE is not the truth: the daemon loads it once at startup and
+    holds that snapshot for its whole life, so an edit since then — a changed
+    `local_models`, a wider `max_context_tokens`, `enabled` flipped — is a
+    setting the running gateway does not have. `server_status` is the one
+    place the daemon reports the gateway config it is actually serving, so
+    ask it rather than re-reading the file behind its back.
+    """
+    import anyio
+
+    if not _port_open(port):
         return None
-    finally:
-        conn.close()
+    try:
+        return anyio.run(_server_status, port)
+    except Exception as exc:
+        # Deliberately wide, and deliberately not silent. The failure surfaces
+        # from inside an anyio task group, so it arrives as an ExceptionGroup
+        # whose leaves belong to whatever HTTP client the installed mcp uses
+        # (2.1 swapped httpx for httpx2) — a type list here would rot into a
+        # traceback out of `sous claude`. A Ctrl-C is not an Exception and
+        # still propagates. Reached only when something IS listening, so the
+        # names are worth printing: the caller's "no daemon" alone would be
+        # the wrong diagnosis.
+        print(
+            f"sous claude: 127.0.0.1:{port} did not answer server_status "
+            f"({', '.join(_failure_names(exc))})",
+            file=sys.stderr,
+        )
+        return None
 
 
 def _cmd_claude(user_args: list[str]) -> None:
-    """Replace this process with Claude Code pointed at the gateway."""
+    """Replace this process with Claude Code pointed at the gateway.
+
+    Every gateway value here comes from the running daemon; the config file is
+    consulted only for the port to reach it on and the path to name in an
+    error message.
+    """
     config = load_config()
-    if not config.gateway_enabled:
-        print(
-            f"sous claude: the gateway is off; set [gateway].enabled = true in "
-            f"{config.config_path} and restart the daemon",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
     exe = shutil.which("claude")
     if exe is None:
         print("sous claude: `claude` is not on PATH; install Claude Code first", file=sys.stderr)
         raise SystemExit(1)
-    probe = _probe_gateway(config.server_port)
-    if probe is None:
+    status = _daemon_status(config.server_port)
+    if status is None:
         print(
             f"sous claude: no daemon on 127.0.0.1:{config.server_port}; start it with: "
             "sous serve   (or: sous install-launchd)",
             file=sys.stderr,
         )
         raise SystemExit(1)
-    status, forwarded = probe
-    # No Via means the daemon answered /api/hello itself, and a gateway that
-    # routes never does: it forwards everything it does not serve, so even its
-    # own 502/504 carries one. Whatever the status, this daemon would 404 every
-    # frontier-model request, which is the main loop of the session about to be
-    # launched — refuse instead of advertising a hybrid session that cannot run.
-    if not forwarded:
-        if status == 404:
-            print(
-                "sous claude: the daemon is running without the gateway (started before "
-                "[gateway].enabled was set?); restart it and try again",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"sous claude: the daemon answered /api/hello itself (HTTP {status}) — that is "
-                "a pre-routing gateway that would 404 every frontier-model request; reinstall "
-                "sous and restart the daemon",
-                file=sys.stderr,
-            )
-        raise SystemExit(1)
-    if status >= 500:
+    gateway = status.get("config", {}).get("gateway", {})
+    # A Phase 1 daemon reports a gateway but no upstream_url: it serves the
+    # local model and 404s everything else, so the frontier main loop of the
+    # session about to be launched could not run at all.
+    if "upstream_url" not in gateway:
         print(
-            f"sous claude: warning: the gateway could not reach its upstream just now "
-            f"(HTTP {status}); launching anyway — Claude Code will say if it persists",
+            "sous claude: the running daemon is a pre-routing build that would 404 every "
+            "frontier-model request; reinstall sous and restart the daemon",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if not gateway.get("enabled"):
+        print(
+            f"sous claude: the running daemon has the gateway off (config edited without a "
+            f"restart?); set [gateway].enabled = true in {config.config_path} and restart "
+            "the daemon",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    local_models = gateway["local_models"]
+    max_context_tokens = gateway["max_context_tokens"]
+    # The daemon's values win, so a file edited since it started is a note,
+    # not a silent difference between what is advertised and what is served.
+    drifted = [
+        key
+        for key, running, on_disk in (
+            ("local_models", list(local_models), list(config.gateway_local_models)),
+            ("max_context_tokens", max_context_tokens, config.gateway_max_context_tokens),
+        )
+        if running != on_disk
+    ]
+    if drifted:
+        print(
+            f"sous claude: note: config.toml differs from the running daemon "
+            f"({', '.join(drifted)}); using the daemon's values — restart it to apply the file",
             file=sys.stderr,
         )
     for var in _CREDENTIAL_VARS:
@@ -163,7 +231,7 @@ def _cmd_claude(user_args: list[str]) -> None:
                 "the main loop will not run upstream; unset it for a hybrid session",
                 file=sys.stderr,
             )
-    env = claude_env(config, os.environ)
+    env = claude_env(config.server_port, local_models, max_context_tokens, os.environ)
     print(
         f"sous claude: ANTHROPIC_BASE_URL={env['ANTHROPIC_BASE_URL']} "
         f"CLAUDE_CODE_SUBAGENT_MODEL={env['CLAUDE_CODE_SUBAGENT_MODEL']} "
