@@ -459,6 +459,8 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("mcp", help="bridge stdio to the daemon (for stdio-only MCP clients)")
     sub.add_parser("install-launchd", help="install start-at-login LaunchAgent")
     sub.add_parser("uninstall-launchd", help="remove the start-at-login LaunchAgent")
+    # Registered for `sous --help` only: the verb is dispatched at the top of
+    # main(), before argparse ever sees it, so there is no `claude` branch below.
     sub.add_parser(
         "claude",
         help="launch Claude Code against the gateway: subagents local, main loop upstream "

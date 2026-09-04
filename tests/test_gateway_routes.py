@@ -765,6 +765,9 @@ def test_close_after_a_completed_turn_stops_the_session_and_the_pools(tmp_path: 
     assert elapsed < 2.5  # promptly: nothing here is a running generation to wait out
     assert not session._thread.is_alive()
     assert gateway._turns._shutdown and gateway._counts._shutdown
+    # close() is the sync half; the upstream client needs the async one, and
+    # leaving it open leaks a connection pool for the rest of the session.
+    asyncio.run(gateway._upstream.aclose())
 
 
 def test_close_does_not_touch_a_running_turns_session(tmp_path: Path):
@@ -792,6 +795,7 @@ def test_close_does_not_touch_a_running_turns_session(tmp_path: Path):
     assert gateway._runner._session is session_before  # untouched: the lock was busy
     turn.join(10)
     assert inner.finished.wait(5)
+    asyncio.run(gateway._upstream.aclose())
 
 
 def test_a_stream_never_iterated_still_drains_and_releases_its_slot(tmp_path: Path):

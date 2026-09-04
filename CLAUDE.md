@@ -50,7 +50,11 @@ Claude Code use stretches further — evaluate features against that goal.
   body's `Content-Length` change; responses gain only `Via`), never turn
   `trust_env` on. The routing predicate is the decoded body's `model` after
   stripping one trailing `[…]` suffix; a body that does not decode is the
-  upstream's, not a 400.
+  upstream's, not a 400. Any third-party library that enters the gateway's
+  request path gets its logger pinned in `mount_gateway`: sse-starlette logs
+  each SSE frame, httpx the full upstream URL with its query string, httpcore
+  response header values — and `MCPServer.__init__` installs a root stderr
+  handler at INFO, so none of that is hypothetical.
 
 ## Security boundary
 
