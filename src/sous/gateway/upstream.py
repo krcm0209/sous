@@ -4,9 +4,10 @@ A transparent HTTP/1.1 proxy to one fixed origin: the bytes the client sent
 are the bytes the upstream gets, end-to-end headers travel unmodified (in
 their original order, duplicates included), and the upstream's status,
 headers and body come back untouched. Only what a proxy must change changes:
-`Host`, the hop-by-hop headers of RFC 9110 §7.6.1, and a `Via` on the way
-back. Never logs anything; never adds a credential (no netrc, no proxy
-environment — trust_env is off).
+`Host`, the hop-by-hop headers of RFC 9110 §7.6.1, `Date` and `Server` (the
+daemon's own replace the upstream's — uvicorn sends them on every response),
+and a `Via` on the way back. Never logs anything; never adds a credential (no
+netrc, no proxy environment — trust_env is off).
 """
 
 from __future__ import annotations
@@ -178,8 +179,10 @@ class Upstream:
         # user-agent) are added to every request that did not carry them, so
         # the upstream would see a request described as httpx's rather than as
         # the client made it — including a gzip it never asked for, whose raw
-        # relayed bytes it could not decompress. Nothing is lost by not asking:
-        # a server does not compress for a client that sent no Accept-Encoding.
+        # relayed bytes it could not decompress. A client that sent no
+        # Accept-Encoding has said "anything" (RFC 9110 §12.5.3); whatever the
+        # upstream then chooses comes back with its Content-Encoding intact,
+        # which is the client's own bargain, not one made on its behalf.
         self._client.headers.clear()
         # httpx has no "no cookies" switch: its jar stores every upstream
         # Set-Cookie (Cloudflare sets __cf_bm on Anthropic responses) and adds
