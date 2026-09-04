@@ -518,9 +518,9 @@ def test_prompt_conversion_reaches_the_engine(tmp_path: Path):
 def test_max_tokens_is_clamped_to_the_window(tmp_path: Path):
     inner = FakeEngine(["ok", "ok"])
     app = _app(tmp_path, inner)
-    _post(app, _body(max_tokens=100_000))  # above the 65536 window, so the clamp bites
+    _post(app, _body(max_tokens=200_000))  # above the 131072 window, so the clamp bites
     assert inner.max_tokens_seen == [
-        65536 - inner.count_tokens([{"role": "user", "content": "hi"}], [])
+        131072 - inner.count_tokens([{"role": "user", "content": "hi"}], [])
     ]
     _post(app, _body(max_tokens=10))
     assert inner.max_tokens_seen[-1] == 10
@@ -529,7 +529,7 @@ def test_max_tokens_is_clamped_to_the_window(tmp_path: Path):
 def test_prompt_too_long_is_400_plain_and_an_error_event_streamed(tmp_path: Path):
     inner = FakeEngine(["never", "never"])
     app = _app(tmp_path, inner)
-    huge = _body(messages=[{"role": "user", "content": "x" * 300_000}])
+    huge = _body(messages=[{"role": "user", "content": "x" * 600_000}])
     r = _post(app, huge)
     assert r.status_code == 400
     assert r.json()["error"]["type"] == "invalid_request_error"
@@ -545,7 +545,7 @@ def test_prompt_too_long_is_400_plain_and_an_error_event_streamed(tmp_path: Path
         "type": "error",
         "error": {
             "type": "invalid_request_error",
-            "message": f"prompt is too long: {tokens} tokens > 65536 maximum",
+            "message": f"prompt is too long: {tokens} tokens > 131072 maximum",
         },
     }
     assert inner.calls == []

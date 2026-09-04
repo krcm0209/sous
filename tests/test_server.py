@@ -622,7 +622,7 @@ def test_server_status_reports_gateway_config(svc):
     assert gw == {
         "enabled": False,
         "local_models": ["sous-local"],
-        "max_context_tokens": 65536,
+        "max_context_tokens": 131072,
         "upstream_url": "https://api.anthropic.com",
     }
 
