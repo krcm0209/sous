@@ -161,9 +161,10 @@ def _daemon_status(port: int) -> dict | None:
 def _cmd_claude(user_args: list[str]) -> None:
     """Replace this process with Claude Code pointed at the gateway.
 
-    Every gateway value here comes from the running daemon; the config file is
-    consulted only for the port to reach it on and the path to name in an
-    error message.
+    Every gateway value Claude Code is given comes from the running daemon;
+    the config file supplies the port to reach it on, the path to name in an
+    error message, and the two gateway values compared against the daemon's
+    for the drift note — never the values themselves.
     """
     config = load_config()
     exe = shutil.which("claude")
