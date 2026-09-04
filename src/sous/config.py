@@ -126,7 +126,7 @@ class SousConfig:
     # prompts are far larger than the worker's, and the worker's cap stays put.
     gateway_enabled: bool = False
     gateway_local_models: tuple[str, ...] = ("sous-local",)
-    gateway_max_context_tokens: int = 65536
+    gateway_max_context_tokens: int = 131072
     gateway_generation_timeout_minutes: int = 30
     gateway_upstream_url: str = GATEWAY_DEFAULT_UPSTREAM
     data_dir: Path = DEFAULT_DATA_DIR
@@ -260,14 +260,14 @@ def _gateway_values(gateway: dict) -> tuple[bool, tuple[str, ...], int, int]:
             stacklevel=3,
         )
         models = ["sous-local"]
-    window = gateway.get("max_context_tokens", 65536)
+    window = gateway.get("max_context_tokens", 131072)
     if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
         warnings.warn(
             f"sous config: [gateway].max_context_tokens {window!r} must be a positive "
-            "integer; using 65536",
+            "integer; using 131072",
             stacklevel=3,
         )
-        window = 65536
+        window = 131072
     elif window < GATEWAY_MIN_CONTEXT_TOKENS:
         warnings.warn(
             f"sous config: [gateway].max_context_tokens {window} is below Claude Code's "

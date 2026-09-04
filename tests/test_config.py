@@ -346,7 +346,7 @@ def test_gateway_defaults_are_off_and_above_the_claude_code_floor(tmp_path: Path
     cfg = load_config(tmp_path / "nope.toml")
     assert cfg.gateway_enabled is False
     assert cfg.gateway_local_models == ("sous-local",)
-    assert cfg.gateway_max_context_tokens == 65536
+    assert cfg.gateway_max_context_tokens == 131072
     assert cfg.gateway_max_context_tokens >= GATEWAY_MIN_CONTEXT_TOKENS == 49152
     assert cfg.gateway_generation_timeout_minutes == 30
 
@@ -400,7 +400,7 @@ def test_gateway_bad_values_degrade_to_defaults_with_warnings(tmp_path: Path):
         cfg = load_config(p)
     assert cfg.gateway_enabled is False
     assert cfg.gateway_local_models == ("sous-local",)
-    assert cfg.gateway_max_context_tokens == 65536
+    assert cfg.gateway_max_context_tokens == 131072
     assert cfg.gateway_generation_timeout_minutes == 30
     assert cfg.gateway_upstream_url == "https://api.anthropic.com"
     messages = " ".join(str(w.message) for w in caught)

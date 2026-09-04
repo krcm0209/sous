@@ -68,7 +68,7 @@ def claude_env(
     max_context_tokens: int,
     base: Mapping[str, str],
 ) -> dict[str, str]:
-    """The inherited environment plus the four variables the gateway needs.
+    """The inherited environment plus the five variables the gateway needs.
 
     The gateway values are the RUNNING daemon's (see _daemon_status), not the
     config file's: pinning subagents to an id the daemon does not serve would
@@ -81,10 +81,17 @@ def claude_env(
     per Claude Code's own /config copy), so pinning it to the local window
     would make the frontier main loop compact far too early. The subagent's
     threshold is already bounded by its window.
+
+    CLAUDE_CODE_SUBAGENT_MODEL_FORCE: as of Claude Code 2.1.26x,
+    CLAUDE_CODE_SUBAGENT_MODEL only sets the *default* subagent model — a
+    built-in agent's own `model:` (Explore, for one) or an explicit per-spawn
+    model now overrides it, which sent Explore upstream to claude-opus-5 in
+    practice. The FORCE variable makes it apply to every subagent regardless.
     """
     env = dict(base)
     env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
     env["CLAUDE_CODE_SUBAGENT_MODEL"] = local_models[0]
+    env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] = "1"
     env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(max_context_tokens)
     env["API_TIMEOUT_MS"] = _API_TIMEOUT_MS
     return env
@@ -236,6 +243,7 @@ def _cmd_claude(user_args: list[str]) -> None:
     print(
         f"sous claude: ANTHROPIC_BASE_URL={env['ANTHROPIC_BASE_URL']} "
         f"CLAUDE_CODE_SUBAGENT_MODEL={env['CLAUDE_CODE_SUBAGENT_MODEL']} "
+        f"CLAUDE_CODE_SUBAGENT_MODEL_FORCE={env['CLAUDE_CODE_SUBAGENT_MODEL_FORCE']} "
         f"CLAUDE_CODE_MAX_CONTEXT_TOKENS={env['CLAUDE_CODE_MAX_CONTEXT_TOKENS']} "
         f"API_TIMEOUT_MS={env['API_TIMEOUT_MS']}",
         file=sys.stderr,

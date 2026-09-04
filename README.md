@@ -159,7 +159,8 @@ disagree, and uses the daemon's values. Then it replaces itself with
 | Variable | Value | Why |
 |---|---|---|
 | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8383` | one endpoint; the gateway routes on the requested model id |
-| `CLAUDE_CODE_SUBAGENT_MODEL` | `sous-local` (the first `local_models` entry the daemon reports) | pins every Task-tool subagent to the local model; the main loop keeps its `claude-*` id |
+| `CLAUDE_CODE_SUBAGENT_MODEL` | `sous-local` (the first `local_models` entry the daemon reports) | the default model for Task-tool subagents; the main loop keeps its `claude-*` id |
+| `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` | `1` | the override: since Claude Code 2.1.26x a built-in agent's own `model:` (Explore, for one) or a per-spawn model beats the default above; this applies the default to every subagent regardless |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | the daemon's `max_context_tokens` | Claude Code has no built-in size for `sous-local`; it honours this variable only for non-`claude-*` ids, so the main loop is unaffected |
 | `API_TIMEOUT_MS` | `3000000` | a cold model load plus a long prefill takes minutes |
 
@@ -301,12 +302,15 @@ local_models = ["sous-local"]   # model ids served locally; every other id is fo
 upstream_url = "https://api.anthropic.com"  # where non-local requests go: an https origin, no path,
                                             # ASCII hostname or IP literal.
                                             # Plain http is accepted for a loopback host only.
-max_context_tokens = 65536      # server-side limit on prompt + reply tokens for local turns;
-                                # positive values below 49152 are raised to it. `sous claude`
-                                # sets CLAUDE_CODE_MAX_CONTEXT_TOKENS to the running daemon's
-                                # value of this (restart it after an edit); without
-                                # the launcher, set it yourself or a long subagent conversation
-                                # grows past it and fails with "prompt is too long".
+max_context_tokens = 131072     # server-side limit on prompt + reply tokens for local turns;
+                                # a Claude Code subagent's prompt — its agent prompt plus the
+                                # session's tool schemas — is ~50-58K tokens before it does
+                                # anything, and it asks for 32K of output; 65536 was too small
+                                # in practice. Positive values below 49152 are raised to it.
+                                # `sous claude` sets CLAUDE_CODE_MAX_CONTEXT_TOKENS to the
+                                # running daemon's value of this (restart it after an edit);
+                                # without the launcher, set it yourself or a long subagent
+                                # conversation grows past it and fails with "prompt is too long".
 generation_timeout_minutes = 30
 ```
 

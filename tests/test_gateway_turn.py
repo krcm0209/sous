@@ -94,9 +94,9 @@ def test_a_non_replay_safe_sink_passes_on_delta_through_unwrapped(tmp_path: Path
 def test_max_tokens_is_clamped_to_the_room_left_in_the_window(tmp_path: Path):
     inner = FakeEngine(["ok"])
     runner, _ = _runner(tmp_path, inner)
-    # 100_000 > the 65536 window: with a request that already fits, the test
+    # 200_000 > the 131072 window: with a request that already fits, the test
     # would be vacuous (Claude Code's 32000 fits comfortably).
-    runner.run(MSGS, [], 100_000, RecordingSink())
+    runner.run(MSGS, [], 200_000, RecordingSink())
     room = runner._window - inner.count_tokens(MSGS, [])
     assert inner.max_tokens_seen == [room]
     inner.script.append("ok")
@@ -106,11 +106,11 @@ def test_max_tokens_is_clamped_to_the_room_left_in_the_window(tmp_path: Path):
 
 def test_prompt_that_fills_the_window_is_rejected_before_generating(tmp_path: Path):
     inner = FakeEngine(["never"])
-    runner, _ = _runner(tmp_path, inner)  # window 65536; FakeEngine counts len/4
+    runner, _ = _runner(tmp_path, inner)  # window 131072; FakeEngine counts len/4
     sink = RecordingSink()
     with pytest.raises(PromptTooLong) as exc:
-        runner.run([{"role": "user", "content": "x" * 300_000}], [], 100, sink)
-    assert exc.value.window == 65536 and exc.value.tokens >= 65536
+        runner.run([{"role": "user", "content": "x" * 600_000}], [], 100, sink)
+    assert exc.value.window == 131072 and exc.value.tokens >= 131072
     assert "prompt is too long" in str(exc.value)
     assert sink.started_with == [] and inner.calls == []
 
