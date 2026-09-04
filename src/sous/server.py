@@ -25,6 +25,7 @@ from mcp.server import MCPServer
 from sous.config import SousConfig, current_allowlist, load_config, persist_allowlist_entry
 from sous.engine.base import EngineManager, release_mlx_thread_state
 from sous.gateway.routes import Gateway, mount_gateway
+from sous.gateway.upstream import Upstream
 from sous.tasks import FINISHED_STATES, Task, TaskState, TaskStore
 from sous.toolexec import (
     _is_within,
@@ -244,6 +245,7 @@ class SousService:
                     "enabled": self.config.gateway_enabled,
                     "local_models": list(self.config.gateway_local_models),
                     "max_context_tokens": self.config.gateway_max_context_tokens,
+                    "upstream_url": self.config.gateway_upstream_url,
                 },
             },
         }
@@ -293,7 +295,13 @@ draft, never a merge.
 """
 
 
-def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) -> MCPServer:
+def create_server(
+    store: TaskStore,
+    engines: EngineManager,
+    config: SousConfig,
+    *,
+    upstream: Upstream | None = None,
+) -> MCPServer:
     svc = SousService(store, engines, config)
     # mount_gateway (below) runs after MCPServer(...) is constructed, so the
     # lifespan closure below needs a late-bound holder for whatever it
@@ -312,9 +320,10 @@ def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) 
             # awaits this shutdown), plus any embedded lifecycle that drives
             # lifespan. Without it the gateway's session thread stays parked
             # in _requests.get() and never reaches release_mlx_thread_state()
-            # (ml-explore/mlx#4327) on a non-signal exit.
+            # (ml-explore/mlx#4327) on a non-signal exit — and the upstream
+            # forwarder's connection pool is closed with it.
             for gateway in mounted_gateway:
-                gateway.close()
+                await gateway.aclose()
 
     mcp = MCPServer("sous", instructions=_INSTRUCTIONS, lifespan=_lifespan)
 
@@ -385,7 +394,7 @@ def create_server(store: TaskStore, engines: EngineManager, config: SousConfig) 
         return svc.server_status()
 
     if config.gateway_enabled:
-        mounted_gateway.append(mount_gateway(mcp, engines, config))
+        mounted_gateway.append(mount_gateway(mcp, engines, config, upstream=upstream))
 
     return mcp
 
@@ -503,6 +512,13 @@ def uvicorn_config(app, host: str, port: int, log_level: str = "info") -> uvicor
         host=host,
         port=port,
         log_level=log_level,
+        # uvicorn's access log prints the raw request target for every
+        # response — query string included — at INFO, which is the level the
+        # daemon runs at. The gateway's catch-all forwards whatever Claude Code
+        # puts in one, and nothing of value is lost by silencing it: the
+        # gateway writes its own bounded metadata line per forwarded request,
+        # and the MCP transport never had a query string worth logging.
+        access_log=False,
         timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
     )
 
@@ -546,7 +562,8 @@ def main() -> None:
     if config.gateway_enabled:
         print(
             f"sous: gateway (experimental) serving {', '.join(config.gateway_local_models)} "
-            f"at http://127.0.0.1:{config.server_port}/v1/messages"
+            f"at http://127.0.0.1:{config.server_port}/v1/messages; "
+            f"everything else is forwarded to {config.gateway_upstream_url}"
         )
     try:
         serve(mcp, "127.0.0.1", config.server_port)

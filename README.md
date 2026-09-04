@@ -109,6 +109,7 @@ First delegation downloads the model (~16.1 GB for the default) — one time.
 ```bash
 sous status             # is it up, and what has it been doing
 sous wait <task-id>     # block until a task finishes or needs approval
+sous claude             # Claude Code with local subagents (gateway mode, below)
 sous stop               # stop it (see below)
 sous uninstall-launchd  # stop it starting at login, and remove the agent
 ```
@@ -134,33 +135,73 @@ reconnect and start a fresh one on the next call.
 
 ## Gateway mode (experimental)
 
-sous can also stand in for `api.anthropic.com`: with `[gateway].enabled =
-true` the daemon serves `POST /v1/messages` (streaming and not),
-`POST /v1/messages/count_tokens` and `HEAD /api/hello` on the same
-`127.0.0.1:8383`, answering requests for the model id `sous-local` with the
-local model. Claude Code executes the tool calls itself, with its usual
-permission prompts; the model only decides what to call.
+sous can also stand between Claude Code and `api.anthropic.com`: with
+`[gateway].enabled = true` the daemon serves Anthropic's Messages API on the
+same `127.0.0.1:8383`, answers requests for the model id `sous-local` with the
+local model, and forwards everything else — the main loop's requests, the
+startup probe, usage and telemetry calls — to the real API untouched. That is
+the hybrid in issue #41: a frontier main loop on your subscription, Task-tool
+subagents on the local model, one `ANTHROPIC_BASE_URL`, and a frontier model
+always reviewing the local model's work.
 
-This is the first half of the hybrid design in issue #41. The intended mode
-is a frontier main loop with local subagents — `CLAUDE_CODE_SUBAGENT_MODEL=sous-local`,
-tier variables left alone, so a frontier model always reviews the local
-model's work — and it needs the routing half and the `sous claude` launcher,
-which come next. Until then a Claude Code session pointed at the gateway runs
-*entirely* on the local model: exactly the trade "Why" and "How sous
-compares" above argue against, supported only as a way to exercise the
-endpoint, not as a mode. The recipe for that lives in
-[CONTRIBUTING.md](CONTRIBUTING.md#verifying-the-gateway-endpoint).
+```bash
+sous claude                            # Claude Code, subagents served locally
+sous claude -p "summarize README.md"   # every argument passes through to claude
+```
 
-No gateway response tells Claude Code how large the window is, and `sous-local`
-is not an id it has a built-in size for, so it falls back to its own default
-unless `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set (it honours that variable only
-for non-`claude-*` ids — one reason the served id is honest). Set it (and
-`CLAUDE_CODE_AUTO_COMPACT_WINDOW`) to `[gateway].max_context_tokens` in the
-environment that launches Claude Code, or requests eventually exceed the
-server limit and return `400 invalid_request_error: prompt is too long`. The
-planned `sous claude` launcher (Phase 2) will set these automatically.
+`sous claude` asks the running daemon for its effective gateway settings —
+the config file may have been edited since it started, and only a restart
+applies it — and refuses if no daemon answers, if the gateway is off, or if
+the daemon predates routing. It says so when the file and the daemon
+disagree, and uses the daemon's values. Then it replaces itself with
+`claude`, having set:
 
-What a locally served turn gives up, stated plainly:
+| Variable | Value | Why |
+|---|---|---|
+| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8383` | one endpoint; the gateway routes on the requested model id |
+| `CLAUDE_CODE_SUBAGENT_MODEL` | `sous-local` (the first `local_models` entry the daemon reports) | pins every Task-tool subagent to the local model; the main loop keeps its `claude-*` id |
+| `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | the daemon's `max_context_tokens` | Claude Code has no built-in size for `sous-local`; it honours this variable only for non-`claude-*` ids, so the main loop is unaffected |
+| `API_TIMEOUT_MS` | `3000000` | a cold model load plus a long prefill takes minutes |
+
+plus `--disallowedTools LSP` unless you pass your own `--disallowedTools` (a
+language server connecting mid-session appends its schema to every request
+and re-prefills the conversation). It sets **no** `ANTHROPIC_AUTH_TOKEN`,
+`ANTHROPIC_API_KEY` or `ANTHROPIC_DEFAULT_*_MODEL`: either credential
+variable switches Claude Code from your subscription login to API-credit
+billing, and the tier variables would pull the main loop onto the local
+model. If your shell already exports a credential variable, `sous claude`
+warns and launches anyway — that is your billing decision, not sous's (the
+same for an inherited `ANTHROPIC_DEFAULT_*_MODEL`, which would pull that tier
+off the upstream). It
+also leaves `CLAUDE_CODE_AUTO_COMPACT_WINDOW` alone: that setting is global,
+and pinning it to the local window would make the frontier main loop compact
+far too early; the subagent's window is bounded by
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` instead.
+
+Forwarding is a plain HTTP/1.1 pass-through to `[gateway].upstream_url`
+(default `https://api.anthropic.com`): the request body goes up byte for
+byte; `Authorization`, `anthropic-beta`, `anthropic-version` and every header
+sous does not recognise travel unmodified; only `Host` and the hop-by-hop
+headers change — and, on the two Messages routes whose body sous had to read,
+`Content-Length` is recomputed from the exact bytes — and responses carry the
+upstream's headers minus the
+hop-by-hop set, plus a `Via: 1.1 sous`, with `Date` and `Server` being the
+daemon's own rather than the upstream's. sous stores no
+credential — it never sees a token it did not receive to forward — honours
+no `HTTPS_PROXY` or `~/.netrc`, follows no redirect, and retries nothing
+(Claude Code retries). When the upstream is unreachable, forwarded requests
+get a `502` (`504` on timeout) and the local model keeps working. WebSocket
+features (voice) are not forwarded.
+
+A whole-session-local run — every tier pinned to `sous-local` — remains
+possible for exercising the endpoint; the recipe is in
+[CONTRIBUTING.md](CONTRIBUTING.md#verifying-the-gateway-endpoint). It is a
+verification setup, not a mode: it is exactly the trade "Why" and "How sous
+compares" above argue against.
+
+Claude Code executes the tool calls itself, with its usual permission
+prompts; the local model only decides what to call. What a locally served
+turn gives up, stated plainly:
 
 - **No sandbox.** The gateway returns `tool_use` blocks and never runs a
   tool; `toolexec.py` (path confinement, allowlist, audit) is not in this
@@ -170,37 +211,42 @@ What a locally served turn gives up, stated plainly:
   schema).** `WebSearch`, `WebFetch`-as-server-tool and code execution run
   inside Anthropic's API; `bash_*`, `text_editor_*` and the other built-ins
   run on the client but arrive with their schema implied by the type. Both are
-  dropped from the request (logged as `dropped N tool(s) with no
+  dropped from a locally served request (logged as `dropped N tool(s) with no
   client-supplied schema`) — the local chat template can only offer a tool it
   has an explicit schema for. Claude Code sends custom-typed equivalents when
-  it drives a non-claude model, so a delegated turn keeps its file and shell
-  tools.
+  it drives a non-claude model, so a local subagent keeps its file and shell
+  tools. The main loop, forwarded upstream, keeps everything.
 - **No thinking, no request-level sampling.** `thinking`, `temperature`,
   `top_p`, `top_k`, `stop_sequences` and `tool_choice` are accepted and
   ignored; the daemon's `[model]` sampler applies. Images and documents in
   messages become a one-line `[image omitted: sous serves text only]`
   placeholder.
-- **One turn at a time, one cache slot.** Turns are serialized behind the
-  same lock as delegated tasks, and the prompt cache has one slot: a
-  subagent's consecutive turns reuse it (turn 2 of a 57k-token prompt
-  prefills only the new tokens), but while a delegated task and a gateway
-  conversation overlap — or two conversations interleave — every turn on
-  both sides is a cold prefill, because each evicts the other. Do not run
-  both at once until keyed cache slots land.
-- **A client that disconnects does not stop the model.** The turn runs to
+- **One turn at a time, one cache slot.** Local turns are serialized behind
+  the same lock as delegated tasks, and the prompt cache has one slot. In
+  hybrid mode only subagent turns reach the local model, so a subagent's
+  consecutive turns reuse it (turn 2 of a 57k-token prompt prefills only the
+  new tokens); a delegated task running at the same time, or two subagents
+  interleaving, evicts it and every turn on both sides is a cold prefill.
+  Keyed cache slots come later.
+- **A client that disconnects does not stop the model.** A local turn runs to
   completion (so the next request never waits on a wedged lock); aborting
-  mid-generation comes with batching, later.
+  mid-generation comes with batching, later. A forwarded stream, by contrast,
+  is closed upstream the moment the client hangs up.
 
-Each `/v1/messages` turn logs one metadata-only line to the daemon's
-stderr — method, model, stream flag, status, token counts, stop reason,
-cache hit/miss, seconds — plus one line naming the Anthropic tool *types*
-it dropped, when any. `/api/hello` and `count_tokens` add nothing beyond
-uvicorn's access log; no request body or header value is ever logged.
-Errors are Anthropic-shaped
-(`{"type": "error", "error": {"type": ..., "message": ...}}`); an unknown
-model id is a `404 not_found_error`, an oversized body (over 32 MiB) a
-`413 request_too_large`, and a prompt that fills the window an
-`invalid_request_error` saying `prompt is too long`.
+Each `/v1/messages` turn served locally logs one metadata-only line to the
+daemon's stderr — method, model, stream flag, status, token counts, stop
+reason, cache hit/miss, seconds — plus one line naming the Anthropic tool
+*types* it dropped, when any. Each forwarded request logs one line too:
+`upstream`, method, path, the model id when the body named one, the
+upstream's status, and seconds to its headers. The daemon also disables
+uvicorn's access log, which would otherwise print every request target —
+query string included — at INFO. Nothing else is logged — not a request body,
+not a header value, not a query string, not a response — at any level. Errors sous produces itself are Anthropic-shaped
+(`{"type": "error", "error": {"type": ..., "message": ...}}`): an oversized
+body (over 32 MiB) on `/v1/messages` is a `413 request_too_large`, a prompt
+that fills the local window an `invalid_request_error` saying `prompt is too
+long`, an unreachable upstream a `502 api_error`. Errors from the real API
+come back exactly as it sent them.
 
 ## Configuration — `~/.sous/config.toml`
 
@@ -246,18 +292,21 @@ min_tokens = 8192  # auto: never shrink the window below this
 retention = 200
 
 [gateway]
-# EXPERIMENTAL — see "Gateway mode" above. Serve Claude Code from the local
-# model over an Anthropic-compatible /v1/messages on the same port.
+# EXPERIMENTAL — see "Gateway mode" above. Serve Claude Code subagents from the
+# local model and forward everything else to the real API, on the same port.
 enabled = false
-local_models = ["sous-local"]   # model ids served locally; anything else is a 404 for now.
+local_models = ["sous-local"]   # model ids served locally; every other id is forwarded upstream.
                                 # Never claude-*: Claude Code ignores its context-window
                                 # env vars for those ids (the config rejects them).
-max_context_tokens = 65536      # server-side limit on prompt + reply tokens; positive
-                                # values below 49152 are raised to it. Claude Code does NOT
-                                # learn this from the gateway: set CLAUDE_CODE_MAX_CONTEXT_TOKENS
-                                # (and CLAUDE_CODE_AUTO_COMPACT_WINDOW) to the same value in
-                                # its environment, or a long conversation grows past it and
-                                # fails with "prompt is too long".
+upstream_url = "https://api.anthropic.com"  # where non-local requests go: an https origin, no path,
+                                            # ASCII hostname or IP literal.
+                                            # Plain http is accepted for a loopback host only.
+max_context_tokens = 65536      # server-side limit on prompt + reply tokens for local turns;
+                                # positive values below 49152 are raised to it. `sous claude`
+                                # sets CLAUDE_CODE_MAX_CONTEXT_TOKENS to the running daemon's
+                                # value of this (restart it after an edit); without
+                                # the launcher, set it yourself or a long subagent conversation
+                                # grows past it and fails with "prompt is too long".
 generation_timeout_minutes = 30
 ```
 
@@ -382,9 +431,13 @@ draft from a small local model costs your plan nothing.
 - **Gateway mode bypasses the sandbox by design.** A locally served Claude
   Code turn never touches `toolexec.py`: the gateway hands `tool_use` blocks
   back and Claude Code executes them under its own permission rules. The
-  gateway binds to `127.0.0.1` only, stores no credential, and never logs
-  request bodies or header values — including the `Authorization` header
-  Claude Code sends with every request. It is off by default.
+  gateway binds to `127.0.0.1` only and refuses foreign `Host`/`Origin`
+  values on every route, forwarded ones included. It forwards the
+  `Authorization` header Claude Code sends with every request to
+  `[gateway].upstream_url` unmodified and nowhere else, stores it nowhere,
+  adds no credential of its own (no `~/.netrc`, no proxy environment), and
+  never logs a request body, header value or query string. A plain-`http`
+  upstream is accepted for a loopback host only. It is off by default.
 
 ## Validation status
 
@@ -424,13 +477,14 @@ that Qwen3 emits and the hermes JSON format used by other MLX models.
   `failed` or `budget-exhausted` even when it writes the right file — it
   exercises the plumbing, not model competence. The real-model runs above are
   the meaningful end-to-end evidence.
-- Gateway mode (experimental) serves one turn at a time on a single-slot
-  prompt cache, drops Anthropic server-side and built-in tool types (the ones
-  that carry no client-supplied schema), ignores request-level sampling and
-  thinking, and finishes a turn even after the client hangs up.
-  It serves the model ids in `[gateway].local_models` locally and answers
-  every other id with `404 not_found_error`; routing those upstream (the
-  hybrid in issue #41) is not built yet.
+- Gateway mode (experimental) serves one local turn at a time on a
+  single-slot prompt cache, drops Anthropic server-side and built-in tool
+  types from local turns (the ones that carry no client-supplied schema),
+  ignores request-level sampling and thinking, and finishes a local turn
+  even after the client hangs up. It serves the model ids in
+  `[gateway].local_models` locally and forwards everything else to
+  `[gateway].upstream_url` over HTTP/1.1 only — no WebSocket upgrade, no
+  HTTP/2, no proxy environment.
 
 ## Development
 

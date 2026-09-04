@@ -530,3 +530,321 @@ def test_wait_timeout_zero_is_an_immediate_probe(tmp_path, capsys, monkeypatch):
     store.finish(done.id, "completed", {"summary": "s"})
     cli.main(["wait", done.id, "--timeout", "0"])
     assert "done" in capsys.readouterr().out
+
+
+# --- sous claude ---------------------------------------------------------------------
+
+
+_DEFAULT_STATUS = object()
+
+
+def _status(**gateway) -> dict:
+    """What the running daemon reports about itself — the shape of
+    SousService.server_status()["config"]["gateway"], which is what the
+    launcher reads instead of trusting the config file."""
+    return {
+        "config": {
+            "gateway": {
+                "enabled": True,
+                "local_models": ["sous-local"],
+                "max_context_tokens": 65536,
+                "upstream_url": "https://api.anthropic.com",
+                **gateway,
+            }
+        }
+    }
+
+
+def _claude_setup(tmp_path, monkeypatch, *, status=_DEFAULT_STATUS, **overrides):
+    """A gateway-enabled config file, a `claude` on PATH, a daemon that answers
+    server_status, and an execve that records instead of replacing the
+    process. `status=None` is a daemon that does not answer at all."""
+    import os
+
+    from sous import cli
+    from sous.config import SousConfig
+
+    # Popped rather than passed alongside **overrides: a test overriding
+    # gateway_enabled would otherwise collide with a literal keyword of the
+    # same name below and raise "got multiple values for keyword argument".
+    gateway_enabled = overrides.pop("gateway_enabled", True)
+    cfg = SousConfig(
+        server_port=8383,
+        data_dir=tmp_path,
+        config_path=tmp_path / "c.toml",
+        gateway_enabled=gateway_enabled,
+        **overrides,
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(
+        cli.shutil, "which", lambda name: "/opt/bin/claude" if name == "claude" else None
+    )
+    answer = _status() if status is _DEFAULT_STATUS else status
+    monkeypatch.setattr(cli, "_daemon_status", lambda port: answer)
+    for var in (
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "API_TIMEOUT_MS",
+        *cli._TIER_VARS,
+    ):
+        monkeypatch.delenv(var, raising=False)
+    calls: list[tuple] = []
+    monkeypatch.setattr(os, "execve", lambda exe, argv, env: calls.append((exe, argv, env)))
+    return cfg, calls
+
+
+def test_claude_argv_appends_the_lsp_opt_out_unless_the_user_chose_their_own():
+    """Claude Code's --disallowedTools is variadic, so it goes last (prepended,
+    it would swallow a positional prompt) — and before a `--` if there is one."""
+    from sous.cli import claude_argv
+
+    assert claude_argv([]) == ["--disallowedTools", "LSP"]
+    assert claude_argv(["-p", "hi"]) == ["-p", "hi", "--disallowedTools", "LSP"]
+    assert claude_argv(["--", "fix it"]) == ["--disallowedTools", "LSP", "--", "fix it"]
+    for own in (
+        ["--disallowedTools", "Foo"],
+        ["--disallowedTools=Foo"],
+        ["--disallowed-tools", "Foo", "Bar"],
+        ["--disallowed-tools=Foo"],
+    ):
+        assert claude_argv(["-p", "x", *own]) == ["-p", "x", *own]
+    # After a `--` the same text is a prompt, not an option Claude Code will
+    # parse, so it cannot be the user choosing their own opt-out.
+    assert claude_argv(["--", "--disallowedTools"]) == [
+        "--disallowedTools",
+        "LSP",
+        "--",
+        "--disallowedTools",
+    ]
+    assert claude_argv(["--disallowedTools", "X", "--", "y"]) == [
+        "--disallowedTools",
+        "X",
+        "--",
+        "y",
+    ]
+
+
+def test_claude_env_sets_the_gateway_variables_and_nothing_credential_shaped():
+    from sous.cli import claude_env
+
+    env = claude_env(
+        9999,
+        ["sous-fast", "sous-local"],
+        131072,
+        {"PATH": "/usr/bin", "API_TIMEOUT_MS": "5", "HOME": "/Users/x"},
+    )
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9999"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "sous-fast"
+    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
+    assert env["API_TIMEOUT_MS"] == "3000000"
+    assert env["PATH"] == "/usr/bin" and env["HOME"] == "/Users/x"
+    # Global, not per-model: pinning it would make the frontier main loop
+    # compact at the local window (decision 10).
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
+    for forbidden in (
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    ):
+        assert forbidden not in env
+
+
+def test_claude_execs_claude_with_the_gateway_environment(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    cfg, calls = _claude_setup(tmp_path, monkeypatch)
+    cli.main(["claude", "-p", "hi"])
+    [(exe, argv, env)] = calls
+    assert exe == "/opt/bin/claude"
+    assert argv == ["/opt/bin/claude", "-p", "hi", "--disallowedTools", "LSP"]
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8383"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "sous-local"
+    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "65536"
+    assert env["API_TIMEOUT_MS"] == "3000000"
+    assert "ANTHROPIC_API_KEY" not in env and "ANTHROPIC_AUTH_TOKEN" not in env
+    err = capsys.readouterr().err
+    assert "ANTHROPIC_BASE_URL=http://127.0.0.1:8383" in err
+    assert "CLAUDE_CODE_SUBAGENT_MODEL=sous-local" in err
+    assert "warning" not in err
+
+
+def test_claude_passes_every_argument_through_including_help(tmp_path, monkeypatch):
+    """Dispatch happens before argparse: `sous claude --help` is Claude Code's
+    help, and a leading option is not sous's to reject."""
+    from sous import cli
+
+    _, calls = _claude_setup(tmp_path, monkeypatch)
+    cli.main(["claude", "--help"])
+    cli.main(["claude", "--model", "opus", "--verbose"])
+    assert calls[0][1] == ["/opt/bin/claude", "--help", "--disallowedTools", "LSP"]
+    assert calls[1][1] == [
+        "/opt/bin/claude",
+        "--model",
+        "opus",
+        "--verbose",
+        "--disallowedTools",
+        "LSP",
+    ]
+
+
+def test_claude_warns_about_a_credential_variable_but_still_launches(tmp_path, capsys, monkeypatch):
+    """Spec: warn, don't refuse — either variable moves the main loop from the
+    subscription to API-credit billing, and that is the user's call to make."""
+    from sous import cli
+
+    _, calls = _claude_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-canary")
+    cli.main(["claude"])
+    assert len(calls) == 1
+    err = capsys.readouterr().err
+    assert "warning" in err and "ANTHROPIC_API_KEY" in err and "API credits" in err
+    assert "sk-ant-api03-canary" not in err
+    assert calls[0][2]["ANTHROPIC_API_KEY"] == "sk-ant-api03-canary"  # untouched, not unset
+
+
+def test_claude_warns_about_an_inherited_tier_variable_but_still_launches(
+    tmp_path, capsys, monkeypatch
+):
+    """Same ruling as the credential variables: the user's environment is the
+    user's. A leftover export from the whole-session recipe in CONTRIBUTING is
+    exactly this case, so name the variable and its value (a model id, not a
+    secret) and say what it costs — then launch."""
+    from sous import cli
+
+    _, calls = _claude_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "sous-local")
+    cli.main(["claude"])
+    assert len(calls) == 1
+    err = capsys.readouterr().err
+    assert "warning" in err
+    assert "ANTHROPIC_DEFAULT_SONNET_MODEL" in err and "sous-local" in err
+    assert "hybrid" in err
+    # Warned about, never stripped: the export is the user's to keep.
+    assert calls[0][2]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "sous-local"
+
+
+def test_claude_refuses_when_the_running_daemon_has_the_gateway_off(tmp_path, capsys, monkeypatch):
+    """The file says enabled; the daemon says off. The daemon's startup
+    snapshot is the truth — a file edited since it started changes nothing
+    until it restarts."""
+    from sous import cli
+
+    _, calls = _claude_setup(tmp_path, monkeypatch, status=_status(enabled=False))
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["claude"])
+    assert exc.value.code == 1 and calls == []
+    err = capsys.readouterr().err
+    assert "[gateway]" in err and "restart" in err
+
+
+def test_claude_refuses_when_no_daemon_answers(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    _, calls = _claude_setup(tmp_path, monkeypatch, status=None)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["claude"])
+    assert exc.value.code == 1 and calls == []
+    assert "sous serve" in capsys.readouterr().err
+
+
+def test_claude_refuses_a_pre_routing_daemon(tmp_path, capsys, monkeypatch):
+    """A Phase 1 daemon reports its gateway without an upstream_url: it serves
+    the local model and 404s everything else, so the main loop of the session
+    about to be launched could not run at all."""
+    from sous import cli
+
+    status = _status()
+    del status["config"]["gateway"]["upstream_url"]
+    _, calls = _claude_setup(tmp_path, monkeypatch, status=status)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["claude"])
+    assert exc.value.code == 1 and calls == []
+    assert "reinstall" in capsys.readouterr().err
+
+
+def test_claude_uses_the_daemons_values_and_says_so_when_the_file_disagrees(
+    tmp_path, capsys, monkeypatch
+):
+    """Pinning subagents to an id the running daemon would forward upstream is
+    the whole failure this replaces: the env comes from the daemon, and the
+    drift from the file is reported rather than silently applied."""
+    from sous import cli
+
+    _, calls = _claude_setup(
+        tmp_path,
+        monkeypatch,
+        status=_status(local_models=["sous-fast"], max_context_tokens=131072),
+        gateway_local_models=("sous-local",),
+        gateway_max_context_tokens=65536,
+    )
+    cli.main(["claude"])
+    [(_exe, _argv, env)] = calls
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "sous-fast"
+    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
+    err = capsys.readouterr().err
+    assert "local_models" in err and "max_context_tokens" in err
+    assert "restart" in err
+
+
+def test_claude_refuses_without_the_claude_binary(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    _, calls = _claude_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["claude"])
+    assert exc.value.code == 1 and calls == []
+    assert "PATH" in capsys.readouterr().err
+
+
+@pytest.mark.slow
+def test_daemon_status_reads_the_real_daemons_gateway_config(tmp_path):
+    """The launcher's one source of truth, against the real server: an MCP
+    call to server_status over streamable HTTP, and None when nothing is
+    listening."""
+    import contextlib
+    from collections.abc import Iterator
+
+    import uvicorn
+
+    from sous.cli import _daemon_status
+    from sous.config import SousConfig
+    from sous.engine.base import EngineManager
+    from sous.server import create_server, uvicorn_config
+    from sous.tasks import TaskStore
+    from tests.fake_engine import FakeEngine
+
+    @contextlib.contextmanager
+    def serve(app, port: int) -> Iterator[None]:
+        server = uvicorn.Server(uvicorn_config(app, "127.0.0.1", port, log_level="warning"))
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 20
+        while not server.started and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert server.started, "uvicorn never started"
+        try:
+            yield
+        finally:
+            server.should_exit = True
+            thread.join(20)
+
+    cfg = SousConfig(
+        data_dir=tmp_path / "data", config_path=tmp_path / "c.toml", gateway_enabled=True
+    )
+    engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
+    app = create_server(TaskStore(tmp_path / "tasks.db"), engines, cfg).streamable_http_app()
+    port = _free_cli_port()
+    with serve(app, port):
+        status = _daemon_status(port)
+    assert status is not None
+    assert status["config"]["gateway"] == {
+        "enabled": True,
+        "local_models": ["sous-local"],
+        "max_context_tokens": 65536,
+        "upstream_url": "https://api.anthropic.com",
+    }
+    # Nothing listening on that port any more.
+    assert _daemon_status(port) is None
