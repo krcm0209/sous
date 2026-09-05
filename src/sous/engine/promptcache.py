@@ -525,7 +525,8 @@ class PrefixCache:
         into history), and the owner is retired so a generation still running
         on it cannot publish afterwards. Without: everything, and the epoch
         bump makes every in-flight publish from any thread drop itself —
-        unload and a stalled gateway session use this form.
+        unload uses this form; the worker and the gateway's stall path retire
+        an owner instead.
 
         Takes only the bookkeeping lock, never the generation lock: the caller
         may be the worker's finally while a stalled generation still holds

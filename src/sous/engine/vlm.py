@@ -272,9 +272,12 @@ class VLMEngine:
         verifies per turn that those ids really are a token prefix of this
         render, and that the header clears the fork floor.
 
-        Every Claude Code subagent of one type shares exactly this prefix; the
-        worker's short system prompt never qualifies, and a render below the
-        floor cannot contain a header above it — so it never pays the probe."""
+        Reuse needs the rendered header to match token for token, which in
+        practice means subagents of one type inside one Claude Code session:
+        a new `claude` process puts its own session scratchpad path above the
+        tool schemas, so its header diverges after ~1K tokens. The worker's
+        short system prompt never qualifies, and a render below the floor
+        cannot contain a header above it — so it never pays the probe."""
         if (
             len(messages) < 2
             or messages[0].get("role") != "system"

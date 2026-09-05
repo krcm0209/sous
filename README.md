@@ -227,11 +227,15 @@ turn gives up, stated plainly:
   resident conversation (bounded by `[model].prompt_cache_gb`), so a subagent's
   consecutive turns reuse their own slot, two subagents interleaving reuse
   theirs, and a delegated task running in between no longer evicts anything.
-  A new subagent of a type seen before starts from a *fork*: a copy of the
-  cache taken where its predecessor's system prompt and tool schemas end
-  (~50K tokens for a Claude Code subagent), so its first turn prefills only
-  its own brief — seconds instead of minutes. Two subagents still run one at
-  a time; batching is a later phase.
+  A new subagent whose rendered header is identical to one already seen —
+  in practice a same-type subagent within the same Claude Code session —
+  starts from a *fork*: a copy of the cache taken where its predecessor's
+  system prompt and tool schemas end (~50K tokens for a Claude Code
+  subagent), so its first turn prefills only its own brief — seconds instead
+  of minutes. A *new* `claude` process misses: its system prompt carries that
+  session's own scratchpad path above the tool schemas, so the two headers
+  share only the first ~1K tokens. Two subagents still run one at a time;
+  batching is a later phase.
 - **A client that disconnects does not stop the model.** A local turn runs to
   completion (so the next request never waits on a wedged lock); aborting
   mid-generation comes with batching, later. A forwarded stream, by contrast,
@@ -358,15 +362,18 @@ scratch.
 `[model].prompt_cache_gb` (default `"auto"`) bounds the caches kept resident
 *beyond* the turn that is running: one slot per conversation, plus one *fork*
 slot per distinct system prompt long enough to be worth copying (4096 tokens
-or more) — the ~50K-token header every Claude Code subagent of one type
-shares. `"auto"` is what Metal's recommended working set has left once the
-weights, one full context window of KV (the larger of `[model]`'s and
-`[gateway]`'s) and 2 GiB of slack are paid for — about 27 GiB on a 64 GB
-machine with the default model and gateway window, room for several
-conversations. Slots are evicted least-recently-used first when the budget,
-a count of 16, or live memory pressure says so; the conversation that just
-ran is never evicted by its own turn, so `0` means exactly one slot (the
-pre-3a behaviour) and a 32 GB machine degrades to that on its own.
+or more) — the ~50K-token header that Claude Code subagents of one type share
+within a session. Headers must match token for token, and a new `claude`
+process renders a different one (see above), so a fork slot pays off across
+the subagents of one session, not across sessions. `"auto"` is what Metal's
+recommended working set has left once the weights, one full context window of
+KV (the larger of `[model]`'s and `[gateway]`'s) and 2 GiB of slack are paid
+for — about 27 GiB on a 64 GB machine with the default model and gateway
+window, room for several conversations. Slots are evicted least-recently-used
+first when the budget, a count of 16, or live memory pressure says so; the
+conversation that just ran is never evicted by its own turn, so `0` means
+exactly one slot (the pre-3a behaviour) and a 32 GB machine degrades to that
+on its own.
 `server_status` reports `prompt_cache` — slots, resident bytes, hits, fork
 hits, evictions — counts only.
 
