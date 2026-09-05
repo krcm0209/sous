@@ -204,3 +204,102 @@ def test_vlm_engine_streams_deltas_that_reassemble_the_reply():
     # max_tokens finish it repeats the last count, len(seen) - 1.
     assert seen[-1].output_tokens in (len(seen), len(seen) - 1)
     e.unload()
+
+
+@pytest.mark.parametrize(
+    ("model_id", "is_hybrid"),
+    [
+        pytest.param(TINY_VLM, False, id="pure-attention"),
+        pytest.param(HYBRID_VLM, True, id="linear-attention-hybrid"),
+    ],
+)
+def test_vlm_fork_copy_matches_a_split_prefill_bit_for_bit(model_id, is_hybrid):
+    """The VLM twin of the LM fork test, and the only coverage of a fork over
+    recurrent layers: on HYBRID_VLM the copy has to carry each ArraysCache's
+    whole state, because those layers cannot be rebuilt by replaying tokens
+    the way a KVCache can. A fork that aliased or dropped one would hand every
+    subagent a context that silently differs from a cold prefill.
+
+    Reference is prefill(header) then prefill(tail) on a fresh cache, not one
+    call over header+tail: a quantized matmul's rounding depends on the row
+    count, so the single call differs by a ULP from the split one every warm
+    turn already makes. See the LM test for the measurement."""
+    import mlx.core as mx
+    from mlx_vlm.models.cache import make_prompt_cache
+
+    from sous.engine.promptcache import fork_copy, slot_bytes
+    from sous.engine.vlm import VLMEngine
+
+    def assert_identical(x, y):
+        for a, b in zip(x, y, strict=True):
+            # getattr, not a.offset: an ArraysCache layer has no offset at all
+            # (nothing to rewind), and its state is compared whole below.
+            off = int(getattr(a, "offset", 0) or 0)
+            assert off == int(getattr(b, "offset", 0) or 0)
+            for xa, xb in zip(a.state, b.state, strict=True):
+                if xa is None or xb is None:
+                    assert xa is None and xb is None, "one side is None, the other is not"
+                    continue
+                if hasattr(a, "trim") and xa.ndim >= 3 and off:
+                    xa, xb = xa[..., :off, :], xb[..., :off, :]
+                d = mx.max(mx.abs(xa.astype(mx.float32) - xb.astype(mx.float32)))
+                mx.eval(d)
+                assert d.item() == 0.0
+
+    e = VLMEngine(model_id, cache_budget=0)
+    model, _ = e._loaded()
+    ids = e._encode("def f(x):\n    return x + 1\n" * 40)
+    header, tail = ids[: len(ids) // 2], ids[len(ids) // 2 :]
+
+    ref = make_prompt_cache(model.language_model)
+    e.prefill(ref, header)
+    e.prefill(ref, tail)
+
+    src = make_prompt_cache(model.language_model)
+    e.prefill(src, header)
+    # What a source that was never forked from looks like — the same single
+    # prefill call, so the comparison below is exact rather than a kernel
+    # determinism test.
+    untouched = make_prompt_cache(model.language_model)
+    e.prefill(untouched, header)
+
+    fork = make_prompt_cache(model.language_model)
+    fork_copy(src, fork, e.copy_array)
+    # Fail loudly if a model stops having the cache shape it was picked for.
+    # The recurrent arrays must also be *populated*: an all-None ArraysCache
+    # would make every comparison below vacuous on the branch this test
+    # exists for (measured on Qwen3.5-9B: 24 of 32 layers, 48 arrays).
+    recurrent = [c for c in src if not hasattr(c, "trim")]
+    assert bool(recurrent) is is_hybrid
+    assert all(any(a is not None for a in c.state) for c in recurrent)
+    assert slot_bytes(fork) > 0
+    assert slot_bytes(fork) <= slot_bytes(src)  # the copy carries no step padding
+    assert_identical(fork, src)  # the copy itself, before anything continues it
+    e.prefill(fork, tail)
+
+    assert_identical(fork, ref)
+    # And the source is still the header and nothing else: the slot stays in
+    # the map for the next conversation to fork again, so a copy that aliased
+    # it would corrupt every later fork — and would pass every check above.
+    assert [int(c.offset) for c in src if hasattr(c, "offset")] == [len(header)] * sum(
+        1 for c in src if hasattr(c, "offset")
+    )
+    assert_identical(src, untouched)
+    e.unload()
+
+
+def test_vlm_engine_serves_a_second_conversation_from_the_header_fork():
+    """End to end on a real VLM tokenizer and template: two conversations with
+    the same (long) system turn; the second's first turn is a fork hit."""
+    from sous.engine.promptcache import FORK_MIN_TOKENS
+    from sous.engine.vlm import VLMEngine
+
+    e = VLMEngine(TINY_VLM, prompt_cache=True, cache_budget=1 << 34)
+    system = {"role": "system", "content": "You are terse. " * (FORK_MIN_TOKENS // 3)}
+    e.generate([system, {"role": "user", "content": "Say A."}], [], 4)
+    e.generate([system, {"role": "user", "content": "Say B, please."}], [], 4)
+    s = e.prompt_cache_stats()
+    assert s["forks"] == 1
+    assert s["fork_hits"] == 1
+    assert s["reused_tokens"] >= FORK_MIN_TOKENS
+    e.unload()
