@@ -643,10 +643,11 @@ class Gateway:
     def _log_turn(
         self, chat: ChatRequest, result: TurnResult, assembler: TurnAssembler, *, stream: bool
     ) -> None:
+        cache = "fork" if result.forked else "hit" if result.cache_hit else "miss"
         _log(
             f"POST /v1/messages model={_model_label(chat)} stream={int(stream)} status=200 "
             f"input_tokens={result.input_tokens} output_tokens={result.output_tokens} "
-            f"stop={assembler.stop_reason} cache={'hit' if result.cache_hit else 'miss'} "
+            f"stop={assembler.stop_reason} cache={cache} "
             f"reused_tokens={result.reused_tokens} seconds={result.seconds:.1f}"
         )
 

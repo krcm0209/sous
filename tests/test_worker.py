@@ -410,9 +410,9 @@ def test_generation_timeout_at_wall_budget_is_budget_exhausted(env):
     assert got.outcome == "budget-exhausted"
     assert "files_changed" in got.report  # partial report still assembled
     assert Path(got.report["transcript_path"]).exists()
-    # Both resets ran on the worker thread — the abandoned session must never
+    # The retire ran on the worker thread — the abandoned session must never
     # reset anything (a late reset would race the next task's cache).
-    assert inner.resets == 2
+    assert inner.resets == 1
     assert all(i == threading.get_ident() for i in inner.reset_idents)
     # Unwedge and join the leaked session thread so it cannot outlive this
     # test and fire a later test's monkeypatched hooks.
@@ -462,9 +462,9 @@ def test_context_over_cap_with_nothing_to_elide_fails_cleanly(env):
     assert "files_changed" in got.report
     assert Path(got.report["transcript_path"]).exists()
     # Zero-generation task: the session was created and must still close
-    # promptly, with both resets present and the thread gone.
+    # promptly, with the retire present and the thread gone.
     assert elapsed < 3.0
-    assert inner.resets == 2
+    assert inner.resets == 1
     _join_sessions(engine)
 
 
@@ -622,7 +622,7 @@ def test_engine_exception_fails_task_cleanly(env):
     assert got.state == TaskState.FAILED
     assert "engine error" in got.report["error"]
     assert "boom" in got.report["error"]
-    assert inner.resets == 2  # the finally still closed the session and reset
+    assert inner.resets == 1  # the finally still closed the session and retired
     _join_sessions(engine)
 
 
@@ -772,16 +772,20 @@ def test_worker_loop_releases_mlx_state_on_exit(env, monkeypatch):
     assert released == [True]
 
 
-def test_run_task_resets_the_prompt_cache_at_start_and_end(env):
+def test_run_task_retires_only_its_own_session_at_the_end(env):
+    """No reset at entry — the task's session thread is new, so nothing
+    resident can be adopted, and a reset there would wipe the gateway's
+    slots every time a delegated task ran. At the end the task retires
+    exactly its session's thread, from the worker thread as before."""
     root, cfg, store = env
     task = _start(store, root)
     inner = FakeEngine([FINISH])
     engine = SessionCapturingEngine(inner)
     run_task(task, store, engine, cfg)
-    assert inner.resets == 2  # once at entry, once in the finally
+    assert inner.resets == 1
+    assert inner.reset_owners == [engine.sessions[0].thread]
     _join_sessions(engine)
-    here = threading.get_ident()
-    assert inner.reset_idents == [here, here]  # the worker thread owns every reset
+    assert inner.reset_idents == [threading.get_ident()]
 
 
 def test_run_task_resets_even_when_the_task_fails(env):
@@ -790,21 +794,22 @@ def test_run_task_resets_even_when_the_task_fails(env):
     engine = FakeEngine(["<tool_call>{bad json}</tool_call>"] * 3)
     run_task(task, store, ManagedEngine(engine), cfg)
     assert store.get(task.id).state == TaskState.FAILED
-    assert engine.resets == 2
+    assert engine.resets == 1
 
 
 def test_report_carries_the_prompt_cache_block(env):
     root, cfg, store = env
     task = _start(store, root)
-    engine = FakeEngine([FINISH])
-    engine.stats = {
+    inner = FakeEngine([FINISH])
+    inner.stats = {
         "hits": 4,
         "misses": 1,
         "reused_tokens": 900,
         "snapshot_bytes": 0,
         "cold_retries": 0,
     }
-    run_task(task, store, ManagedEngine(engine), cfg)
+    engine = SessionCapturingEngine(inner)
+    run_task(task, store, engine, cfg)
     got = store.get(task.id)
     # Pins that this exercises the success-report path, not _failure_extra —
     # a different code path entirely that also assembles a prompt_cache block.
@@ -812,21 +817,28 @@ def test_report_carries_the_prompt_cache_block(env):
     block = got.report["prompt_cache"]
     assert block["hits"] == 4
     assert block["elisions"] == 0
+    # The report is this task's own counters, not the whole daemon's: a
+    # gateway turn's hits must never be attributed to a delegated task.
+    assert inner.stats_owners and all(o is engine.sessions[0].thread for o in inner.stats_owners)
+    _join_sessions(engine)
 
 
 def test_failure_extra_carries_the_prompt_cache_block(env):
     root, cfg, store = env
     task = _start(store, root)
-    engine = FakeEngine(["<tool_call>{bad json}</tool_call>"] * 3)
-    engine.stats = {
+    inner = FakeEngine(["<tool_call>{bad json}</tool_call>"] * 3)
+    inner.stats = {
         "hits": 1,
         "misses": 1,
         "reused_tokens": 10,
         "snapshot_bytes": 0,
         "cold_retries": 0,
     }
-    run_task(task, store, ManagedEngine(engine), cfg)
+    engine = SessionCapturingEngine(inner)
+    run_task(task, store, engine, cfg)
     assert store.get(task.id).report["prompt_cache"]["hits"] == 1
+    assert inner.stats_owners and all(o is engine.sessions[0].thread for o in inner.stats_owners)
+    _join_sessions(engine)
 
 
 def test_elisions_are_counted_in_the_report(env):
