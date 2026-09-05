@@ -130,7 +130,8 @@ def test_no_system_turn_means_no_fork():
 
 
 def test_a_system_only_prompt_does_not_fork():
-    # Nothing would follow the header; fork_point's strict-prefix rule says 0.
+    # Nothing would follow the header, but _fork_at's `len(messages) < 2`
+    # guard returns first: fork_point's strict-prefix rule is never asked.
     engine, rec = _engine(FakeTokenizer())
     engine.generate([SYSTEM], [], 8)
     assert rec.fork_ats == [0]
@@ -160,7 +161,7 @@ def test_owner_scoped_stats_and_reset_pass_through():
     assert spy.seen == [("stats", me), ("reset", me)]
 
 
-# ---- the same six, for the VLM backend ------------------------------------
+# ---- the same seven, for the VLM backend ----------------------------------
 #
 # _encode is monkeypatched away because its real body imports mlx_vlm; the
 # fake tokenizer's own encode() is what the LM tests exercise, and this keeps

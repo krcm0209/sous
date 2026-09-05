@@ -64,8 +64,9 @@ class LMEngine:
         )
 
     def _ids(self, slot: str, messages: list[dict], tools: list[dict]) -> list[int]:
-        """Tokenize a render once per turn. The two slots are the stable render
-        and the full prompt; count_tokens and generate both read them."""
+        """Tokenize a render once per turn. The three slots are the stable
+        render, the full prompt and the header (the fork boundary);
+        count_tokens and generate both read them."""
         # One lock for every tokenization: HF's fast tokenizer mutates shared
         # Rust state on each encode (set_truncation_and_padding), and since the
         # gateway there are two callers — a turn on a pool thread and Claude

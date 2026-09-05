@@ -132,6 +132,12 @@ def test_lm_fork_copy_matches_a_cold_prefill_bit_for_bit():
 
     src = make_prompt_cache(model)
     e.prefill(src, header)
+    # What a source that was never forked from looks like — the same single
+    # prefill call, so the comparison below is exact rather than a kernel
+    # determinism test.
+    untouched = make_prompt_cache(model)
+    e.prefill(untouched, header)
+
     fork = make_prompt_cache(model)
     fork_copy(src, fork, e.copy_array)
     assert slot_bytes(fork) > 0
@@ -140,6 +146,11 @@ def test_lm_fork_copy_matches_a_cold_prefill_bit_for_bit():
     e.prefill(fork, tail)
 
     assert_identical(fork, ref)
+    # And the source is still the header and nothing else: the slot stays in
+    # the map for the next conversation to fork again, so a copy that aliased
+    # it would corrupt every later fork — and would pass every check above.
+    assert [int(c.offset) for c in src] == [len(header)] * len(src)
+    assert_identical(src, untouched)
     e.unload()
 
 

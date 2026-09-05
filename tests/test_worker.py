@@ -788,7 +788,7 @@ def test_run_task_retires_only_its_own_session_at_the_end(env):
     assert inner.reset_idents == [threading.get_ident()]
 
 
-def test_run_task_resets_even_when_the_task_fails(env):
+def test_run_task_retires_even_when_the_task_fails(env):
     root, cfg, store = env
     task = _start(store, root)
     engine = FakeEngine(["<tool_call>{bad json}</tool_call>"] * 3)

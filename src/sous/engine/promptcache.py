@@ -34,8 +34,11 @@ def reuse_length(cached_ids: Sequence[int], new_ids: Sequence[int]) -> int:
         return 0
     # A slice comparison runs in C. With up to MAX_SLOTS candidate slots of
     # ~50K tokens each to test per turn, a Python loop here would cost tens
-    # of milliseconds on every lookup.
-    return n if list(new_ids[:n]) == list(cached_ids) else 0
+    # of milliseconds on every lookup. Both operands are lists in practice
+    # (that is what the memo and every Slot hold), and re-wrapping them would
+    # add two ~50K-element copies per candidate to save a type check.
+    head = new_ids[:n] if isinstance(new_ids, list) else list(new_ids[:n])
+    return n if head == (cached_ids if isinstance(cached_ids, list) else list(cached_ids)) else 0
 
 
 def all_trimmable(cache: Sequence[Any]) -> bool:
@@ -256,8 +259,9 @@ class CacheHooks(Protocol):
     # cannot tell (no mlx). Read on the owner thread; must not release thread
     # state. Called with no cache lock held and must take none of its own: the
     # cache's promise that reset() never waits on a generation rests on its
-    # bookkeeping lock covering list and dict work alone, and this is the one
-    # engine call the eviction path makes.
+    # bookkeeping lock covering list and dict work plus the deallocation a
+    # drop triggers — all bounded — and this is the one engine call the
+    # eviction path makes.
     def headroom(self) -> int | None: ...
 
 
@@ -315,9 +319,10 @@ class PrefixCache:
         self.enabled = enabled
         self.max_bytes = max_bytes
         self.reserve_bytes = reserve_bytes
-        # Held only across list/dict operations, never across prefill or
-        # decode. reset() must never wait on a generation (its caller may be
-        # the worker's finally while a stalled generation still runs), and
+        # Held only across list and dict work, plus the deallocation a drop
+        # triggers — never across prefill or decode. reset() must never wait
+        # on a generation (its caller may be the worker's finally while a
+        # stalled generation still runs), and freeing a cache is bounded, so
         # with this discipline it never does.
         self._lock = threading.Lock()
         self._slots: list[Slot] = []
@@ -453,10 +458,11 @@ class PrefixCache:
 
         Takes the lock one drop at a time instead of holding it across the
         loop, because `headroom()` is an engine call (an mlx memory query, on
-        a real engine). The bookkeeping lock covers list and dict work only;
-        that is the whole reason reset() can promise never to wait on a
-        generation, and it would stop being true the moment an engine call ran
-        underneath it. Dropping the lock between readings is safe: every
+        a real engine). The bookkeeping lock covers list and dict work plus
+        the deallocation a drop triggers, all bounded; that is the whole
+        reason reset() can promise never to wait on a generation, and it would
+        stop being true the moment an engine call ran underneath it. Dropping
+        the lock between readings is safe: every
         iteration re-reads both the headroom and the map, so a concurrent
         publish or reset just changes what the next pass sees.
         """

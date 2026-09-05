@@ -239,8 +239,9 @@ turn gives up, stated plainly:
 
 Each `/v1/messages` turn served locally logs one metadata-only line to the
 daemon's stderr — method, model, stream flag, status, token counts, stop
-reason, cache `hit`/`fork`/`miss` (`fork`: the turn started from a copied header slot), seconds — plus one line naming the Anthropic tool
-*types* it dropped, when any. Each forwarded request logs one line too:
+reason, cache `hit`/`fork`/`miss` (`fork`: the turn started from a copied
+header slot), seconds — plus one line naming the Anthropic tool *types* it
+dropped, when any. Each forwarded request logs one line too:
 `upstream`, method, path, the model id when the body named one, the
 upstream's status, and seconds to its headers. The daemon also disables
 uvicorn's access log, which would otherwise print every request target —
@@ -263,7 +264,9 @@ id = "mlx-community/Qwen3.8-27B-4bit"
 idle_unload_minutes = 30
 max_context_tokens = 32768
 prompt_cache = true
-prompt_cache_gb = "auto"  # resident cache slots beyond the running turn; a number of GiB, or 0 for one slot
+# Cache slots kept resident beyond the running turn: "auto" sizes them
+# from free Metal memory, a number sets the GiB, 0 keeps a single slot.
+prompt_cache_gb = "auto"
 temperature = 0.7
 top_p = 0.8
 top_k = 20
