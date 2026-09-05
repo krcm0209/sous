@@ -1514,6 +1514,81 @@ def test_the_probe_is_resolved_on_warm_turns_too():
     assert pc.stats()["forks"] == 3
 
 
+def test_a_budget_for_one_copy_skips_the_second_boundary_rather_than_evicting_into_it():
+    """The second copy of a cold turn is charged with the first protected: a
+    budget with room for exactly one fork keeps the tools fork (the one every
+    later session can use) and never allocates the header copy. Without the
+    protection LRU would pick the tools fork — the only evictable slot — and
+    the turn would end with the less shareable of the two."""
+    seen: list[list[list[int]]] = []
+    h = FakeHooks(trimmable=True)
+    h.on_new_cache = lambda: seen.append([s.held for s in pc.slots() if s.kind == "fork"])
+    pc = PrefixCache(h, max_bytes=TOOLS_AT * 8 * 2)  # exactly the tools copy, two layers
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    assert pc.stats()["forks"] == 1
+    # Two allocations only — the turn's own cache and the tools copy. No
+    # header copy was allocated, let alone evicted into.
+    assert len(h.caches) == 2
+    assert seen == [[], []]
+    assert h.prefilled[:2] == [T, HA[TOOLS_AT:]]  # the turn still stopped at both
+    # The turn slot's own publish then takes the budget for itself, exactly as
+    # in 3a: a turn slot that alone exceeds the budget lands protected and
+    # evicts what it can. Not this test's subject, but say what happens.
+    assert [s.kind for s in pc.slots()] == ["turn"]
+
+
+def test_three_tool_sets_forks_coexist_under_a_budget_that_holds_them():
+    U = list(range(20001, 20001 + FORK_MIN_TOKENS))  # a second tool set (general-purpose)
+    HU = [*U, 8201]
+    UX1, UX1_FULL = [*HU, 901, 902], [*HU, 901, 902, 90, 91]
+    V = list(range(30001, 30001 + FORK_MIN_TOKENS))  # a third (general-purpose, deferred tools)
+    HV = [*V, 8301, 8302]
+    VX1, VX1_FULL = [*HV, 911], [*HV, 911, 90, 91]
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    pc.generate(UX1, UX1_FULL, 16, fork_at=[len(U), len(HU)])
+    pc.generate(VX1, VX1_FULL, 16, fork_at=[len(V), len(HV)])
+    forks = sorted(s.held for s in pc.slots() if s.kind == "fork")
+    assert forks == sorted([T, HA, HB, U, HU, V, HV])
+    assert pc.stats()["forks"] == 7
+    assert pc.stats()["evictions"] == 0
+
+
+def test_across_turns_the_least_recently_used_fork_goes_first():
+    """Protection is within a turn only. Across turns LRU decides as in 3a: an
+    earlier session's header fork, untouched since, goes before the tools
+    fork the current turn just started from."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)  # touches T, adds HB
+    # One byte short of everything resident: the next turn evicts, LRU first.
+    pc.max_bytes = pc.stats()["resident_bytes"] - 1
+    pc.generate(BX2, BX2_FULL, 16, fork_at=BOUNDS_B)  # hits HB (touched), adds a turn slot
+    held = [s.held for s in pc.slots()]
+    assert HA not in held  # session A's header fork: the oldest untouched slot
+    assert AX1 not in held  # then session A's finished conversation
+    assert T in held and HB in held
+    assert pc.stats()["evictions"] == 2
+
+
+def test_a_failed_copy_at_one_boundary_still_forks_at_the_next():
+    """A copy failure at one boundary must not block the next: each boundary
+    is charged and published independently, so a lost tools copy still lets
+    the header copy land."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    _fail_next_copy(h)
+    with pytest.warns(UserWarning, match="fork copy failed"):
+        pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    assert pc.stats()["forks"] == 1
+    forks = [s for s in pc.slots() if s.kind == "fork"]
+    assert [s.held for s in forks] == [HA]
+    assert h.prefilled[:2] == [T, HA[TOOLS_AT:]]
+
+
 # ---- budget ------------------------------------------------------------------
 
 

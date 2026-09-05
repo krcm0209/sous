@@ -358,10 +358,12 @@ class PrefixCache:
     def _resident(self) -> int:
         return sum(s.nbytes for s in self._slots)
 
-    def _evictable(self, protect: Slot | None) -> list[Slot]:
-        return [s for s in self._slots if s is not protect]
+    def _evictable(self, protect: Sequence[Slot]) -> list[Slot]:
+        # Identity, not equality: Slot is a dataclass, and `==` would compare
+        # two ~50K-token id lists (and two caches) per candidate.
+        return [s for s in self._slots if not any(s is p for p in protect)]
 
-    def _drop_lru(self, protect: Slot | None) -> None:
+    def _drop_lru(self, protect: Sequence[Slot]) -> None:
         victim = min(self._evictable(protect), key=lambda s: s.last_used)
         self._slots.remove(victim)
         self._stats_for(victim.owner).evictions += 1
@@ -369,30 +371,35 @@ class PrefixCache:
         # nothing else references it, which is what the pressure re-read in
         # _evict_pressure relies on.
 
-    def _evict_caps(self, protect: Slot | None) -> None:
-        """Bring the map under its count and byte caps, never touching
-        `protect`. On its own before a turn starts, `protect` is None: nothing
-        here is spoken for."""
+    def _evict_caps(self, protect: Sequence[Slot]) -> None:
+        """Bring the map under its count and byte caps, never touching a slot
+        in `protect`. On its own before a turn starts, `protect` is empty:
+        nothing here is spoken for."""
         while self._evictable(protect) and (
             len(self._slots) > MAX_SLOTS or self._resident() > self.max_bytes
         ):
             self._drop_lru(protect)
 
-    def _make_room(self, nbytes: int) -> None:
-        """Evict LRU until a slot of `nbytes` would fit under the byte cap.
+    def _make_room(self, nbytes: int, protect: Sequence[Slot] = ()) -> bool:
+        """Evict LRU until a slot of `nbytes` would fit under the byte cap, and
+        say whether it now does.
 
         For the fork copy, which is charged before it is allocated rather than
         after: publishing first and evicting afterwards would put the copy and
         whatever it displaces on the machine at the same time — the transient
-        doubling the spec promises never happens. Nothing is protected: the
-        turn's own cache is not in the map, and a fork slot this turn copied
-        from has already been copied.
+        doubling the spec promises never happens. `protect` is the forks this
+        same turn already published: a second copy is never made room for by
+        evicting the first, and when the budget cannot hold both the answer
+        is False and the caller skips the copy rather than evicting into it.
+        The turn's own cache is not in the map, and a fork slot this turn
+        copied from has already been copied, so neither needs protecting.
 
         Takes the lock itself.
         """
         with self._lock:
-            while self._evictable(None) and self._resident() + nbytes > self.max_bytes:
-                self._drop_lru(None)
+            while self._evictable(protect) and self._resident() + nbytes > self.max_bytes:
+                self._drop_lru(protect)
+            return self._resident() + nbytes <= self.max_bytes
 
     def _take(self, owner: threading.Thread, stable_ids: list[int]) -> Slot | None:
         """The longest slot `owner` holds that `stable_ids` strictly extends.
@@ -434,7 +441,10 @@ class PrefixCache:
         another session's tools fork (`reuse` is the tools boundary) and must
         still publish its own header fork, or that session's next subagent
         reuses ~45K tokens instead of ~57K. The memo makes a warm probe two
-        renders and a string compare; the encode it saves is the cost.
+        renders and a string compare; the encode it saves is the cost. A warm
+        attempt that fails and is retried cold resolves the probe twice — two
+        extra renders under the tokenize lock, memoized encode — so the cost
+        is on record.
 
         Resolved before the lock is taken: the probe tokenizes, and nothing
         that slow may run under the bookkeeping lock that reset() promises
@@ -466,27 +476,31 @@ class PrefixCache:
             forks = [s.held for s in self._slots if s.owner is owner and s.kind == "fork"]
         return [b for b in wanted if stable_ids[:b] not in forks]
 
-    def _publish(self, slot: Slot, epoch: int) -> bool:
+    def _publish(self, slot: Slot, epoch: int, protect: Sequence[Slot] = ()) -> bool:
         """Add `slot` unless the world moved on: a full reset since the turn
         began, or the owner retired (its task ended) while it generated.
 
         The caps are applied under the same lock as the append — nothing must
         ever observe the map over budget — but the pressure pass runs after
         the lock is released, because it asks the engine for a reading. Both
-        protect `slot`: a turn's own slot is never evicted by its own publish,
-        so on a machine with room for exactly one slot, that one survives.
+        protect `slot` and `protect` (the forks this turn published before
+        it): a slot is never evicted by its own publish, so on a machine with
+        room for exactly one slot that one survives — and a cold turn's second
+        fork never evicts its first.
         """
+        keep = (slot, *protect)
         with self._lock:
             if epoch != self._epoch or slot.owner in self._retired:
                 return False
             self._slots.append(slot)
-            self._evict_caps(protect=slot)
-        self._evict_pressure(protect=slot)
+            self._evict_caps(protect=keep)
+        self._evict_pressure(protect=keep)
         return True
 
-    def _evict_pressure(self, protect: Slot | None) -> None:
+    def _evict_pressure(self, protect: Sequence[Slot]) -> None:
         """Shrink the map until the machine has `reserve_bytes` free again,
-        never touching `protect` — the slot just published.
+        never touching a slot in `protect` — the slot just published and this
+        turn's earlier forks.
 
         Takes the lock one drop at a time instead of holding it across the
         loop, because `headroom()` is an engine call (an mlx memory query, on
@@ -494,9 +508,9 @@ class PrefixCache:
         the deallocation a drop triggers, all bounded; that is the whole
         reason reset() can promise never to wait on a generation, and it would
         stop being true the moment an engine call ran underneath it. Dropping
-        the lock between readings is safe: every
-        iteration re-reads both the headroom and the map, so a concurrent
-        publish or reset just changes what the next pass sees.
+        the lock between readings is safe: every iteration re-reads both the
+        headroom and the map, so a concurrent publish or reset just changes
+        what the next pass sees.
         """
         while (headroom := self._hooks.headroom()) is not None and headroom < self.reserve_bytes:
             with self._lock:
@@ -630,7 +644,7 @@ class PrefixCache:
             # is already out of the map and needs no protection; a taken fork
             # slot is not, and dropping the very slot this turn just chose to
             # share would defeat the point of having forked it.
-            self._evict_caps(protect=slot if slot is not None and slot.kind == "fork" else None)
+            self._evict_caps(protect=(slot,) if slot is not None and slot.kind == "fork" else ())
         warm: list | None = None
         if slot is not None and slot.kind == "fork":
             # The slot stays for the next conversation; this turn works on its
@@ -751,6 +765,7 @@ class PrefixCache:
     ) -> str:
         hooks = self._hooks
         anchor = len(stable_ids)
+        published: list[Slot] = []
         for boundary in self._fork_boundaries(owner, stable_ids, fork_at, reuse):
             # Stop at the boundary and continue from there: a fork is taken
             # while prefilling past it because no layer can be rewound to it
@@ -760,22 +775,23 @@ class PrefixCache:
             reuse = boundary
             # What the cache holds at the boundary is what the copy will hold,
             # so it is also the price — re-read at every stop, since the cache
-            # has grown. A copy that cannot fit under the budget even on an
-            # empty map is not taken at all — better one prefill than a second
-            # cache the machine has no room for.
+            # has grown.
             price = slot_bytes(cache)
-            if price > self.max_bytes:
-                continue
             copy: list | None = None
             try:
-                self._make_room(price)
-                copy = hooks.new_cache()
-                fork_copy(cache, copy, hooks.copy_array)
-                if self._publish(
-                    Slot(copy, list(stable_ids[:boundary]), owner, "fork", slot_bytes(copy)),
-                    epoch,
-                ):
-                    stats.forks += 1
+                # Charged before it is allocated, with this turn's earlier
+                # copies protected: a budget with room for one copy skips the
+                # second rather than evicting the first into it, and a copy
+                # that cannot fit even on an empty map is not taken at all —
+                # better one prefill than a second cache the machine has no
+                # room for.
+                if self._make_room(price, protect=published):
+                    copy = hooks.new_cache()
+                    fork_copy(cache, copy, hooks.copy_array)
+                    slot = Slot(copy, list(stable_ids[:boundary]), owner, "fork", slot_bytes(copy))
+                    if self._publish(slot, epoch, protect=published):
+                        stats.forks += 1
+                        published.append(slot)
             except Exception as e:
                 # The fork is an optimization on a turn that is already
                 # prefilled to the boundary and needs nothing more from it.
@@ -795,6 +811,11 @@ class PrefixCache:
                 # whole decode that follows. (An accepted one is never evicted
                 # by its own publish: _publish protects the slot it adds.)
                 copy = None
+        # The list existed to protect the copies from each other while they
+        # were charged. Dropping it here means a fork that pressure or a reset
+        # evicts during the decode below is freed then, not pinned by this
+        # frame until the turn ends.
+        published = []
         if all_trimmable(cache):
             # Everything rewinds, so (the rest of) prefill and decode fuse into
             # one pass and the generation block plus the generated tokens are
