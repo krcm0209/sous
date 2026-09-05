@@ -77,15 +77,15 @@ class Recording:
     enabled = True
 
     def __init__(self):
-        self.fork_ats: list[int] = []
+        self.fork_ats: list[list[int]] = []
         self._resolver = PrefixCache(cast("CacheHooks", None), max_bytes=1 << 40)
 
-    def generate(self, stable_ids, full_ids, max_tokens, on_delta=None, fork_at=0):
+    def generate(self, stable_ids, full_ids, max_tokens, on_delta=None, fork_at=()):
         if callable(fork_at):
-            fork_at = self._resolver._fork_wanted(
+            fork_at = self._resolver._fork_boundaries(
                 threading.current_thread(), list(stable_ids), fork_at, 0
             )
-        self.fork_ats.append(fork_at)
+        self.fork_ats.append(list(fork_at))
         return "text"
 
     def stats(self, owner=None):
@@ -177,19 +177,19 @@ def test_a_leading_system_turn_long_enough_is_the_fork_point():
     # One past the system render: the probes share the separator the template
     # emits before the first user turn's content, and everything they share is
     # header — the boundary is no longer the system turn's own render length.
-    assert rec.fork_ats == [FORK_MIN_TOKENS + 1]
+    assert rec.fork_ats == [[FORK_MIN_TOKENS + 1]]
 
 
 def test_a_short_system_turn_does_not_fork():
     engine, rec = _engine(FakeTokenizer(header_chars=10))
     engine.generate([SYSTEM, USER], [], 8)
-    assert rec.fork_ats == [0]
+    assert rec.fork_ats == [[]]
 
 
 def test_no_system_turn_means_no_fork():
     engine, rec = _engine(FakeTokenizer())
     engine.generate([USER], [], 8)
-    assert rec.fork_ats == [0]
+    assert rec.fork_ats == [[]]
 
 
 def test_a_system_only_prompt_does_not_fork():
@@ -199,20 +199,20 @@ def test_a_system_only_prompt_does_not_fork():
     # engine at all under one that refuses to render it.
     engine, rec = _engine(Tolerant())
     engine.generate([SYSTEM], [], 8)
-    assert rec.fork_ats == [0]
+    assert rec.fork_ats == [[]]
 
 
 def test_a_template_whose_header_is_not_a_token_prefix_does_not_fork():
     engine, rec = _engine(Rewriting())
     engine.generate([SYSTEM, USER, ASSISTANT], [], 8)
-    assert rec.fork_ats == [0]
+    assert rec.fork_ats == [[]]
 
 
 def test_a_template_that_refuses_the_probe_warns_and_does_not_fork():
     engine, rec = _engine(RefusingProbes())
-    with pytest.warns(UserWarning, match="header probe"):
+    with pytest.warns(UserWarning, match="fork probe"):
         assert engine.generate([SYSTEM, USER], [], 8) == "text"
-    assert rec.fork_ats == [0]
+    assert rec.fork_ats == [[]]
 
 
 def test_the_header_is_encoded_once_across_turns():
@@ -224,14 +224,14 @@ def test_the_header_is_encoded_once_across_turns():
     # The renders repeat (they are cheap and text-keyed); the tokenize of the
     # ~50K-token header is what the memo slot has to save.
     assert tokenizer.encoded.count(HEADER) == 1
-    assert rec.fork_ats == [FORK_MIN_TOKENS + 1, FORK_MIN_TOKENS + 1]
+    assert rec.fork_ats == [[FORK_MIN_TOKENS + 1], [FORK_MIN_TOKENS + 1]]
 
 
 def test_the_header_render_is_skipped_when_the_cache_is_disabled():
     engine, rec = _engine(FakeTokenizer())
     rec.enabled = False
     engine.generate([SYSTEM, USER], [], 8)
-    assert rec.fork_ats == [0]
+    assert rec.fork_ats == [[]]
     assert engine._memo.get("header", HEADER) is None
 
 
@@ -261,38 +261,38 @@ def _mlx_free_vlm(monkeypatch, tokenizer) -> tuple[VLMEngine, Recording]:
 def test_vlm_a_leading_system_turn_long_enough_is_the_fork_point(monkeypatch):
     engine, rec = _mlx_free_vlm(monkeypatch, FakeTokenizer())
     engine.generate([SYSTEM, USER], [], 8)
-    assert rec.fork_ats == [FORK_MIN_TOKENS + 1]
+    assert rec.fork_ats == [[FORK_MIN_TOKENS + 1]]
 
 
 def test_vlm_a_short_system_turn_does_not_fork(monkeypatch):
     engine, rec = _mlx_free_vlm(monkeypatch, FakeTokenizer(header_chars=10))
     engine.generate([SYSTEM, USER], [], 8)
-    assert rec.fork_ats == [0]
+    assert rec.fork_ats == [[]]
 
 
 def test_vlm_no_system_turn_means_no_fork(monkeypatch):
     engine, rec = _mlx_free_vlm(monkeypatch, FakeTokenizer())
     engine.generate([USER], [], 8)
-    assert rec.fork_ats == [0]
+    assert rec.fork_ats == [[]]
 
 
 def test_vlm_a_system_only_prompt_does_not_fork(monkeypatch):
     engine, rec = _mlx_free_vlm(monkeypatch, Tolerant())
     engine.generate([SYSTEM], [], 8)
-    assert rec.fork_ats == [0]
+    assert rec.fork_ats == [[]]
 
 
 def test_vlm_a_template_whose_header_is_not_a_token_prefix_does_not_fork(monkeypatch):
     engine, rec = _mlx_free_vlm(monkeypatch, Rewriting())
     engine.generate([SYSTEM, USER, ASSISTANT], [], 8)
-    assert rec.fork_ats == [0]
+    assert rec.fork_ats == [[]]
 
 
 def test_vlm_a_template_that_refuses_the_probe_warns_and_does_not_fork(monkeypatch):
     engine, rec = _mlx_free_vlm(monkeypatch, RefusingProbes())
-    with pytest.warns(UserWarning, match="header probe"):
+    with pytest.warns(UserWarning, match="fork probe"):
         assert engine.generate([SYSTEM, USER], [], 8) == "text"
-    assert rec.fork_ats == [0]
+    assert rec.fork_ats == [[]]
 
 
 def test_vlm_the_header_is_encoded_once_across_turns(monkeypatch):
@@ -302,14 +302,14 @@ def test_vlm_the_header_is_encoded_once_across_turns(monkeypatch):
     assert engine._memo.get("header", HEADER) == [ord(c) for c in HEADER]
     engine.generate([SYSTEM, {"role": "user", "content": "a different brief"}], [], 8)
     assert tokenizer.encoded.count(HEADER) == 1
-    assert rec.fork_ats == [FORK_MIN_TOKENS + 1, FORK_MIN_TOKENS + 1]
+    assert rec.fork_ats == [[FORK_MIN_TOKENS + 1], [FORK_MIN_TOKENS + 1]]
 
 
 def test_vlm_the_header_render_is_skipped_when_the_cache_is_disabled(monkeypatch):
     engine, rec = _mlx_free_vlm(monkeypatch, FakeTokenizer())
     rec.enabled = False
     engine.generate([SYSTEM, USER], [], 8)
-    assert rec.fork_ats == [0]
+    assert rec.fork_ats == [[]]
     assert engine._memo.get("header", HEADER) is None
 
 

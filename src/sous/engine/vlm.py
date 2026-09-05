@@ -258,7 +258,7 @@ class VLMEngine:
 
     def _header_probe(
         self, messages: list[dict], tools: list[dict], stable_ids: list[int]
-    ) -> Callable[[], int] | int:
+    ) -> Callable[[], list[int]] | list[int]:
         """The header boundary — everything the template emits above the first
         user turn's content — as a closure PrefixCache resolves only when this
         turn could actually fork.
@@ -283,9 +283,9 @@ class VLMEngine:
             or messages[0].get("role") != "system"
             or len(stable_ids) < FORK_MIN_TOKENS
         ):
-            return 0
+            return []
 
-        def probe() -> int:
+        def probe() -> list[int]:
             with self._tokenize_lock:
                 renders = [
                     self._prompt([messages[0], user], tools, generation=False) for user in _PROBES
@@ -298,7 +298,8 @@ class VLMEngine:
                 if header_ids is None:
                     header_ids = self._encode(header)
                     self._memo.put("header", header, header_ids)
-            return fork_point(header_ids, stable_ids)
+            at = fork_point(header_ids, stable_ids)
+            return [at] if at else []
 
         return probe
 

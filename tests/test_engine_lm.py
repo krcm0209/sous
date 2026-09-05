@@ -188,8 +188,8 @@ def test_lm_header_probe_matches_a_real_conversation_render():
     ]
     stable = e._ids("stable", msgs, [])
     probe = e._header_probe(msgs, [], stable)
-    # not isinstance(..., int) rather than callable(): the same narrowing, and
+    # not isinstance(..., list) rather than callable(): the same narrowing, and
     # the one ty follows.
-    assert not isinstance(probe, int), "a long system turn must be probed, not refused"
-    assert probe() >= FORK_MIN_TOKENS
+    assert not isinstance(probe, list), "a long system turn must be probed, not refused"
+    assert probe() and probe()[0] >= FORK_MIN_TOKENS
     e.unload()
