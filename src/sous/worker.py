@@ -153,16 +153,21 @@ def _elide_if_needed(
 
 
 def _failure_extra(
-    ex: ToolExecutor, transcript: _Transcript, engine: Engine, elisions: int
+    ex: ToolExecutor,
+    transcript: _Transcript,
+    engine: Engine,
+    elisions: int,
+    owner: threading.Thread,
 ) -> dict:
     """Attached to every terminal store.fail() in run_task so a failed task
     still tells Claude what changed on disk, where to audit, and what the
     prompt cache did — silent, unreviewed file modifications are the worst
-    failure shape here."""
+    failure shape here. `owner` is the task's session thread: the counters
+    are per owner, so the report is this task's reuse and not the gateway's."""
     return {
         "files_changed": [vars(c) for c in ex.changed_files()],
         "transcript_path": str(transcript.path),
-        "prompt_cache": {**engine.prompt_cache_stats(), "elisions": elisions},
+        "prompt_cache": {**engine.prompt_cache_stats(owner=owner), "elisions": elisions},
     }
 
 
@@ -190,9 +195,11 @@ def run_task(
     ex = ToolExecutor(root, config.config_path, data_dir=config.data_dir)
     transcript = _Transcript(config.data_dir / "tasks" / task.id / "transcript.jsonl")
 
-    # Reset before the try too: a stale prefix left resident by whatever task
-    # ran on this engine last must never be reused by this one.
-    engine.reset_prompt_cache()
+    # No reset here. A slot is usable only from the thread that built it, and
+    # this task's session thread is brand new, so nothing resident can be
+    # adopted — and a strict-prefix match would be correct if it could. A
+    # reset here used to wipe the gateway's slot every time a delegated task
+    # ran between two subagent turns.
     # One generation thread for the whole task: the prompt cache lives on
     # that thread's mlx streams, so this is what lets turn N+1 reuse it (#34).
     session = engine.session()
@@ -224,7 +231,7 @@ def run_task(
             if store.is_cancel_requested(task.id):
                 transcript.log(event="cancelled")
                 store.mark_cancelled(
-                    task.id, extra=_failure_extra(ex, transcript, engine, elisions)
+                    task.id, extra=_failure_extra(ex, transcript, engine, elisions, session.thread)
                 )
                 return
             token_count, elided = _elide_if_needed(messages, engine, context.tokens)
@@ -236,7 +243,11 @@ def run_task(
                     f"nothing left to elide"
                 )
                 transcript.log(event="context_overflow", error=reason)
-                store.fail(task.id, reason, extra=_failure_extra(ex, transcript, engine, elisions))
+                store.fail(
+                    task.id,
+                    reason,
+                    extra=_failure_extra(ex, transcript, engine, elisions, session.thread),
+                )
                 return
             # The window bounds prompt PLUS output: with auto sizing the window
             # can BE the model's native maximum, where an unbounded generation
@@ -248,7 +259,11 @@ def run_task(
                     f"window ({context.reason}); no room to generate"
                 )
                 transcript.log(event="context_overflow", error=reason)
-                store.fail(task.id, reason, extra=_failure_extra(ex, transcript, engine, elisions))
+                store.fail(
+                    task.id,
+                    reason,
+                    extra=_failure_extra(ex, transcript, engine, elisions, session.thread),
+                )
                 return
             remaining = max(0.1, deadline - time.monotonic())
             try:
@@ -267,7 +282,11 @@ def run_task(
                     transcript.log(event="budget-exhausted", error=str(e))
                     break
                 transcript.log(event="stalled", error=str(e))
-                store.fail(task.id, str(e), extra=_failure_extra(ex, transcript, engine, elisions))
+                store.fail(
+                    task.id,
+                    str(e),
+                    extra=_failure_extra(ex, transcript, engine, elisions, session.thread),
+                )
                 return
             except Exception as e:
                 # The engine raised something other than a stall (a real
@@ -277,7 +296,7 @@ def run_task(
                 store.fail(
                     task.id,
                     f"engine error: {e}",
-                    extra=_failure_extra(ex, transcript, engine, elisions),
+                    extra=_failure_extra(ex, transcript, engine, elisions, session.thread),
                 )
                 return
             turns += 1
@@ -293,7 +312,7 @@ def run_task(
                     store.fail(
                         task.id,
                         "model-confused: 3 consecutive malformed tool calls",
-                        extra=_failure_extra(ex, transcript, engine, elisions),
+                        extra=_failure_extra(ex, transcript, engine, elisions, session.thread),
                     )
                     return
                 messages.append({"role": "user", "content": FORMAT_REMINDER.format(error=e)})
@@ -304,7 +323,7 @@ def run_task(
                     store.fail(
                         task.id,
                         "model-confused: 3 consecutive turns without a tool call",
-                        extra=_failure_extra(ex, transcript, engine, elisions),
+                        extra=_failure_extra(ex, transcript, engine, elisions, session.thread),
                     )
                     return
                 messages.append({"role": "user", "content": NUDGE})
@@ -320,7 +339,8 @@ def run_task(
                 if store.is_cancel_requested(task.id):
                     transcript.log(event="cancelled")
                     store.mark_cancelled(
-                        task.id, extra=_failure_extra(ex, transcript, engine, elisions)
+                        task.id,
+                        extra=_failure_extra(ex, transcript, engine, elisions, session.thread),
                     )
                     return
                 if call.name == "finish":
@@ -383,7 +403,10 @@ def run_task(
                 "context_tokens": context.tokens,
                 "context_reason": context.reason,
             },
-            "prompt_cache": {**engine.prompt_cache_stats(), "elisions": elisions},
+            "prompt_cache": {
+                **engine.prompt_cache_stats(owner=session.thread),
+                "elisions": elisions,
+            },
             "transcript_path": str(transcript.path),
         }
         transcript.log(event="finished", outcome=outcome)
@@ -391,10 +414,12 @@ def run_task(
     finally:
         # Runs on every exit from the try — normal finish, any early return
         # in the loop, or an exception escaping it. The session thread ends
-        # here; the reset stays on the worker thread, the single reset owner
-        # on every path, so the cache never outlives the task that built it.
+        # here; the retire stays on the worker thread, the single owner of
+        # it on every path, and names the session's thread so only this
+        # task's slots go (the gateway's stay) and a late publish from a
+        # stalled generation on that thread is refused.
         session.close()
-        engine.reset_prompt_cache()
+        engine.reset_prompt_cache(owner=session.thread)
 
 
 def run_worker_loop(

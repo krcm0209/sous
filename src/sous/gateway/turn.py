@@ -66,6 +66,7 @@ class TurnResult:
     cache_hit: bool
     reused_tokens: int
     seconds: float
+    forked: bool = False  # the hit was served by copying a fork slot
 
 
 class TurnRunner:
@@ -121,10 +122,11 @@ class TurnRunner:
                 room = self._window - input_tokens
                 if room <= 0:
                     raise PromptTooLong(input_tokens, self._window)
-                # Hit/miss is for the log only: the counters are global, and a
-                # worker task resetting the cache mid-turn zeroes them, so a hit
-                # can read as a miss. Exact per-turn reuse comes with keyed slots.
-                before = engine.prompt_cache_stats()
+                # Owner-scoped, so the before/after delta is exact: only this
+                # session's thread moves these counters, and the turn holds
+                # the gateway lock, so nothing else's hit or reset can land
+                # between the two reads.
+                before = engine.prompt_cache_stats(owner=session.thread)
                 sink.started(input_tokens)
                 final: Delta | None = None
 
@@ -149,25 +151,27 @@ class TurnRunner:
                 except GenerationStalled:
                     # The session is unusable after a stall (its thread may still
                     # be generating, holding the engine lock); the next turn gets a
-                    # fresh one and waits on the lock like the worker would. Reset
-                    # the cache too: when the abandoned thread finishes it publishes
-                    # the KV cache it built on ITS streams, and a cache is usable
-                    # only from the thread that built it (#34). The reset's epoch
-                    # bump makes that late publish drop itself — the same guard
-                    # run_task's finally relies on.
+                    # fresh one and waits on the lock like the worker would. Retire
+                    # the stalled session's thread too: when the abandoned thread
+                    # finishes it would publish the KV cache it built on ITS
+                    # streams, and a cache is usable only from the thread that
+                    # built it (#34). Retirement makes that late publish drop
+                    # itself, and leaves the worker's slots alone.
+                    stalled = session.thread
                     self._drop_session()
                     # Best-effort: a reset that raises would replace GenerationStalled
                     # with a generic 500 and lose the stall's classification.
                     with contextlib.suppress(Exception):
-                        engine.reset_prompt_cache()
+                        engine.reset_prompt_cache(owner=stalled)
                     raise
-                after = engine.prompt_cache_stats()
+                after = engine.prompt_cache_stats(owner=session.thread)
                 return TurnResult(
                     text=text,
                     input_tokens=input_tokens,
                     output_tokens=final.output_tokens if final else 0,
                     finish_reason=final.finish_reason if final else "stop",
                     cache_hit=after.get("hits", 0) > before.get("hits", 0),
+                    forked=after.get("fork_hits", 0) > before.get("fork_hits", 0),
                     reused_tokens=max(
                         0, after.get("reused_tokens", 0) - before.get("reused_tokens", 0)
                     ),

@@ -81,3 +81,10 @@ def test_vlm_reset_prompt_cache_works_after_unload():
     engine = _unloaded_vlm()
     engine.reset_prompt_cache()  # must not raise
     assert engine.prompt_cache_stats()["hits"] == 0
+
+
+def test_lm_headroom_never_raises_without_mlx(monkeypatch):
+    import sous.engine.base as base
+
+    monkeypatch.setattr(base, "live_headroom", lambda: None)
+    assert _unloaded_lm().headroom() is None

@@ -44,6 +44,19 @@ Claude Code use stretches further — evaluate features against that goal.
   retry. A non-streaming turn's `on_delta` is accounting-only and wrapped in
   `ReplaySafe` (`engine/base.py`), so it still retries cold on a warm-cache
   failure — nothing was sent that a re-run would send twice.
+- Prompt-cache slots (`engine/promptcache.py`) are owned by the thread that
+  built them (#34) and looked up only by that thread. `reset_prompt_cache`
+  and `prompt_cache_stats` take an `owner`: the worker retires its session's
+  thread (`session.thread`) at task end and never calls the bare `reset()`,
+  which drops the gateway's slots too. A `fork` slot is a *copy* taken while
+  a cold turn prefills past the system header (`fork_point`, 4096-token
+  floor) — the header is found by rendering two probe conversations and
+  taking their common prefix, never by rendering the system turn alone,
+  which Qwen3.8's template refuses; a `turn` slot is *moved* into the turn
+  that extends it. Never rewind a cache to make a slot — a hybrid model's
+  recurrent layers cannot.
+  `base.measure_cache_budget`/`live_headroom` deliberately do not call
+  `release_mlx_thread_state()`: they run on threads whose caches are live.
 - The gateway forwards every request it does not serve (`gateway/upstream.py`)
   as a transparent proxy: never re-serialize a forwarded body, never add or
   alter an end-to-end header (only `Host`, the hop-by-hop set and a buffered

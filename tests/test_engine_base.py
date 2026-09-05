@@ -27,6 +27,10 @@ def test_select_backend_text_only():
     assert select_backend({"model_type": "qwen3_moe"}) == "lm"
 
 
+def _cfg(tmp_path, **overrides) -> SousConfig:
+    return SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml", **overrides)
+
+
 def _manager(idle_minutes: int = 30) -> tuple[EngineManager, list]:
     created: list[FakeEngine] = []
 
@@ -195,6 +199,16 @@ def test_managed_engine_forwards_prompt_cache_stats():
     assert ManagedEngine(inner).prompt_cache_stats() == {"hits": 3}
 
 
+def test_managed_engine_forwards_owner_scoped_reset_and_stats():
+    inner = FakeEngine([])
+    managed = ManagedEngine(inner)
+    me = threading.current_thread()
+    managed.reset_prompt_cache(owner=me)
+    managed.prompt_cache_stats(owner=me)
+    assert inner.reset_owners == [me]
+    assert inner.stats_owners == [me]
+
+
 def test_reset_prompt_cache_does_not_wait_for_the_generation_lock():
     """A stalled generation is abandoned while still holding _gen_lock. A reset
     that waited for it would wedge the next task, so it must be lock-free."""
@@ -239,6 +253,15 @@ def test_session_runs_all_generations_on_one_fresh_thread():
     assert not session._thread.is_alive()
     assert inner.generate_threads[0] is inner.generate_threads[1] is session._thread
     assert session._thread is not threading.current_thread()
+
+
+def test_session_exposes_its_thread():
+    inner = FakeEngine(["a"])
+    session = ManagedEngine(inner).session()
+    session.generate([], [], 8, timeout=5)
+    assert inner.generate_threads == [session.thread]
+    session.close()
+    session.join(5)
 
 
 def test_session_releases_mlx_state_once_on_its_own_thread(monkeypatch):
@@ -410,13 +433,18 @@ def test_default_factory_passes_drafter_settings_to_vlm_only(monkeypatch):
     monkeypatch.setattr(vlm_mod, "VLMEngine", FakeVLM)
     monkeypatch.setattr(lm_mod, "LMEngine", FakeLM)
 
+    # Neither fake model config carries KV-cost fields, so cache_budget's
+    # unspecified-auto default falls back to a single slot with a warning —
+    # unrelated to what this test checks, but real _default_factory behavior.
     monkeypatch.setattr(base, "fetch_model_config", lambda _id: {"vision_config": {}})
-    base._default_factory("m", 0.7, 0.8, 20, True, draft_id="z-lab/drafter", draft_block_size=3)
+    with pytest.warns(UserWarning, match="KV cost"):
+        base._default_factory("m", 0.7, 0.8, 20, True, draft_id="z-lab/drafter", draft_block_size=3)
     assert captured["vlm"]["draft_id"] == "z-lab/drafter"
     assert captured["vlm"]["draft_block_size"] == 3
 
     monkeypatch.setattr(base, "fetch_model_config", lambda _id: {"model_type": "qwen3"})
-    base._default_factory("m", 0.7, 0.8, 20, True, draft_id="z-lab/drafter", draft_block_size=3)
+    with pytest.warns(UserWarning, match="KV cost"):
+        base._default_factory("m", 0.7, 0.8, 20, True, draft_id="z-lab/drafter", draft_block_size=3)
     assert "draft_id" not in captured["lm"]
     assert "draft_block_size" not in captured["lm"]
 
@@ -551,3 +579,141 @@ def test_vlm_tokenization_is_serialized(monkeypatch):
     _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
     _stub(monkeypatch, "mlx_vlm.utils", should_add_special_tokens=lambda model_type, proc: True)
     _hammer_ids(VLMEngine("test/model"), tokenizer)
+
+
+# ---- prompt-cache budget plumbing (Phase 3a) --------------------------------
+
+
+def test_status_carries_the_prompt_cache_view_once_loaded(tmp_path):
+    inner = FakeEngine([])
+    inner.stats = {"hits": 1, "slots": 2, "resident_bytes": 3}
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    assert "prompt_cache" not in manager.status()
+    manager.get()
+    assert manager.status()["prompt_cache"] == {"hits": 1, "slots": 2, "resident_bytes": 3}
+
+
+def test_default_factory_threads_the_cache_budget_and_reserve(monkeypatch):
+    """The reserve is one full window of KV at the model's per-token cost, for
+    the larger of the worker's and the gateway's windows."""
+    from sous.engine import base, lm
+
+    seen = {}
+
+    class FakeLM:
+        def __init__(self, model_id, **kw):
+            seen.update(kw)
+
+    monkeypatch.setattr(lm, "LMEngine", FakeLM)
+    monkeypatch.setattr(
+        base,
+        "fetch_model_config",
+        lambda mid: {
+            "model_type": "qwen3",
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+        },
+    )
+    base._default_factory("m", prompt_cache=True, cache_budget=7, reserve_tokens=1000)
+    # 2 (K,V) x 2 layers x 1 head x 8 dim x 2 bytes = 64 B/token
+    assert seen["reserve_bytes"] == 64 * 1000
+    assert seen["cache_budget"] == 7
+
+
+def _mystery_lm(monkeypatch) -> dict:
+    """_default_factory against a model whose KV cost per token is unknown."""
+    from sous.engine import base, lm
+
+    seen = {}
+
+    class FakeLM:
+        def __init__(self, model_id, **kw):
+            seen.update(kw)
+
+    monkeypatch.setattr(lm, "LMEngine", FakeLM)
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"model_type": "mystery"})
+    return seen
+
+
+def test_default_factory_falls_back_to_a_single_slot_when_the_kv_cost_is_unknown(monkeypatch):
+    from sous.engine import base
+
+    seen = _mystery_lm(monkeypatch)
+    with pytest.warns(UserWarning, match="single prompt-cache slot"):
+        base._default_factory("m", prompt_cache=True, cache_budget=None, reserve_tokens=1000)
+    assert (seen["cache_budget"], seen["reserve_bytes"]) == (0, 0)
+
+
+def test_an_explicit_budget_with_an_unknown_kv_cost_still_warns(monkeypatch):
+    """Without a per-token cost there is no reserve, so the pressure check can
+    never fire: the budget cap is the only thing bounding the map. Silence
+    would make that look like a working configuration."""
+    from sous.engine import base
+
+    seen = _mystery_lm(monkeypatch)
+    with pytest.warns(UserWarning, match="memory-pressure check is disabled"):
+        base._default_factory("m", prompt_cache=True, cache_budget=1 << 30, reserve_tokens=1000)
+    assert (seen["cache_budget"], seen["reserve_bytes"]) == (1 << 30, 0)
+
+
+def test_measure_cache_budget_reads_mlxs_numbers(monkeypatch):
+    from sous.engine import base
+    from sous.engine.promptcache import CACHE_BUDGET_SLACK
+
+    _fake_mlx(monkeypatch, info={"max_recommended_working_set_size": 100 + CACHE_BUDGET_SLACK})
+    assert base.measure_cache_budget(30) == 100 - 40 - 30
+
+
+@pytest.mark.parametrize("info", [{}, "raise"])
+def test_measure_cache_budget_degrades_to_a_single_slot_when_mlx_cannot_answer(monkeypatch, info):
+    """An mlx API change must not brick delegation and the gateway: every other
+    reader of these numbers degrades, and so does this one."""
+    from sous.engine import base
+
+    _fake_mlx(monkeypatch, info=info)
+    with pytest.warns(UserWarning, match="could not measure the prompt-cache budget"):
+        assert base.measure_cache_budget(30) == 0
+
+
+def _fake_mlx(monkeypatch, *, info) -> None:
+    """A stand-in mlx.core, for machines with mlx and for CI without it."""
+    import sys
+    import types
+
+    def device_info():
+        if info == "raise":
+            raise RuntimeError("mlx moved")
+        return info
+
+    # SimpleNamespace, not ModuleType: the import machinery takes whatever
+    # sys.modules holds, and attributes set in a constructor keep ty happy.
+    core = types.SimpleNamespace(device_info=device_info, get_active_memory=lambda: 40)
+    monkeypatch.setitem(sys.modules, "mlx", types.SimpleNamespace(core=core))
+    monkeypatch.setitem(sys.modules, "mlx.core", core)
+
+
+def test_engine_manager_passes_the_configured_budget_and_the_larger_window(tmp_path, monkeypatch):
+    from sous.engine import base
+
+    seen = {}
+
+    def factory(model_id, *args, **kw):
+        seen.update(kw)
+        return FakeEngine([])
+
+    monkeypatch.setattr(base, "_default_factory", factory)
+    cfg = _cfg(
+        tmp_path,
+        prompt_cache_gb=1.5,
+        max_context_tokens=32768,
+        gateway_enabled=True,
+        gateway_max_context_tokens=131072,
+    )
+    EngineManager(cfg).get()
+    assert seen["cache_budget"] == int(1.5 * (1 << 30))
+    assert seen["reserve_tokens"] == 131072
+    seen.clear()
+    EngineManager(_cfg(tmp_path, gateway_enabled=False, max_context_tokens=32768)).get()
+    assert seen["cache_budget"] is None  # auto
+    assert seen["reserve_tokens"] == 32768

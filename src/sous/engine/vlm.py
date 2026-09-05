@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import warnings
+from collections.abc import Callable
 from typing import Any, cast
 
 from sous.engine.base import Delta, OnDelta
-from sous.engine.promptcache import PrefixCache, PromptMemo
+from sous.engine.promptcache import FORK_MIN_TOKENS, PrefixCache, PromptMemo, fork_point
+
+# Two conversations that differ only in the first user turn's content, so that
+# what their renders have in common is exactly the header — see _header_probe.
+_PROBES = ({"role": "user", "content": "0"}, {"role": "user", "content": "1"})
 
 
 def _load_quantized_drafter(model: object, draft_id: str) -> tuple[Any, str]:
@@ -46,16 +52,19 @@ class VLMEngine:
         prompt_cache: bool = False,
         draft_id: str = "",
         draft_block_size: int = 0,
+        cache_budget: int | None = None,
+        reserve_bytes: int = 0,
     ):
         from mlx_vlm import load
         from mlx_vlm.sample_utils import make_sampler
+
+        from sous.engine.base import measure_cache_budget
 
         self.model_id = model_id
         self._model, self._processor = load(model_id)
         self._sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
         self._memo = PromptMemo()
         self._tokenize_lock = threading.Lock()
-        self._cache = PrefixCache(self, enabled=prompt_cache)
         self._draft = None
         self._draft_kind = ""
         self._draft_block_size = draft_block_size
@@ -68,6 +77,13 @@ class VLMEngine:
                     f" {model_id} ({e}); generating without it",
                     stacklevel=2,
                 )
+        # Measured after load AND after the drafter, so the weights of both are
+        # inside `active` and the budget is what the machine actually has left.
+        if cache_budget is None:
+            cache_budget = measure_cache_budget(reserve_bytes)
+        self._cache = PrefixCache(
+            self, enabled=prompt_cache, max_bytes=cache_budget, reserve_bytes=reserve_bytes
+        )
 
     def _loaded(self) -> tuple:
         """The (model, processor) pair, or a clear error if already unloaded.
@@ -209,6 +225,13 @@ class VLMEngine:
         # `object`; everything that reaches here is an mx.array.
         return mx.array(cast("mx.array", a))
 
+    def headroom(self) -> int | None:
+        # Imported inside the method so a test can monkeypatch
+        # sous.engine.base.live_headroom and see it take effect here.
+        from sous.engine.base import live_headroom
+
+        return live_headroom()
+
     # ---- Engine ----------------------------------------------------------
 
     def generate(
@@ -219,21 +242,78 @@ class VLMEngine:
         on_delta: OnDelta | None = None,
     ) -> str:
         full_ids = self._ids("full", messages, tools)
-        # The stable render is only an anchor for reuse, and PrefixCache discards
-        # it when disabled — so computing it would cost a whole extra tokenization
-        # per turn for nothing.
-        stable_ids = self._ids("stable", messages, tools) if self._cache.enabled else []
-        return self._cache.generate(stable_ids, full_ids, max_tokens, on_delta)
+        if not self._cache.enabled:
+            # The stable render is only an anchor for reuse, and PrefixCache
+            # discards it when disabled — so computing it (and the header)
+            # would cost extra tokenizations per turn for nothing.
+            return self._cache.generate([], full_ids, max_tokens, on_delta)
+        stable_ids = self._ids("stable", messages, tools)
+        return self._cache.generate(
+            stable_ids,
+            full_ids,
+            max_tokens,
+            on_delta,
+            fork_at=self._header_probe(messages, tools, stable_ids),
+        )
+
+    def _header_probe(
+        self, messages: list[dict], tools: list[dict], stable_ids: list[int]
+    ) -> Callable[[], int] | int:
+        """The header boundary — everything the template emits above the first
+        user turn's content — as a closure PrefixCache resolves only when this
+        turn could actually fork.
+
+        Found from two probe conversations rather than from the system turn
+        rendered alone: [model].id accepts any chat template, and a template
+        may refuse a message list with no user turn outright (the default
+        model's does: `raise_exception("No user query found in messages.")`).
+        Two renders that differ only in the first user turn's content share
+        exactly the header, whatever the template puts there. fork_point still
+        verifies per turn that those ids really are a token prefix of this
+        render, and that the header clears the fork floor.
+
+        Reuse needs the rendered header to match token for token, which in
+        practice means subagents of one type inside one Claude Code session:
+        a new `claude` process puts its own session scratchpad path above the
+        tool schemas, so its header diverges after ~1K tokens. The worker's
+        short system prompt never qualifies, and a render below the floor
+        cannot contain a header above it — so it never pays the probe."""
+        if (
+            len(messages) < 2
+            or messages[0].get("role") != "system"
+            or len(stable_ids) < FORK_MIN_TOKENS
+        ):
+            return 0
+
+        def probe() -> int:
+            with self._tokenize_lock:
+                renders = [
+                    self._prompt([messages[0], user], tools, generation=False) for user in _PROBES
+                ]
+                header = os.path.commonprefix(renders)
+                # Memoized like the other renders: the header is the longest
+                # thing in the prompt, and a conversation re-probes it on every
+                # cold turn.
+                header_ids = self._memo.get("header", header)
+                if header_ids is None:
+                    header_ids = self._encode(header)
+                    self._memo.put("header", header, header_ids)
+            return fork_point(header_ids, stable_ids)
+
+        return probe
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
         return len(self._ids("full", messages, tools))
 
-    def reset_prompt_cache(self) -> None:
-        self._cache.reset()
-        self._memo.clear()
+    def reset_prompt_cache(self, owner: threading.Thread | None = None) -> None:
+        self._cache.reset(owner)
+        # The memo is text-keyed and shared by every caller, so an owner-scoped
+        # reset leaves it alone; only the drop-everything form (unload) clears it.
+        if owner is None:
+            self._memo.clear()
 
-    def prompt_cache_stats(self) -> dict:
-        return self._cache.stats()
+    def prompt_cache_stats(self, owner: threading.Thread | None = None) -> dict:
+        return self._cache.stats(owner)
 
     def unload(self) -> None:
         import gc
