@@ -830,10 +830,15 @@ def test_stats_as_dict_reports_every_counter():
     }
 
 
-def test_stats_add_sums_every_counter():
-    a = PromptCacheStats(hits=1, forks=1)
-    a.add(PromptCacheStats(hits=2, evictions=4))
+def test_stats_add_sums_the_counters_and_maxes_the_snapshot_gauge():
+    a = PromptCacheStats(hits=1, forks=1, snapshot_bytes=64)
+    a.add(PromptCacheStats(hits=2, evictions=4, snapshot_bytes=16))
     assert (a.hits, a.forks, a.evictions) == (3, 1, 4)
+    # snapshot_bytes is assigned per turn, not accumulated: folding owners
+    # together must report the largest one's copy cost, not 80.
+    assert a.snapshot_bytes == 64
+    a.add(PromptCacheStats(snapshot_bytes=100))
+    assert a.snapshot_bytes == 100
 
 
 def test_memo_accepts_the_header_slot():
@@ -897,6 +902,67 @@ def test_default_budget_keeps_exactly_one_slot():
     assert pc.stats()["evictions"] == 1
     pc.generate(A2, A2_FULL, 16)
     assert pc.stats()["misses"] == 3  # A's slot was evicted by B's publish
+
+
+def test_a_fork_the_turn_selected_survives_the_pre_turn_eviction_pass():
+    """The pre-turn cap pass runs after `_take`, and a fork slot stays in the
+    map when it is taken — so the pass must protect it. Otherwise the turn
+    that decided to reuse the shared slot is the very turn that drops it, and
+    no later conversation finds it."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=1)  # tighter than any populated slot
+    planted = h.new_cache()
+    h._advance(planted, len(A1))  # a fork with real bytes, so it is chargeable
+    pc._plant(planted, A1, kind="fork")
+    seen: dict = {}
+
+    def look_while_the_turn_runs(hooks, cache, token_ids, max_tokens):
+        seen["kinds"] = [s.kind for s in pc.slots()]
+        hooks.decoded.append(list(token_ids))
+        return "text"
+
+    h.decode_impl = look_while_the_turn_runs
+    pc.generate(A2, A2_FULL, 16)
+    assert seen["kinds"] == ["fork"]
+    assert pc.stats()["fork_hits"] == 1
+    # Charged like any slot: the publish pass, which protects only the new
+    # turn slot, is what finally evicts it — once, not once before and once
+    # after.
+    assert pc.stats()["evictions"] == 1
+    assert [s.kind for s in pc.slots()] == ["turn"]
+
+
+def test_pressure_eviction_never_holds_the_lock_across_a_headroom_call():
+    """`headroom()` is an engine call (an mlx memory query on a real engine).
+    reset() must never queue behind one: its caller can be the worker's
+    `finally` while a stalled generation still runs, and blocking there wedges
+    the next task."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY, reserve_bytes=1000)
+    reading = threading.Event()
+    release = threading.Event()
+
+    def blocking_headroom() -> int | None:
+        reading.set()
+        release.wait(10)
+        return 5000  # above the reserve, so nothing is evicted either way
+
+    h.headroom = blocking_headroom  # ty: ignore[invalid-assignment]
+    turn = threading.Thread(target=lambda: pc.generate(A1, A1_FULL, 16))
+    turn.start()
+    assert reading.wait(5)
+
+    done = threading.Event()
+
+    def reset_and_report():
+        pc.reset()
+        done.set()
+
+    threading.Thread(target=reset_and_report).start()
+    assert done.wait(2), "reset() blocked behind the engine's headroom() call"
+    release.set()
+    turn.join(5)
+    assert not turn.is_alive()
 
 
 def test_slot_count_is_capped():

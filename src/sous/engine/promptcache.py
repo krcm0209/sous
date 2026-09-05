@@ -197,8 +197,18 @@ class PromptCacheStats:
         return dataclasses.asdict(self)
 
     def add(self, other: PromptCacheStats) -> None:
+        """Fold `other`'s counters into these.
+
+        Every field is a running count and sums — except `snapshot_bytes`,
+        which is a gauge assigned per turn (the last non-trimmable turn's copy
+        cost). Summing it would make the daemon-wide view grow with the number
+        of owners rather than report a size, so the largest reading wins.
+        """
         for f in dataclasses.fields(self):
-            setattr(self, f.name, getattr(self, f.name) + getattr(other, f.name))
+            mine, theirs = getattr(self, f.name), getattr(other, f.name)
+            setattr(
+                self, f.name, max(mine, theirs) if f.name == "snapshot_bytes" else mine + theirs
+            )
 
 
 _MEMO_SLOTS = ("stable", "full", "header")
@@ -244,7 +254,10 @@ class CacheHooks(Protocol):
     def copy_array(self, a: object) -> object: ...
     # Bytes the machine can still give a cache right now, or None when it
     # cannot tell (no mlx). Read on the owner thread; must not release thread
-    # state.
+    # state. Called with no cache lock held and must take none of its own: the
+    # cache's promise that reset() never waits on a generation rests on its
+    # bookkeeping lock covering list and dict work alone, and this is the one
+    # engine call the eviction path makes.
     def headroom(self) -> int | None: ...
 
 
@@ -318,7 +331,9 @@ class PrefixCache:
         self._retired: weakref.WeakSet[threading.Thread] = weakref.WeakSet()
         self._epoch = 0
 
-    # ---- bookkeeping (call with self._lock held) ----------------------------
+    # ---- bookkeeping (the helpers up to _take want self._lock held; each of
+    # the entry points after it says in its docstring what it does with the
+    # lock, and _evict_pressure must NOT be called holding it) ---------------
 
     def _sweep(self) -> None:
         """Drop what dead threads left: their arrays lived on streams that no
@@ -346,7 +361,7 @@ class PrefixCache:
         self._stats_for(victim.owner).evictions += 1
         # `victim` dies with this frame: the slot's cache is freed the moment
         # nothing else references it, which is what the pressure re-read in
-        # _evict relies on.
+        # _evict_pressure relies on.
 
     def _evict_caps(self, protect: Slot | None) -> None:
         """Bring the map under its count and byte caps, never touching
@@ -356,17 +371,6 @@ class PrefixCache:
             len(self._slots) > MAX_SLOTS or self._resident() > self.max_bytes
         ):
             self._drop_lru(protect)
-
-    def _evict(self, protect: Slot) -> None:
-        """Bring the map under its caps, then under memory pressure, never
-        touching `protect` — the slot just published. A turn's own slot is
-        never evicted by its own publish: on a machine with room for exactly
-        one slot, that one still survives."""
-        self._evict_caps(protect)
-        headroom = self._hooks.headroom()
-        while headroom is not None and headroom < self.reserve_bytes and self._evictable(protect):
-            self._drop_lru(protect)
-            headroom = self._hooks.headroom()
 
     def _take(self, owner: threading.Thread, stable_ids: list[int]) -> Slot | None:
         """The longest slot `owner` holds that `stable_ids` strictly extends.
@@ -387,19 +391,46 @@ class PrefixCache:
 
     def _publish(self, slot: Slot, epoch: int) -> bool:
         """Add `slot` unless the world moved on: a full reset since the turn
-        began, or the owner retired (its task ended) while it generated."""
+        began, or the owner retired (its task ended) while it generated.
+
+        The caps are applied under the same lock as the append — nothing must
+        ever observe the map over budget — but the pressure pass runs after
+        the lock is released, because it asks the engine for a reading. Both
+        protect `slot`: a turn's own slot is never evicted by its own publish,
+        so on a machine with room for exactly one slot, that one survives.
+        """
         with self._lock:
             if epoch != self._epoch or slot.owner in self._retired:
                 return False
             self._slots.append(slot)
-            self._evict(protect=slot)
-            return True
+            self._evict_caps(protect=slot)
+        self._evict_pressure(protect=slot)
+        return True
 
-    def _plant(self, cache: list, held: list[int]) -> None:
-        """Test seam: publish a turn slot for the calling thread directly."""
+    def _evict_pressure(self, protect: Slot | None) -> None:
+        """Shrink the map until the machine has `reserve_bytes` free again,
+        never touching `protect` — the slot just published.
+
+        Takes the lock one drop at a time instead of holding it across the
+        loop, because `headroom()` is an engine call (an mlx memory query, on
+        a real engine). The bookkeeping lock covers list and dict work only;
+        that is the whole reason reset() can promise never to wait on a
+        generation, and it would stop being true the moment an engine call ran
+        underneath it. Dropping the lock between readings is safe: every
+        iteration re-reads both the headroom and the map, so a concurrent
+        publish or reset just changes what the next pass sees.
+        """
+        while (headroom := self._hooks.headroom()) is not None and headroom < self.reserve_bytes:
+            with self._lock:
+                if not self._evictable(protect):
+                    return
+                self._drop_lru(protect)
+
+    def _plant(self, cache: list, held: list[int], kind: str = "turn") -> None:
+        """Test seam: publish a slot for the calling thread directly."""
         with self._lock:
             self._slots.append(
-                Slot(cache, list(held), threading.current_thread(), "turn", slot_bytes(cache))
+                Slot(cache, list(held), threading.current_thread(), kind, slot_bytes(cache))
             )
 
     # ---- public --------------------------------------------------------------
@@ -423,6 +454,10 @@ class PrefixCache:
         """
         with self._lock:
             if owner is None:
+                # `_retired` is deliberately kept: a retired owner stays
+                # retired for the rest of its life. Every owner is a per-task
+                # session thread or a dropped gateway session — never reused,
+                # so there is nothing to un-retire and much to get wrong.
                 self._epoch += 1
                 self._slots = []
                 self._owner_stats = {}
@@ -507,8 +542,11 @@ class PrefixCache:
             # default budget of 0 this is what releases the previous turn's
             # cache before a miss rebuilds one. Only the caps, not the
             # pressure reading — headroom is read once the turn's own cache is
-            # real and its cost visible, which is at publish.
-            self._evict_caps(protect=None)
+            # real and its cost visible, which is at publish. A taken turn slot
+            # is already out of the map and needs no protection; a taken fork
+            # slot is not, and dropping the very slot this turn just chose to
+            # share would defeat the point of having forked it.
+            self._evict_caps(protect=slot if slot is not None and slot.kind == "fork" else None)
         if slot is not None:
             reuse = len(slot.held)
             if slot.kind == "fork":
