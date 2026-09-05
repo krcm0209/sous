@@ -1516,14 +1516,14 @@ def test_the_probe_is_resolved_on_warm_turns_too():
 
 def test_a_budget_for_one_copy_skips_the_second_boundary_rather_than_evicting_into_it():
     """The second copy of a cold turn is charged with the first protected: a
-    budget with room for exactly one fork keeps the tools fork (the one every
-    later session can use) and never allocates the header copy. Without the
-    protection LRU would pick the tools fork — the only evictable slot — and
-    the turn would end with the less shareable of the two."""
+    budget with room for exactly one fork copy keeps the tools fork (the one
+    every later session can use) and never allocates the header copy. Without
+    the protection LRU would pick the tools fork — the only evictable slot —
+    evict it, and publish the header fork instead."""
     seen: list[list[list[int]]] = []
     h = FakeHooks(trimmable=True)
     h.on_new_cache = lambda: seen.append([s.held for s in pc.slots() if s.kind == "fork"])
-    pc = PrefixCache(h, max_bytes=TOOLS_AT * 8 * 2)  # exactly the tools copy, two layers
+    pc = PrefixCache(h, max_bytes=len(HA) * 8 * 2)  # exactly the header copy, two layers
     pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
     assert pc.stats()["forks"] == 1
     # Two allocations only — the turn's own cache and the tools copy. No
