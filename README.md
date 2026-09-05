@@ -222,13 +222,16 @@ turn gives up, stated plainly:
   ignored; the daemon's `[model]` sampler applies. Images and documents in
   messages become a one-line `[image omitted: sous serves text only]`
   placeholder.
-- **One turn at a time, one cache slot.** Local turns are serialized behind
-  the same lock as delegated tasks, and the prompt cache has one slot. In
-  hybrid mode only subagent turns reach the local model, so a subagent's
-  consecutive turns reuse it (turn 2 of a 57k-token prompt prefills only the
-  new tokens); a delegated task running at the same time, or two subagents
-  interleaving, evicts it and every turn on both sides is a cold prefill.
-  Keyed cache slots come later.
+- **One turn at a time; keyed prompt-cache slots.** Local turns are serialized
+  behind the same lock as delegated tasks. The prompt cache keeps one slot per
+  resident conversation (bounded by `[model].prompt_cache_gb`), so a subagent's
+  consecutive turns reuse their own slot, two subagents interleaving reuse
+  theirs, and a delegated task running in between no longer evicts anything.
+  A new subagent of a type seen before starts from a *fork*: a copy of the
+  cache taken where its predecessor's system prompt and tool schemas end
+  (~50K tokens for a Claude Code subagent), so its first turn prefills only
+  its own brief — seconds instead of minutes. Two subagents still run one at
+  a time; batching is a later phase.
 - **A client that disconnects does not stop the model.** A local turn runs to
   completion (so the next request never waits on a wedged lock); aborting
   mid-generation comes with batching, later. A forwarded stream, by contrast,
@@ -236,7 +239,7 @@ turn gives up, stated plainly:
 
 Each `/v1/messages` turn served locally logs one metadata-only line to the
 daemon's stderr — method, model, stream flag, status, token counts, stop
-reason, cache hit/miss, seconds — plus one line naming the Anthropic tool
+reason, cache `hit`/`fork`/`miss` (`fork`: the turn started from a copied header slot), seconds — plus one line naming the Anthropic tool
 *types* it dropped, when any. Each forwarded request logs one line too:
 `upstream`, method, path, the model id when the body named one, the
 upstream's status, and seconds to its headers. The daemon also disables
@@ -260,6 +263,7 @@ id = "mlx-community/Qwen3.8-27B-4bit"
 idle_unload_minutes = 30
 max_context_tokens = 32768
 prompt_cache = true
+prompt_cache_gb = "auto"  # resident cache slots beyond the running turn; a number of GiB, or 0 for one slot
 temperature = 0.7
 top_p = 0.8
 top_k = 20
@@ -340,13 +344,28 @@ discards the cache, and elision fires only when the prompt exceeds the window,
 a window the task never reaches means the cache survives the whole task. The
 shipped default is `fixed` at 32768 tokens.
 
-`[model].prompt_cache` (default `true`) reuses one KV cache across the turns
-of a task, prefilling only what the conversation gained instead of the whole
-thing every turn. All of a task's generations run on one worker-owned thread
-so the cache survives between turns; measured on the default model in one
-process, six growing turns took 29.5s warm against 77s cold, with per-turn
+`[model].prompt_cache` (default `true`) reuses a KV cache across the turns of a
+conversation, prefilling only what the conversation gained instead of the
+whole thing every turn. All of a task's generations run on one worker-owned
+thread so the cache survives between turns; measured on the default model in
+one process, six growing turns took 29.5s warm against 77s cold, with per-turn
 time flat instead of growing. Set it to `false` to prefill every turn from
 scratch.
+
+`[model].prompt_cache_gb` (default `"auto"`) bounds the caches kept resident
+*beyond* the turn that is running: one slot per conversation, plus one *fork*
+slot per distinct system prompt long enough to be worth copying (4096 tokens
+or more) — the ~50K-token header every Claude Code subagent of one type
+shares. `"auto"` is what Metal's recommended working set has left once the
+weights, one full context window of KV (the larger of `[model]`'s and
+`[gateway]`'s) and 2 GiB of slack are paid for — about 27 GiB on a 64 GB
+machine with the default model and gateway window, room for several
+conversations. Slots are evicted least-recently-used first when the budget,
+a count of 16, or live memory pressure says so; the conversation that just
+ran is never evicted by its own turn, so `0` means exactly one slot (the
+pre-3a behaviour) and a 32 GB machine degrades to that on its own.
+`server_status` reports `prompt_cache` — slots, resident bytes, hits, fork
+hits, evictions — counts only.
 
 `temperature`/`top_p`/`top_k` control the worker's sampler (Qwen's own
 documented non-thinking-mode defaults). Greedy decoding (temperature 0)
@@ -482,7 +501,8 @@ that Qwen3 emits and the hermes JSON format used by other MLX models.
   exercises the plumbing, not model competence. The real-model runs above are
   the meaningful end-to-end evidence.
 - Gateway mode (experimental) serves one local turn at a time on a
-  single-slot prompt cache, drops Anthropic server-side and built-in tool
+  keyed prompt cache (one slot per conversation plus header forks, budgeted
+  by `[model].prompt_cache_gb`), drops Anthropic server-side and built-in tool
   types from local turns (the ones that carry no client-supplied schema),
   ignores request-level sampling and thinking, and finishes a local turn
   even after the client hangs up. It serves the model ids in

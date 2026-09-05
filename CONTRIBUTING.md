@@ -145,13 +145,12 @@ setting is global and would cap the frontier main loop.
 `API_TIMEOUT_MS` covers model load plus a long prefill; `--disallowedTools
 LSP` keeps a language server from appending its schema mid-session and
 re-prefilling the whole conversation. Watch `~/.sous/daemon.log` for the
-`sous gateway:` lines. Expect every turn here to report `cache=miss`: a
-whole-session-local run interleaves Claude Code's small background queries
-with the main loop, and the single prompt-cache slot holds only the most
-recent prompt, so each ~80K-token main turn re-prefills from cold (minutes,
-not seconds). That thrash is why the endpoint is built for subagents, whose
-turns run back to back and reuse the slot; keyed slots that would fix the
-whole-session case are a later phase.
+`sous gateway:` lines. Expect the main loop's turns to report `cache=hit` after
+the first: Claude Code's small background queries (titles, suggestions) get
+slots of their own instead of evicting the main loop's, and each `~80K`-token
+main turn prefills only what the conversation gained. A subagent spawned
+mid-session reports `cache=fork` on its first turn when an earlier subagent of
+the same type already prefilled that header, `cache=miss` otherwise.
 
 To verify *forwarding* rather than the endpoint, `sous claude` plus
 `~/.sous/daemon.log` is enough: every forwarded request logs an `upstream
