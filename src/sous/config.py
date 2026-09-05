@@ -244,6 +244,11 @@ def _prompt_cache_gb(model: dict) -> float | None:
         # infinite budget reaches EngineManager as int(inf * (1 << 30)) —
         # an OverflowError out of engine load rather than a bad budget.
         or not math.isfinite(value)
+        # The scaled value has to be finite too, not just the value: 1e308 is
+        # a finite float whose product with 1 << 30 is not, so it would reach
+        # EngineManager as the same int(inf) OverflowError. Test what the
+        # engine will actually compute.
+        or not math.isfinite(value * (1 << 30))
         or value < 0
     ):
         warnings.warn(

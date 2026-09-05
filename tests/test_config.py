@@ -312,7 +312,7 @@ def test_prompt_cache_gb_zero_means_a_single_slot(tmp_path: Path):
     assert cfg.prompt_cache_gb == 0.0
 
 
-@pytest.mark.parametrize("bad", ["-1", "true", "'lots'", "nan", "inf", "-inf"])
+@pytest.mark.parametrize("bad", ["-1", "true", "'lots'", "nan", "inf", "-inf", "1e308"])
 def test_prompt_cache_gb_rejects_garbage_with_a_warning(tmp_path: Path, bad: str):
     p = tmp_path / "config.toml"
     p.write_text(f"[model]\nprompt_cache_gb = {bad}\n")
