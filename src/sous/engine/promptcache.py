@@ -631,15 +631,35 @@ class PrefixCache:
             # slot is not, and dropping the very slot this turn just chose to
             # share would defeat the point of having forked it.
             self._evict_caps(protect=slot if slot is not None and slot.kind == "fork" else None)
+        warm: list | None = None
+        if slot is not None and slot.kind == "fork":
+            # The slot stays for the next conversation; this turn works on its
+            # own copy. Taking that copy is part of the warm optimization, so
+            # a failure here degrades to a cold prefill rather than failing
+            # the turn — the same rule the warm-retry and header-probe paths
+            # follow. Nothing has been emitted at this point, so unlike a
+            # mid-generation failure there is no replay to weigh. The slot
+            # itself is untouched (a fork is never removed by `_take`), so the
+            # next conversation still finds it.
+            try:
+                warm = hooks.new_cache()
+                fork_copy(slot.cache, warm, hooks.copy_array)
+            except Exception as e:
+                warnings.warn(
+                    f"sous prompt cache: fork clone failed ({type(e).__name__}); prefilling cold",
+                    stacklevel=2,
+                )
+                # Drop the half-built copy before the cold cache is allocated,
+                # and take the miss branch below: this is not a hit, and
+                # `cold_retries` is not the counter for it either — that one
+                # means a warm run that failed after it had started.
+                warm = None
+                slot = None
+            else:
+                stats.fork_hits += 1
         if slot is not None:
             reuse = len(slot.held)
-            if slot.kind == "fork":
-                # The slot stays for the next conversation; this turn works
-                # on its own copy.
-                warm: list = hooks.new_cache()
-                fork_copy(slot.cache, warm, hooks.copy_array)
-                stats.fork_hits += 1
-            else:
+            if warm is None:
                 warm = slot.cache
             stats.hits += 1
             stats.reused_tokens += reuse
@@ -746,19 +766,36 @@ class PrefixCache:
             # than a second cache the machine has no room for.
             price = slot_bytes(cache)
             if price <= self.max_bytes:
-                self._make_room(price)
-                copy = hooks.new_cache()
-                fork_copy(cache, copy, hooks.copy_array)
-                if self._publish(
-                    Slot(copy, list(stable_ids[:boundary]), owner, "fork", slot_bytes(copy)), epoch
-                ):
-                    stats.forks += 1
-                # A publish can still refuse the slot — a reset since the turn
-                # began, or the owner retired mid-turn — and a refused copy
-                # must not stay pinned by this frame for the whole decode that
-                # follows. (An accepted one is never evicted by its own
-                # publish: _publish protects the slot it adds.)
-                del copy
+                copy: list | None = None
+                try:
+                    self._make_room(price)
+                    copy = hooks.new_cache()
+                    fork_copy(cache, copy, hooks.copy_array)
+                    if self._publish(
+                        Slot(copy, list(stable_ids[:boundary]), owner, "fork", slot_bytes(copy)),
+                        epoch,
+                    ):
+                        stats.forks += 1
+                except Exception as e:
+                    # The fork is an optimization on a turn that is already
+                    # prefilled to the boundary and needs nothing more from
+                    # it. Saying so explicitly matters here: only a cold
+                    # attempt forks, so `reuse` is 0 and `generate`'s handler
+                    # re-raises instead of retrying — an exception escaping
+                    # this block would fail a viable generation.
+                    warnings.warn(
+                        f"sous prompt cache: fork copy failed ({type(e).__name__}); "
+                        "continuing without a fork",
+                        stacklevel=2,
+                    )
+                finally:
+                    # A publish can still refuse the slot — a reset since the
+                    # turn began, or the owner retired mid-turn — and neither a
+                    # refused nor a half-built copy may stay pinned by this
+                    # frame for the whole decode that follows. (An accepted one
+                    # is never evicted by its own publish: _publish protects
+                    # the slot it adds.)
+                    copy = None
         if all_trimmable(cache):
             # Everything rewinds, so (the rest of) prefill and decode fuse into
             # one pass and the generation block plus the generated tokens are

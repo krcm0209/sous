@@ -314,6 +314,9 @@ class FakeHooks:
         # Injected rather than monkeypatched: assigning over a bound method makes
         # ty report invalid-assignment, and ty checks the tests too.
         self.decode_impl = decode_impl
+        # Same seam for array copies, so a test can fail the one allocation a
+        # fork is made of without failing anything else.
+        self.copy_impl = None
         # Fires on every allocation, so a test can see the map at that instant
         # — the fork copy is charged before it is allocated, not after.
         self.on_new_cache = None
@@ -358,6 +361,8 @@ class FakeHooks:
         return "text"
 
     def copy_array(self, a):
+        if self.copy_impl is not None:
+            return self.copy_impl(self, a)
         return copy_array(a)
 
     def headroom(self):
@@ -1245,6 +1250,61 @@ def test_a_cold_retry_still_forks():
         pc.generate(C2, C2_FULL, 16, fork_at=FORK)
     assert pc.stats()["forks"] == 1
     assert pc.stats()["cold_retries"] == 1
+
+
+def _fail_next_copy(h: FakeHooks) -> None:
+    """Make the very next array copy raise, once. A fork's copy is the first
+    one any turn takes — snapshot's, on the non-trimmable path, comes after
+    the whole fork block."""
+
+    def impl(hooks, a):
+        hooks.copy_impl = None
+        raise RuntimeError("out of memory")
+
+    h.copy_impl = impl
+
+
+@pytest.mark.parametrize("trimmable", [True, False])
+def test_a_failed_fork_copy_degrades_to_a_turn_without_one(trimmable):
+    """The fork is an optimization on a turn that is already prefilled to the
+    boundary: losing it must cost the fork, not the generation. `reuse` is 0
+    on the forking path, and generate re-raises rather than retrying there."""
+    h = FakeHooks(trimmable=trimmable)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    _fail_next_copy(h)
+    with pytest.warns(UserWarning, match="fork copy failed"):
+        assert pc.generate(C1, C1_FULL, 16, fork_at=FORK) == "text"
+    assert pc.stats()["forks"] == 0
+    # The turn slot still lands, and the decode continued from the boundary
+    # exactly as it would have if the fork had been refused for budget.
+    assert [(s.kind, s.held) for s in pc.slots()] == [("turn", C1)]
+    assert h.prefilled[0] == H
+    if trimmable:
+        assert h.decoded[-1] == C1_FULL[FORK:]
+    else:
+        assert h.prefilled[1] == C1[FORK:]
+
+
+def test_a_failed_fork_clone_prefills_cold_and_leaves_the_fork_resident():
+    """Cloning a resident fork on a hit is the warm optimization, and nothing
+    has been emitted when it runs — so a failure is a miss, not a failed
+    turn, and the slot the next conversation wants is untouched."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    before = pc.stats()
+    _fail_next_copy(h)
+    with pytest.warns(UserWarning, match="fork clone failed"):
+        assert pc.generate(C2, C2_FULL, 16, fork_at=FORK) == "text"
+    after = pc.stats()
+    assert after["hits"] == before["hits"]
+    assert after["fork_hits"] == before["fork_hits"]
+    assert after["misses"] == before["misses"] + 1
+    assert h.decoded[-1] == C2_FULL  # the whole prompt, cold
+    assert [s.held for s in pc.slots() if s.kind == "fork"] == [H]
+    # And the fork is still usable: a third conversation clones it.
+    pc.generate(C3, C3_FULL, 16, fork_at=FORK)
+    assert pc.stats()["fork_hits"] == before["fork_hits"] + 1
 
 
 def test_a_fork_is_not_taken_when_the_fork_exists_but_this_turn_missed_it():
