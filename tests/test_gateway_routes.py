@@ -685,6 +685,28 @@ def test_log_lines_carry_metadata_only(tmp_path: Path, capsys):
     assert "a reply" not in err
 
 
+def test_the_log_says_cache_fork_when_the_turn_started_from_a_copy(tmp_path: Path, capsys):
+    """miss / hit / fork are three distinct outcomes for a turn, and only the
+    log distinguishes them: a fork is a hit that cost a header copy."""
+    inner = FakeEngine(["a reply", "another reply"])
+    inner.stats = {"hits": 0, "fork_hits": 0, "reused_tokens": 0}
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 2:  # the second turn is served by copying a fork slot
+            inner.stats = {"hits": 1, "fork_hits": 1, "reused_tokens": 4000}
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    app = _app(tmp_path, inner)
+    assert _post(app, _body()).status_code == 200
+    assert _post(app, _body()).status_code == 200
+    lines = [line for line in capsys.readouterr().err.splitlines() if "POST /v1/messages" in line]
+    assert "cache=miss" in lines[0]
+    assert "cache=fork" in lines[1]
+
+
 def test_mounting_pins_the_sse_logger_above_debug(tmp_path: Path, monkeypatch):
     """sse-starlette logs every frame it sends at DEBUG — the model's reply,
     verbatim. Mounting the gateway pins that logger, so the no-bodies rule does

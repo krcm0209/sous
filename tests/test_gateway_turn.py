@@ -253,6 +253,34 @@ def test_a_stall_drops_the_session_and_the_next_turn_gets_a_new_one(tmp_path: Pa
     assert inner.generate_threads[0] is not inner.generate_threads[1]
 
 
+def test_a_stall_retires_the_dropped_sessions_thread_not_everything(tmp_path: Path):
+    """The stall retires the abandoned session's own thread, so its late
+    publish drops itself — and only its slots go. A worker task's slots
+    belong to a thread this turn knows nothing about and must survive."""
+    gate = threading.Event()
+    generated = threading.Event()
+
+    class Gated(FakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            gate.wait(10)
+            try:
+                return super().generate(messages, tools, max_tokens, on_delta)
+            finally:
+                # Only now has the abandoned thread recorded itself, which is
+                # what the test compares the retire's owner against.
+                generated.set()
+
+    inner = Gated(["late"])
+    runner, _ = _runner(tmp_path, inner)
+    runner._timeout = 0.1
+    with pytest.raises(GenerationStalled):
+        runner.run(MSGS, [], 100, RecordingSink())
+    gate.set()  # the stalled thread finishes and releases the engine lock
+    assert generated.wait(5)
+    stalled_thread = inner.generate_threads[0]
+    assert inner.reset_owners == [stalled_thread]  # the first session's thread, not None
+
+
 def test_a_turn_abandoned_while_queued_never_generates(tmp_path: Path):
     """Drain-to-completion covers a generation that started. One whose client
     left while it was still waiting for the lock must not start."""
@@ -329,22 +357,29 @@ def test_count_tokens_uses_the_engine_and_releases(tmp_path: Path, monkeypatch):
     assert released == [True]
 
 
-def test_cache_hit_is_reported_from_the_engines_counters(tmp_path: Path):
-    inner = FakeEngine(["a", "b"])
-    inner.stats = {"hits": 0, "reused_tokens": 0}
+def test_cache_hit_is_reported_from_the_sessions_own_counters(tmp_path: Path):
+    inner = FakeEngine(["a", "b", "c"])
+    inner.stats = {"hits": 0, "fork_hits": 0, "reused_tokens": 0}
     runner, _ = _runner(tmp_path, inner)
-
-    # Simulate the engine's stats moving during the second turn.
     original = inner.generate
 
+    # Simulate the engine's stats moving during the second and third turns.
     def generate(messages, tools, max_tokens, on_delta=None):
         out = original(messages, tools, max_tokens, on_delta)
         if len(inner.calls) == 2:
-            inner.stats = {"hits": 1, "reused_tokens": 900}
+            inner.stats = {"hits": 1, "fork_hits": 0, "reused_tokens": 900}
+        if len(inner.calls) == 3:
+            inner.stats = {"hits": 2, "fork_hits": 1, "reused_tokens": 900 + 4000}
         return out
 
     inner.generate = generate  # ty: ignore[invalid-assignment]
     first = runner.run(MSGS, [], 100, RecordingSink())
     second = runner.run(MSGS, [], 100, RecordingSink())
-    assert (first.cache_hit, first.reused_tokens) == (False, 0)
-    assert (second.cache_hit, second.reused_tokens) == (True, 900)
+    third = runner.run(MSGS, [], 100, RecordingSink())
+    assert (first.cache_hit, first.forked, first.reused_tokens) == (False, False, 0)
+    assert (second.cache_hit, second.forked, second.reused_tokens) == (True, False, 900)
+    assert (third.cache_hit, third.forked, third.reused_tokens) == (True, True, 4000)
+    # Every read named the gateway session's thread: exact per-turn deltas,
+    # unaffected by a worker task's counters or resets.
+    session_thread = inner.generate_threads[0]
+    assert inner.stats_owners and all(o is session_thread for o in inner.stats_owners)

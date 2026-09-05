@@ -17,6 +17,8 @@ class FakeEngine:
         self.unloaded = False
         self.resets = 0
         self.stats: dict = {}
+        self.reset_owners: list[threading.Thread | None] = []
+        self.stats_owners: list[threading.Thread | None] = []
         # Which thread ran each call: the per-task-thread design (issue #34)
         # is pinned on these. Thread objects, not idents — idents recycle.
         self.generate_threads: list[threading.Thread] = []
@@ -52,11 +54,13 @@ class FakeEngine:
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
         return sum(len(str(m)) for m in messages) // 4
 
-    def reset_prompt_cache(self) -> None:
+    def reset_prompt_cache(self, owner: threading.Thread | None = None) -> None:
         self.resets += 1
         self.reset_idents.append(threading.get_ident())
+        self.reset_owners.append(owner)
 
-    def prompt_cache_stats(self) -> dict:
+    def prompt_cache_stats(self, owner: threading.Thread | None = None) -> dict:
+        self.stats_owners.append(owner)
         return dict(self.stats)
 
     def unload(self) -> None:

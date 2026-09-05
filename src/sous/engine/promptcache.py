@@ -8,10 +8,13 @@ a fake cache layer can exercise it. Array copies arrive through an injected
 
 from __future__ import annotations
 
+import dataclasses
 import threading
+import time
 import warnings
+import weakref
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from sous.engine.base import Delta, OnDelta, ReplaySafe
@@ -26,14 +29,16 @@ def reuse_length(cached_ids: Sequence[int], new_ids: Sequence[int]) -> int:
     required rather than incidental: mlx rejects an empty prompt, so an exact
     match must count as a miss.
     """
-    if not cached_ids or len(new_ids) <= len(cached_ids):
+    n = len(cached_ids)
+    if not n or len(new_ids) <= n:
         return 0
-    # strict=False is deliberate: the lengths differ by design. ruff selects B,
-    # so B905 requires the flag to be explicit either way.
-    for a, b in zip(cached_ids, new_ids, strict=False):
-        if a != b:
-            return 0
-    return len(cached_ids)
+    # A slice comparison runs in C. With up to MAX_SLOTS candidate slots of
+    # ~50K tokens each to test per turn, a Python loop here would cost tens
+    # of milliseconds on every lookup. Both operands are lists in practice
+    # (that is what the memo and every Slot hold), and re-wrapping them would
+    # add two ~50K-element copies per candidate to save a type check.
+    head = new_ids[:n] if isinstance(new_ids, list) else list(new_ids[:n])
+    return n if head == (cached_ids if isinstance(cached_ids, list) else list(cached_ids)) else 0
 
 
 def all_trimmable(cache: Sequence[Any]) -> bool:
@@ -108,29 +113,115 @@ def trim_to(cache: Sequence[Any], n_tokens: int) -> None:
             c.trim(current - n_tokens)
 
 
+# A header shorter than this is not worth a fork slot: prefilling it costs
+# under a second on the default model, and a fork is a full second copy of its
+# KV. The worker's ~2K-token system prompt never qualifies; a Claude Code
+# subagent's ~50K one always does.
+FORK_MIN_TOKENS = 4096
+# A sanity bound on the slot count. Finished subagent conversations are what
+# fills the map, and LRU eviction discards those first; the byte budget is the
+# real limit.
+MAX_SLOTS = 16
+# Kept free beyond weights, resident slots and the in-flight turn's own cache
+# when the budget is derived automatically: drafter activations, mlx's
+# allocator slack, the tokenizer.
+CACHE_BUDGET_SLACK = 2 << 30
+
+
+def fork_point(header_ids: Sequence[int], stable_ids: Sequence[int]) -> int:
+    """Where a turn may fork a shared-prefix slot: the header's length when the
+    header is a strict token prefix of the stable render and long enough to be
+    worth a copy, else 0.
+
+    `reuse_length` is the test on purpose: [model].id accepts any chat
+    template, and whether "the system turn rendered alone" is a token prefix
+    of "the whole conversation rendered" is a property of that template and
+    tokenizer. It is verified here every turn, never assumed.
+    """
+    n = len(header_ids)
+    if n < FORK_MIN_TOKENS or reuse_length(header_ids, stable_ids) != n:
+        return 0
+    return n
+
+
+def slot_bytes(cache: Sequence[Any]) -> int:
+    """Bytes a cache holds resident: every layer's `nbytes`. For a KVCache that
+    is the whole allocated buffer, 256-step padding and the trimmed-off
+    generation region included — the truth about residency, and an upper
+    bound."""
+    return sum(int(getattr(c, "nbytes", 0) or 0) for c in cache)
+
+
+def fork_copy(src: Sequence[Any], dst: Sequence[Any], copy_array: Callable) -> None:
+    """Make `dst` — a fresh cache of the same layout — hold exactly what `src`
+    holds now, as an independent copy.
+
+    Every layer's `state` is copied array by array and `meta_state` carried
+    over: that pair is what mlx's own `_BaseCache.from_state` rebuilds a layer
+    from, so it is complete for every cache class mlx ships. A KVCache's
+    `state` getter slices keys/values to the current offset, so the copy
+    materialises just that many tokens (no step padding) and the setter
+    derives the offset from the copied shape. Unlike `snapshot`, which records
+    only an offset for a layer it will later restore in place, a fork must
+    copy the attention layers too — it is a second cache, not a bookmark.
+
+    Callers fork only after a prefill of at least FORK_MIN_TOKENS tokens, so
+    every layer is populated (an empty KVCache's `state` getter would raise).
+    Nested-tuple states (QuantizedKVCache) are not handled; sous never
+    quantizes its KV.
+    """
+    for s, d in zip(src, dst, strict=True):
+        d.state = [None if a is None else copy_array(a) for a in s.state]
+        d.meta_state = s.meta_state
+
+
+def auto_cache_budget(*, working_set: int, active: int, reserve_bytes: int) -> int:
+    """Bytes resident slots may hold beyond the in-flight turn: what Metal
+    serves without paging, minus what mlx already holds (the weights, when
+    read at load), minus the largest cache one turn can build (`reserve_bytes`
+    — the window times the KV cost of a token), minus a fixed slack. This is
+    the "reserved out of the generation budget" of the spec: the turn's own
+    cache is paid for first, slots get what is left."""
+    return max(0, working_set - active - reserve_bytes - CACHE_BUDGET_SLACK)
+
+
 @dataclass
 class PromptCacheStats:
-    hits: int = 0
+    hits: int = 0  # every warm run, from a turn slot or a fork copy
     misses: int = 0
     reused_tokens: int = 0
     snapshot_bytes: int = 0
     cold_retries: int = 0
+    fork_hits: int = 0  # the subset of hits served by copying a fork slot
+    forks: int = 0  # fork slots created
+    evictions: int = 0  # slots dropped for budget, count or pressure
 
     def as_dict(self) -> dict:
-        return {
-            "hits": self.hits,
-            "misses": self.misses,
-            "reused_tokens": self.reused_tokens,
-            "snapshot_bytes": self.snapshot_bytes,
-            "cold_retries": self.cold_retries,
-        }
+        return dataclasses.asdict(self)
+
+    def add(self, other: PromptCacheStats) -> None:
+        """Fold `other`'s counters into these.
+
+        Every field is a running count and sums — except `snapshot_bytes`,
+        which is a gauge assigned per turn (the last non-trimmable turn's copy
+        cost). Summing it would make the daemon-wide view grow with the number
+        of owners rather than report a size, so the largest reading wins.
+        """
+        for f in dataclasses.fields(self):
+            mine, theirs = getattr(self, f.name), getattr(other, f.name)
+            setattr(
+                self, f.name, max(mine, theirs) if f.name == "snapshot_bytes" else mine + theirs
+            )
 
 
-_MEMO_SLOTS = ("stable", "full")
+_MEMO_SLOTS = ("stable", "full", "header")
 
 
 class PromptMemo:
     """One slot per render, keyed by the exact prompt text.
+
+    The header slot holds the fork boundary's text: what two probe renders of
+    the system turn have in common (see the engines' `_header_probe`).
 
     Each turn needs both the stable render and the full prompt, and
     `count_tokens` asks for one of them before `generate` asks again. Keying on
@@ -157,7 +248,7 @@ class PromptMemo:
 
 
 class CacheHooks(Protocol):
-    """The four things only an engine can do. Everything else is shared."""
+    """The five things only an engine can do. Everything else is shared."""
 
     def new_cache(self) -> list: ...
     def prefill(self, cache: list, token_ids: list[int]) -> None: ...
@@ -165,50 +256,316 @@ class CacheHooks(Protocol):
         self, cache: list, token_ids: list[int], max_tokens: int, on_delta: OnDelta | None
     ) -> str: ...
     def copy_array(self, a: object) -> object: ...
+    # Bytes the machine can still give a cache right now, or None when it
+    # cannot tell (no mlx). Read on the owner thread; must not release thread
+    # state. Called with no cache lock held and must take none of its own: the
+    # cache's promise that reset() never waits on a generation rests on its
+    # bookkeeping lock covering list and dict work plus the deallocation a
+    # drop triggers — all bounded — and this is the one engine call the
+    # eviction path makes.
+    def headroom(self) -> int | None: ...
+
+
+@dataclass
+class Slot:
+    """One resident cache and the exact ids it holds, at the stable boundary.
+
+    `owner` is the thread whose mlx streams built the arrays (issue #34): the
+    Thread object, not its ident — idents are recycled after a thread exits,
+    a strongly held Thread object cannot falsely match a later thread. `kind`
+    is "turn" (published when a turn ends; consumed by the turn that extends
+    it) or "fork" (a copy taken at a shared-prefix boundary; copied on every
+    hit, left in place)."""
+
+    cache: list
+    held: list[int]
+    owner: threading.Thread
+    kind: str
+    nbytes: int
+    last_used: float = field(default_factory=time.monotonic)
 
 
 class PrefixCache:
-    """One KV cache per task, always left at the stable-render boundary.
+    """KV caches at the stable-render boundary, one slot per resident prefix.
 
     The boundary matters: the stable render (`add_generation_prompt=False`) is a
     strict prefix of the next turn's stable render, while the full prompt never
     is — the chat template appends a generation-only block that it strips when
     it later re-renders that same assistant turn as history. Anchoring here is
     what makes reuse possible at all.
+
+    A turn looks for the longest slot its own thread owns whose ids are a
+    strict prefix of its stable render. A "turn" slot is taken over and
+    extended in place, so a conversation never holds two copies of itself; a
+    "fork" slot is copied, so the next conversation sharing that prefix finds
+    it too. Everything published is charged to `max_bytes`; the in-flight
+    turn's own cache never is — `reserve_bytes` (one full window of KV) was
+    subtracted from the machine's headroom before `max_bytes` was derived.
     """
 
-    def __init__(self, hooks: CacheHooks, enabled: bool = True):
-        # This default is the orchestrator's own semantics, not the user-facing
-        # one — both engines always pass `enabled` explicitly. The shipped
-        # default lives in SousConfig.prompt_cache; don't couple this one
-        # to it.
+    def __init__(
+        self,
+        hooks: CacheHooks,
+        enabled: bool = True,
+        *,
+        max_bytes: int = 0,
+        reserve_bytes: int = 0,
+    ):
+        # These defaults are the orchestrator's own semantics, not the
+        # user-facing ones — both engines always pass them explicitly. The
+        # shipped defaults live in SousConfig (prompt_cache, prompt_cache_gb);
+        # don't couple these to them. max_bytes=0 keeps exactly one slot: the
+        # behaviour every pre-keyed test in the suite was written against.
         self._hooks = hooks
         self.enabled = enabled
-        self._cache: list | None = None
-        self._held: list[int] = []
-        # The thread whose mlx streams built self._cache (issue #34). A Thread
-        # object, not its ident: idents are recycled after a thread exits, so
-        # an ident could falsely match a later, unrelated thread — a strongly
-        # held Thread object cannot.
-        self._owner: threading.Thread | None = None
+        self.max_bytes = max_bytes
+        self.reserve_bytes = reserve_bytes
+        # Held only across list and dict work, plus the deallocation a drop
+        # triggers — never across prefill or decode. reset() must never wait
+        # on a generation (its caller may be the worker's finally while a
+        # stalled generation still runs), and freeing a cache is bounded, so
+        # with this discipline it never does.
+        self._lock = threading.Lock()
+        self._slots: list[Slot] = []
+        self._owner_stats: dict[threading.Thread, PromptCacheStats] = {}
+        # Counters of owners already retired or swept, so the daemon-wide view
+        # keeps their history without keeping their Thread objects.
+        self._history = PromptCacheStats()
+        # Owners whose late publishes are refused: a task's session thread
+        # after the task ended, a gateway session after a stall. Weak, so a
+        # thread that is truly gone costs nothing to remember.
+        self._retired: weakref.WeakSet[threading.Thread] = weakref.WeakSet()
         self._epoch = 0
-        self._stats = PromptCacheStats()
 
-    def reset(self) -> None:
-        """Drop the cache, the token record, and the counters.
+    # ---- bookkeeping (the helpers up to _take want self._lock held; each of
+    # the entry points after it says in its docstring what it does with the
+    # lock, and _evict_pressure must NOT be called holding it) ---------------
 
-        Deliberately takes no lock. ManagedEngine's generation lock is still
-        held by an abandoned stalled generation, so a reset that waited for it
-        would wedge the next task. The epoch bump is what makes that safe.
+    def _sweep(self) -> None:
+        """Drop what dead threads left: their arrays lived on streams that no
+        longer exist, and nothing can ever adopt them."""
+        dead = {s.owner for s in self._slots if not s.owner.is_alive()}
+        dead |= {o for o in self._owner_stats if not o.is_alive()}
+        if not dead:
+            return
+        self._slots = [s for s in self._slots if s.owner not in dead]
+        for owner in dead:
+            self._history.add(self._owner_stats.pop(owner, PromptCacheStats()))
+
+    def _stats_for(self, owner: threading.Thread) -> PromptCacheStats:
+        return self._owner_stats.setdefault(owner, PromptCacheStats())
+
+    def _resident(self) -> int:
+        return sum(s.nbytes for s in self._slots)
+
+    def _evictable(self, protect: Slot | None) -> list[Slot]:
+        return [s for s in self._slots if s is not protect]
+
+    def _drop_lru(self, protect: Slot | None) -> None:
+        victim = min(self._evictable(protect), key=lambda s: s.last_used)
+        self._slots.remove(victim)
+        self._stats_for(victim.owner).evictions += 1
+        # `victim` dies with this frame: the slot's cache is freed the moment
+        # nothing else references it, which is what the pressure re-read in
+        # _evict_pressure relies on.
+
+    def _evict_caps(self, protect: Slot | None) -> None:
+        """Bring the map under its count and byte caps, never touching
+        `protect`. On its own before a turn starts, `protect` is None: nothing
+        here is spoken for."""
+        while self._evictable(protect) and (
+            len(self._slots) > MAX_SLOTS or self._resident() > self.max_bytes
+        ):
+            self._drop_lru(protect)
+
+    def _make_room(self, nbytes: int) -> None:
+        """Evict LRU until a slot of `nbytes` would fit under the byte cap.
+
+        For the fork copy, which is charged before it is allocated rather than
+        after: publishing first and evicting afterwards would put the copy and
+        whatever it displaces on the machine at the same time — the transient
+        doubling the spec promises never happens. Nothing is protected: the
+        turn's own cache is not in the map, and a fork slot this turn copied
+        from has already been copied.
+
+        Takes the lock itself.
         """
-        self._epoch += 1
-        self._cache = None
-        self._held = []
-        self._owner = None
-        self._stats = PromptCacheStats()
+        with self._lock:
+            while self._evictable(None) and self._resident() + nbytes > self.max_bytes:
+                self._drop_lru(None)
 
-    def stats(self) -> dict:
-        return self._stats.as_dict()
+    def _take(self, owner: threading.Thread, stable_ids: list[int]) -> Slot | None:
+        """The longest slot `owner` holds that `stable_ids` strictly extends.
+        A turn slot leaves the map with the caller (its cache is about to be
+        mutated); a fork slot stays."""
+        best: Slot | None = None
+        for s in self._slots:
+            if s.owner is not owner or not reuse_length(s.held, stable_ids):
+                continue
+            if best is None or len(s.held) > len(best.held):
+                best = s
+        if best is None:
+            return None
+        best.last_used = time.monotonic()
+        if best.kind == "turn":
+            self._slots.remove(best)
+        return best
+
+    def _fork_wanted(
+        self,
+        owner: threading.Thread,
+        stable_ids: list[int],
+        fork_at: int | Callable[[], int],
+        reuse: int,
+    ) -> int:
+        """Whether this turn should leave a fork slot at `fork_at`: only a turn
+        that is itself prefilling past the boundary can (a hit that started at
+        or beyond it holds the header inside a cache that cannot rewind), only
+        when no fork with exactly those ids exists for this owner, and only
+        when there is a budget to charge the copy to.
+
+        The budget test is first because a refusal here is total: the turn then
+        never even stops at the boundary, so at `max_bytes == 0` — the
+        pre-3a single-slot behaviour — nothing about the turn changes.
+
+        Takes the lock itself, for the scan.
+        """
+        if self.max_bytes <= 0:
+            return 0
+        at = fork_at
+        if not isinstance(at, int):
+            # A callable boundary is the engine's header probe, and it costs
+            # renders and a tokenize — so it is asked only where its answer
+            # could still be used, which is a cold miss. A warm start at a
+            # shorter boundary forgoes the longer header deliberately: no
+            # layer rewinds to it, so paying the probe would buy nothing.
+            # Exactly one `_run` per turn ever has `reuse == 0` (a cold
+            # attempt that fails is not retried), so this resolves at most
+            # once per turn. Resolved before the lock is taken: the probe
+            # tokenizes, and nothing that slow may run under the bookkeeping
+            # lock that reset() promises never to wait behind.
+            if reuse:
+                return 0
+            try:
+                at = at()
+            except Exception as e:
+                # An optimization must never fail a turn — the same rule the
+                # warm-retry path follows. A chat template is free to refuse
+                # the probe conversation; the turn just does not fork.
+                warnings.warn(
+                    f"sous prompt cache: header probe failed ({type(e).__name__}); "
+                    "not forking this turn",
+                    stacklevel=2,
+                )
+                return 0
+        if not (reuse < at < len(stable_ids)):
+            return 0
+        held = stable_ids[:at]
+        with self._lock:
+            for s in self._slots:
+                if s.owner is owner and s.kind == "fork" and s.held == held:
+                    return 0
+        return at
+
+    def _publish(self, slot: Slot, epoch: int) -> bool:
+        """Add `slot` unless the world moved on: a full reset since the turn
+        began, or the owner retired (its task ended) while it generated.
+
+        The caps are applied under the same lock as the append — nothing must
+        ever observe the map over budget — but the pressure pass runs after
+        the lock is released, because it asks the engine for a reading. Both
+        protect `slot`: a turn's own slot is never evicted by its own publish,
+        so on a machine with room for exactly one slot, that one survives.
+        """
+        with self._lock:
+            if epoch != self._epoch or slot.owner in self._retired:
+                return False
+            self._slots.append(slot)
+            self._evict_caps(protect=slot)
+        self._evict_pressure(protect=slot)
+        return True
+
+    def _evict_pressure(self, protect: Slot | None) -> None:
+        """Shrink the map until the machine has `reserve_bytes` free again,
+        never touching `protect` — the slot just published.
+
+        Takes the lock one drop at a time instead of holding it across the
+        loop, because `headroom()` is an engine call (an mlx memory query, on
+        a real engine). The bookkeeping lock covers list and dict work plus
+        the deallocation a drop triggers, all bounded; that is the whole
+        reason reset() can promise never to wait on a generation, and it would
+        stop being true the moment an engine call ran underneath it. Dropping
+        the lock between readings is safe: every
+        iteration re-reads both the headroom and the map, so a concurrent
+        publish or reset just changes what the next pass sees.
+        """
+        while (headroom := self._hooks.headroom()) is not None and headroom < self.reserve_bytes:
+            with self._lock:
+                if not self._evictable(protect):
+                    return
+                self._drop_lru(protect)
+
+    def _plant(self, cache: list, held: list[int], kind: str = "turn") -> None:
+        """Test seam: publish a slot for the calling thread directly."""
+        with self._lock:
+            self._slots.append(
+                Slot(cache, list(held), threading.current_thread(), kind, slot_bytes(cache))
+            )
+
+    # ---- public --------------------------------------------------------------
+
+    def slots(self) -> list[Slot]:
+        with self._lock:
+            return list(self._slots)
+
+    def reset(self, owner: threading.Thread | None = None) -> None:
+        """Drop resident caches.
+
+        With an owner: that thread's slots and counters (the counters fold
+        into history), and the owner is retired so a generation still running
+        on it cannot publish afterwards. Without: everything, and the epoch
+        bump makes every in-flight publish from any thread drop itself —
+        unload uses this form; the worker and the gateway's stall path retire
+        an owner instead.
+
+        Takes only the bookkeeping lock, never the generation lock: the caller
+        may be the worker's finally while a stalled generation still holds
+        that one, and waiting there would wedge the next task.
+        """
+        with self._lock:
+            if owner is None:
+                # `_retired` is deliberately kept: a retired owner stays
+                # retired for the rest of its life. Every owner is a per-task
+                # session thread or a dropped gateway session — never reused,
+                # so there is nothing to un-retire and much to get wrong.
+                self._epoch += 1
+                self._slots = []
+                self._owner_stats = {}
+                self._history = PromptCacheStats()
+                return
+            self._slots = [s for s in self._slots if s.owner is not owner]
+            self._history.add(self._owner_stats.pop(owner, PromptCacheStats()))
+            self._retired.add(owner)
+
+    def stats(self, owner: threading.Thread | None = None) -> dict:
+        """Counters plus `slots` and `resident_bytes`: for one owner thread, or
+        daemon-wide (every live owner plus the history of retired ones)."""
+        with self._lock:
+            self._sweep()
+            if owner is not None:
+                total = self._owner_stats.get(owner, PromptCacheStats())
+                mine = [s for s in self._slots if s.owner is owner]
+            else:
+                total = PromptCacheStats()
+                total.add(self._history)
+                for each in self._owner_stats.values():
+                    total.add(each)
+                mine = self._slots
+            return {
+                **total.as_dict(),
+                "slots": len(mine),
+                "resident_bytes": sum(s.nbytes for s in mine),
+            }
 
     def generate(
         self,
@@ -216,10 +573,26 @@ class PrefixCache:
         full_ids: list[int],
         max_tokens: int,
         on_delta: OnDelta | None = None,
+        fork_at: int | Callable[[], int] = 0,
     ) -> str:
+        """`fork_at` is the header boundary, as a token count or as a callable
+        that computes one. The callable form lets an engine defer a probe that
+        renders and tokenizes until this turn is known to be able to fork at
+        all — see `_fork_wanted`, which resolves it."""
         hooks = self._hooks
         if not self.enabled:
             return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens, on_delta)
+
+        owner = threading.current_thread()
+        with self._lock:
+            self._sweep()
+            # Bind the owner's stats object itself and write through this
+            # local for the whole call (passed into _run too). reset(owner)
+            # swaps in nothing for this owner; if an abandoned generation
+            # thread reaches a late write after that, it lands on this
+            # orphaned object instead of on counters a later reader sees.
+            stats = self._stats_for(owner)
+            epoch = self._epoch
 
         # `_run`'s anchor (`len(stable_ids)`) only means what it assumes: that
         # `full_ids` is the stable render plus a generation-only suffix, true
@@ -228,12 +601,11 @@ class PrefixCache:
         # chat template, so sous cannot assume that in general. reuse_length
         # already tests exactly this — strict prefix, with a suffix left to
         # decode — so ask it instead of duplicating the rule. Checked before
-        # any cache is chosen or published: self._cache/self._held are left
-        # exactly as they were, so nothing from this turn is retained and a
-        # cache still held from an earlier, well-behaved turn survives for a
-        # later one to reuse.
+        # any slot is taken: nothing from this turn is retained, and every
+        # slot an earlier, well-behaved turn published survives for a later
+        # one to reuse.
         if reuse_length(stable_ids, full_ids) == 0:
-            self._stats.misses += 1
+            stats.misses += 1
             warnings.warn(
                 "sous prompt cache: full prompt is not the stable render "
                 "plus a generation suffix; decoding cold this turn",
@@ -241,48 +613,66 @@ class PrefixCache:
             )
             return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens, on_delta)
 
-        epoch = self._epoch
-        # Bind the stats object itself, not self._stats, and write through
-        # this local for the whole call (passed into _run too). reset() swaps
-        # in a fresh PromptCacheStats; if an abandoned generation thread
-        # reaches a late write (snapshot_bytes after prefill, cold_retries in
-        # the retry path) after that swap, it lands on this orphaned object
-        # instead of the next task's counters.
-        stats = self._stats
-        cache, held = self._cache, self._held
-        # Invalid until a generation completes. The cache is mutated in place,
-        # so a raise mid-stream leaves it holding tokens `held` does not
-        # describe, and reusing it then would duplicate them.
-        self._cache, self._held = None, []
-
-        reuse = reuse_length(held, stable_ids) if cache is not None else 0
-        if reuse and self._owner is not threading.current_thread():
-            # The cached arrays live only on the publishing thread's mlx
-            # streams (issue #34); a different session thread (a worker task
-            # vs the gateway's long-lived one) must prefill cold rather than
-            # touch them. Force the same miss path a prefix mismatch takes,
-            # rather than attempt a warm run doomed to the cross-thread mlx
-            # failure that _run's except clause would otherwise have to catch.
-            reuse = 0
-        # `cache is not None and reuse` rather than a bare `if reuse`: it is what
-        # lets the type checker see `warm` as a plain list in both branches, with
-        # no assert and no ignore pragma.
-        if cache is not None and reuse:
+        with self._lock:
+            # Owner-filtered: the arrays live only on the publishing thread's
+            # mlx streams (issue #34), so a different session thread (a worker
+            # task vs the gateway's long-lived one) gets a cold miss rather
+            # than a warm run doomed to the cross-thread mlx failure.
+            slot = self._take(owner, stable_ids)
+            # Whatever is still in the map is not going to serve this turn,
+            # and this turn's own cache is about to be prefilled to full size
+            # beside it. Bring the map under its caps here rather than only at
+            # publish, so the two are never outstanding at once: at the
+            # default budget of 0 this is what releases the previous turn's
+            # cache before a miss rebuilds one. Only the caps, not the
+            # pressure reading — headroom is read once the turn's own cache is
+            # real and its cost visible, which is at publish. A taken turn slot
+            # is already out of the map and needs no protection; a taken fork
+            # slot is not, and dropping the very slot this turn just chose to
+            # share would defeat the point of having forked it.
+            self._evict_caps(protect=slot if slot is not None and slot.kind == "fork" else None)
+        warm: list | None = None
+        if slot is not None and slot.kind == "fork":
+            # The slot stays for the next conversation; this turn works on its
+            # own copy. Taking that copy is part of the warm optimization, so
+            # a failure here degrades to a cold prefill rather than failing
+            # the turn — the same rule the warm-retry and header-probe paths
+            # follow. Nothing has been emitted at this point, so unlike a
+            # mid-generation failure there is no replay to weigh. The slot
+            # itself is untouched (a fork is never removed by `_take`), so the
+            # next conversation still finds it.
+            try:
+                warm = hooks.new_cache()
+                fork_copy(slot.cache, warm, hooks.copy_array)
+            except Exception as e:
+                warnings.warn(
+                    f"sous prompt cache: fork clone failed ({type(e).__name__}); prefilling cold",
+                    stacklevel=2,
+                )
+                # Drop the half-built copy before the cold cache is allocated,
+                # and take the miss branch below: this is not a hit, and
+                # `cold_retries` is not the counter for it either — that one
+                # means a warm run that failed after it had started.
+                warm = None
+                slot = None
+            else:
+                stats.fork_hits += 1
+        if slot is not None:
+            reuse = len(slot.held)
+            if warm is None:
+                warm = slot.cache
             stats.hits += 1
             stats.reused_tokens += reuse
-            warm: list = cache
         else:
             reuse = 0
             stats.misses += 1
             warm = hooks.new_cache()
-        # Drop the only remaining reference to the previous turn's cache
-        # before a full-size replacement is prefilled below. On a miss,
-        # `cache` above still points at the prior turn's cache, and a miss
-        # only ever happens mid-task after elision — i.e. precisely when that
-        # cache is at its largest. Without this line both caches are pinned
-        # in memory at once while the new one is prefilled to full size,
-        # which is exactly the doubling the spec promises never happens.
-        cache = None
+        # Drop the only remaining reference to a consumed turn slot's cache
+        # other than `warm` before anything else is allocated: on a miss with
+        # a full window there is no slot to speak of, but on a consumed slot
+        # this is what keeps one conversation from ever holding two copies of
+        # itself. (A fork slot is referenced by the map by design.)
+        slot = None
 
         # A warm attempt that already streamed text cannot be retried: the
         # consumer has forwarded those deltas, and a cold re-run would deliver
@@ -310,7 +700,9 @@ class PrefixCache:
         text = ""
         retry_reason: str | None = None
         try:
-            text = self._run(stats, warm, stable_ids, full_ids, reuse, max_tokens, relay)
+            text = self._run(
+                stats, warm, stable_ids, full_ids, reuse, max_tokens, relay, fork_at, owner, epoch
+            )
         except Exception as e:
             if reuse == 0:
                 raise
@@ -319,7 +711,7 @@ class PrefixCache:
             # at the end of the except clause (PEP 3110) — retrying inside it
             # would keep the failed full-size cache pinned by that traceback
             # for the whole retry, on top of the cold replacement being
-            # prefilled, which is the same doubling as the miss path above.
+            # prefilled: exactly the doubling the spec promises never happens.
             retry_reason = str(e)
 
         if retry_reason is not None:
@@ -337,11 +729,11 @@ class PrefixCache:
                 stacklevel=2,
             )
             warm = hooks.new_cache()
-            text = self._run(stats, warm, stable_ids, full_ids, 0, max_tokens, relay)
+            text = self._run(
+                stats, warm, stable_ids, full_ids, 0, max_tokens, relay, fork_at, owner, epoch
+            )
 
-        if epoch == self._epoch:
-            self._cache, self._held = warm, list(stable_ids)
-            self._owner = threading.current_thread()
+        self._publish(Slot(warm, list(stable_ids), owner, "turn", slot_bytes(warm)), epoch)
         return text
 
     def _run(
@@ -353,13 +745,61 @@ class PrefixCache:
         reuse: int,
         max_tokens: int,
         on_delta: OnDelta | None,
+        fork_at: int | Callable[[], int],
+        owner: threading.Thread,
+        epoch: int,
     ) -> str:
         hooks = self._hooks
         anchor = len(stable_ids)
+        # A separate name, not `fork_at` reassigned: the parameter may be a
+        # callable, and what _fork_wanted answers is always a token count.
+        boundary = self._fork_wanted(owner, stable_ids, fork_at, reuse)
+        if boundary:
+            # Stop at the boundary and continue from there: a fork is taken
+            # while prefilling past the header because no layer can be rewound
+            # to it afterwards.
+            hooks.prefill(cache, list(stable_ids[reuse:boundary]))
+            reuse = boundary
+            # What the cache holds at the boundary is what the copy will hold,
+            # so it is also the price. A copy that cannot fit under the budget
+            # even on an empty map is not taken at all — better one prefill
+            # than a second cache the machine has no room for.
+            price = slot_bytes(cache)
+            if price <= self.max_bytes:
+                copy: list | None = None
+                try:
+                    self._make_room(price)
+                    copy = hooks.new_cache()
+                    fork_copy(cache, copy, hooks.copy_array)
+                    if self._publish(
+                        Slot(copy, list(stable_ids[:boundary]), owner, "fork", slot_bytes(copy)),
+                        epoch,
+                    ):
+                        stats.forks += 1
+                except Exception as e:
+                    # The fork is an optimization on a turn that is already
+                    # prefilled to the boundary and needs nothing more from
+                    # it. Saying so explicitly matters here: only a cold
+                    # attempt forks, so `reuse` is 0 and `generate`'s handler
+                    # re-raises instead of retrying — an exception escaping
+                    # this block would fail a viable generation.
+                    warnings.warn(
+                        f"sous prompt cache: fork copy failed ({type(e).__name__}); "
+                        "continuing without a fork",
+                        stacklevel=2,
+                    )
+                finally:
+                    # A publish can still refuse the slot — a reset since the
+                    # turn began, or the owner retired mid-turn — and neither a
+                    # refused nor a half-built copy may stay pinned by this
+                    # frame for the whole decode that follows. (An accepted one
+                    # is never evicted by its own publish: _publish protects
+                    # the slot it adds.)
+                    copy = None
         if all_trimmable(cache):
-            # Everything rewinds, so prefill and decode fuse into one pass and
-            # the generation block plus the generated tokens are simply trimmed
-            # back off afterwards.
+            # Everything rewinds, so (the rest of) prefill and decode fuse into
+            # one pass and the generation block plus the generated tokens are
+            # simply trimmed back off afterwards.
             text = hooks.decode(cache, list(full_ids[reuse:]), max_tokens, on_delta)
             trim_to(cache, anchor)
             return text
