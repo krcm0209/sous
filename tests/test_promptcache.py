@@ -1085,3 +1085,219 @@ def test_reset_without_an_owner_still_drops_everything_and_bumps_the_epoch():
     pc.reset()
     assert pc.slots() == []
     assert pc.stats() == _empty_stats()
+
+
+# ---- forks -------------------------------------------------------------------
+
+# Two conversations that share a header long enough to fork, then diverge.
+H = list(range(1, FORK_MIN_TOKENS + 1))
+FORK = len(H)
+C1 = [*H, 501, 502]
+C1_FULL = [*C1, 90, 91]
+C1_NEXT = [*C1, 503]
+C1_NEXT_FULL = [*C1_NEXT, 90, 91]
+C2 = [*H, 601, 602, 603]
+C2_FULL = [*C2, 90, 91]
+C3 = [*H, 701]
+C3_FULL = [*C3, 90, 91]
+
+
+@pytest.mark.parametrize("trimmable", [True, False])
+def test_a_cold_turn_forks_at_the_header(trimmable):
+    h = FakeHooks(trimmable=trimmable)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    kinds = sorted((s.kind, s.held) for s in pc.slots())
+    assert kinds == [("fork", H), ("turn", C1)]
+    assert pc.stats()["forks"] == 1
+    # The header was prefilled as its own segment, whatever the layer kinds,
+    # because the copy has to be taken exactly at the boundary.
+    assert h.prefilled[0] == H
+    if trimmable:
+        assert h.decoded[0] == C1_FULL[FORK:]  # the rest still fuses into decode
+    else:
+        assert h.prefilled[1] == C1[FORK:]
+
+
+def test_the_fork_is_an_independent_copy():
+    h = FakeHooks(trimmable=False)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    fork = next(s for s in pc.slots() if s.kind == "fork")
+    turn = next(s for s in pc.slots() if s.kind == "turn")
+    assert fork.cache is not turn.cache
+    assert cast(FakeTrimmable, fork.cache[0]).offset == FORK
+    assert cast(FakeTrimmable, turn.cache[0]).offset == len(C1)
+
+
+def test_a_new_conversation_sharing_the_header_starts_from_the_fork():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    pc.generate(C2, C2_FULL, 16, fork_at=FORK)
+    s = pc.stats()
+    assert (s["hits"], s["fork_hits"], s["reused_tokens"]) == (1, 1, FORK)
+    assert h.decoded[-1] == C2_FULL[FORK:]  # only the tail was fed
+    # The fork stayed (copied, not consumed), so a third conversation hits too.
+    assert [x.held for x in pc.slots() if x.kind == "fork"] == [H]
+    pc.generate(C3, C3_FULL, 16, fork_at=FORK)
+    assert pc.stats()["fork_hits"] == 2
+    assert sorted(x.held for x in pc.slots() if x.kind == "turn") == sorted([C1, C2, C3])
+
+
+def test_a_fork_hit_does_not_fork_again_and_neither_does_a_turn_hit():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    pc.generate(C2, C2_FULL, 16, fork_at=FORK)  # fork hit: reuse == fork_at
+    pc.generate(C1_NEXT, C1_NEXT_FULL, 16, fork_at=FORK)  # turn hit: reuse > fork_at
+    assert pc.stats()["forks"] == 1
+    assert sum(1 for s in pc.slots() if s.kind == "fork") == 1
+
+
+def test_a_second_conversations_turn_slot_does_not_disturb_the_firsts():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    pc.generate(C2, C2_FULL, 16, fork_at=FORK)
+    pc.generate(C1_NEXT, C1_NEXT_FULL, 16, fork_at=FORK)
+    assert pc.stats()["hits"] == 2
+    assert h.decoded[-1] == C1_NEXT_FULL[len(C1) :]  # C1's own slot, not the fork
+
+
+def test_fork_at_zero_never_forks():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16)  # the default
+    assert [s.kind for s in pc.slots()] == ["turn"]
+    assert h.prefilled == []  # the trimmable path fused as before
+
+
+def test_fork_at_past_the_render_is_ignored():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=len(C1) + 5)
+    assert [s.kind for s in pc.slots()] == ["turn"]
+
+
+def test_a_cold_retry_still_forks():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    # Consume the fork so the next turn's warm attempt has reuse == fork_at
+    # (no fork wanted), then fail it: the cold retry prefills from 0 and the
+    # header is on its way past the boundary again — but a fork with those
+    # ids already exists, so none is added.
+    h.fail_once = True
+    with pytest.warns(UserWarning, match="retrying cold"):
+        pc.generate(C2, C2_FULL, 16, fork_at=FORK)
+    assert pc.stats()["forks"] == 1
+    assert pc.stats()["cold_retries"] == 1
+
+
+def test_a_fork_is_not_taken_when_the_fork_exists_but_this_turn_missed_it():
+    """Owner filter: a fork owned by another thread is invisible, so this
+    thread forks its own. The two coexist under different owners."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    _run_on_thread(lambda: pc.generate(C1, C1_FULL, 16, fork_at=FORK))
+    # that thread is dead: swept. Plant instead, on a live helper thread.
+    stop = threading.Event()
+    ready = threading.Event()
+
+    def holder():
+        pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+        ready.set()
+        stop.wait(5)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    ready.wait(5)
+    pc.generate(C2, C2_FULL, 16, fork_at=FORK)  # main thread: a miss, forks its own
+    assert pc.stats(owner=threading.current_thread())["forks"] == 1
+    assert pc.stats(owner=t)["forks"] == 1
+    stop.set()
+    t.join(5)
+
+
+# ---- budget ------------------------------------------------------------------
+
+
+def _bytes_of(pc: PrefixCache, held) -> int:
+    return next(s.nbytes for s in pc.slots() if s.held == held)
+
+
+def test_the_byte_budget_evicts_least_recently_used_first():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)
+    one = _bytes_of(pc, A1)
+    # Room for exactly two turn slots of this size, then a third arrives.
+    pc.max_bytes = 2 * one + 1
+    pc.generate([20, 21, 22, 23], [20, 21, 22, 23, 90, 91], 16)
+    assert [s.held for s in pc.slots()] == [B1, [20, 21, 22, 23]]
+    assert pc.stats()["evictions"] == 1
+
+
+def test_a_hit_refreshes_the_slots_recency():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)  # A is now the most recent
+    pc.max_bytes = _bytes_of(pc, A2) + _bytes_of(pc, B1) - 1  # room for one
+    pc.generate([20, 21], [20, 21, 90, 91], 16)
+    assert B1 not in [s.held for s in pc.slots()]
+    assert A2 in [s.held for s in pc.slots()]
+
+
+def test_the_slot_just_published_is_never_evicted_by_its_own_publish():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=1)  # nothing fits
+    pc.generate(A1, A1_FULL, 16)
+    assert [s.held for s in pc.slots()] == [A1]
+    pc.generate(A2, A2_FULL, 16)
+    assert pc.stats()["hits"] == 1  # the protected slot was there to be reused
+
+
+def test_a_fork_is_charged_and_can_be_evicted_like_any_slot():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    fork_bytes = _bytes_of(pc, H)
+    assert fork_bytes == FORK * 8 * 2  # two trimmable layers at the boundary
+    assert pc.stats()["resident_bytes"] == fork_bytes + _bytes_of(pc, C1)
+    pc.max_bytes = 0
+    pc.generate(C2, C2_FULL, 16, fork_at=FORK)  # hits the fork, then evicts it
+    assert [s.kind for s in pc.slots()] == ["turn"]
+
+
+def test_pressure_evicts_until_headroom_covers_the_reserve():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY, reserve_bytes=1000)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)
+    readings = iter([100, 100, 5000])  # below reserve until two slots go
+
+    h.headroom = lambda: next(readings)  # ty: ignore[invalid-assignment]
+    pc.generate([20, 21], [20, 21, 90, 91], 16)
+    assert [s.held for s in pc.slots()] == [[20, 21]]  # both older slots gone
+    assert pc.stats()["evictions"] == 2
+
+
+def test_pressure_never_evicts_the_slot_just_published():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY, reserve_bytes=1000)
+    h.headroom_value = 0  # permanently short
+    pc.generate(A1, A1_FULL, 16)
+    assert [s.held for s in pc.slots()] == [A1]
+
+
+def test_unknown_headroom_skips_the_pressure_check():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY, reserve_bytes=1 << 60)
+    h.headroom_value = None
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)
+    assert pc.stats()["slots"] == 2

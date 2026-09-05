@@ -389,6 +389,25 @@ class PrefixCache:
             self._slots.remove(best)
         return best
 
+    def _fork_wanted(
+        self, owner: threading.Thread, stable_ids: list[int], fork_at: int, reuse: int
+    ) -> int:
+        """Whether this turn should leave a fork slot at `fork_at`: only a turn
+        that is itself prefilling past the boundary can (a hit that started at
+        or beyond it holds the header inside a cache that cannot rewind), and
+        only when no fork with exactly those ids exists for this owner.
+
+        Takes the lock itself, for the scan.
+        """
+        if not (reuse < fork_at < len(stable_ids)):
+            return 0
+        held = stable_ids[:fork_at]
+        with self._lock:
+            for s in self._slots:
+                if s.owner is owner and s.kind == "fork" and s.held == held:
+                    return 0
+        return fork_at
+
     def _publish(self, slot: Slot, epoch: int) -> bool:
         """Add `slot` unless the world moved on: a full reset since the turn
         began, or the owner retired (its task ended) while it generated.
@@ -647,10 +666,28 @@ class PrefixCache:
     ) -> str:
         hooks = self._hooks
         anchor = len(stable_ids)
+        fork_at = self._fork_wanted(owner, stable_ids, fork_at, reuse)
+        if fork_at:
+            # Stop at the boundary, copy, and continue from the copy's twin:
+            # a fork is taken while prefilling past the header because no
+            # layer can be rewound to it afterwards. The copy is charged to
+            # the budget like any slot and may be evicted by the very publish
+            # that adds it — then this turn simply left nothing behind.
+            hooks.prefill(cache, list(stable_ids[reuse:fork_at]))
+            copy = hooks.new_cache()
+            fork_copy(cache, copy, hooks.copy_array)
+            if self._publish(
+                Slot(copy, list(stable_ids[:fork_at]), owner, "fork", slot_bytes(copy)), epoch
+            ):
+                stats.forks += 1
+            # A fork the publish evicted (the budget was full) must not stay
+            # pinned by this frame for the whole decode that follows.
+            del copy
+            reuse = fork_at
         if all_trimmable(cache):
-            # Everything rewinds, so prefill and decode fuse into one pass and
-            # the generation block plus the generated tokens are simply trimmed
-            # back off afterwards.
+            # Everything rewinds, so (the rest of) prefill and decode fuse into
+            # one pass and the generation block plus the generated tokens are
+            # simply trimmed back off afterwards.
             text = hooks.decode(cache, list(full_ids[reuse:]), max_tokens, on_delta)
             trim_to(cache, anchor)
             return text
