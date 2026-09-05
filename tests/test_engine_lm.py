@@ -90,3 +90,71 @@ def test_lm_engine_streams_deltas_that_reassemble_the_reply():
     assert seen[-1].finish_reason in ("stop", "length")
     assert all(d.finish_reason is None for d in seen[:-1])
     e.unload()
+
+
+def test_lm_fork_copy_matches_a_cold_prefill_bit_for_bit():
+    """A cache continued from a fork copy must equal a cache prefilled cold
+    over the same tokens, exactly — the fork is a second cache, and any
+    drift here would silently change the context of every subagent that
+    starts from it.
+
+    The reference is the same two prefill calls without a fork, NOT one call
+    over header+tail: a quantized matmul's rounding depends on how many rows
+    it is given, so mlx's own 440-token prefill and its 220+220 differ by one
+    bf16 ULP (measured: a key of -316 against -314) from the first layer's
+    keys onward, at position 0. That is a property of the prefill split every
+    warm turn already makes, not of the copy — so comparing against it would
+    test kernel determinism rather than the fork, and the copy is required to
+    be exact here.
+    """
+    import mlx.core as mx
+    from mlx_lm.models.cache import make_prompt_cache
+
+    from sous.engine.lm import LMEngine
+    from sous.engine.promptcache import fork_copy, slot_bytes
+
+    def assert_identical(x, y):
+        for a, b in zip(x, y, strict=True):
+            assert int(a.offset) == int(b.offset)
+            for xa, xb in zip(a.state, b.state, strict=True):
+                d = mx.max(mx.abs(xa.astype(mx.float32) - xb.astype(mx.float32)))
+                mx.eval(d)
+                assert d.item() == 0.0
+
+    e = LMEngine(TINY, cache_budget=0)
+    model, tokenizer = e._loaded()
+    ids = list(tokenizer.encode("def f(x):\n    return x + 1\n" * 40))
+    header, tail = ids[: len(ids) // 2], ids[len(ids) // 2 :]
+
+    ref = make_prompt_cache(model)
+    e.prefill(ref, header)
+    e.prefill(ref, tail)
+
+    src = make_prompt_cache(model)
+    e.prefill(src, header)
+    fork = make_prompt_cache(model)
+    fork_copy(src, fork, e.copy_array)
+    assert slot_bytes(fork) > 0
+    assert slot_bytes(fork) <= slot_bytes(src)  # the copy carries no step padding
+    assert_identical(fork, src)  # the copy itself, before anything continues it
+    e.prefill(fork, tail)
+
+    assert_identical(fork, ref)
+    e.unload()
+
+
+def test_lm_engine_serves_a_second_conversation_from_the_header_fork():
+    """End to end on a real tokenizer and template: two conversations with the
+    same (long) system turn; the second's first turn is a fork hit."""
+    from sous.engine.lm import LMEngine
+    from sous.engine.promptcache import FORK_MIN_TOKENS
+
+    e = LMEngine(TINY, prompt_cache=True, cache_budget=1 << 34)
+    system = {"role": "system", "content": "You are terse. " * (FORK_MIN_TOKENS // 3)}
+    e.generate([system, {"role": "user", "content": "Say A."}], [], 4)
+    e.generate([system, {"role": "user", "content": "Say B, please."}], [], 4)
+    s = e.prompt_cache_stats()
+    assert s["forks"] == 1
+    assert s["fork_hits"] == 1
+    assert s["reused_tokens"] >= FORK_MIN_TOKENS
+    e.unload()

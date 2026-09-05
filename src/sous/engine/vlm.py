@@ -7,7 +7,7 @@ import warnings
 from typing import Any, cast
 
 from sous.engine.base import Delta, OnDelta
-from sous.engine.promptcache import PrefixCache, PromptMemo
+from sous.engine.promptcache import PrefixCache, PromptMemo, fork_point
 
 
 def _load_quantized_drafter(model: object, draft_id: str) -> tuple[Any, str]:
@@ -46,16 +46,19 @@ class VLMEngine:
         prompt_cache: bool = False,
         draft_id: str = "",
         draft_block_size: int = 0,
+        cache_budget: int | None = None,
+        reserve_bytes: int = 0,
     ):
         from mlx_vlm import load
         from mlx_vlm.sample_utils import make_sampler
+
+        from sous.engine.base import measure_cache_budget
 
         self.model_id = model_id
         self._model, self._processor = load(model_id)
         self._sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
         self._memo = PromptMemo()
         self._tokenize_lock = threading.Lock()
-        self._cache = PrefixCache(self, enabled=prompt_cache)
         self._draft = None
         self._draft_kind = ""
         self._draft_block_size = draft_block_size
@@ -68,6 +71,13 @@ class VLMEngine:
                     f" {model_id} ({e}); generating without it",
                     stacklevel=2,
                 )
+        # Measured after load AND after the drafter, so the weights of both are
+        # inside `active` and the budget is what the machine actually has left.
+        if cache_budget is None:
+            cache_budget = measure_cache_budget(reserve_bytes)
+        self._cache = PrefixCache(
+            self, enabled=prompt_cache, max_bytes=cache_budget, reserve_bytes=reserve_bytes
+        )
 
     def _loaded(self) -> tuple:
         """The (model, processor) pair, or a clear error if already unloaded.
@@ -209,6 +219,13 @@ class VLMEngine:
         # `object`; everything that reaches here is an mx.array.
         return mx.array(cast("mx.array", a))
 
+    def headroom(self) -> int | None:
+        # Imported inside the method so a test can monkeypatch
+        # sous.engine.base.live_headroom and see it take effect here.
+        from sous.engine.base import live_headroom
+
+        return live_headroom()
+
     # ---- Engine ----------------------------------------------------------
 
     def generate(
@@ -219,21 +236,43 @@ class VLMEngine:
         on_delta: OnDelta | None = None,
     ) -> str:
         full_ids = self._ids("full", messages, tools)
-        # The stable render is only an anchor for reuse, and PrefixCache discards
-        # it when disabled — so computing it would cost a whole extra tokenization
-        # per turn for nothing.
-        stable_ids = self._ids("stable", messages, tools) if self._cache.enabled else []
-        return self._cache.generate(stable_ids, full_ids, max_tokens, on_delta)
+        if not self._cache.enabled:
+            # The stable render is only an anchor for reuse, and PrefixCache
+            # discards it when disabled — so computing it (and the header)
+            # would cost extra tokenizations per turn for nothing.
+            return self._cache.generate([], full_ids, max_tokens, on_delta)
+        stable_ids = self._ids("stable", messages, tools)
+        return self._cache.generate(
+            stable_ids,
+            full_ids,
+            max_tokens,
+            on_delta,
+            fork_at=self._fork_at(messages, tools, stable_ids),
+        )
+
+    def _fork_at(self, messages: list[dict], tools: list[dict], stable_ids: list[int]) -> int:
+        """The header boundary: the leading system turn rendered alone, with
+        the same tools, when it is a strict token prefix of the whole stable
+        render and long enough to be worth a fork slot (promptcache.fork_point
+        decides both). Every Claude Code subagent of one type shares exactly
+        this prefix; the worker's short system prompt never qualifies."""
+        if len(messages) < 2 or messages[0].get("role") != "system":
+            return 0
+        header_ids = self._ids("header", messages[:1], tools)
+        return fork_point(header_ids, stable_ids)
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
         return len(self._ids("full", messages, tools))
 
-    def reset_prompt_cache(self) -> None:
-        self._cache.reset()
-        self._memo.clear()
+    def reset_prompt_cache(self, owner: threading.Thread | None = None) -> None:
+        self._cache.reset(owner)
+        # The memo is text-keyed and shared by every caller, so an owner-scoped
+        # reset leaves it alone; only the drop-everything form (unload) clears it.
+        if owner is None:
+            self._memo.clear()
 
-    def prompt_cache_stats(self) -> dict:
-        return self._cache.stats()
+    def prompt_cache_stats(self, owner: threading.Thread | None = None) -> dict:
+        return self._cache.stats(owner)
 
     def unload(self) -> None:
         import gc

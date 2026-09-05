@@ -767,15 +767,15 @@ def test_fork_copy_detaches_the_recurrent_state():
     src = [FakeRecurrent([arr, None])]
     dst = [FakeRecurrent()]
     fork_copy(src, dst, copy_array)
-    assert cast(FakeRecurrent, dst[0]).state[0] is not arr
-    assert cast(FakeRecurrent, dst[0]).state[1] is None
+    assert dst[0].state[0] is not arr
+    assert dst[0].state[1] is None
 
 
 def test_fork_copy_leaves_the_source_untouched():
     src = [FakeTrimmable(offset=100)]
     fork_copy(src, [FakeTrimmable()], copy_array)
-    cast(FakeTrimmable, src[0]).offset += 1  # the copy must not alias the source
-    assert cast(FakeTrimmable, src[0]).offset == 101
+    src[0].offset += 1  # the copy must not alias the source
+    assert src[0].offset == 101
 
 
 def test_slot_bytes_sums_every_layer():
