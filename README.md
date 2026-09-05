@@ -227,11 +227,12 @@ turn gives up, stated plainly:
   resident conversation (bounded by `[model].prompt_cache_gb`), so a subagent's
   consecutive turns reuse their own slot, two subagents interleaving reuse
   theirs, and a delegated task running in between no longer wipes the
-  gateway's slots the way a shared single slot did. Slots are keyed, not
-  owned exclusively: the budget and memory-pressure eviction below still
-  apply across the daemon, so a delegated task's own slot can displace a
-  least-recently-used gateway one (and at `prompt_cache_gb = 0`, where only
-  one slot fits, it will).
+  gateway's slots the way a shared single slot did. Reuse stays owner-scoped
+  — a slot is used only by the thread that built it, so a delegated task can
+  never adopt a gateway slot or vice versa — but the budget and
+  memory-pressure eviction below apply across the daemon, so a delegated
+  task's own slot can displace a least-recently-used gateway one (and at
+  `prompt_cache_gb = 0`, where only one slot fits, it will).
   A new subagent whose rendered header is identical to one already seen —
   in practice a same-type subagent within the same Claude Code session —
   starts from a *fork*: a copy of the cache taken where its predecessor's
