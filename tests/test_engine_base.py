@@ -621,7 +621,8 @@ def test_default_factory_threads_the_cache_budget_and_reserve(monkeypatch):
     assert seen["cache_budget"] == 7
 
 
-def test_default_factory_falls_back_to_a_single_slot_when_the_kv_cost_is_unknown(monkeypatch):
+def _mystery_lm(monkeypatch) -> dict:
+    """_default_factory against a model whose KV cost per token is unknown."""
     from sous.engine import base, lm
 
     seen = {}
@@ -632,9 +633,64 @@ def test_default_factory_falls_back_to_a_single_slot_when_the_kv_cost_is_unknown
 
     monkeypatch.setattr(lm, "LMEngine", FakeLM)
     monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"model_type": "mystery"})
-    with pytest.warns(UserWarning, match="KV cost"):
+    return seen
+
+
+def test_default_factory_falls_back_to_a_single_slot_when_the_kv_cost_is_unknown(monkeypatch):
+    from sous.engine import base
+
+    seen = _mystery_lm(monkeypatch)
+    with pytest.warns(UserWarning, match="single prompt-cache slot"):
         base._default_factory("m", prompt_cache=True, cache_budget=None, reserve_tokens=1000)
     assert (seen["cache_budget"], seen["reserve_bytes"]) == (0, 0)
+
+
+def test_an_explicit_budget_with_an_unknown_kv_cost_still_warns(monkeypatch):
+    """Without a per-token cost there is no reserve, so the pressure check can
+    never fire: the budget cap is the only thing bounding the map. Silence
+    would make that look like a working configuration."""
+    from sous.engine import base
+
+    seen = _mystery_lm(monkeypatch)
+    with pytest.warns(UserWarning, match="memory-pressure check is disabled"):
+        base._default_factory("m", prompt_cache=True, cache_budget=1 << 30, reserve_tokens=1000)
+    assert (seen["cache_budget"], seen["reserve_bytes"]) == (1 << 30, 0)
+
+
+def test_measure_cache_budget_reads_mlxs_numbers(monkeypatch):
+    from sous.engine import base
+    from sous.engine.promptcache import CACHE_BUDGET_SLACK
+
+    _fake_mlx(monkeypatch, info={"max_recommended_working_set_size": 100 + CACHE_BUDGET_SLACK})
+    assert base.measure_cache_budget(30) == 100 - 40 - 30
+
+
+@pytest.mark.parametrize("info", [{}, "raise"])
+def test_measure_cache_budget_degrades_to_a_single_slot_when_mlx_cannot_answer(monkeypatch, info):
+    """An mlx API change must not brick delegation and the gateway: every other
+    reader of these numbers degrades, and so does this one."""
+    from sous.engine import base
+
+    _fake_mlx(monkeypatch, info=info)
+    with pytest.warns(UserWarning, match="could not measure the prompt-cache budget"):
+        assert base.measure_cache_budget(30) == 0
+
+
+def _fake_mlx(monkeypatch, *, info) -> None:
+    """A stand-in mlx.core, for machines with mlx and for CI without it."""
+    import sys
+    import types
+
+    def device_info():
+        if info == "raise":
+            raise RuntimeError("mlx moved")
+        return info
+
+    # SimpleNamespace, not ModuleType: the import machinery takes whatever
+    # sys.modules holds, and attributes set in a constructor keep ty happy.
+    core = types.SimpleNamespace(device_info=device_info, get_active_memory=lambda: 40)
+    monkeypatch.setitem(sys.modules, "mlx", types.SimpleNamespace(core=core))
+    monkeypatch.setitem(sys.modules, "mlx.core", core)
 
 
 def test_engine_manager_passes_the_configured_budget_and_the_larger_window(tmp_path, monkeypatch):

@@ -97,17 +97,31 @@ def measure_cache_budget(reserve_bytes: int) -> int:
     `active` is the weights (drafter included). Deliberately no
     release_mlx_thread_state() here: this runs on whichever thread loaded the
     engine, and that thread releases on its own schedule — a release from
-    inside would destroy streams the caller still uses (#34)."""
-    import mlx.core as mx
+    inside would destroy streams the caller still uses (#34).
 
-    from sous.engine.promptcache import auto_cache_budget
+    Runs inside both engine constructors, so it must never raise: an mlx API
+    change here would otherwise brick delegation and the gateway together, on
+    the shipped default. Every other reader of these numbers degrades instead
+    (decide_context, live_headroom), and so does this one — to a single slot.
+    """
+    try:
+        import mlx.core as mx
 
-    info = mx.device_info()
-    return auto_cache_budget(
-        working_set=int(info["max_recommended_working_set_size"]),
-        active=mx.get_active_memory(),
-        reserve_bytes=reserve_bytes,
-    )
+        from sous.engine.promptcache import auto_cache_budget
+
+        info = mx.device_info()
+        return auto_cache_budget(
+            working_set=int(info["max_recommended_working_set_size"]),
+            active=mx.get_active_memory(),
+            reserve_bytes=reserve_bytes,
+        )
+    except Exception as e:  # noqa: BLE001 — an optimization, never a failure
+        warnings.warn(
+            f"sous: could not measure the prompt-cache budget ({type(e).__name__}); "
+            "keeping a single slot",
+            stacklevel=2,
+        )
+        return 0
 
 
 def live_headroom() -> int | None:
@@ -171,14 +185,24 @@ def _default_factory(
     # per-token cost means the reserve cannot be sized, so the automatic
     # budget degrades to a single slot — never to an unbounded one.
     bytes_per_token = kv_bytes_per_token(model_config)
-    reserve_bytes = reserve_tokens * bytes_per_token if bytes_per_token else 0
-    if bytes_per_token is None and cache_budget is None:
+    reserve_bytes = reserve_tokens * bytes_per_token if bytes_per_token is not None else 0
+    if bytes_per_token is None:
+        # No reserve means the pressure check can never fire (headroom is
+        # never below zero), so say so however the budget was set: with an
+        # explicit one, the cap becomes the only thing bounding the map.
+        auto = cache_budget is None
         warnings.warn(
-            f"sous: KV cost per token unknown for {model_id}; keeping a single "
-            "prompt-cache slot (set [model].prompt_cache_gb to override)",
+            f"sous: KV cost per token unknown for {model_id}; the prompt cache's "
+            "memory-pressure check is disabled"
+            + (
+                " and a single prompt-cache slot is kept (set [model].prompt_cache_gb to override)"
+                if auto
+                else ""
+            ),
             stacklevel=2,
         )
-        cache_budget = 0
+        if auto:
+            cache_budget = 0
     if backend == "vlm":
         # Import the module, not the class, so tests can monkeypatch the
         # engine class on its home module and be seen here.
