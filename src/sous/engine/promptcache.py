@@ -372,6 +372,22 @@ class PrefixCache:
         ):
             self._drop_lru(protect)
 
+    def _make_room(self, nbytes: int) -> None:
+        """Evict LRU until a slot of `nbytes` would fit under the byte cap.
+
+        For the fork copy, which is charged before it is allocated rather than
+        after: publishing first and evicting afterwards would put the copy and
+        whatever it displaces on the machine at the same time — the transient
+        doubling the spec promises never happens. Nothing is protected: the
+        turn's own cache is not in the map, and a fork slot this turn copied
+        from has already been copied.
+
+        Takes the lock itself.
+        """
+        with self._lock:
+            while self._evictable(None) and self._resident() + nbytes > self.max_bytes:
+                self._drop_lru(None)
+
     def _take(self, owner: threading.Thread, stable_ids: list[int]) -> Slot | None:
         """The longest slot `owner` holds that `stable_ids` strictly extends.
         A turn slot leaves the map with the caller (its cache is about to be
@@ -394,12 +410,17 @@ class PrefixCache:
     ) -> int:
         """Whether this turn should leave a fork slot at `fork_at`: only a turn
         that is itself prefilling past the boundary can (a hit that started at
-        or beyond it holds the header inside a cache that cannot rewind), and
-        only when no fork with exactly those ids exists for this owner.
+        or beyond it holds the header inside a cache that cannot rewind), only
+        when no fork with exactly those ids exists for this owner, and only
+        when there is a budget to charge the copy to.
+
+        The budget test is first because a refusal here is total: the turn then
+        never even stops at the boundary, so at `max_bytes == 0` — the
+        pre-3a single-slot behaviour — nothing about the turn changes.
 
         Takes the lock itself, for the scan.
         """
-        if not (reuse < fork_at < len(stable_ids)):
+        if self.max_bytes <= 0 or not (reuse < fork_at < len(stable_ids)):
             return 0
         held = stable_ids[:fork_at]
         with self._lock:
@@ -668,22 +689,30 @@ class PrefixCache:
         anchor = len(stable_ids)
         fork_at = self._fork_wanted(owner, stable_ids, fork_at, reuse)
         if fork_at:
-            # Stop at the boundary, copy, and continue from the copy's twin:
-            # a fork is taken while prefilling past the header because no
-            # layer can be rewound to it afterwards. The copy is charged to
-            # the budget like any slot and may be evicted by the very publish
-            # that adds it — then this turn simply left nothing behind.
+            # Stop at the boundary and continue from there: a fork is taken
+            # while prefilling past the header because no layer can be rewound
+            # to it afterwards.
             hooks.prefill(cache, list(stable_ids[reuse:fork_at]))
-            copy = hooks.new_cache()
-            fork_copy(cache, copy, hooks.copy_array)
-            if self._publish(
-                Slot(copy, list(stable_ids[:fork_at]), owner, "fork", slot_bytes(copy)), epoch
-            ):
-                stats.forks += 1
-            # A fork the publish evicted (the budget was full) must not stay
-            # pinned by this frame for the whole decode that follows.
-            del copy
             reuse = fork_at
+            # What the cache holds at the boundary is what the copy will hold,
+            # so it is also the price. A copy that cannot fit under the budget
+            # even on an empty map is not taken at all — better one prefill
+            # than a second cache the machine has no room for.
+            price = slot_bytes(cache)
+            if price <= self.max_bytes:
+                self._make_room(price)
+                copy = hooks.new_cache()
+                fork_copy(cache, copy, hooks.copy_array)
+                if self._publish(
+                    Slot(copy, list(stable_ids[:fork_at]), owner, "fork", slot_bytes(copy)), epoch
+                ):
+                    stats.forks += 1
+                # A publish can still refuse the slot — a reset since the turn
+                # began, or the owner retired mid-turn — and a refused copy
+                # must not stay pinned by this frame for the whole decode that
+                # follows. (An accepted one is never evicted by its own
+                # publish: _publish protects the slot it adds.)
+                del copy
         if all_trimmable(cache):
             # Everything rewinds, so (the rest of) prefill and decode fuse into
             # one pass and the generation block plus the generated tokens are

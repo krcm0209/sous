@@ -117,6 +117,39 @@ class FakeRecurrent:
         return sum(a.nbytes for a in self.cache if a is not None)
 
 
+class FakeMeta:
+    """A cache that keeps real bookkeeping in `meta_state`, the way
+    RotatingKVCache keeps its window size and ring index there: a fork has to
+    carry that over, or the copy would rebuild with the wrong geometry."""
+
+    def __init__(self, state=None, meta: tuple[str, ...] = ()):
+        self.cache = list(state) if state else [None]
+        self.meta = meta
+
+    def is_trimmable(self) -> bool:
+        return False
+
+    @property
+    def state(self):
+        return self.cache
+
+    @state.setter
+    def state(self, v):
+        self.cache = list(v)
+
+    @property
+    def meta_state(self) -> tuple[str, ...]:
+        return self.meta
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.meta = v
+
+    @property
+    def nbytes(self) -> int:
+        return sum(a.nbytes for a in self.cache if a is not None)
+
+
 def _empty_stats() -> dict:
     return {**PromptCacheStats().as_dict(), "slots": 0, "resident_bytes": 0}
 
@@ -281,6 +314,9 @@ class FakeHooks:
         # Injected rather than monkeypatched: assigning over a bound method makes
         # ty report invalid-assignment, and ty checks the tests too.
         self.decode_impl = decode_impl
+        # Fires on every allocation, so a test can see the map at that instant
+        # — the fork copy is charged before it is allocated, not after.
+        self.on_new_cache = None
         self.caches: list[list] = []
         self.prefilled: list[list[int]] = []
         self.decoded: list[list[int]] = []
@@ -288,6 +324,8 @@ class FakeHooks:
         self.headroom_value: int | None = None
 
     def new_cache(self) -> list:
+        if self.on_new_cache is not None:
+            self.on_new_cache()
         if self.trimmable:
             cache = [FakeTrimmable() for _ in range(self.layers)]
         else:
@@ -776,6 +814,20 @@ def test_fork_copy_leaves_the_source_untouched():
     fork_copy(src, [FakeTrimmable()], copy_array)
     src[0].offset += 1  # the copy must not alias the source
     assert src[0].offset == 101
+
+
+def test_fork_copy_carries_a_layers_meta_state_over():
+    # mlx rebuilds a layer from the (state, meta_state) pair; a copy that
+    # carried only the arrays would come back with the wrong geometry.
+    src = [FakeMeta([FakeArray(1)], meta=("4096", "3"))]
+    dst = [FakeMeta()]
+    fork_copy(src, dst, copy_array)
+    assert dst[0].meta_state == ("4096", "3")
+    assert dst[0].state == [FakeArray(1)]
+    assert dst[0].state[0] is not src[0].state[0]
+    # And the source keeps its own: the next conversation forks from it again.
+    assert src[0].meta_state == ("4096", "3")
+    assert src[0].state == [FakeArray(1)]
 
 
 def test_slot_bytes_sums_every_layer():
@@ -1271,6 +1323,49 @@ def test_a_fork_is_charged_and_can_be_evicted_like_any_slot():
     pc.max_bytes = 0
     pc.generate(C2, C2_FULL, 16, fork_at=FORK)  # hits the fork, then evicts it
     assert [s.kind for s in pc.slots()] == ["turn"]
+
+
+def test_the_default_budget_refuses_the_fork_before_it_splits_the_prefill():
+    """max_bytes 0 is the pre-3a single-slot behaviour, and a fork is a second
+    copy of the header's KV: with no budget to charge it to, the turn must not
+    even stop at the boundary."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)  # the constructor default
+    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    assert len(h.caches) == 1  # the turn's own, and nothing else
+    assert pc.stats()["forks"] == 0
+    assert h.prefilled == []  # no boundary split: the trimmable path fused as before
+    assert [s.kind for s in pc.slots()] == ["turn"]
+
+
+def test_a_fork_larger_than_the_whole_budget_is_never_copied():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=FORK * 8 * 2 - 1)  # a byte short of the copy
+    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    assert len(h.caches) == 1
+    assert pc.stats()["forks"] == 0
+    # The turn slot is protected by its own publish, so it lands even though it
+    # too is over budget.
+    assert [s.held for s in pc.slots()] == [C1]
+
+
+def test_the_fork_copy_makes_room_before_it_is_allocated():
+    """The copy is charged first, not after: allocating it and then evicting
+    would put both on the machine at once."""
+    x1, x1_full = [901, 902, 903, 904], [901, 902, 903, 904, 90, 91]
+    y1, y1_full = [911, 912, 913, 914], [911, 912, 913, 914, 90, 91]
+    seen: list[list[list[int]]] = []
+    h = FakeHooks(trimmable=True)
+    h.on_new_cache = lambda: seen.append([s.held for s in pc.slots()])
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(x1, x1_full, 16)
+    pc.generate(y1, y1_full, 16)
+    # Room for the fork copy plus exactly one of the two resident slots.
+    pc.max_bytes = _bytes_of(pc, x1) + FORK * 8 * 2
+    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    assert pc.stats()["forks"] == 1
+    # The last allocation is the copy, and by then the LRU slot was already gone.
+    assert seen == [[], [x1], [x1, y1], [y1]]
 
 
 def test_pressure_evicts_until_headroom_covers_the_reserve():
