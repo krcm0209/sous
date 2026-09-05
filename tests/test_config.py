@@ -1,6 +1,8 @@
 import warnings
 from pathlib import Path
 
+import pytest
+
 from sous.config import (
     DEFAULT_ALLOWLIST,
     SousConfig,
@@ -287,6 +289,36 @@ def test_prompt_cache_is_a_known_model_key(tmp_path: Path):
         warnings.simplefilter("always")
         load_config(path)
     assert not [w for w in caught if "unknown" in str(w.message).lower()]
+
+
+def test_prompt_cache_gb_defaults_to_auto(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nid = 'x'\n")
+    cfg = load_config(p)
+    assert cfg.prompt_cache_gb is None
+
+
+def test_prompt_cache_gb_accepts_a_number(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nprompt_cache_gb = 12.5\n")
+    cfg = load_config(p)
+    assert cfg.prompt_cache_gb == 12.5
+
+
+def test_prompt_cache_gb_zero_means_a_single_slot(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nprompt_cache_gb = 0\n")
+    cfg = load_config(p)
+    assert cfg.prompt_cache_gb == 0.0
+
+
+@pytest.mark.parametrize("bad", ["-1", "true", "'lots'", "nan"])
+def test_prompt_cache_gb_rejects_garbage_with_a_warning(tmp_path: Path, bad: str):
+    p = tmp_path / "config.toml"
+    p.write_text(f"[model]\nprompt_cache_gb = {bad}\n")
+    with pytest.warns(UserWarning, match=r"\[model\]\.prompt_cache_gb"):
+        cfg = load_config(p)
+    assert cfg.prompt_cache_gb is None
 
 
 def test_speculative_defaults(tmp_path: Path):

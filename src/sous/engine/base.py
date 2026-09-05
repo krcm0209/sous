@@ -7,6 +7,7 @@ import json
 import queue
 import threading
 import time
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
@@ -66,8 +67,8 @@ class Engine(Protocol):
         on_delta: OnDelta | None = None,
     ) -> str: ...
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int: ...
-    def reset_prompt_cache(self) -> None: ...
-    def prompt_cache_stats(self) -> dict: ...
+    def reset_prompt_cache(self, owner: threading.Thread | None = None) -> None: ...
+    def prompt_cache_stats(self, owner: threading.Thread | None = None) -> dict: ...
     def unload(self) -> None: ...
 
 
@@ -89,6 +90,42 @@ def release_mlx_thread_state() -> None:
         mx.clear_streams()
     except Exception:  # noqa: BLE001 — see docstring
         pass
+
+
+def measure_cache_budget(reserve_bytes: int) -> int:
+    """The automatic resident-slot budget, read once the weights are loaded so
+    `active` is the weights (drafter included). Deliberately no
+    release_mlx_thread_state() here: this runs on whichever thread loaded the
+    engine, and that thread releases on its own schedule — a release from
+    inside would destroy streams the caller still uses (#34)."""
+    import mlx.core as mx
+
+    from sous.engine.promptcache import auto_cache_budget
+
+    info = mx.device_info()
+    return auto_cache_budget(
+        working_set=int(info["max_recommended_working_set_size"]),
+        active=mx.get_active_memory(),
+        reserve_bytes=reserve_bytes,
+    )
+
+
+def live_headroom() -> int | None:
+    """Bytes a cache could still take without paging: the tighter of Metal's
+    working set minus what mlx holds and available RAM plus mlx's reclaimable
+    buffer cache (sous.context.auto_context_tokens' definition). Read on the
+    owner thread mid-turn; same no-release rule as measure_cache_budget. None
+    when the numbers are unavailable — the caller then skips its check."""
+    try:
+        import mlx.core as mx
+        import psutil
+
+        info = mx.device_info()
+        metal = int(info["max_recommended_working_set_size"]) - mx.get_active_memory()
+        system = psutil.virtual_memory().available + mx.get_cache_memory()
+        return max(0, min(metal, system))
+    except Exception:  # noqa: BLE001 — mlx absent or API moved; a check we skip, not a failure
+        return None
 
 
 class GenerationStalled(Exception):
@@ -122,8 +159,26 @@ def _default_factory(
     prompt_cache: bool = True,
     draft_id: str = "",
     draft_block_size: int = 0,
+    cache_budget: int | None = None,
+    reserve_tokens: int = 0,
 ) -> Engine:
-    backend = select_backend(fetch_model_config(model_id))
+    from sous.context import kv_bytes_per_token
+
+    model_config = fetch_model_config(model_id)
+    backend = select_backend(model_config)
+    # One full window of KV, kept free for the in-flight turn before slots get
+    # anything (the spec's "reserved out of the generation budget"). Unknown
+    # per-token cost means the reserve cannot be sized, so the automatic
+    # budget degrades to a single slot — never to an unbounded one.
+    bytes_per_token = kv_bytes_per_token(model_config)
+    reserve_bytes = reserve_tokens * bytes_per_token if bytes_per_token else 0
+    if bytes_per_token is None and cache_budget is None:
+        warnings.warn(
+            f"sous: KV cost per token unknown for {model_id}; keeping a single "
+            "prompt-cache slot (set [model].prompt_cache_gb to override)",
+            stacklevel=2,
+        )
+        cache_budget = 0
     if backend == "vlm":
         # Import the module, not the class, so tests can monkeypatch the
         # engine class on its home module and be seen here.
@@ -137,6 +192,8 @@ def _default_factory(
             prompt_cache=prompt_cache,
             draft_id=draft_id,
             draft_block_size=draft_block_size,
+            cache_budget=cache_budget,
+            reserve_bytes=reserve_bytes,
         )
     # The drafter settings stop here: speculative decoding is an mlx-vlm
     # feature, and the mlx-lm backend has no parameter for it.
@@ -148,6 +205,8 @@ def _default_factory(
         top_p=top_p,
         top_k=top_k,
         prompt_cache=prompt_cache,
+        cache_budget=cache_budget,
+        reserve_bytes=reserve_bytes,
     )
 
 
@@ -182,20 +241,21 @@ class ManagedEngine:
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
         return self._inner.count_tokens(messages, tools)
 
-    def reset_prompt_cache(self) -> None:
+    def reset_prompt_cache(self, owner: threading.Thread | None = None) -> None:
         # No _gen_lock, on purpose. An abandoned stalled generation still holds
         # it, and run_task calls this in a finally — waiting there would wedge
         # the next task. What actually makes a lock-free reset safe against
-        # that thread's late write-back is not the epoch guard by itself: the
-        # cache is always published together with the exact token ids it
+        # that thread's late write-back is not the epoch guard by itself: a
+        # slot is always published together with the exact token ids it
         # contains, and reuse_length demands a full strict-prefix match, so a
-        # stale cache adopted by a later task is either rejected outright or
-        # genuinely correct for it. The epoch is only a cheap early-out on
-        # top of that — it skips the adoption, it doesn't guarantee it.
-        self._inner.reset_prompt_cache()
+        # stale slot adopted by a later task is either rejected outright or
+        # genuinely correct for it. The epoch (and, per owner, retirement) is
+        # only a cheap early-out on top of that — it skips the adoption, it
+        # doesn't guarantee it.
+        self._inner.reset_prompt_cache(owner)
 
-    def prompt_cache_stats(self) -> dict:
-        return self._inner.prompt_cache_stats()
+    def prompt_cache_stats(self, owner: threading.Thread | None = None) -> dict:
+        return self._inner.prompt_cache_stats(owner)
 
     def generation_in_flight(self) -> bool:
         return self._gen_lock.locked()
@@ -258,6 +318,12 @@ class GenerationSession:
         # a wedged generation must not block task teardown.
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+
+    @property
+    def thread(self) -> threading.Thread:
+        """The thread every generation of this session runs on — the owner
+        of every prompt-cache slot those generations publish."""
+        return self._thread
 
     def _loop(self) -> None:
         try:
@@ -339,6 +405,17 @@ class EngineManager:
                 config.prompt_cache,
                 draft_id=config.speculative_draft_id,
                 draft_block_size=config.speculative_block_size,
+                cache_budget=(
+                    None
+                    if config.prompt_cache_gb is None
+                    else int(config.prompt_cache_gb * (1 << 30))
+                ),
+                # The largest cache one turn can build on this daemon: the
+                # gateway's window when it is on, else the worker's.
+                reserve_tokens=max(
+                    config.max_context_tokens,
+                    config.gateway_max_context_tokens if config.gateway_enabled else 0,
+                ),
             )
         )
         self._lock = threading.Lock()
@@ -395,8 +472,12 @@ class EngineManager:
     def status(self) -> dict:
         with self._lock:
             idle = (time.monotonic() - self._last_used) if self._last_used else None
-            return {
+            out = {
                 "loaded": self._engine is not None,
                 "model_id": self._config.model_id,
                 "idle_seconds": idle,
             }
+            if self._engine is not None:
+                # Counts and byte totals only; never a token id.
+                out["prompt_cache"] = self._engine.prompt_cache_stats()
+            return out

@@ -51,6 +51,7 @@ _KNOWN = {
         "top_p",
         "top_k",
         "prompt_cache",
+        "prompt_cache_gb",
         "speculative_draft_id",
         "speculative_block_size",
     },
@@ -107,6 +108,14 @@ class SousConfig:
     # thread (#34) — mlx streams are thread-scoped, so the cache only
     # survives between turns that run on the thread that built it.
     prompt_cache: bool = True
+    # Memory resident prompt-cache slots may hold beyond the in-flight turn's
+    # own cache, in GiB. None means automatic: what Metal's working set has
+    # left once the weights, one full window of KV (the larger of the worker's
+    # and the gateway's) and 2 GiB of slack are paid for. 0 keeps a single
+    # slot. Slots are what let two conversations interleave on the local model
+    # without evicting each other, and what lets a new subagent start from a
+    # copy of the ~50K-token header its predecessor already prefilled.
+    prompt_cache_gb: float | None = None
     max_turns: int = 40
     max_minutes: int = 15
     max_tokens_per_generation: int = 4096
@@ -219,6 +228,27 @@ def _speculative_block_size(model: dict) -> int:
         )
         return 0
     return value
+
+
+def _prompt_cache_gb(model: dict) -> float | None:
+    """[model].prompt_cache_gb: "auto" (None) or a non-negative number of GiB.
+    Anything else warns and means auto."""
+    value = model.get("prompt_cache_gb", "auto")
+    if value == "auto":
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or value != value  # NaN
+        or value < 0
+    ):
+        warnings.warn(
+            f'sous config: [model].prompt_cache_gb {value!r} must be "auto" or a '
+            'non-negative number of GiB; using "auto"',
+            stacklevel=3,
+        )
+        return None
+    return float(value)
 
 
 def _gateway_values(gateway: dict) -> tuple[bool, tuple[str, ...], int, int]:
@@ -379,6 +409,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         top_p=model.get("top_p", 0.8),
         top_k=model.get("top_k", 20),
         prompt_cache=model.get("prompt_cache", True),
+        prompt_cache_gb=_prompt_cache_gb(model),
         speculative_draft_id=model.get("speculative_draft_id", "z-lab/Qwen3.8-27B-DFlash2"),
         speculative_block_size=_speculative_block_size(model),
         max_turns=budgets.get("max_turns", 40),
