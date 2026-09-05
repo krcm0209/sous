@@ -8,10 +8,13 @@ a fake cache layer can exercise it. Array copies arrive through an injected
 
 from __future__ import annotations
 
+import dataclasses
 import threading
+import time  # noqa: F401 -- unused until Task 2 wires up keyed slots
 import warnings
+import weakref  # noqa: F401 -- unused until Task 2 wires up keyed slots
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field  # noqa: F401 -- field unused until Task 2
 from typing import Any, Protocol
 
 from sous.engine.base import Delta, OnDelta, ReplaySafe
@@ -26,14 +29,13 @@ def reuse_length(cached_ids: Sequence[int], new_ids: Sequence[int]) -> int:
     required rather than incidental: mlx rejects an empty prompt, so an exact
     match must count as a miss.
     """
-    if not cached_ids or len(new_ids) <= len(cached_ids):
+    n = len(cached_ids)
+    if not n or len(new_ids) <= n:
         return 0
-    # strict=False is deliberate: the lengths differ by design. ruff selects B,
-    # so B905 requires the flag to be explicit either way.
-    for a, b in zip(cached_ids, new_ids, strict=False):
-        if a != b:
-            return 0
-    return len(cached_ids)
+    # A slice comparison runs in C. With up to MAX_SLOTS candidate slots of
+    # ~50K tokens each to test per turn, a Python loop here would cost tens
+    # of milliseconds on every lookup.
+    return n if list(new_ids[:n]) == list(cached_ids) else 0
 
 
 def all_trimmable(cache: Sequence[Any]) -> bool:
@@ -108,29 +110,104 @@ def trim_to(cache: Sequence[Any], n_tokens: int) -> None:
             c.trim(current - n_tokens)
 
 
+# A header shorter than this is not worth a fork slot: prefilling it costs
+# under a second on the default model, and a fork is a full second copy of its
+# KV. The worker's ~2K-token system prompt never qualifies; a Claude Code
+# subagent's ~50K one always does.
+FORK_MIN_TOKENS = 4096
+# A sanity bound on the slot count. Finished subagent conversations are what
+# fills the map, and LRU eviction discards those first; the byte budget is the
+# real limit.
+MAX_SLOTS = 16
+# Kept free beyond weights, resident slots and the in-flight turn's own cache
+# when the budget is derived automatically: drafter activations, mlx's
+# allocator slack, the tokenizer.
+CACHE_BUDGET_SLACK = 2 << 30
+
+
+def fork_point(header_ids: Sequence[int], stable_ids: Sequence[int]) -> int:
+    """Where a turn may fork a shared-prefix slot: the header's length when the
+    header is a strict token prefix of the stable render and long enough to be
+    worth a copy, else 0.
+
+    `reuse_length` is the test on purpose: [model].id accepts any chat
+    template, and whether "the system turn rendered alone" is a token prefix
+    of "the whole conversation rendered" is a property of that template and
+    tokenizer. It is verified here every turn, never assumed.
+    """
+    n = len(header_ids)
+    if n < FORK_MIN_TOKENS or reuse_length(header_ids, stable_ids) != n:
+        return 0
+    return n
+
+
+def slot_bytes(cache: Sequence[Any]) -> int:
+    """Bytes a cache holds resident: every layer's `nbytes`. For a KVCache that
+    is the whole allocated buffer, 256-step padding and the trimmed-off
+    generation region included — the truth about residency, and an upper
+    bound."""
+    return sum(int(getattr(c, "nbytes", 0) or 0) for c in cache)
+
+
+def fork_copy(src: Sequence[Any], dst: Sequence[Any], copy_array: Callable) -> None:
+    """Make `dst` — a fresh cache of the same layout — hold exactly what `src`
+    holds now, as an independent copy.
+
+    Every layer's `state` is copied array by array and `meta_state` carried
+    over: that pair is what mlx's own `_BaseCache.from_state` rebuilds a layer
+    from, so it is complete for every cache class mlx ships. A KVCache's
+    `state` getter slices keys/values to the current offset, so the copy
+    materialises just that many tokens (no step padding) and the setter
+    derives the offset from the copied shape. Unlike `snapshot`, which records
+    only an offset for a layer it will later restore in place, a fork must
+    copy the attention layers too — it is a second cache, not a bookmark.
+
+    Callers fork only after a prefill of at least FORK_MIN_TOKENS tokens, so
+    every layer is populated (an empty KVCache's `state` getter would raise).
+    Nested-tuple states (QuantizedKVCache) are not handled; sous never
+    quantizes its KV.
+    """
+    for s, d in zip(src, dst, strict=True):
+        d.state = [None if a is None else copy_array(a) for a in s.state]
+        d.meta_state = s.meta_state
+
+
+def auto_cache_budget(*, working_set: int, active: int, reserve_bytes: int) -> int:
+    """Bytes resident slots may hold beyond the in-flight turn: what Metal
+    serves without paging, minus what mlx already holds (the weights, when
+    read at load), minus the largest cache one turn can build (`reserve_bytes`
+    — the window times the KV cost of a token), minus a fixed slack. This is
+    the "reserved out of the generation budget" of the spec: the turn's own
+    cache is paid for first, slots get what is left."""
+    return max(0, working_set - active - reserve_bytes - CACHE_BUDGET_SLACK)
+
+
 @dataclass
 class PromptCacheStats:
-    hits: int = 0
+    hits: int = 0  # every warm run, from a turn slot or a fork copy
     misses: int = 0
     reused_tokens: int = 0
     snapshot_bytes: int = 0
     cold_retries: int = 0
+    fork_hits: int = 0  # the subset of hits served by copying a fork slot
+    forks: int = 0  # fork slots created
+    evictions: int = 0  # slots dropped for budget, count or pressure
 
     def as_dict(self) -> dict:
-        return {
-            "hits": self.hits,
-            "misses": self.misses,
-            "reused_tokens": self.reused_tokens,
-            "snapshot_bytes": self.snapshot_bytes,
-            "cold_retries": self.cold_retries,
-        }
+        return dataclasses.asdict(self)
+
+    def add(self, other: PromptCacheStats) -> None:
+        for f in dataclasses.fields(self):
+            setattr(self, f.name, getattr(self, f.name) + getattr(other, f.name))
 
 
-_MEMO_SLOTS = ("stable", "full")
+_MEMO_SLOTS = ("stable", "full", "header")
 
 
 class PromptMemo:
     """One slot per render, keyed by the exact prompt text.
+
+    The header slot holds the system turn rendered alone — the fork boundary.
 
     Each turn needs both the stable render and the full prompt, and
     `count_tokens` asks for one of them before `generate` asks again. Keying on
@@ -157,7 +234,7 @@ class PromptMemo:
 
 
 class CacheHooks(Protocol):
-    """The four things only an engine can do. Everything else is shared."""
+    """The five things only an engine can do. Everything else is shared."""
 
     def new_cache(self) -> list: ...
     def prefill(self, cache: list, token_ids: list[int]) -> None: ...
@@ -165,6 +242,10 @@ class CacheHooks(Protocol):
         self, cache: list, token_ids: list[int], max_tokens: int, on_delta: OnDelta | None
     ) -> str: ...
     def copy_array(self, a: object) -> object: ...
+    # Bytes the machine can still give a cache right now, or None when it
+    # cannot tell (no mlx). Read on the owner thread; must not release thread
+    # state.
+    def headroom(self) -> int | None: ...
 
 
 class PrefixCache:

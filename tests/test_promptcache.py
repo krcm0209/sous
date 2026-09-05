@@ -14,12 +14,17 @@ import pytest
 
 from sous.engine.base import Delta
 from sous.engine.promptcache import (
+    FORK_MIN_TOKENS,
     PrefixCache,
     PromptCacheStats,
     PromptMemo,
     all_trimmable,
+    auto_cache_budget,
+    fork_copy,
+    fork_point,
     restore,
     reuse_length,
+    slot_bytes,
     snapshot,
     trim_to,
 )
@@ -41,7 +46,10 @@ def copy_array(a: FakeArray) -> FakeArray:
 
 
 class FakeTrimmable:
-    """A KVCache stand-in: O(n) state, rewound by moving an integer offset."""
+    """A KVCache stand-in: O(n) state, rewound by moving an integer offset.
+    `state` carries the offset as one FakeArray so fork_copy can rebuild it
+    the way KVCache's setter derives offset from the copied shape; nbytes
+    grows with the offset like a real KV buffer."""
 
     offset: int
 
@@ -55,6 +63,26 @@ class FakeTrimmable:
         n = min(self.offset, n)
         self.offset -= n
         return n
+
+    @property
+    def state(self):
+        return [FakeArray(self.offset, nbytes=self.offset * 8)]
+
+    @state.setter
+    def state(self, v):
+        self.offset = v[0].value
+
+    @property
+    def meta_state(self):
+        return ""
+
+    @meta_state.setter
+    def meta_state(self, v):
+        assert not v
+
+    @property
+    def nbytes(self) -> int:
+        return self.offset * 8
 
 
 class FakeRecurrent:
@@ -75,6 +103,18 @@ class FakeRecurrent:
     @state.setter
     def state(self, v):
         self.cache = list(v)
+
+    @property
+    def meta_state(self):
+        return ""
+
+    @meta_state.setter
+    def meta_state(self, v):
+        assert not v
+
+    @property
+    def nbytes(self) -> int:
+        return sum(a.nbytes for a in self.cache if a is not None)
 
 
 # ---- reuse_length ----------------------------------------------------------
@@ -177,20 +217,6 @@ def test_trim_to_is_a_no_op_when_already_short_enough():
     assert cache[0].offset == 80
 
 
-# ---- stats ----------------------------------------------------------------
-
-
-def test_stats_as_dict_reports_every_counter():
-    s = PromptCacheStats(hits=2, misses=1, reused_tokens=900, snapshot_bytes=16, cold_retries=1)
-    assert s.as_dict() == {
-        "hits": 2,
-        "misses": 1,
-        "reused_tokens": 900,
-        "snapshot_bytes": 16,
-        "cold_retries": 1,
-    }
-
-
 # ---- memo -----------------------------------------------------------------
 
 
@@ -250,6 +276,7 @@ class FakeHooks:
         self.prefilled: list[list[int]] = []
         self.decoded: list[list[int]] = []
         self.generated = [7, 8, 9]
+        self.headroom_value: int | None = None
 
     def new_cache(self) -> list:
         if self.trimmable:
@@ -285,6 +312,9 @@ class FakeHooks:
 
     def copy_array(self, a):
         return copy_array(a)
+
+    def headroom(self):
+        return self.headroom_value
 
 
 STABLE_1, FULL_1 = [1, 2, 3, 4], [1, 2, 3, 4, 90, 91]
@@ -369,13 +399,7 @@ def test_same_turn_mismatch_decodes_whole_prompt_cold_and_warns(trimmable):
         assert pc.generate(REWRITTEN_STABLE, REWRITTEN_FULL, 16) == "text"
     assert h.decoded == [REWRITTEN_FULL]  # the whole prompt, not a reuse-sliced suffix
     assert h.prefilled == []  # the guard sits above the trim/state-copy split
-    assert pc.stats() == {
-        "hits": 0,
-        "misses": 1,
-        "reused_tokens": 0,
-        "snapshot_bytes": 0,
-        "cold_retries": 0,
-    }
+    assert pc.stats() == PromptCacheStats(misses=1).as_dict()
 
 
 @pytest.mark.parametrize("trimmable", [True, False])
@@ -699,3 +723,119 @@ def test_a_cache_built_on_another_thread_is_a_cold_miss():
     full_4 = [*stable_4, 90, 91]
     pc.generate(stable_4, full_4, 16)
     assert pc.stats()["hits"] == 2
+
+
+# ---- fork_point ------------------------------------------------------------
+
+HEADER = list(range(FORK_MIN_TOKENS))
+BODY = [90_000, 90_001, 90_002]
+
+
+def test_fork_point_accepts_a_long_header_that_is_a_strict_prefix():
+    assert fork_point(HEADER, HEADER + BODY) == len(HEADER)
+
+
+def test_fork_point_rejects_a_header_that_is_not_a_prefix():
+    assert fork_point(HEADER, [1, *HEADER[1:], *BODY]) == 0
+
+
+def test_fork_point_rejects_a_header_equal_to_the_whole_render():
+    # Nothing would be left to prefill after the fork; also an exact match is
+    # a miss under reuse_length, so the two rules agree.
+    assert fork_point(HEADER, HEADER) == 0
+
+
+def test_fork_point_rejects_a_short_header():
+    short = HEADER[: FORK_MIN_TOKENS - 1]
+    assert fork_point(short, short + BODY) == 0
+
+
+# ---- fork_copy / slot_bytes --------------------------------------------------
+
+
+def test_fork_copy_gives_the_destination_the_same_offsets_and_state():
+    src = [FakeTrimmable(offset=100), FakeRecurrent([FakeArray(1), FakeArray(2)])]
+    dst = [FakeTrimmable(), FakeRecurrent()]
+    fork_copy(src, dst, copy_array)
+    assert cast(FakeTrimmable, dst[0]).offset == 100
+    assert cast(FakeRecurrent, dst[1]).state == [FakeArray(1), FakeArray(2)]
+
+
+def test_fork_copy_detaches_the_recurrent_state():
+    arr = FakeArray(1)
+    src = [FakeRecurrent([arr, None])]
+    dst = [FakeRecurrent()]
+    fork_copy(src, dst, copy_array)
+    assert cast(FakeRecurrent, dst[0]).state[0] is not arr
+    assert cast(FakeRecurrent, dst[0]).state[1] is None
+
+
+def test_fork_copy_leaves_the_source_untouched():
+    src = [FakeTrimmable(offset=100)]
+    fork_copy(src, [FakeTrimmable()], copy_array)
+    cast(FakeTrimmable, src[0]).offset += 1  # the copy must not alias the source
+    assert cast(FakeTrimmable, src[0]).offset == 101
+
+
+def test_slot_bytes_sums_every_layer():
+    cache = [FakeTrimmable(offset=10), FakeRecurrent([FakeArray(1, nbytes=8), None])]
+    assert slot_bytes(cache) == 80 + 8
+
+
+def test_slot_bytes_tolerates_a_layer_without_nbytes():
+    class Bare:
+        pass
+
+    assert slot_bytes([Bare(), FakeTrimmable(offset=1)]) == 8
+
+
+# ---- auto_cache_budget -------------------------------------------------------
+
+
+def test_auto_cache_budget_is_working_set_minus_weights_reserve_and_slack():
+    gib = 1 << 30
+    got = auto_cache_budget(working_set=52 * gib, active=18 * gib, reserve_bytes=8 * gib)
+    assert got == (52 - 18 - 8 - 2) * gib
+
+
+def test_auto_cache_budget_never_goes_negative():
+    gib = 1 << 30
+    assert auto_cache_budget(working_set=24 * gib, active=18 * gib, reserve_bytes=8 * gib) == 0
+
+
+# ---- stats -----------------------------------------------------------------
+
+
+def test_stats_as_dict_reports_every_counter():
+    s = PromptCacheStats(
+        hits=2,
+        misses=1,
+        reused_tokens=900,
+        snapshot_bytes=16,
+        cold_retries=1,
+        fork_hits=1,
+        forks=1,
+        evictions=3,
+    )
+    assert s.as_dict() == {
+        "hits": 2,
+        "misses": 1,
+        "reused_tokens": 900,
+        "snapshot_bytes": 16,
+        "cold_retries": 1,
+        "fork_hits": 1,
+        "forks": 1,
+        "evictions": 3,
+    }
+
+
+def test_stats_add_sums_every_counter():
+    a = PromptCacheStats(hits=1, forks=1)
+    a.add(PromptCacheStats(hits=2, evictions=4))
+    assert (a.hits, a.forks, a.evictions) == (3, 1, 4)
+
+
+def test_memo_accepts_the_header_slot():
+    m = PromptMemo()
+    m.put("header", "sys", [1, 2])
+    assert m.get("header", "sys") == [1, 2]
