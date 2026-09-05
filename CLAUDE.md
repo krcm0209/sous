@@ -50,8 +50,11 @@ Claude Code use stretches further — evaluate features against that goal.
   thread (`session.thread`) at task end and never calls the bare `reset()`,
   which drops the gateway's slots too. A `fork` slot is a *copy* taken while
   a cold turn prefills past the system header (`fork_point`, 4096-token
-  floor); a `turn` slot is *moved* into the turn that extends it. Never
-  rewind a cache to make a slot — a hybrid model's recurrent layers cannot.
+  floor) — the header is found by rendering two probe conversations and
+  taking their common prefix, never by rendering the system turn alone,
+  which Qwen3.8's template refuses; a `turn` slot is *moved* into the turn
+  that extends it. Never rewind a cache to make a slot — a hybrid model's
+  recurrent layers cannot.
   `base.measure_cache_budget`/`live_headroom` deliberately do not call
   `release_mlx_thread_state()`: they run on threads whose caches are live.
 - The gateway forwards every request it does not serve (`gateway/upstream.py`)

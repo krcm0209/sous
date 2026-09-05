@@ -220,7 +220,8 @@ _MEMO_SLOTS = ("stable", "full", "header")
 class PromptMemo:
     """One slot per render, keyed by the exact prompt text.
 
-    The header slot holds the system turn rendered alone — the fork boundary.
+    The header slot holds the fork boundary's text: what two probe renders of
+    the system turn have in common (see the engines' `_header_probe`).
 
     Each turn needs both the stable render and the full prompt, and
     `count_tokens` asks for one of them before `generate` asks again. Keying on
@@ -411,7 +412,11 @@ class PrefixCache:
         return best
 
     def _fork_wanted(
-        self, owner: threading.Thread, stable_ids: list[int], fork_at: int, reuse: int
+        self,
+        owner: threading.Thread,
+        stable_ids: list[int],
+        fork_at: int | Callable[[], int],
+        reuse: int,
     ) -> int:
         """Whether this turn should leave a fork slot at `fork_at`: only a turn
         that is itself prefilling past the boundary can (a hit that started at
@@ -425,14 +430,42 @@ class PrefixCache:
 
         Takes the lock itself, for the scan.
         """
-        if self.max_bytes <= 0 or not (reuse < fork_at < len(stable_ids)):
+        if self.max_bytes <= 0:
             return 0
-        held = stable_ids[:fork_at]
+        at = fork_at
+        if not isinstance(at, int):
+            # A callable boundary is the engine's header probe, and it costs
+            # renders and a tokenize — so it is asked only where its answer
+            # could still be used, which is a cold miss. A warm start at a
+            # shorter boundary forgoes the longer header deliberately: no
+            # layer rewinds to it, so paying the probe would buy nothing.
+            # Exactly one `_run` per turn ever has `reuse == 0` (a cold
+            # attempt that fails is not retried), so this resolves at most
+            # once per turn. Resolved before the lock is taken: the probe
+            # tokenizes, and nothing that slow may run under the bookkeeping
+            # lock that reset() promises never to wait behind.
+            if reuse:
+                return 0
+            try:
+                at = at()
+            except Exception as e:
+                # An optimization must never fail a turn — the same rule the
+                # warm-retry path follows. A chat template is free to refuse
+                # the probe conversation; the turn just does not fork.
+                warnings.warn(
+                    f"sous prompt cache: header probe failed ({type(e).__name__}); "
+                    "not forking this turn",
+                    stacklevel=2,
+                )
+                return 0
+        if not (reuse < at < len(stable_ids)):
+            return 0
+        held = stable_ids[:at]
         with self._lock:
             for s in self._slots:
                 if s.owner is owner and s.kind == "fork" and s.held == held:
                     return 0
-        return fork_at
+        return at
 
     def _publish(self, slot: Slot, epoch: int) -> bool:
         """Add `slot` unless the world moved on: a full reset since the turn
@@ -539,8 +572,12 @@ class PrefixCache:
         full_ids: list[int],
         max_tokens: int,
         on_delta: OnDelta | None = None,
-        fork_at: int = 0,
+        fork_at: int | Callable[[], int] = 0,
     ) -> str:
+        """`fork_at` is the header boundary, as a token count or as a callable
+        that computes one. The callable form lets an engine defer a probe that
+        renders and tokenizes until this turn is known to be able to fork at
+        all — see `_fork_wanted`, which resolves it."""
         hooks = self._hooks
         if not self.enabled:
             return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens, on_delta)
@@ -687,19 +724,21 @@ class PrefixCache:
         reuse: int,
         max_tokens: int,
         on_delta: OnDelta | None,
-        fork_at: int,
+        fork_at: int | Callable[[], int],
         owner: threading.Thread,
         epoch: int,
     ) -> str:
         hooks = self._hooks
         anchor = len(stable_ids)
-        fork_at = self._fork_wanted(owner, stable_ids, fork_at, reuse)
-        if fork_at:
+        # A separate name, not `fork_at` reassigned: the parameter may be a
+        # callable, and what _fork_wanted answers is always a token count.
+        boundary = self._fork_wanted(owner, stable_ids, fork_at, reuse)
+        if boundary:
             # Stop at the boundary and continue from there: a fork is taken
             # while prefilling past the header because no layer can be rewound
             # to it afterwards.
-            hooks.prefill(cache, list(stable_ids[reuse:fork_at]))
-            reuse = fork_at
+            hooks.prefill(cache, list(stable_ids[reuse:boundary]))
+            reuse = boundary
             # What the cache holds at the boundary is what the copy will hold,
             # so it is also the price. A copy that cannot fit under the budget
             # even on an empty map is not taken at all — better one prefill
@@ -710,7 +749,7 @@ class PrefixCache:
                 copy = hooks.new_cache()
                 fork_copy(cache, copy, hooks.copy_array)
                 if self._publish(
-                    Slot(copy, list(stable_ids[:fork_at]), owner, "fork", slot_bytes(copy)), epoch
+                    Slot(copy, list(stable_ids[:boundary]), owner, "fork", slot_bytes(copy)), epoch
                 ):
                     stats.forks += 1
                 # A publish can still refuse the slot — a reset since the turn

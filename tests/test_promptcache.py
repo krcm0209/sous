@@ -1272,6 +1272,71 @@ def test_a_fork_is_not_taken_when_the_fork_exists_but_this_turn_missed_it():
     t.join(5)
 
 
+def _probe(value: int, calls: list[int]):
+    """A header probe like the engines': it costs two renders and a tokenize,
+    so the count of calls is what these tests are about."""
+
+    def probe() -> int:
+        calls.append(value)
+        return value
+
+    return probe
+
+
+def test_a_callable_fork_at_is_resolved_once_on_a_cold_miss():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    calls: list[int] = []
+    pc.generate(C1, C1_FULL, 16, fork_at=_probe(FORK, calls))
+    assert calls == [FORK]
+    assert sorted((s.kind, s.held) for s in pc.slots()) == [("fork", H), ("turn", C1)]
+
+
+def test_a_callable_fork_at_is_not_resolved_when_a_turn_slot_serves_the_turn():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    calls: list[int] = []
+    pc.generate(C1_NEXT, C1_NEXT_FULL, 16, fork_at=_probe(FORK, calls))
+    assert calls == []
+
+
+def test_a_callable_fork_at_is_not_resolved_on_a_fork_hit():
+    # The header is already inside this turn's cache and no layer rewinds to
+    # it, so the probe's answer could not be used even if it were asked for.
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    calls: list[int] = []
+    pc.generate(C2, C2_FULL, 16, fork_at=_probe(FORK, calls))
+    assert pc.stats()["fork_hits"] == 1
+    assert calls == []
+
+
+def test_a_callable_fork_at_is_not_resolved_without_a_budget():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)  # max_bytes=0: the single-slot default forks nothing
+    calls: list[int] = []
+    pc.generate(C1, C1_FULL, 16, fork_at=_probe(FORK, calls))
+    assert calls == []
+    assert [s.kind for s in pc.slots()] == ["turn"]
+
+
+def test_a_failing_header_probe_warns_and_leaves_the_turn_alone():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+
+    def probe() -> int:
+        # What the default model's chat template does to a render it refuses.
+        raise ValueError("No user query found in messages.")
+
+    with pytest.warns(UserWarning, match="header probe"):
+        assert pc.generate(C1, C1_FULL, 16, fork_at=probe) == "text"
+    assert pc.stats()["forks"] == 0
+    assert [s.kind for s in pc.slots()] == ["turn"]
+    assert h.prefilled == []  # no stop at a boundary: the trimmable path fused
+
+
 # ---- budget ------------------------------------------------------------------
 
 

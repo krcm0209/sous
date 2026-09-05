@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import warnings
+from collections.abc import Callable
 from typing import Any, cast
 
 from sous.engine.base import Delta, OnDelta
-from sous.engine.promptcache import PrefixCache, PromptMemo, fork_point
+from sous.engine.promptcache import FORK_MIN_TOKENS, PrefixCache, PromptMemo, fork_point
+
+# Two conversations that differ only in the first user turn's content, so that
+# what their renders have in common is exactly the header — see _header_probe.
+_PROBES = ({"role": "user", "content": "0"}, {"role": "user", "content": "1"})
 
 
 def _load_quantized_drafter(model: object, draft_id: str) -> tuple[Any, str]:
@@ -247,19 +253,51 @@ class VLMEngine:
             full_ids,
             max_tokens,
             on_delta,
-            fork_at=self._fork_at(messages, tools, stable_ids),
+            fork_at=self._header_probe(messages, tools, stable_ids),
         )
 
-    def _fork_at(self, messages: list[dict], tools: list[dict], stable_ids: list[int]) -> int:
-        """The header boundary: the leading system turn rendered alone, with
-        the same tools, when it is a strict token prefix of the whole stable
-        render and long enough to be worth a fork slot (promptcache.fork_point
-        decides both). Every Claude Code subagent of one type shares exactly
-        this prefix; the worker's short system prompt never qualifies."""
-        if len(messages) < 2 or messages[0].get("role") != "system":
+    def _header_probe(
+        self, messages: list[dict], tools: list[dict], stable_ids: list[int]
+    ) -> Callable[[], int] | int:
+        """The header boundary — everything the template emits above the first
+        user turn's content — as a closure PrefixCache resolves only when this
+        turn could actually fork.
+
+        Found from two probe conversations rather than from the system turn
+        rendered alone: [model].id accepts any chat template, and a template
+        may refuse a message list with no user turn outright (the default
+        model's does: `raise_exception("No user query found in messages.")`).
+        Two renders that differ only in the first user turn's content share
+        exactly the header, whatever the template puts there. fork_point still
+        verifies per turn that those ids really are a token prefix of this
+        render, and that the header clears the fork floor.
+
+        Every Claude Code subagent of one type shares exactly this prefix; the
+        worker's short system prompt never qualifies, and a render below the
+        floor cannot contain a header above it — so it never pays the probe."""
+        if (
+            len(messages) < 2
+            or messages[0].get("role") != "system"
+            or len(stable_ids) < FORK_MIN_TOKENS
+        ):
             return 0
-        header_ids = self._ids("header", messages[:1], tools)
-        return fork_point(header_ids, stable_ids)
+
+        def probe() -> int:
+            with self._tokenize_lock:
+                renders = [
+                    self._prompt([messages[0], user], tools, generation=False) for user in _PROBES
+                ]
+                header = os.path.commonprefix(renders)
+                # Memoized like the other renders: the header is the longest
+                # thing in the prompt, and a conversation re-probes it on every
+                # cold turn.
+                header_ids = self._memo.get("header", header)
+                if header_ids is None:
+                    header_ids = self._encode(header)
+                    self._memo.put("header", header, header_ids)
+            return fork_point(header_ids, stable_ids)
+
+        return probe
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
         return len(self._ids("full", messages, tools))
