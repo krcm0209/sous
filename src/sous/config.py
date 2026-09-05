@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import shlex
 import tomllib
@@ -239,7 +240,10 @@ def _prompt_cache_gb(model: dict) -> float | None:
     if (
         isinstance(value, bool)
         or not isinstance(value, int | float)
-        or value != value  # NaN
+        # isfinite, not a NaN check: TOML spells inf and -inf too, and an
+        # infinite budget reaches EngineManager as int(inf * (1 << 30)) —
+        # an OverflowError out of engine load rather than a bad budget.
+        or not math.isfinite(value)
         or value < 0
     ):
         warnings.warn(
