@@ -117,6 +117,15 @@ class FakeRecurrent:
         return sum(a.nbytes for a in self.cache if a is not None)
 
 
+def _empty_stats() -> dict:
+    return {**PromptCacheStats().as_dict(), "slots": 0, "resident_bytes": 0}
+
+
+# Roomy enough that nothing is ever evicted for size in tests that want to see
+# several slots coexist; the default of 0 keeps a single slot, as before.
+ROOMY = 1 << 40
+
+
 # ---- reuse_length ----------------------------------------------------------
 
 
@@ -399,7 +408,7 @@ def test_same_turn_mismatch_decodes_whole_prompt_cold_and_warns(trimmable):
         assert pc.generate(REWRITTEN_STABLE, REWRITTEN_FULL, 16) == "text"
     assert h.decoded == [REWRITTEN_FULL]  # the whole prompt, not a reuse-sliced suffix
     assert h.prefilled == []  # the guard sits above the trim/state-copy split
-    assert pc.stats() == PromptCacheStats(misses=1).as_dict()
+    assert pc.stats() == {**_empty_stats(), "misses": 1}
 
 
 @pytest.mark.parametrize("trimmable", [True, False])
@@ -422,33 +431,25 @@ def test_disabled_never_reuses_and_never_counts():
     pc.generate(STABLE_1, FULL_1, 16)
     pc.generate(STABLE_2, FULL_2, 16)
     assert len(h.caches) == 2
-    assert pc.stats() == PromptCacheStats().as_dict()
+    assert pc.stats() == _empty_stats()
 
 
 def test_disabled_never_reads_stable_ids():
     """LMEngine/VLMEngine.generate skip computing the stable render whenever
     the cache is disabled, and pass `[]` in its place — safe only because the
-    disabled branch here, `hooks.decode(hooks.new_cache(), list(full_ids), ...)`,
-    never looks at `stable_ids` at all. Prove that directly rather than assuming
-    it: plant a stale cache plus a `_held` prefix that `stable_ids` genuinely
-    extends, so a real engine's `[]` would look nothing like it, and if the
-    disabled branch ever started consulting `stable_ids` (or `self._cache` /
-    `self._held`) for a reuse decision, this plant would register as a bona
-    fide hit — reusing the planted cache and decoding only the unreused suffix
-    of full_ids. It must instead build a brand new cache and decode the whole
-    prompt, exactly as if `stable_ids` had never been passed.
-    """
+    disabled branch never looks at `stable_ids` at all. Plant a slot whose
+    held prefix `stable_ids` genuinely extends; if the disabled branch ever
+    consulted the slots for a reuse decision, this plant would register as a
+    bona fide hit. It must instead build a brand new cache and decode the
+    whole prompt."""
     h = FakeHooks(trimmable=True)
-    pc = PrefixCache(h, enabled=False)
-    # STABLE_1 is a genuine strict prefix of STABLE_2 (see reuse_length), so if
-    # consulted this is indistinguishable from a legitimate warm cache left by
-    # an earlier, enabled turn.
-    planted_cache = h.new_cache()
-    pc._cache, pc._held = planted_cache, STABLE_1
+    pc = PrefixCache(h, enabled=False, max_bytes=ROOMY)
+    planted = h.new_cache()
+    pc._plant(planted, STABLE_1)  # test seam: a turn slot owned by this thread
     pc.generate(STABLE_2, FULL_2, 16)
-    assert h.decoded == [FULL_2]  # the whole prompt, not a reuse-sliced suffix
-    assert len(h.caches) == 2  # a fresh cache was built; the planted one was ignored
-    assert pc.stats() == PromptCacheStats().as_dict()  # no hit/miss ever recorded
+    assert h.decoded == [FULL_2]
+    assert len(h.caches) == 2
+    assert pc.stats() == {**_empty_stats(), "slots": 1, "resident_bytes": slot_bytes(planted)}
 
 
 def test_reset_drops_the_cache_so_the_next_turn_is_cold():
@@ -465,7 +466,7 @@ def test_reset_clears_the_counters():
     pc = PrefixCache(h)
     pc.generate(STABLE_1, FULL_1, 16)
     pc.reset()
-    assert pc.stats() == PromptCacheStats().as_dict()
+    assert pc.stats() == _empty_stats()
 
 
 def test_a_warm_failure_retries_cold_once_and_counts_it():
@@ -603,7 +604,7 @@ def test_a_late_cold_retry_write_after_reset_does_not_land_on_fresh_counters():
         pc.generate(STABLE_2, FULL_2, 16)
 
     assert calls["n"] == 2  # the failure and its retry both really ran
-    assert pc.stats() == PromptCacheStats().as_dict()  # fresh counters, untouched
+    assert pc.stats() == _empty_stats()  # fresh counters, untouched
 
 
 # ---- streaming deltas ----------------------------------------------------------
@@ -839,3 +840,182 @@ def test_memo_accepts_the_header_slot():
     m = PromptMemo()
     m.put("header", "sys", [1, 2])
     assert m.get("header", "sys") == [1, 2]
+
+
+# ---- keyed slots -------------------------------------------------------------
+
+A1, A1_FULL = [1, 2, 3, 4], [1, 2, 3, 4, 90, 91]
+A2, A2_FULL = [1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6, 90, 91]
+B1, B1_FULL = [7, 8, 9, 10], [7, 8, 9, 10, 90, 91]
+B2, B2_FULL = [7, 8, 9, 10, 11], [7, 8, 9, 10, 11, 90, 91]
+
+
+def test_two_interleaved_conversations_both_reuse():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)  # A's slot survived B's turn
+    pc.generate(B2, B2_FULL, 16)
+    assert pc.stats()["hits"] == 2
+    assert pc.stats()["misses"] == 2
+    assert h.decoded[2] == A2_FULL[len(A1) :]
+    assert h.decoded[3] == B2_FULL[len(B1) :]
+    assert len(h.caches) == 2  # one cache per conversation, each extended in place
+
+
+def test_a_turn_slot_is_consumed_by_the_turn_that_extends_it():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)
+    held = [s.held for s in pc.slots()]
+    assert held == [A2]  # not [A1, A2]: the old key is gone with the cache it named
+
+
+def test_the_longest_matching_slot_wins():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    short = h.new_cache()
+    long = h.new_cache()
+    pc._plant(short, A1)
+    pc._plant(long, A2)
+    a3 = [*A2, 7]
+    pc.generate(a3, [*a3, 90, 91], 16)
+    assert pc.stats()["reused_tokens"] == len(A2)
+    assert h.decoded[-1] == [7, 90, 91]
+
+
+def test_default_budget_keeps_exactly_one_slot():
+    """max_bytes=0 is the constructor default and today's behaviour: at most
+    one slot is ever resident, so a second conversation replaces the first."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)
+    assert [s.held for s in pc.slots()] == [B1]
+    assert pc.stats()["evictions"] == 1
+    pc.generate(A2, A2_FULL, 16)
+    assert pc.stats()["misses"] == 3  # A's slot was evicted by B's publish
+
+
+def test_slot_count_is_capped():
+    from sous.engine.promptcache import MAX_SLOTS
+
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    for i in range(MAX_SLOTS + 3):
+        stable = [1000 + i, 1]
+        pc.generate(stable, [*stable, 90, 91], 16)
+    assert len(pc.slots()) == MAX_SLOTS
+    assert pc.stats()["evictions"] == 3
+    # LRU: the three oldest are the ones gone.
+    assert [1000, 1] not in [s.held for s in pc.slots()]
+    assert [1000 + MAX_SLOTS + 2, 1] in [s.held for s in pc.slots()]
+
+
+def test_resident_bytes_track_the_slots():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)
+    expected = sum(slot_bytes(c) for c in h.caches)
+    assert pc.stats()["resident_bytes"] == expected
+    assert pc.stats()["slots"] == 2
+
+
+# ---- owners ------------------------------------------------------------------
+
+
+def _run_on_thread(fn) -> threading.Thread:
+    t = threading.Thread(target=fn)
+    t.start()
+    t.join()
+    return t
+
+
+def test_stats_are_scoped_to_the_owner_thread():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)  # main thread: one miss
+
+    def other():
+        pc.generate(B1, B1_FULL, 16)
+        pc.generate(B2, B2_FULL, 16)
+
+    t = _run_on_thread(other)
+    mine = pc.stats(owner=threading.current_thread())
+    assert (mine["hits"], mine["misses"]) == (0, 1)
+    # The other thread is dead: its slots are swept and its counters folded
+    # into the daemon-wide history rather than lost.
+    theirs = pc.stats(owner=t)
+    assert (theirs["hits"], theirs["misses"], theirs["slots"]) == (0, 0, 0)
+    total = pc.stats()
+    assert (total["hits"], total["misses"], total["slots"]) == (1, 2, 1)
+
+
+def test_reset_with_an_owner_drops_only_that_owners_slots():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    stop = threading.Event()
+    started = threading.Event()
+
+    def other():
+        pc.generate(B1, B1_FULL, 16)
+        started.set()
+        stop.wait(5)
+
+    t = threading.Thread(target=other)
+    t.start()
+    started.wait(5)
+    assert pc.stats()["slots"] == 2
+    pc.reset(owner=t)
+    assert [s.held for s in pc.slots()] == [A1]
+    assert pc.stats(owner=t)["misses"] == 0  # folded into history...
+    assert pc.stats()["misses"] == 2  # ...not lost
+    stop.set()
+    t.join(5)
+    pc.generate(A2, A2_FULL, 16)  # the surviving owner's slot still reuses
+    assert pc.stats(owner=threading.current_thread())["hits"] == 1
+
+
+def test_a_retired_owners_late_publish_is_refused():
+    """The worker retires its session's thread when the task ends; a stalled
+    generation on that thread that finishes later must not resurrect a slot."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    me = threading.current_thread()
+
+    def retires_midway(hooks, cache, token_ids, max_tokens):
+        pc.reset(owner=me)  # the task ends while this generation runs
+        hooks.decoded.append(list(token_ids))
+        return "text"
+
+    h.decode_impl = retires_midway
+    pc.generate(A1, A1_FULL, 16)
+    assert pc.slots() == []
+    h.decode_impl = None
+    pc.generate(A2, A2_FULL, 16)  # the retired thread is us: still refused
+    assert pc.slots() == []
+    assert pc.stats()["misses"] == 2
+
+
+def test_a_dead_owners_slots_are_swept_on_the_next_call():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    _run_on_thread(lambda: pc.generate(B1, B1_FULL, 16))
+    # No retire happened; the thread simply exited. Anything it left is
+    # unusable (its mlx streams are gone) and must not stay resident.
+    assert pc.stats()["slots"] == 0
+    assert pc.stats()["misses"] == 1  # history keeps the count
+
+
+def test_reset_without_an_owner_still_drops_everything_and_bumps_the_epoch():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    _run_on_thread(lambda: pc.generate(B1, B1_FULL, 16))
+    pc.reset()
+    assert pc.slots() == []
+    assert pc.stats() == _empty_stats()

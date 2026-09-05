@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import dataclasses
 import threading
-import time  # noqa: F401 -- unused until Task 2 wires up keyed slots
+import time
 import warnings
-import weakref  # noqa: F401 -- unused until Task 2 wires up keyed slots
+import weakref
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field  # noqa: F401 -- field unused until Task 2
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from sous.engine.base import Delta, OnDelta, ReplaySafe
@@ -248,48 +248,209 @@ class CacheHooks(Protocol):
     def headroom(self) -> int | None: ...
 
 
+@dataclass
+class Slot:
+    """One resident cache and the exact ids it holds, at the stable boundary.
+
+    `owner` is the thread whose mlx streams built the arrays (issue #34): the
+    Thread object, not its ident — idents are recycled after a thread exits,
+    a strongly held Thread object cannot falsely match a later thread. `kind`
+    is "turn" (published when a turn ends; consumed by the turn that extends
+    it) or "fork" (a copy taken at a shared-prefix boundary; copied on every
+    hit, left in place)."""
+
+    cache: list
+    held: list[int]
+    owner: threading.Thread
+    kind: str
+    nbytes: int
+    last_used: float = field(default_factory=time.monotonic)
+
+
 class PrefixCache:
-    """One KV cache per task, always left at the stable-render boundary.
+    """KV caches at the stable-render boundary, one slot per resident prefix.
 
     The boundary matters: the stable render (`add_generation_prompt=False`) is a
     strict prefix of the next turn's stable render, while the full prompt never
     is — the chat template appends a generation-only block that it strips when
     it later re-renders that same assistant turn as history. Anchoring here is
     what makes reuse possible at all.
+
+    A turn looks for the longest slot its own thread owns whose ids are a
+    strict prefix of its stable render. A "turn" slot is taken over and
+    extended in place, so a conversation never holds two copies of itself; a
+    "fork" slot is copied, so the next conversation sharing that prefix finds
+    it too. Everything published is charged to `max_bytes`; the in-flight
+    turn's own cache never is — `reserve_bytes` (one full window of KV) was
+    subtracted from the machine's headroom before `max_bytes` was derived.
     """
 
-    def __init__(self, hooks: CacheHooks, enabled: bool = True):
-        # This default is the orchestrator's own semantics, not the user-facing
-        # one — both engines always pass `enabled` explicitly. The shipped
-        # default lives in SousConfig.prompt_cache; don't couple this one
-        # to it.
+    def __init__(
+        self,
+        hooks: CacheHooks,
+        enabled: bool = True,
+        *,
+        max_bytes: int = 0,
+        reserve_bytes: int = 0,
+    ):
+        # These defaults are the orchestrator's own semantics, not the
+        # user-facing ones — both engines always pass them explicitly. The
+        # shipped defaults live in SousConfig (prompt_cache, prompt_cache_gb);
+        # don't couple these to them. max_bytes=0 keeps exactly one slot: the
+        # behaviour every pre-keyed test in the suite was written against.
         self._hooks = hooks
         self.enabled = enabled
-        self._cache: list | None = None
-        self._held: list[int] = []
-        # The thread whose mlx streams built self._cache (issue #34). A Thread
-        # object, not its ident: idents are recycled after a thread exits, so
-        # an ident could falsely match a later, unrelated thread — a strongly
-        # held Thread object cannot.
-        self._owner: threading.Thread | None = None
+        self.max_bytes = max_bytes
+        self.reserve_bytes = reserve_bytes
+        # Held only across list/dict operations, never across prefill or
+        # decode. reset() must never wait on a generation (its caller may be
+        # the worker's finally while a stalled generation still runs), and
+        # with this discipline it never does.
+        self._lock = threading.Lock()
+        self._slots: list[Slot] = []
+        self._owner_stats: dict[threading.Thread, PromptCacheStats] = {}
+        # Counters of owners already retired or swept, so the daemon-wide view
+        # keeps their history without keeping their Thread objects.
+        self._history = PromptCacheStats()
+        # Owners whose late publishes are refused: a task's session thread
+        # after the task ended, a gateway session after a stall. Weak, so a
+        # thread that is truly gone costs nothing to remember.
+        self._retired: weakref.WeakSet[threading.Thread] = weakref.WeakSet()
         self._epoch = 0
-        self._stats = PromptCacheStats()
 
-    def reset(self) -> None:
-        """Drop the cache, the token record, and the counters.
+    # ---- bookkeeping (call with self._lock held) ----------------------------
 
-        Deliberately takes no lock. ManagedEngine's generation lock is still
-        held by an abandoned stalled generation, so a reset that waited for it
-        would wedge the next task. The epoch bump is what makes that safe.
+    def _sweep(self) -> None:
+        """Drop what dead threads left: their arrays lived on streams that no
+        longer exist, and nothing can ever adopt them."""
+        dead = {s.owner for s in self._slots if not s.owner.is_alive()}
+        dead |= {o for o in self._owner_stats if not o.is_alive()}
+        if not dead:
+            return
+        self._slots = [s for s in self._slots if s.owner not in dead]
+        for owner in dead:
+            self._history.add(self._owner_stats.pop(owner, PromptCacheStats()))
+
+    def _stats_for(self, owner: threading.Thread) -> PromptCacheStats:
+        return self._owner_stats.setdefault(owner, PromptCacheStats())
+
+    def _resident(self) -> int:
+        return sum(s.nbytes for s in self._slots)
+
+    def _evictable(self, protect: Slot | None) -> list[Slot]:
+        return [s for s in self._slots if s is not protect]
+
+    def _drop_lru(self, protect: Slot | None) -> None:
+        victim = min(self._evictable(protect), key=lambda s: s.last_used)
+        self._slots.remove(victim)
+        self._stats_for(victim.owner).evictions += 1
+        # `victim` dies with this frame: the slot's cache is freed the moment
+        # nothing else references it, which is what the pressure re-read in
+        # _evict relies on.
+
+    def _evict_caps(self, protect: Slot | None) -> None:
+        """Bring the map under its count and byte caps, never touching
+        `protect`. On its own before a turn starts, `protect` is None: nothing
+        here is spoken for."""
+        while self._evictable(protect) and (
+            len(self._slots) > MAX_SLOTS or self._resident() > self.max_bytes
+        ):
+            self._drop_lru(protect)
+
+    def _evict(self, protect: Slot) -> None:
+        """Bring the map under its caps, then under memory pressure, never
+        touching `protect` — the slot just published. A turn's own slot is
+        never evicted by its own publish: on a machine with room for exactly
+        one slot, that one still survives."""
+        self._evict_caps(protect)
+        headroom = self._hooks.headroom()
+        while headroom is not None and headroom < self.reserve_bytes and self._evictable(protect):
+            self._drop_lru(protect)
+            headroom = self._hooks.headroom()
+
+    def _take(self, owner: threading.Thread, stable_ids: list[int]) -> Slot | None:
+        """The longest slot `owner` holds that `stable_ids` strictly extends.
+        A turn slot leaves the map with the caller (its cache is about to be
+        mutated); a fork slot stays."""
+        best: Slot | None = None
+        for s in self._slots:
+            if s.owner is not owner or not reuse_length(s.held, stable_ids):
+                continue
+            if best is None or len(s.held) > len(best.held):
+                best = s
+        if best is None:
+            return None
+        best.last_used = time.monotonic()
+        if best.kind == "turn":
+            self._slots.remove(best)
+        return best
+
+    def _publish(self, slot: Slot, epoch: int) -> bool:
+        """Add `slot` unless the world moved on: a full reset since the turn
+        began, or the owner retired (its task ended) while it generated."""
+        with self._lock:
+            if epoch != self._epoch or slot.owner in self._retired:
+                return False
+            self._slots.append(slot)
+            self._evict(protect=slot)
+            return True
+
+    def _plant(self, cache: list, held: list[int]) -> None:
+        """Test seam: publish a turn slot for the calling thread directly."""
+        with self._lock:
+            self._slots.append(
+                Slot(cache, list(held), threading.current_thread(), "turn", slot_bytes(cache))
+            )
+
+    # ---- public --------------------------------------------------------------
+
+    def slots(self) -> list[Slot]:
+        with self._lock:
+            return list(self._slots)
+
+    def reset(self, owner: threading.Thread | None = None) -> None:
+        """Drop resident caches.
+
+        With an owner: that thread's slots and counters (the counters fold
+        into history), and the owner is retired so a generation still running
+        on it cannot publish afterwards. Without: everything, and the epoch
+        bump makes every in-flight publish from any thread drop itself —
+        unload and a stalled gateway session use this form.
+
+        Takes only the bookkeeping lock, never the generation lock: the caller
+        may be the worker's finally while a stalled generation still holds
+        that one, and waiting there would wedge the next task.
         """
-        self._epoch += 1
-        self._cache = None
-        self._held = []
-        self._owner = None
-        self._stats = PromptCacheStats()
+        with self._lock:
+            if owner is None:
+                self._epoch += 1
+                self._slots = []
+                self._owner_stats = {}
+                self._history = PromptCacheStats()
+                return
+            self._slots = [s for s in self._slots if s.owner is not owner]
+            self._history.add(self._owner_stats.pop(owner, PromptCacheStats()))
+            self._retired.add(owner)
 
-    def stats(self) -> dict:
-        return self._stats.as_dict()
+    def stats(self, owner: threading.Thread | None = None) -> dict:
+        """Counters plus `slots` and `resident_bytes`: for one owner thread, or
+        daemon-wide (every live owner plus the history of retired ones)."""
+        with self._lock:
+            self._sweep()
+            if owner is not None:
+                total = self._owner_stats.get(owner, PromptCacheStats())
+                mine = [s for s in self._slots if s.owner is owner]
+            else:
+                total = PromptCacheStats()
+                total.add(self._history)
+                for each in self._owner_stats.values():
+                    total.add(each)
+                mine = self._slots
+            return {
+                **total.as_dict(),
+                "slots": len(mine),
+                "resident_bytes": sum(s.nbytes for s in mine),
+            }
 
     def generate(
         self,
@@ -297,10 +458,22 @@ class PrefixCache:
         full_ids: list[int],
         max_tokens: int,
         on_delta: OnDelta | None = None,
+        fork_at: int = 0,
     ) -> str:
         hooks = self._hooks
         if not self.enabled:
             return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens, on_delta)
+
+        owner = threading.current_thread()
+        with self._lock:
+            self._sweep()
+            # Bind the owner's stats object itself and write through this
+            # local for the whole call (passed into _run too). reset(owner)
+            # swaps in nothing for this owner; if an abandoned generation
+            # thread reaches a late write after that, it lands on this
+            # orphaned object instead of on counters a later reader sees.
+            stats = self._stats_for(owner)
+            epoch = self._epoch
 
         # `_run`'s anchor (`len(stable_ids)`) only means what it assumes: that
         # `full_ids` is the stable render plus a generation-only suffix, true
@@ -309,12 +482,11 @@ class PrefixCache:
         # chat template, so sous cannot assume that in general. reuse_length
         # already tests exactly this — strict prefix, with a suffix left to
         # decode — so ask it instead of duplicating the rule. Checked before
-        # any cache is chosen or published: self._cache/self._held are left
-        # exactly as they were, so nothing from this turn is retained and a
-        # cache still held from an earlier, well-behaved turn survives for a
-        # later one to reuse.
+        # any slot is taken: nothing from this turn is retained, and every
+        # slot an earlier, well-behaved turn published survives for a later
+        # one to reuse.
         if reuse_length(stable_ids, full_ids) == 0:
-            self._stats.misses += 1
+            stats.misses += 1
             warnings.warn(
                 "sous prompt cache: full prompt is not the stable render "
                 "plus a generation suffix; decoding cold this turn",
@@ -322,48 +494,43 @@ class PrefixCache:
             )
             return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens, on_delta)
 
-        epoch = self._epoch
-        # Bind the stats object itself, not self._stats, and write through
-        # this local for the whole call (passed into _run too). reset() swaps
-        # in a fresh PromptCacheStats; if an abandoned generation thread
-        # reaches a late write (snapshot_bytes after prefill, cold_retries in
-        # the retry path) after that swap, it lands on this orphaned object
-        # instead of the next task's counters.
-        stats = self._stats
-        cache, held = self._cache, self._held
-        # Invalid until a generation completes. The cache is mutated in place,
-        # so a raise mid-stream leaves it holding tokens `held` does not
-        # describe, and reusing it then would duplicate them.
-        self._cache, self._held = None, []
-
-        reuse = reuse_length(held, stable_ids) if cache is not None else 0
-        if reuse and self._owner is not threading.current_thread():
-            # The cached arrays live only on the publishing thread's mlx
-            # streams (issue #34); a different session thread (a worker task
-            # vs the gateway's long-lived one) must prefill cold rather than
-            # touch them. Force the same miss path a prefix mismatch takes,
-            # rather than attempt a warm run doomed to the cross-thread mlx
-            # failure that _run's except clause would otherwise have to catch.
-            reuse = 0
-        # `cache is not None and reuse` rather than a bare `if reuse`: it is what
-        # lets the type checker see `warm` as a plain list in both branches, with
-        # no assert and no ignore pragma.
-        if cache is not None and reuse:
+        with self._lock:
+            # Owner-filtered: the arrays live only on the publishing thread's
+            # mlx streams (issue #34), so a different session thread (a worker
+            # task vs the gateway's long-lived one) gets a cold miss rather
+            # than a warm run doomed to the cross-thread mlx failure.
+            slot = self._take(owner, stable_ids)
+            # Whatever is still in the map is not going to serve this turn,
+            # and this turn's own cache is about to be prefilled to full size
+            # beside it. Bring the map under its caps here rather than only at
+            # publish, so the two are never outstanding at once: at the
+            # default budget of 0 this is what releases the previous turn's
+            # cache before a miss rebuilds one. Only the caps, not the
+            # pressure reading — headroom is read once the turn's own cache is
+            # real and its cost visible, which is at publish.
+            self._evict_caps(protect=None)
+        if slot is not None:
+            reuse = len(slot.held)
+            if slot.kind == "fork":
+                # The slot stays for the next conversation; this turn works
+                # on its own copy.
+                warm: list = hooks.new_cache()
+                fork_copy(slot.cache, warm, hooks.copy_array)
+                stats.fork_hits += 1
+            else:
+                warm = slot.cache
             stats.hits += 1
             stats.reused_tokens += reuse
-            warm: list = cache
         else:
             reuse = 0
             stats.misses += 1
             warm = hooks.new_cache()
-        # Drop the only remaining reference to the previous turn's cache
-        # before a full-size replacement is prefilled below. On a miss,
-        # `cache` above still points at the prior turn's cache, and a miss
-        # only ever happens mid-task after elision — i.e. precisely when that
-        # cache is at its largest. Without this line both caches are pinned
-        # in memory at once while the new one is prefilled to full size,
-        # which is exactly the doubling the spec promises never happens.
-        cache = None
+        # Drop the only remaining reference to a consumed turn slot's cache
+        # other than `warm` before anything else is allocated: on a miss with
+        # a full window there is no slot to speak of, but on a consumed slot
+        # this is what keeps one conversation from ever holding two copies of
+        # itself. (A fork slot is referenced by the map by design.)
+        slot = None
 
         # A warm attempt that already streamed text cannot be retried: the
         # consumer has forwarded those deltas, and a cold re-run would deliver
@@ -391,7 +558,9 @@ class PrefixCache:
         text = ""
         retry_reason: str | None = None
         try:
-            text = self._run(stats, warm, stable_ids, full_ids, reuse, max_tokens, relay)
+            text = self._run(
+                stats, warm, stable_ids, full_ids, reuse, max_tokens, relay, fork_at, owner, epoch
+            )
         except Exception as e:
             if reuse == 0:
                 raise
@@ -400,7 +569,7 @@ class PrefixCache:
             # at the end of the except clause (PEP 3110) — retrying inside it
             # would keep the failed full-size cache pinned by that traceback
             # for the whole retry, on top of the cold replacement being
-            # prefilled, which is the same doubling as the miss path above.
+            # prefilled: exactly the doubling the spec promises never happens.
             retry_reason = str(e)
 
         if retry_reason is not None:
@@ -418,11 +587,11 @@ class PrefixCache:
                 stacklevel=2,
             )
             warm = hooks.new_cache()
-            text = self._run(stats, warm, stable_ids, full_ids, 0, max_tokens, relay)
+            text = self._run(
+                stats, warm, stable_ids, full_ids, 0, max_tokens, relay, fork_at, owner, epoch
+            )
 
-        if epoch == self._epoch:
-            self._cache, self._held = warm, list(stable_ids)
-            self._owner = threading.current_thread()
+        self._publish(Slot(warm, list(stable_ids), owner, "turn", slot_bytes(warm)), epoch)
         return text
 
     def _run(
@@ -434,6 +603,9 @@ class PrefixCache:
         reuse: int,
         max_tokens: int,
         on_delta: OnDelta | None,
+        fork_at: int,
+        owner: threading.Thread,
+        epoch: int,
     ) -> str:
         hooks = self._hooks
         anchor = len(stable_ids)
