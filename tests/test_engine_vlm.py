@@ -303,3 +303,171 @@ def test_vlm_engine_serves_a_second_conversation_from_the_header_fork():
     assert s["fork_hits"] == 1
     assert s["reused_tokens"] >= FORK_MIN_TOKENS
     e.unload()
+
+
+def _fat_tools(n: int = 80) -> list[dict]:
+    """A tool array long enough to clear the fork floor on its own (~90 tokens
+    per tool), in the shape convert.py hands the template."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": f"tool_{i}",
+                "description": f"Tool number {i}. "
+                + "It does one specific, well-documented thing to a file. " * 4,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "description": "An absolute path."}},
+                    "required": ["path"],
+                },
+            },
+        }
+        for i in range(n)
+    ]
+
+
+def test_vlm_fork_probe_finds_the_tools_boundary_on_a_tools_first_template():
+    """Qwen3.5/3.8's template renders # Tools before the client's system text,
+    so two sessions differing only in that text share the whole tool block.
+    The tools boundary is the first of two and ends at `</IMPORTANT>\n\n` —
+    the separator the template emits only when there is system text."""
+    from sous.engine.promptcache import FORK_MIN_TOKENS
+    from sous.engine.vlm import VLMEngine
+
+    e = VLMEngine(HYBRID_VLM, cache_budget=1 << 34)
+    tools = _fat_tools()
+    a = {"role": "system", "content": "Session /tmp/a. You are terse."}
+    b = {"role": "system", "content": "Session /tmp/b. You are terse."}
+    user = {"role": "user", "content": "Say A."}
+    stable_a = e._ids("stable", [a, user], tools)
+    probe = e._fork_probe([a, user], tools, stable_a)
+    assert not isinstance(probe, list)
+    bounds = probe()
+    assert len(bounds) == 2
+    assert FORK_MIN_TOKENS <= bounds[0] < bounds[1] < len(stable_a)
+    # The tools boundary is a prefix of BOTH sessions' renders; the header of A's only.
+    stable_b = e._ids("stable", [b, user], tools)
+    assert stable_b[: bounds[0]] == stable_a[: bounds[0]]
+    assert stable_b[: bounds[1]] != stable_a[: bounds[1]]
+    assert e._tokenizer.decode(stable_a[: bounds[0]]).endswith("</IMPORTANT>\n\n")
+    # With no system text there is no separator, so no tools boundary — the
+    # header (the tool block plus the system turn's close) is the one left.
+    empty = {"role": "system", "content": ""}
+    stable_e = e._ids("stable", [empty, user], tools)
+    probe_e = e._fork_probe([empty, user], tools, stable_e)
+    assert not isinstance(probe_e, list)
+    bounds_e = probe_e()
+    assert len(bounds_e) == 1
+    assert e._tokenizer.decode(stable_e[: bounds_e[0]]).endswith("<|im_end|>\n<|im_start|>user\n")
+    e.unload()
+
+
+def test_vlm_fork_copies_at_two_boundaries_match_a_split_prefill_bit_for_bit():
+    """A cache continued from the tools copy, and one continued from the
+    header copy taken after the source itself was continued past the tools
+    copy, must both equal a cache prefilled cold over the same three segments
+    — on the hybrid, whose recurrent layers cannot be rebuilt by replay.
+
+    Reference is three prefill calls, not one: a quantized matmul's rounding
+    depends on the row count, so a single call differs by a bf16 ULP from the
+    split every warm turn already makes (measured in Phase 3a)."""
+    import mlx.core as mx
+    from mlx_vlm.models.cache import make_prompt_cache
+
+    from sous.engine.promptcache import fork_copy, slot_bytes
+    from sous.engine.vlm import VLMEngine
+
+    def assert_identical(x, y):
+        for p, q in zip(x, y, strict=True):
+            # getattr, not p.offset: an ArraysCache layer has no offset at all
+            # (nothing to rewind), and its state is compared whole below.
+            off = int(getattr(p, "offset", 0) or 0)
+            assert off == int(getattr(q, "offset", 0) or 0)
+            for xa, xb in zip(p.state, q.state, strict=True):
+                if xa is None or xb is None:
+                    assert xa is None and xb is None, "one side is None, the other is not"
+                    continue
+                if hasattr(p, "trim") and xa.ndim >= 3 and off:
+                    xa, xb = xa[..., :off, :], xb[..., :off, :]
+                d = mx.max(mx.abs(xa.astype(mx.float32) - xb.astype(mx.float32)))
+                mx.eval(d)
+                assert d.item() == 0.0
+
+    e = VLMEngine(HYBRID_VLM, cache_budget=0)
+    model, _ = e._loaded()
+    ids = e._encode("def f(x):\n    return x + 1\n" * 60)
+    third = len(ids) // 3
+    tools_seg, header_seg, tail = ids[:third], ids[third : 2 * third], ids[2 * third :]
+
+    ref = make_prompt_cache(model.language_model)
+    e.prefill(ref, tools_seg)
+    e.prefill(ref, header_seg)
+    e.prefill(ref, tail)
+
+    src = make_prompt_cache(model.language_model)
+    e.prefill(src, tools_seg)
+    tools_fork = make_prompt_cache(model.language_model)
+    fork_copy(src, tools_fork, e.copy_array)
+    e.prefill(src, header_seg)  # the source turn continues past its first copy
+    header_fork = make_prompt_cache(model.language_model)
+    fork_copy(src, header_fork, e.copy_array)
+    assert 0 < slot_bytes(tools_fork) <= slot_bytes(header_fork)
+
+    # A later session from the tools fork: its own "system text" then the tail.
+    e.prefill(tools_fork, header_seg)
+    e.prefill(tools_fork, tail)
+    assert_identical(tools_fork, ref)
+    # The same session's next subagent, from the header fork: the tail only.
+    e.prefill(header_fork, tail)
+    assert_identical(header_fork, ref)
+    # And the source, continued to the end itself, is the same cache too.
+    e.prefill(src, tail)
+    assert_identical(src, ref)
+    e.unload()
+
+
+def test_vlm_engine_serves_a_second_session_from_the_tools_fork():
+    """End to end on the hybrid: two conversations with the same tools and
+    different system texts. The second's first turn is a fork hit that reuses
+    the tool block; that session's next conversation reuses its whole header."""
+    from sous.engine.promptcache import FORK_MIN_TOKENS
+    from sous.engine.vlm import VLMEngine
+
+    e = VLMEngine(HYBRID_VLM, prompt_cache=True, cache_budget=1 << 34)
+    tools = _fat_tools()
+    a = {"role": "system", "content": "Session /tmp/a. You are terse."}
+    b = {"role": "system", "content": "Session /tmp/b. You are terse."}
+    e.generate([a, {"role": "user", "content": "Say A."}], tools, 4)
+    s1 = e.prompt_cache_stats()
+    assert s1["forks"] == 2  # the tools fork and A's header fork
+    e.generate([b, {"role": "user", "content": "Say B."}], tools, 4)
+    s2 = e.prompt_cache_stats()
+    assert (s2["fork_hits"], s2["forks"]) == (1, 3)  # started from the tools fork; added B's header
+    reused_by_b = s2["reused_tokens"] - s1["reused_tokens"]
+    assert reused_by_b >= FORK_MIN_TOKENS
+    e.generate([b, {"role": "user", "content": "Say C."}], tools, 4)
+    s3 = e.prompt_cache_stats()
+    assert s3["fork_hits"] == 2
+    assert s3["reused_tokens"] - s2["reused_tokens"] > reused_by_b  # B's header is deeper
+    e.unload()
+
+
+def test_vlm_a_turn_from_the_tools_fork_matches_its_cold_run_token_for_token():
+    """Greedy, so the comparison is exact. The cold run is the same engine
+    after a reset, so both runs split the prefill at the same boundaries and
+    the comparison tests the copy, not prefill-shape ULP drift."""
+    from sous.engine.vlm import VLMEngine
+
+    e = VLMEngine(HYBRID_VLM, temperature=0.0, prompt_cache=True, cache_budget=1 << 34)
+    tools = _fat_tools()
+    a = {"role": "system", "content": "Session /tmp/a. You are terse."}
+    b = {"role": "system", "content": "Session /tmp/b. You are terse."}
+    brief = {"role": "user", "content": "In one sentence, what does tool_7 do?"}
+    e.generate([a, brief], tools, 8)  # publishes the tools fork
+    warm = e.generate([b, brief], tools, 32)  # from the tools fork
+    assert e.prompt_cache_stats()["fork_hits"] == 1
+    e.reset_prompt_cache()
+    cold = e.generate([b, brief], tools, 32)  # a miss: the same prefill, split the same way
+    assert e.prompt_cache_stats()["misses"] == 1
+    assert warm == cold
+    e.unload()
