@@ -171,7 +171,7 @@ def test_lm_engine_serves_a_second_conversation_from_the_header_fork():
     e.unload()
 
 
-def test_lm_header_probe_matches_a_real_conversation_render():
+def test_lm_fork_probe_matches_a_real_conversation_render():
     """The probe's header must be a token prefix of a real render on a real
     template — the property fork_point checks, here against the tokenizer
     rather than a fake. A system-only render is not even attempted: the
@@ -187,9 +187,10 @@ def test_lm_header_probe_matches_a_real_conversation_render():
         {"role": "assistant", "content": "A"},
     ]
     stable = e._ids("stable", msgs, [])
-    probe = e._header_probe(msgs, [], stable)
+    probe = e._fork_probe(msgs, [], stable)
     # not isinstance(..., list) rather than callable(): the same narrowing, and
     # the one ty follows.
     assert not isinstance(probe, list), "a long system turn must be probed, not refused"
-    assert probe() and probe()[0] >= FORK_MIN_TOKENS
+    bounds = probe()
+    assert bounds == [bounds[0]] and bounds[0] >= FORK_MIN_TOKENS  # no tools: the header only
     e.unload()

@@ -904,6 +904,16 @@ def test_memo_accepts_the_header_slot():
     assert m.get("header", "sys") == [1, 2]
 
 
+def test_memo_accepts_the_tools_slot_independently_of_the_header():
+    # Two texts, two slots: in a shared slot the tools text and the header
+    # text would evict each other on every cold turn.
+    m = PromptMemo()
+    m.put("tools", "tools", [1])
+    m.put("header", "tools + sys", [1, 2])
+    assert m.get("tools", "tools") == [1]
+    assert m.get("header", "tools + sys") == [1, 2]
+
+
 # ---- keyed slots -------------------------------------------------------------
 
 A1, A1_FULL = [1, 2, 3, 4], [1, 2, 3, 4, 90, 91]

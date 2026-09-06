@@ -9,6 +9,7 @@ a fake cache layer can exercise it. Array copies arrive through an injected
 from __future__ import annotations
 
 import dataclasses
+import os
 import threading
 import time
 import warnings
@@ -144,6 +145,59 @@ def fork_point(header_ids: Sequence[int], stable_ids: Sequence[int]) -> int:
     return n
 
 
+# Probe conversations, each rendered with the turn's tools. The header pair
+# keeps the real system turn and differs only in the first user turn's
+# content, so their renders share exactly the system block — the header. The
+# tools pair keeps the user turn fixed and differs at the first character of
+# the system text, so their renders share whatever the template emits BEFORE
+# the client's text: on a template that renders tools first (Qwen3.5/3.8) the
+# whole tool block — the ~45–56K tokens every Claude Code session presenting
+# the same tool set shares, across sessions and projects — and on one that
+# renders the system text first (Qwen3) a few tokens, which fork_point drops.
+_HEADER_PROBES = ({"role": "user", "content": "0"}, {"role": "user", "content": "1"})
+_TOOLS_PROBES = (
+    ({"role": "system", "content": "0"}, {"role": "user", "content": "0"}),
+    ({"role": "system", "content": "1"}, {"role": "user", "content": "0"}),
+)
+
+
+def probe_boundaries(
+    render: Callable[[list[dict]], str],
+    encode: Callable[[str], list[int]],
+    memo: PromptMemo,
+    system: dict,
+    stable_ids: Sequence[int],
+) -> list[int]:
+    """Every boundary a turn may fork at, ascending: the tools boundary and the
+    header boundary, each the common prefix of a probe pair's renders, encoded
+    once (memoized by text, one slot each) and verified by `fork_point`
+    against this turn's own render. A candidate that fails the check is
+    dropped and equal candidates merge. A request with no system text renders
+    no separator before it on the default template, so the tools text is then
+    not a prefix and drops out on its own.
+
+    Found from probe pairs rather than from partial renders: [model].id
+    accepts any chat template, and a template may refuse a message list with
+    no user turn outright (the default model's does:
+    `raise_exception("No user query found in messages.")`). The caller holds
+    its tokenize lock — `render` and `encode` both run here.
+    """
+    found: set[int] = set()
+    pairs = (
+        ("tools", [list(conversation) for conversation in _TOOLS_PROBES]),
+        ("header", [[system, user] for user in _HEADER_PROBES]),
+    )
+    for slot, conversations in pairs:
+        text = os.path.commonprefix([render(conversation) for conversation in conversations])
+        ids = memo.get(slot, text)
+        if ids is None:
+            ids = encode(text)
+            memo.put(slot, text, ids)
+        found.add(fork_point(ids, stable_ids))
+    found.discard(0)
+    return sorted(found)
+
+
 def slot_bytes(cache: Sequence[Any]) -> int:
     """Bytes a cache holds resident: every layer's `nbytes`. For a KVCache that
     is the whole allocated buffer, 256-step padding and the trimmed-off
@@ -214,14 +268,17 @@ class PromptCacheStats:
             )
 
 
-_MEMO_SLOTS = ("stable", "full", "header")
+_MEMO_SLOTS = ("stable", "full", "header", "tools")
 
 
 class PromptMemo:
     """One slot per render, keyed by the exact prompt text.
 
-    The header slot holds the fork boundary's text: what two probe renders of
-    the system turn have in common (see the engines' `_header_probe`).
+    The header and tools slots hold the two fork boundaries' texts: what the
+    header probe pair's renders have in common (the whole system block) and
+    what the tools pair's have (the tool block, on a template that renders
+    tools first) — see `probe_boundaries`. Two slots, because the two texts
+    would evict each other from one on every cold turn.
 
     Each turn needs both the stable render and the full prompt, and
     `count_tokens` asks for one of them before `generate` asks again. Keying on
