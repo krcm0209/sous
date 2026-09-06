@@ -383,7 +383,7 @@ more): one at the end of the tool block, shared by every Claude Code session
 and project that presents the same tool array, and one at the end of the
 whole system block, shared by same-type subagents of one session (see
 above). Prefixes must match token for token — one added, removed or
-reordered tool is a different tool set with its own pair of forks. Each fork
+reordered tool is a different tool set with its own tools fork and header forks. Each fork
 is a copy of the KV at its boundary, ~3.4–3.6 GiB at ~57K tokens on the
 default model: one tools fork per tool set, plus one header fork per
 session that has used it, so a daemon that has seen the usual three tool
