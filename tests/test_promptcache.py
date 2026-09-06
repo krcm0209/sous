@@ -904,6 +904,16 @@ def test_memo_accepts_the_header_slot():
     assert m.get("header", "sys") == [1, 2]
 
 
+def test_memo_accepts_the_tools_slot_independently_of_the_header():
+    # Two texts, two slots: in a shared slot the tools text and the header
+    # text would evict each other on every cold turn.
+    m = PromptMemo()
+    m.put("tools", "tools", [1])
+    m.put("header", "tools + sys", [1, 2])
+    assert m.get("tools", "tools") == [1]
+    assert m.get("header", "tools + sys") == [1, 2]
+
+
 # ---- keyed slots -------------------------------------------------------------
 
 A1, A1_FULL = [1, 2, 3, 4], [1, 2, 3, 4, 90, 91]
@@ -1163,7 +1173,7 @@ C3_FULL = [*C3, 90, 91]
 def test_a_cold_turn_forks_at_the_header(trimmable):
     h = FakeHooks(trimmable=trimmable)
     pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
     kinds = sorted((s.kind, s.held) for s in pc.slots())
     assert kinds == [("fork", H), ("turn", C1)]
     assert pc.stats()["forks"] == 1
@@ -1179,7 +1189,7 @@ def test_a_cold_turn_forks_at_the_header(trimmable):
 def test_the_fork_is_an_independent_copy():
     h = FakeHooks(trimmable=False)
     pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
     fork = next(s for s in pc.slots() if s.kind == "fork")
     turn = next(s for s in pc.slots() if s.kind == "turn")
     assert fork.cache is not turn.cache
@@ -1190,14 +1200,14 @@ def test_the_fork_is_an_independent_copy():
 def test_a_new_conversation_sharing_the_header_starts_from_the_fork():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
-    pc.generate(C2, C2_FULL, 16, fork_at=FORK)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
+    pc.generate(C2, C2_FULL, 16, fork_at=[FORK])
     s = pc.stats()
     assert (s["hits"], s["fork_hits"], s["reused_tokens"]) == (1, 1, FORK)
     assert h.decoded[-1] == C2_FULL[FORK:]  # only the tail was fed
     # The fork stayed (copied, not consumed), so a third conversation hits too.
     assert [x.held for x in pc.slots() if x.kind == "fork"] == [H]
-    pc.generate(C3, C3_FULL, 16, fork_at=FORK)
+    pc.generate(C3, C3_FULL, 16, fork_at=[FORK])
     assert pc.stats()["fork_hits"] == 2
     assert sorted(x.held for x in pc.slots() if x.kind == "turn") == sorted([C1, C2, C3])
 
@@ -1205,9 +1215,9 @@ def test_a_new_conversation_sharing_the_header_starts_from_the_fork():
 def test_a_fork_hit_does_not_fork_again_and_neither_does_a_turn_hit():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
-    pc.generate(C2, C2_FULL, 16, fork_at=FORK)  # fork hit: reuse == fork_at
-    pc.generate(C1_NEXT, C1_NEXT_FULL, 16, fork_at=FORK)  # turn hit: reuse > fork_at
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
+    pc.generate(C2, C2_FULL, 16, fork_at=[FORK])  # fork hit: reuse == fork_at
+    pc.generate(C1_NEXT, C1_NEXT_FULL, 16, fork_at=[FORK])  # turn hit: reuse > fork_at
     assert pc.stats()["forks"] == 1
     assert sum(1 for s in pc.slots() if s.kind == "fork") == 1
 
@@ -1215,9 +1225,9 @@ def test_a_fork_hit_does_not_fork_again_and_neither_does_a_turn_hit():
 def test_a_second_conversations_turn_slot_does_not_disturb_the_firsts():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
-    pc.generate(C2, C2_FULL, 16, fork_at=FORK)
-    pc.generate(C1_NEXT, C1_NEXT_FULL, 16, fork_at=FORK)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
+    pc.generate(C2, C2_FULL, 16, fork_at=[FORK])
+    pc.generate(C1_NEXT, C1_NEXT_FULL, 16, fork_at=[FORK])
     assert pc.stats()["hits"] == 2
     assert h.decoded[-1] == C1_NEXT_FULL[len(C1) :]  # C1's own slot, not the fork
 
@@ -1233,21 +1243,21 @@ def test_fork_at_zero_never_forks():
 def test_fork_at_past_the_render_is_ignored():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(C1, C1_FULL, 16, fork_at=len(C1) + 5)
+    pc.generate(C1, C1_FULL, 16, fork_at=[len(C1) + 5])
     assert [s.kind for s in pc.slots()] == ["turn"]
 
 
 def test_a_cold_retry_still_forks():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
     # Consume the fork so the next turn's warm attempt has reuse == fork_at
     # (no fork wanted), then fail it: the cold retry prefills from 0 and the
     # header is on its way past the boundary again — but a fork with those
     # ids already exists, so none is added.
     h.fail_once = True
     with pytest.warns(UserWarning, match="retrying cold"):
-        pc.generate(C2, C2_FULL, 16, fork_at=FORK)
+        pc.generate(C2, C2_FULL, 16, fork_at=[FORK])
     assert pc.stats()["forks"] == 1
     assert pc.stats()["cold_retries"] == 1
 
@@ -1273,7 +1283,7 @@ def test_a_failed_fork_copy_degrades_to_a_turn_without_one(trimmable):
     pc = PrefixCache(h, max_bytes=ROOMY)
     _fail_next_copy(h)
     with pytest.warns(UserWarning, match="fork copy failed"):
-        assert pc.generate(C1, C1_FULL, 16, fork_at=FORK) == "text"
+        assert pc.generate(C1, C1_FULL, 16, fork_at=[FORK]) == "text"
     assert pc.stats()["forks"] == 0
     # The turn slot still lands, and the decode continued from the boundary
     # exactly as it would have if the fork had been refused for budget.
@@ -1291,11 +1301,11 @@ def test_a_failed_fork_clone_prefills_cold_and_leaves_the_fork_resident():
     turn, and the slot the next conversation wants is untouched."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
     before = pc.stats()
     _fail_next_copy(h)
     with pytest.warns(UserWarning, match="fork clone failed"):
-        assert pc.generate(C2, C2_FULL, 16, fork_at=FORK) == "text"
+        assert pc.generate(C2, C2_FULL, 16, fork_at=[FORK]) == "text"
     after = pc.stats()
     assert after["hits"] == before["hits"]
     assert after["fork_hits"] == before["fork_hits"]
@@ -1303,7 +1313,7 @@ def test_a_failed_fork_clone_prefills_cold_and_leaves_the_fork_resident():
     assert h.decoded[-1] == C2_FULL  # the whole prompt, cold
     assert [s.held for s in pc.slots() if s.kind == "fork"] == [H]
     # And the fork is still usable: a third conversation clones it.
-    pc.generate(C3, C3_FULL, 16, fork_at=FORK)
+    pc.generate(C3, C3_FULL, 16, fork_at=[FORK])
     assert pc.stats()["fork_hits"] == before["fork_hits"] + 1
 
 
@@ -1312,20 +1322,20 @@ def test_a_fork_is_not_taken_when_the_fork_exists_but_this_turn_missed_it():
     thread forks its own. The two coexist under different owners."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
-    _run_on_thread(lambda: pc.generate(C1, C1_FULL, 16, fork_at=FORK))
+    _run_on_thread(lambda: pc.generate(C1, C1_FULL, 16, fork_at=[FORK]))
     # that thread is dead: swept. Plant instead, on a live helper thread.
     stop = threading.Event()
     ready = threading.Event()
 
     def holder():
-        pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+        pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
         ready.set()
         stop.wait(5)
 
     t = threading.Thread(target=holder)
     t.start()
     ready.wait(5)
-    pc.generate(C2, C2_FULL, 16, fork_at=FORK)  # main thread: a miss, forks its own
+    pc.generate(C2, C2_FULL, 16, fork_at=[FORK])  # main thread: a miss, forks its own
     assert pc.stats(owner=threading.current_thread())["forks"] == 1
     assert pc.stats(owner=t)["forks"] == 1
     stop.set()
@@ -1333,12 +1343,12 @@ def test_a_fork_is_not_taken_when_the_fork_exists_but_this_turn_missed_it():
 
 
 def _probe(value: int, calls: list[int]):
-    """A header probe like the engines': it costs two renders and a tokenize,
-    so the count of calls is what these tests are about."""
+    """A fork probe like the engines': it costs renders and a tokenize, so the
+    count of calls is what these tests are about."""
 
-    def probe() -> int:
+    def probe() -> list[int]:
         calls.append(value)
-        return value
+        return [value]
 
     return probe
 
@@ -1352,25 +1362,32 @@ def test_a_callable_fork_at_is_resolved_once_on_a_cold_miss():
     assert sorted((s.kind, s.held) for s in pc.slots()) == [("fork", H), ("turn", C1)]
 
 
-def test_a_callable_fork_at_is_not_resolved_when_a_turn_slot_serves_the_turn():
+def test_a_callable_fork_at_is_resolved_on_a_turn_hit_and_forks_nothing():
+    """Warm turns resolve the probe now (see _fork_boundaries): with two
+    boundaries, a turn that started at another session's tools fork has to
+    learn its own header. A turn-slot hit is past every boundary, so the
+    answer is dropped whole."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
     calls: list[int] = []
     pc.generate(C1_NEXT, C1_NEXT_FULL, 16, fork_at=_probe(FORK, calls))
-    assert calls == []
+    assert calls == [FORK]
+    assert pc.stats()["forks"] == 1
+    assert h.prefilled == [H]  # only the cold turn ever stopped at the boundary
 
 
-def test_a_callable_fork_at_is_not_resolved_on_a_fork_hit():
+def test_a_callable_fork_at_is_resolved_on_a_fork_hit_and_forks_nothing_new():
     # The header is already inside this turn's cache and no layer rewinds to
-    # it, so the probe's answer could not be used even if it were asked for.
+    # it: the one boundary the probe answers is `reuse` itself, and is dropped.
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
     calls: list[int] = []
     pc.generate(C2, C2_FULL, 16, fork_at=_probe(FORK, calls))
     assert pc.stats()["fork_hits"] == 1
-    assert calls == []
+    assert calls == [FORK]
+    assert pc.stats()["forks"] == 1
 
 
 def test_a_callable_fork_at_is_not_resolved_without_a_budget():
@@ -1382,19 +1399,299 @@ def test_a_callable_fork_at_is_not_resolved_without_a_budget():
     assert [s.kind for s in pc.slots()] == ["turn"]
 
 
-def test_a_failing_header_probe_warns_and_leaves_the_turn_alone():
+def test_a_failing_fork_probe_warns_and_leaves_the_turn_alone():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
 
-    def probe() -> int:
+    def probe() -> list[int]:
         # What the default model's chat template does to a render it refuses.
         raise ValueError("No user query found in messages.")
 
-    with pytest.warns(UserWarning, match="header probe"):
+    with pytest.warns(UserWarning, match="fork probe"):
         assert pc.generate(C1, C1_FULL, 16, fork_at=probe) == "text"
     assert pc.stats()["forks"] == 0
     assert [s.kind for s in pc.slots()] == ["turn"]
     assert h.prefilled == []  # no stop at a boundary: the trimmable path fused
+
+
+# ---- forks at more than one boundary ----------------------------------------
+#
+# What Claude Code sessions look like to the gateway once the template renders
+# the tool block before the client's system text: every session presenting one
+# tool set shares the tool block T; each session adds its own system text (HA,
+# HB — they differ at a per-session path); each subagent adds its brief.
+T = list(range(1, FORK_MIN_TOKENS + 1))  # the tool block: one tool set
+TOOLS_AT = len(T)
+HA = [*T, 8001, 8002]  # session A's header: the tools, then its system text
+HB = [*T, 8101, 8102, 8103]  # session B's header: a different system text
+BOUNDS_A = [TOOLS_AT, len(HA)]
+BOUNDS_B = [TOOLS_AT, len(HB)]
+AX1, AX1_FULL = [*HA, 501, 502], [*HA, 501, 502, 90, 91]  # session A, subagent 1, turn 1
+AX1_NEXT, AX1_NEXT_FULL = [*AX1, 503], [*AX1, 503, 90, 91]  # ... its turn 2
+AX2, AX2_FULL = [*HA, 601], [*HA, 601, 90, 91]  # session A, subagent 2
+BX1, BX1_FULL = [*HB, 701, 702], [*HB, 701, 702, 90, 91]  # session B, subagent 1
+BX2, BX2_FULL = [*HB, 801], [*HB, 801, 90, 91]  # session B, subagent 2
+
+
+@pytest.mark.parametrize("trimmable", [True, False])
+def test_a_cold_turn_forks_at_every_boundary_ascending(trimmable):
+    h = FakeHooks(trimmable=trimmable)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    kinds = sorted((s.kind, s.held) for s in pc.slots())
+    assert kinds == [("fork", T), ("fork", HA), ("turn", AX1)]
+    assert pc.stats()["forks"] == 2
+    # One prefill segment per boundary, in order, whatever the layer kinds:
+    # each copy has to be taken exactly at its boundary.
+    assert h.prefilled[:2] == [T, HA[TOOLS_AT:]]
+    if trimmable:
+        assert h.decoded[0] == AX1_FULL[len(HA) :]  # the rest still fuses into decode
+    else:
+        assert h.prefilled[2] == AX1[len(HA) :]
+
+
+def test_a_turn_warm_at_the_tools_fork_still_forks_at_its_own_header():
+    """Session B's first turn starts from session A's tools fork. Under the
+    one-boundary rule ("a warm turn never forks") it would publish nothing and
+    B's second subagent would reuse the tool block instead of B's whole
+    header. It must publish B's header fork."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    s = pc.stats()
+    assert (s["fork_hits"], s["forks"]) == (1, 3)
+    assert sorted(x.held for x in pc.slots() if x.kind == "fork") == sorted([T, HA, HB])
+    # B prefilled only its own system text before the copy, then decoded its brief.
+    assert h.prefilled[-1] == HB[TOOLS_AT:]
+    assert h.decoded[-1] == BX1_FULL[len(HB) :]
+
+
+def test_a_turn_warm_at_the_header_fork_forks_nothing():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    pc.generate(AX2, AX2_FULL, 16, fork_at=BOUNDS_A)  # same session: header-fork hit
+    pc.generate(AX1_NEXT, AX1_NEXT_FULL, 16, fork_at=BOUNDS_A)  # turn-slot hit
+    s = pc.stats()
+    assert (s["hits"], s["fork_hits"], s["forks"]) == (2, 1, 2)
+    assert h.decoded[-2] == AX2_FULL[len(HA) :]
+    assert h.decoded[-1] == AX1_NEXT_FULL[len(AX1) :]
+
+
+def test_a_second_session_starts_from_the_tools_fork_and_its_next_subagent_from_its_header():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    before = pc.stats()["reused_tokens"]
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    assert pc.stats()["reused_tokens"] - before == TOOLS_AT
+    before = pc.stats()["reused_tokens"]
+    pc.generate(BX2, BX2_FULL, 16, fork_at=BOUNDS_B)
+    assert pc.stats()["reused_tokens"] - before == len(HB)
+    assert pc.stats()["fork_hits"] == 2
+
+
+def test_equal_out_of_range_and_short_boundaries_are_dropped():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    given = [len(HA), TOOLS_AT, TOOLS_AT, 0, 10, len(AX1), len(AX1) + 5, -1]
+    pc.generate(AX1, AX1_FULL, 16, fork_at=given)
+    kinds = sorted((s.kind, s.held) for s in pc.slots())
+    assert kinds == [("fork", T), ("fork", HA), ("turn", AX1)]
+    assert h.prefilled[:2] == [T, HA[TOOLS_AT:]]  # ascending, whatever order was given
+
+
+def test_the_probe_is_resolved_on_warm_turns_too():
+    """Two boundaries make the warm-turn probe worth its renders: it is how a
+    session whose first turn started at another session's tools fork gets a
+    header fork of its own."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    calls: list[list[int]] = []
+
+    def probe(bounds: list[int]):
+        def run() -> list[int]:
+            calls.append(bounds)
+            return bounds
+
+        return run
+
+    pc.generate(AX1, AX1_FULL, 16, fork_at=probe(BOUNDS_A))  # cold
+    pc.generate(BX1, BX1_FULL, 16, fork_at=probe(BOUNDS_B))  # warm at the tools fork
+    pc.generate(AX1_NEXT, AX1_NEXT_FULL, 16, fork_at=probe(BOUNDS_A))  # warm at a turn slot
+    assert calls == [BOUNDS_A, BOUNDS_B, BOUNDS_A]
+    assert pc.stats()["forks"] == 3
+
+
+def test_a_budget_for_one_copy_skips_the_second_boundary_rather_than_evicting_into_it():
+    """The second copy of a cold turn is charged with the first protected: a
+    budget with room for exactly one fork copy publishes the tools copy (the
+    one every later session can use) and never allocates the header copy at
+    all. Without the protection LRU would pick the tools fork — the only
+    evictable slot — evict it, and publish the header fork instead. The turn
+    slot's own publish then takes the budget for itself and evicts the tools
+    copy in turn, exactly as in 3a — not what this test is about, but the
+    trailing assertion below says so."""
+    seen: list[list[list[int]]] = []
+    h = FakeHooks(trimmable=True)
+    h.on_new_cache = lambda: seen.append([s.held for s in pc.slots() if s.kind == "fork"])
+    pc = PrefixCache(h, max_bytes=len(HA) * 8 * 2)  # exactly the header copy, two layers
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    assert pc.stats()["forks"] == 1
+    # Two allocations only — the turn's own cache and the tools copy. No
+    # header copy was allocated, let alone evicted into.
+    assert len(h.caches) == 2
+    assert seen == [[], []]
+    assert h.prefilled[:2] == [T, HA[TOOLS_AT:]]  # the turn still stopped at both
+    # The turn slot's own publish then takes the budget for itself, exactly as
+    # in 3a: a turn slot that alone exceeds the budget lands protected and
+    # evicts what it can. Not this test's subject, but say what happens.
+    assert [s.kind for s in pc.slots()] == ["turn"]
+
+
+def test_a_copy_that_cannot_fit_beside_this_turns_forks_evicts_nothing():
+    """_make_room's up-front check, not its eviction loop, is what refuses
+    the header copy here. P1 and Q1 are two ordinary turn slots — 4 tokens
+    (64 bytes) and 2 tokens (32 bytes) — and neither is a prefix of AX1, so
+    this really is the cold miss the name implies, not a warm hit on either
+    of them. Funding the tools copy (TOOLS_AT * 16 bytes) against a budget of
+    len(HA) * 16 needs exactly one eviction: P1, the LRU slot. That leaves Q1
+    resident (32 bytes: 32 + TOOLS_AT * 16 is exactly the budget), and the
+    header copy's own price then puts it over budget beside the protected
+    tools copy no matter what else is evicted — so the fix means Q1 survives
+    the header attempt too. It does not survive the turn, though: AX1's own
+    turn slot (2 tokens past HA) alone exceeds the budget, and *its* publish
+    evicts everything else regardless of what happened at the header
+    boundary — so a total eviction count read only once the whole turn is
+    done would be the same either way (3, either order). `decode_impl` reads
+    the map after the boundary loop but before that publish, which is the
+    one point the two codepaths actually differ."""
+    P1, P1_FULL = [901, 902, 903, 904], [901, 902, 903, 904, 90, 91]
+    Q1, Q1_FULL = [911, 912], [911, 912, 90, 91]
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(P1, P1_FULL, 16)  # a turn slot: 4 tokens * 8 bytes * 2 layers = 64 bytes
+    pc.generate(Q1, Q1_FULL, 16)  # another: 2 tokens * 8 bytes * 2 layers = 32 bytes
+    pc.max_bytes = (
+        len(HA) * 8 * 2
+    )  # exactly the header copy; the tools copy (TOOLS_AT * 16) is smaller
+
+    checkpoint: dict = {}
+
+    def snapshot_before_the_turn_slot_publishes(hooks, cache, token_ids, max_tokens):
+        checkpoint["evictions"] = pc.stats()["evictions"]
+        checkpoint["forks"] = sorted(s.held for s in pc.slots() if s.kind == "fork")
+        checkpoint["turns"] = sorted(s.held for s in pc.slots() if s.kind == "turn")
+        hooks.decoded.append(list(token_ids))
+        return "text"
+
+    h.decode_impl = snapshot_before_the_turn_slot_publishes
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+
+    assert pc.stats()["forks"] == 1
+    # With the pre-check: one eviction (P1, funding the tools copy), and Q1
+    # is still resident when the header boundary's own _make_room refuses up
+    # front. Without it — verified by temporarily deleting the pre-check's
+    # two lines (the `protected_bytes` computation and its early `return
+    # False`) — the header attempt's eviction loop finds Q1 still evictable
+    # and drops it too, for a copy that could never have fit regardless: two
+    # evictions at this checkpoint, not one, even though the header copy is
+    # refused either way.
+    assert checkpoint["evictions"] == 1
+    assert checkpoint["forks"] == [T]
+    assert checkpoint["turns"] == [Q1]
+    # By the end of the turn, AX1's own oversized turn slot has evicted both
+    # of the above (see the docstring) — not a fix-discriminating count, but
+    # the final state is still worth pinning.
+    assert pc.stats()["evictions"] == 3
+    assert [s.kind for s in pc.slots()] == ["turn"]
+
+
+def test_three_tool_sets_forks_coexist_under_a_budget_that_holds_them():
+    U = list(range(20001, 20001 + FORK_MIN_TOKENS))  # a second tool set (general-purpose)
+    HU = [*U, 8201]
+    UX1, UX1_FULL = [*HU, 901, 902], [*HU, 901, 902, 90, 91]
+    V = list(range(30001, 30001 + FORK_MIN_TOKENS))  # a third (general-purpose, deferred tools)
+    HV = [*V, 8301, 8302]
+    VX1, VX1_FULL = [*HV, 911], [*HV, 911, 90, 91]
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    pc.generate(UX1, UX1_FULL, 16, fork_at=[len(U), len(HU)])
+    pc.generate(VX1, VX1_FULL, 16, fork_at=[len(V), len(HV)])
+    forks = sorted(s.held for s in pc.slots() if s.kind == "fork")
+    assert forks == sorted([T, HA, HB, U, HU, V, HV])
+    assert pc.stats()["forks"] == 7
+    assert pc.stats()["evictions"] == 0
+
+
+def test_across_turns_the_least_recently_used_fork_goes_first():
+    """Protection is within a turn only. Across turns LRU decides as in 3a: an
+    earlier session's header fork, untouched since, goes before the tools
+    fork the current turn just started from."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)  # touches T, adds HB
+    # One byte short of everything resident: the next turn evicts, LRU first.
+    pc.max_bytes = pc.stats()["resident_bytes"] - 1
+    pc.generate(BX2, BX2_FULL, 16, fork_at=BOUNDS_B)  # hits HB (touched), adds a turn slot
+    held = [s.held for s in pc.slots()]
+    assert HA not in held  # session A's header fork: the oldest untouched slot
+    assert AX1 not in held  # then session A's finished conversation
+    assert T in held and HB in held
+    assert pc.stats()["evictions"] == 2
+
+
+def test_a_failed_copy_at_one_boundary_still_forks_at_the_next():
+    """A copy failure at one boundary must not block the next: each boundary
+    is charged and published independently, so a lost tools copy still lets
+    the header copy land."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    _fail_next_copy(h)
+    with pytest.warns(UserWarning, match="fork copy failed"):
+        pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    assert pc.stats()["forks"] == 1
+    forks = [s for s in pc.slots() if s.kind == "fork"]
+    assert [s.held for s in forks] == [HA]
+    assert h.prefilled[:2] == [T, HA[TOOLS_AT:]]
+
+
+def test_a_failed_copy_at_the_second_boundary_leaves_the_first_fork_resident():
+    """The companion to the test above, but for what a failed copy leaves
+    behind rather than for per-boundary isolation. With max_bytes=ROOMY
+    nothing is ever evicted for budget here, protected or not, so this
+    proves something narrower: a failed second copy leaves the map
+    untouched — the first fork (the tools copy) stays resident, nothing is
+    evicted, and the turn just continues. Two trimmable layers means a fork
+    copy is exactly two copy_array calls (one array per layer), so the third
+    call overall is the header copy's first array — fail it there, after
+    the tools copy already landed."""
+    calls = 0
+
+    def impl(hooks, a):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            hooks.copy_impl = None
+            raise RuntimeError("out of memory")
+        return copy_array(a)
+
+    h = FakeHooks(trimmable=True)
+    h.copy_impl = impl
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    with pytest.warns(UserWarning, match="fork copy failed"):
+        pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    assert pc.stats()["forks"] == 1
+    # The first fork (the tools copy) is still resident and nothing was
+    # evicted: _run's `finally` clears only its own `copy`/`slot` locals when
+    # the second copy fails, never anything the map already holds.
+    assert [s.held for s in pc.slots() if s.kind == "fork"] == [T]
+    assert pc.stats()["evictions"] == 0
+    assert h.prefilled[:2] == [T, HA[TOOLS_AT:]]
 
 
 # ---- budget ------------------------------------------------------------------
@@ -1441,12 +1738,12 @@ def test_the_slot_just_published_is_never_evicted_by_its_own_publish():
 def test_a_fork_is_charged_and_can_be_evicted_like_any_slot():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
     fork_bytes = _bytes_of(pc, H)
     assert fork_bytes == FORK * 8 * 2  # two trimmable layers at the boundary
     assert pc.stats()["resident_bytes"] == fork_bytes + _bytes_of(pc, C1)
     pc.max_bytes = 0
-    pc.generate(C2, C2_FULL, 16, fork_at=FORK)  # hits the fork, then evicts it
+    pc.generate(C2, C2_FULL, 16, fork_at=[FORK])  # hits the fork, then evicts it
     assert [s.kind for s in pc.slots()] == ["turn"]
 
 
@@ -1456,7 +1753,7 @@ def test_the_default_budget_refuses_the_fork_before_it_splits_the_prefill():
     even stop at the boundary."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h)  # the constructor default
-    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
     assert len(h.caches) == 1  # the turn's own, and nothing else
     assert pc.stats()["forks"] == 0
     assert h.prefilled == []  # no boundary split: the trimmable path fused as before
@@ -1466,7 +1763,7 @@ def test_the_default_budget_refuses_the_fork_before_it_splits_the_prefill():
 def test_a_fork_larger_than_the_whole_budget_is_never_copied():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=FORK * 8 * 2 - 1)  # a byte short of the copy
-    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
     assert len(h.caches) == 1
     assert pc.stats()["forks"] == 0
     # The turn slot is protected by its own publish, so it lands even though it
@@ -1487,7 +1784,7 @@ def test_the_fork_copy_makes_room_before_it_is_allocated():
     pc.generate(y1, y1_full, 16)
     # Room for the fork copy plus exactly one of the two resident slots.
     pc.max_bytes = _bytes_of(pc, x1) + FORK * 8 * 2
-    pc.generate(C1, C1_FULL, 16, fork_at=FORK)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
     assert pc.stats()["forks"] == 1
     # The last allocation is the copy, and by then the LRU slot was already gone.
     assert seen == [[], [x1], [x1, y1], [y1]]

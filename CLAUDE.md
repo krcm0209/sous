@@ -49,12 +49,18 @@ Claude Code use stretches further — evaluate features against that goal.
   and `prompt_cache_stats` take an `owner`: the worker retires its session's
   thread (`session.thread`) at task end and never calls the bare `reset()`,
   which drops the gateway's slots too. A `fork` slot is a *copy* taken while
-  a cold turn prefills past the system header (`fork_point`, 4096-token
-  floor) — the header is found by rendering two probe conversations and
-  taking their common prefix, never by rendering the system turn alone,
-  which Qwen3.8's template refuses; a `turn` slot is *moved* into the turn
-  that extends it. Never rewind a cache to make a slot — a hybrid model's
-  recurrent layers cannot.
+  a turn prefills past a boundary (`fork_point`, 4096-token floor). There are
+  two: the *tools* boundary — Qwen3.5/3.8 render `# Tools` *before* the
+  client's system text, so sessions and projects presenting the same tool
+  array share ~45–56K rendered tokens (Phase 3a's "cross-session reuse is
+  impossible" read the request body's order, not the render's) — and the
+  *header* boundary, the whole system block. Both come from probe pairs
+  (`promptcache.probe_boundaries`), never from rendering the system turn
+  alone, which Qwen3.8's template refuses. Warm turns resolve the probe too:
+  a turn that starts at another session's tools fork must still publish its
+  own header fork. A `turn` slot is *moved* into the turn that extends it.
+  Never rewind a cache to make a slot — a hybrid model's recurrent layers
+  cannot.
   `base.measure_cache_budget`/`live_headroom` deliberately do not call
   `release_mlx_thread_state()`: they run on threads whose caches are live.
 - The gateway forwards every request it does not serve (`gateway/upstream.py`)
