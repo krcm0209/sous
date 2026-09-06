@@ -220,7 +220,7 @@ def _fat_tools(n: int = 80) -> list[dict]:
 def test_lm_fork_probe_finds_only_the_header_on_a_system_first_template():
     """Qwen3's template renders the client's system text BEFORE its # Tools
     block, so two sessions' renders diverge inside the first line: the tools
-    pair shares only `<|im_start|>system\n`, far below the floor, and the
+    pair shares only `<|im_start|>system\\n`, far below the floor, and the
     header is the one boundary. The default 27B model's template is the other
     way round — see the hybrid VLM test."""
     from sous.engine.lm import LMEngine

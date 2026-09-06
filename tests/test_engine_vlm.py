@@ -329,7 +329,7 @@ def _fat_tools(n: int = 80) -> list[dict]:
 def test_vlm_fork_probe_finds_the_tools_boundary_on_a_tools_first_template():
     """Qwen3.5/3.8's template renders # Tools before the client's system text,
     so two sessions differing only in that text share the whole tool block.
-    The tools boundary is the first of two and ends at `</IMPORTANT>\n\n` —
+    The tools boundary is the first of two and ends at `</IMPORTANT>\\n\\n` —
     the separator the template emits only when there is system text."""
     from sous.engine.promptcache import FORK_MIN_TOKENS
     from sous.engine.vlm import VLMEngine

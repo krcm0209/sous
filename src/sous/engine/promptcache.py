@@ -503,7 +503,7 @@ class PrefixCache:
         with two it is the point: a session's first turn starts warm at
         another session's tools fork (`reuse` is the tools boundary) and must
         still publish its own header fork, or that session's next subagent
-        reuses ~45K tokens instead of ~57K. The memo makes a warm probe two
+        reuses ~45K tokens instead of ~57K. The memo makes a warm probe four
         renders and a string compare; the encode it saves is the cost. A warm
         attempt that fails and is retried cold resolves the probe twice — two
         extra renders under the tokenize lock, memoized encode — so the cost

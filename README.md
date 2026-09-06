@@ -233,14 +233,22 @@ turn gives up, stated plainly:
   memory-pressure eviction below apply across the daemon, so a delegated
   task's own slot can displace a least-recently-used gateway one (and at
   `prompt_cache_gb = 0`, where only one slot fits, it will).
-  A new subagent whose rendered header is identical to one already seen —
-  in practice a same-type subagent within the same Claude Code session —
-  starts from a *fork*: a copy of the cache taken where its predecessor's
-  system prompt and tool schemas end (~50K tokens for a Claude Code
-  subagent), so its first turn prefills only its own brief — seconds instead
-  of minutes. A *new* `claude` process misses: its system prompt carries that
-  session's own scratchpad path above the tool schemas, so the two headers
-  share only the first ~1K tokens. Two subagents still run one at a time;
+  A new subagent starts from a *fork* when it can: a copy of an earlier
+  conversation's cache taken at a boundary its own prompt shares. Two
+  boundaries are kept per conversation long enough to clear them. The
+  *tools* boundary is where the template's tool block ends — Qwen3.5/3.8
+  render the `# Tools` block *before* the client's system text, and Claude
+  Code's tool array is byte-identical across sessions and projects for a
+  given subagent type (Explore, general-purpose, …), so a new `claude`
+  process's first subagent turn starts ~45–56K tokens warm instead of paying
+  ~170 s cold. The *header* boundary is where the whole system block ends,
+  so a same-type subagent inside the same session starts ~57K tokens warm
+  and prefills only its own brief. Each fork is a full copy of the KV at its
+  boundary (~3.5 GiB at 57K tokens on the default model), two per tool set
+  the daemon has seen, budgeted by `[model].prompt_cache_gb` below. Forks
+  live as long as the weights: `[model].idle_unload_minutes` drops them with
+  the model.
+  Two subagents still run one at a time;
   batching is a later phase.
 - **A client that disconnects does not stop the model.** A local turn runs to
   completion (so the next request never waits on a wedged lock); aborting
@@ -250,7 +258,8 @@ turn gives up, stated plainly:
 Each `/v1/messages` turn served locally logs one metadata-only line to the
 daemon's stderr — method, model, stream flag, status, token counts, stop
 reason, cache `hit`/`fork`/`miss` (`fork`: the turn started from a copied
-header slot), seconds — plus one line naming the Anthropic tool *types* it
+fork slot — ~45–56K reused tokens is a tools fork, ~57K a header fork),
+seconds — plus one line naming the Anthropic tool *types* it
 dropped, when any. Each forwarded request logs one line too:
 `upstream`, method, path, the model id when the body named one, the
 upstream's status, and seconds to its headers. The daemon also disables
@@ -366,20 +375,28 @@ time flat instead of growing. Set it to `false` to prefill every turn from
 scratch.
 
 `[model].prompt_cache_gb` (default `"auto"`) bounds the caches kept resident
-*beyond* the turn that is running: one slot per conversation, plus one *fork*
-slot per distinct system prompt long enough to be worth copying (4096 tokens
-or more) — the ~50K-token header that Claude Code subagents of one type share
-within a session. Headers must match token for token, and a new `claude`
-process renders a different one (see above), so a fork slot pays off across
-the subagents of one session, not across sessions. `"auto"` is what Metal's
-recommended working set has left once the weights, one full context window of
-KV (the larger of `[model]`'s and `[gateway]`'s) and 2 GiB of slack are paid
-for — about 27 GiB on a 64 GB machine with the default model and gateway
-window, room for several conversations. Slots are evicted least-recently-used
+*beyond* the turn that is running: one slot per conversation, plus *fork*
+slots at every boundary long enough to be worth copying (4096 tokens or
+more): one at the end of the tool block, shared by every Claude Code session
+and project that presents the same tool array, and one at the end of the
+whole system block, shared by same-type subagents of one session (see
+above). Prefixes must match token for token — one added, removed or
+reordered tool is a different tool set with its own pair of forks. Each fork
+is a copy of the KV at its boundary, ~3.4–3.6 GiB at ~57K tokens on the
+default model, so a daemon that has seen the usual three tool sets holds up
+to six forks, ~20 GiB. `"auto"` is what Metal's recommended working set has
+left once the weights, one full context window of KV (the larger of
+`[model]`'s and `[gateway]`'s) and 2 GiB of slack are paid for — about
+27 GiB on a 64 GB machine with the default model and gateway window, room
+for those forks and several conversations; a 48 GB machine should set it
+lower, or to `0` to keep forks off. Slots are evicted least-recently-used
 first when the budget, a count of 16, or live memory pressure says so; the
-conversation that just ran is never evicted by its own turn, so `0` means
-exactly one slot (the pre-3a behaviour) and a 32 GB machine degrades to that
-on its own.
+conversation that just ran is never evicted by its own turn, and a cold
+turn's second fork copy never evicts its first, so `0` means exactly one slot
+(the pre-3a behaviour) and a 32 GB machine degrades to that on its own.
+Forks live as long as the weights do: `idle_unload_minutes` drops them with
+the model, so "every new session" means every new session inside that
+window.
 `server_status` reports `prompt_cache` — slots, resident bytes, hits, fork
 hits, evictions — counts only.
 
@@ -517,7 +534,7 @@ that Qwen3 emits and the hermes JSON format used by other MLX models.
   exercises the plumbing, not model competence. The real-model runs above are
   the meaningful end-to-end evidence.
 - Gateway mode (experimental) serves one local turn at a time on a
-  keyed prompt cache (one slot per conversation plus header forks, budgeted
+  keyed prompt cache (one slot per conversation plus tools and header forks, budgeted
   by `[model].prompt_cache_gb`), drops Anthropic server-side and built-in tool
   types from local turns (the ones that carry no client-supplied schema),
   ignores request-level sampling and thinking, and finishes a local turn
