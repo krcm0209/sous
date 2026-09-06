@@ -171,7 +171,7 @@ def test_lm_engine_serves_a_second_conversation_from_the_header_fork():
     e.unload()
 
 
-def test_lm_header_probe_matches_a_real_conversation_render():
+def test_lm_fork_probe_matches_a_real_conversation_render():
     """The probe's header must be a token prefix of a real render on a real
     template — the property fork_point checks, here against the tokenizer
     rather than a fake. A system-only render is not even attempted: the
@@ -187,9 +187,58 @@ def test_lm_header_probe_matches_a_real_conversation_render():
         {"role": "assistant", "content": "A"},
     ]
     stable = e._ids("stable", msgs, [])
-    probe = e._header_probe(msgs, [], stable)
-    # not isinstance(..., int) rather than callable(): the same narrowing, and
+    probe = e._fork_probe(msgs, [], stable)
+    # not isinstance(..., list) rather than callable(): the same narrowing, and
     # the one ty follows.
-    assert not isinstance(probe, int), "a long system turn must be probed, not refused"
-    assert probe() >= FORK_MIN_TOKENS
+    assert not isinstance(probe, list), "a long system turn must be probed, not refused"
+    bounds = probe()
+    assert len(bounds) == 1 and bounds[0] >= FORK_MIN_TOKENS  # no tools: the header only
+    e.unload()
+
+
+def _fat_tools(n: int = 80) -> list[dict]:
+    """A tool array long enough to clear the fork floor on its own (~90 tokens
+    per tool), in the shape convert.py hands the template."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": f"tool_{i}",
+                "description": f"Tool number {i}. "
+                + "It does one specific, well-documented thing to a file. " * 4,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "description": "An absolute path."}},
+                    "required": ["path"],
+                },
+            },
+        }
+        for i in range(n)
+    ]
+
+
+def test_lm_fork_probe_finds_only_the_header_on_a_system_first_template():
+    """Qwen3's template renders the client's system text BEFORE its # Tools
+    block, so two sessions' renders diverge inside the first line: the tools
+    pair shares only `<|im_start|>system\\n`, far below the floor, and the
+    header is the one boundary. The default 27B model's template is the other
+    way round — see the hybrid VLM test."""
+    from sous.engine.lm import LMEngine
+    from sous.engine.promptcache import FORK_MIN_TOKENS
+
+    e = LMEngine(TINY, cache_budget=1 << 34)
+    tools = _fat_tools()
+    system = {"role": "system", "content": "Session /tmp/a. You are terse."}
+    msgs = [system, {"role": "user", "content": "Say A."}]
+    stable = e._ids("stable", msgs, tools)
+    assert len(stable) >= FORK_MIN_TOKENS
+    probe = e._fork_probe(msgs, tools, stable)
+    assert not isinstance(probe, list)
+    bounds = probe()
+    assert len(bounds) == 1
+    assert FORK_MIN_TOKENS <= bounds[0] < len(stable)
+    # The one boundary is the whole system block: it ends right before the
+    # user turn, i.e. the render up to it ends with the system turn's close.
+    _, tokenizer = e._loaded()
+    assert tokenizer.decode(stable[: bounds[0]]).endswith("<|im_end|>\n<|im_start|>user\n")
     e.unload()
