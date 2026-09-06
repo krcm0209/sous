@@ -810,6 +810,13 @@ class PrefixCache:
                 stats, warm, stable_ids, full_ids, 0, max_tokens, relay, fork_at, owner, epoch
             )
 
+        # Protects only itself (decision 10): this turn's own forks are newer
+        # than anything else in the map, so LRU already spares them unless
+        # the budget holds nothing else — and then it cannot hold a fork
+        # beside this turn slot either, so dropping the fork now is exactly
+        # what the next turn's pre-turn cap pass would do anyway. Protecting
+        # it here would only leave the map over budget across a turn
+        # boundary instead of at one.
         self._publish(Slot(warm, list(stable_ids), owner, "turn", slot_bytes(warm)), epoch)
         return text
 

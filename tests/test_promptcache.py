@@ -1551,32 +1551,61 @@ def test_a_budget_for_one_copy_skips_the_second_boundary_rather_than_evicting_in
 
 
 def test_a_copy_that_cannot_fit_beside_this_turns_forks_evicts_nothing():
-    """_make_room's up-front check, not its eviction loop, is what refuses the
-    header copy here: two ordinary turn slots are already resident (A1 turns
-    out to share T's low end, so AX1's turn finds it a warm hit and takes it
-    rather than evicting it; B1 does not match and is the one LRU evicts to
-    fund the tools copy), and the tools copy fits once B1 is gone. The header
-    copy then does not — protected(tools) + its own price is over budget on
-    its own — and the fix means nothing further is evicted trying anyway:
-    _evictable is already empty by that point, so the pre-fix code would not
-    have evicted anything more here either (this pins the outcome; it is not
-    a fix-discriminating case, per the byte sizes below)."""
+    """_make_room's up-front check, not its eviction loop, is what refuses
+    the header copy here. P1 and Q1 are two ordinary turn slots — 4 tokens
+    (64 bytes) and 2 tokens (32 bytes) — and neither is a prefix of AX1, so
+    this really is the cold miss the name implies, not a warm hit on either
+    of them. Funding the tools copy (TOOLS_AT * 16 bytes) against a budget of
+    len(HA) * 16 needs exactly one eviction: P1, the LRU slot. That leaves Q1
+    resident (32 bytes: 32 + TOOLS_AT * 16 is exactly the budget), and the
+    header copy's own price then puts it over budget beside the protected
+    tools copy no matter what else is evicted — so the fix means Q1 survives
+    the header attempt too. It does not survive the turn, though: AX1's own
+    turn slot (2 tokens past HA) alone exceeds the budget, and *its* publish
+    evicts everything else regardless of what happened at the header
+    boundary — so a total eviction count read only once the whole turn is
+    done would be the same either way (3, either order). `decode_impl` reads
+    the map after the boundary loop but before that publish, which is the
+    one point the two codepaths actually differ."""
+    P1, P1_FULL = [901, 902, 903, 904], [901, 902, 903, 904, 90, 91]
+    Q1, Q1_FULL = [911, 912], [911, 912, 90, 91]
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(A1, A1_FULL, 16)  # a turn slot: 4 tokens * 8 bytes * 2 layers = 64 bytes
-    pc.generate(B1, B1_FULL, 16)  # another, same size
+    pc.generate(P1, P1_FULL, 16)  # a turn slot: 4 tokens * 8 bytes * 2 layers = 64 bytes
+    pc.generate(Q1, Q1_FULL, 16)  # another: 2 tokens * 8 bytes * 2 layers = 32 bytes
     pc.max_bytes = (
         len(HA) * 8 * 2
     )  # exactly the header copy; the tools copy (TOOLS_AT * 16) is smaller
+
+    checkpoint: dict = {}
+
+    def snapshot_before_the_turn_slot_publishes(hooks, cache, token_ids, max_tokens):
+        checkpoint["evictions"] = pc.stats()["evictions"]
+        checkpoint["forks"] = sorted(s.held for s in pc.slots() if s.kind == "fork")
+        checkpoint["turns"] = sorted(s.held for s in pc.slots() if s.kind == "turn")
+        hooks.decoded.append(list(token_ids))
+        return "text"
+
+    h.decode_impl = snapshot_before_the_turn_slot_publishes
     pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+
     assert pc.stats()["forks"] == 1
+    # With the pre-check: one eviction (P1, funding the tools copy), and Q1
+    # is still resident when the header boundary's own _make_room refuses up
+    # front. Without it — verified by temporarily deleting the pre-check's
+    # two lines (the `protected_bytes` computation and its early `return
+    # False`) — the header attempt's eviction loop finds Q1 still evictable
+    # and drops it too, for a copy that could never have fit regardless: two
+    # evictions at this checkpoint, not one, even though the header copy is
+    # refused either way.
+    assert checkpoint["evictions"] == 1
+    assert checkpoint["forks"] == [T]
+    assert checkpoint["turns"] == [Q1]
+    # By the end of the turn, AX1's own oversized turn slot has evicted both
+    # of the above (see the docstring) — not a fix-discriminating count, but
+    # the final state is still worth pinning.
+    assert pc.stats()["evictions"] == 3
     assert [s.kind for s in pc.slots()] == ["turn"]
-    # One eviction frees B1 (the only slot still evictable once A1 is taken as
-    # a hit) to fund the tools copy; the second is the turn slot's own publish
-    # evicting the tools copy afterwards, exactly as in the test above — the
-    # exact count, not an inequality, is the point: nothing extra was evicted
-    # trying to fund the header copy that could never have fit.
-    assert pc.stats()["evictions"] == 2
 
 
 def test_three_tool_sets_forks_coexist_under_a_budget_that_holds_them():
@@ -1632,12 +1661,15 @@ def test_a_failed_copy_at_one_boundary_still_forks_at_the_next():
 
 
 def test_a_failed_copy_at_the_second_boundary_leaves_the_first_fork_resident():
-    """The companion to the test above, but for same-turn protection rather
-    than per-boundary isolation: a copy failure at the *second* boundary must
-    not take the *first* boundary's already-published copy down with it.
-    Two trimmable layers means a fork copy is exactly two copy_array calls
-    (one array per layer), so the third call overall is the header copy's
-    first array — fail it there, after the tools copy already landed."""
+    """The companion to the test above, but for what a failed copy leaves
+    behind rather than for per-boundary isolation. With max_bytes=ROOMY
+    nothing is ever evicted for budget here, protected or not, so this
+    proves something narrower: a failed second copy leaves the map
+    untouched — the first fork (the tools copy) stays resident, nothing is
+    evicted, and the turn just continues. Two trimmable layers means a fork
+    copy is exactly two copy_array calls (one array per layer), so the third
+    call overall is the header copy's first array — fail it there, after
+    the tools copy already landed."""
     calls = 0
 
     def impl(hooks, a):
@@ -1654,13 +1686,9 @@ def test_a_failed_copy_at_the_second_boundary_leaves_the_first_fork_resident():
     with pytest.warns(UserWarning, match="fork copy failed"):
         pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
     assert pc.stats()["forks"] == 1
-    # The first fork (the tools copy) is still resident — nothing was evicted
-    # to fund the second copy's failed attempt. Were it evicted instead (the
-    # bug this pins against), this list would be empty and evictions would be
-    # at least 1: a fork is never made room for by evicting an earlier one
-    # this same turn already published (protect=published), and _run's
-    # finally only ever clears its own copy/slot locals, never anything the
-    # map already holds.
+    # The first fork (the tools copy) is still resident and nothing was
+    # evicted: _run's `finally` clears only its own `copy`/`slot` locals when
+    # the second copy fails, never anything the map already holds.
     assert [s.held for s in pc.slots() if s.kind == "fork"] == [T]
     assert pc.stats()["evictions"] == 0
     assert h.prefilled[:2] == [T, HA[TOOLS_AT:]]

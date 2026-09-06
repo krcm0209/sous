@@ -235,19 +235,21 @@ turn gives up, stated plainly:
   `prompt_cache_gb = 0`, where only one slot fits, it will).
   A new subagent starts from a *fork* when it can: a copy of an earlier
   conversation's cache taken at a boundary its own prompt shares. Two
-  boundaries are kept per conversation long enough to clear them. The
-  *tools* boundary is where the template's tool block ends — Qwen3.5/3.8
-  render the `# Tools` block *before* the client's system text, and Claude
-  Code's tool array is byte-identical across sessions and projects for a
-  given subagent type (Explore, general-purpose, …), so a new `claude`
-  process's first subagent turn starts ~45–56K tokens warm instead of paying
-  ~170 s cold. The *header* boundary is where the whole system block ends,
-  so a same-type subagent inside the same session starts ~57K tokens warm
-  and prefills only its own brief. Each fork is a full copy of the KV at its
-  boundary (~3.5 GiB at 57K tokens on the default model), two per tool set
-  the daemon has seen, budgeted by `[model].prompt_cache_gb` below. Forks
-  live as long as the weights: `[model].idle_unload_minutes` drops them with
-  the model.
+  boundaries are kept, each when it is long enough to clear the 4096-token
+  floor. The *tools* boundary is where the template's tool block ends —
+  Qwen3.5/3.8 render the `# Tools` block *before* the client's system text,
+  and Claude Code's tool array is byte-identical across sessions and
+  projects for a given subagent type (Explore, general-purpose, …), so a
+  new `claude` process's first subagent turn starts ~45–56K tokens warm
+  instead of paying ~170 s cold. The *header* boundary is where the whole
+  system block ends, so a same-type subagent inside the same session starts
+  ~57K tokens warm and prefills only its own brief. Each fork is a full copy
+  of the KV at its boundary (~3.5 GiB at 57K tokens on the default model):
+  one tools fork per tool set, plus one header fork per session that has
+  used it, so several live `claude` sessions accumulate more than the
+  tool-set count alone suggests. Budgeted by `[model].prompt_cache_gb`
+  below. Forks live as long as the weights: `[model].idle_unload_minutes`
+  drops them with the model.
   Two subagents still run one at a time;
   batching is a later phase.
 - **A client that disconnects does not stop the model.** A local turn runs to
@@ -383,18 +385,25 @@ whole system block, shared by same-type subagents of one session (see
 above). Prefixes must match token for token — one added, removed or
 reordered tool is a different tool set with its own pair of forks. Each fork
 is a copy of the KV at its boundary, ~3.4–3.6 GiB at ~57K tokens on the
-default model, so a daemon that has seen the usual three tool sets holds up
-to six forks, ~20 GiB. `"auto"` is what Metal's recommended working set has
+default model: one tools fork per tool set, plus one header fork per
+session that has used it, so a daemon that has seen the usual three tool
+sets across one or two live `claude` sessions holds roughly five to nine
+forks, ~17–31 GiB (the tools forks stay most-recently-used, since every new
+session touches them). `"auto"` is what Metal's recommended working set has
 left once the weights, one full context window of KV (the larger of
 `[model]`'s and `[gateway]`'s) and 2 GiB of slack are paid for — about
 27 GiB on a 64 GB machine with the default model and gateway window, room
-for those forks and several conversations; a 48 GB machine should set it
-lower, or to `0` to keep forks off. Slots are evicted least-recently-used
-first when the budget, a count of 16, or live memory pressure says so; the
-conversation that just ran is never evicted by its own turn, and a cold
-turn's second fork copy never evicts its first, so `0` means exactly one slot
-(the pre-3a behaviour) and a 32 GB machine degrades to that on its own.
-Forks live as long as the weights do: `idle_unload_minutes` drops them with
+for those forks and several conversations; a 48 GB machine should set it to
+`0` (forks off, one slot), or to at least one fork copy plus one
+conversation slot — about 8 GiB with the default model at ~57K tokens. A
+value between the two makes every cold turn take a fork copy that its own
+turn slot then evicts, so it pays the copy and never reuses it. Slots are
+evicted least-recently-used first when the budget, a count of 16, or live
+memory pressure says so; the conversation that just ran is never evicted by
+its own turn, and a cold turn's second fork copy never evicts its first, so
+`0` means exactly one slot (the pre-3a behaviour) and a 32 GB machine
+degrades to that on its own. Forks live as long as the weights do:
+`idle_unload_minutes` drops them with
 the model, so "every new session" means every new session inside that
 window.
 `server_status` reports `prompt_cache` — slots, resident bytes, hits, fork
