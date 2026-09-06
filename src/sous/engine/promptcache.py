@@ -393,10 +393,16 @@ class PrefixCache:
         is False and the caller skips the copy rather than evicting into it.
         The turn's own cache is not in the map, and a fork slot this turn
         copied from has already been copied, so neither needs protecting.
+        A copy that cannot fit beside what `protect` alone holds is refused
+        up front, before any eviction runs — otherwise a copy that can never
+        fit would empty the map of everything evictable for nothing.
 
         Takes the lock itself.
         """
         with self._lock:
+            protected_bytes = sum(s.nbytes for s in protect)
+            if protected_bytes + nbytes > self.max_bytes:
+                return False
             while self._evictable(protect) and self._resident() + nbytes > self.max_bytes:
                 self._drop_lru(protect)
             return self._resident() + nbytes <= self.max_bytes
@@ -778,6 +784,7 @@ class PrefixCache:
             # has grown.
             price = slot_bytes(cache)
             copy: list | None = None
+            slot: Slot | None = None
             try:
                 # Charged before it is allocated, with this turn's earlier
                 # copies protected: a budget with room for one copy skips the
@@ -809,8 +816,13 @@ class PrefixCache:
                 # began, or the owner retired mid-turn — and neither a refused
                 # nor a half-built copy may stay pinned by this frame for the
                 # whole decode that follows. (An accepted one is never evicted
-                # by its own publish: _publish protects the slot it adds.)
-                copy = None
+                # by its own publish: _publish protects the slot it adds — and
+                # `published.append(slot)` above already took its own
+                # reference, so clearing `slot` here does not lose it.) `slot`
+                # is cleared too, not just `copy`: `Slot.cache` is the copy, so
+                # a Slot left referenced by this frame keeps the whole copy
+                # alive across the decode below just as surely as `copy` would.
+                copy = slot = None
         # The list existed to protect the copies from each other while they
         # were charged. Dropping it here means a fork that pressure or a reset
         # evicts during the decode below is freed then, not pinned by this
