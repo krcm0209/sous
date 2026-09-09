@@ -20,6 +20,7 @@ from sous.engine.promptcache import (
     PromptMemo,
     all_trimmable,
     auto_cache_budget,
+    common_prefix_length,
     fork_copy,
     fork_point,
     restore,
@@ -874,6 +875,7 @@ def test_stats_as_dict_reports_every_counter():
         fork_hits=1,
         forks=1,
         evictions=3,
+        miss_lcp=40,
     )
     assert s.as_dict() == {
         "hits": 2,
@@ -884,6 +886,7 @@ def test_stats_as_dict_reports_every_counter():
         "fork_hits": 1,
         "forks": 1,
         "evictions": 3,
+        "miss_lcp": 40,
     }
 
 
@@ -896,6 +899,40 @@ def test_stats_add_sums_the_counters_and_maxes_the_snapshot_gauge():
     assert a.snapshot_bytes == 64
     a.add(PromptCacheStats(snapshot_bytes=100))
     assert a.snapshot_bytes == 100
+
+
+def test_stats_add_maxes_the_miss_lcp_gauge_too():
+    # Like snapshot_bytes, miss_lcp is assigned per miss, not accumulated.
+    a = PromptCacheStats(miss_lcp=500)
+    a.add(PromptCacheStats(miss_lcp=200))
+    assert a.miss_lcp == 500
+    a.add(PromptCacheStats(miss_lcp=900))
+    assert a.miss_lcp == 900
+
+
+# ---- common_prefix_length ---------------------------------------------------
+
+
+def test_common_prefix_length_of_identical_lists_is_their_length():
+    assert common_prefix_length([1, 2, 3], [1, 2, 3]) == 3
+
+
+def test_common_prefix_length_stops_at_the_first_difference():
+    assert common_prefix_length([1, 2, 3, 4], [1, 2, 9, 4]) == 2
+
+
+def test_common_prefix_length_is_bounded_by_the_shorter_list():
+    assert common_prefix_length([1, 2], [1, 2, 3, 4]) == 2
+    assert common_prefix_length([1, 2, 3, 4], [1, 2]) == 2
+
+
+def test_common_prefix_length_with_an_empty_list_is_zero():
+    assert common_prefix_length([], [1, 2]) == 0
+    assert common_prefix_length([1, 2], []) == 0
+
+
+def test_common_prefix_length_differing_at_position_zero_is_zero():
+    assert common_prefix_length([5, 2, 3], [1, 2, 3]) == 0
 
 
 def test_memo_accepts_the_header_slot():
@@ -1818,3 +1855,75 @@ def test_unknown_headroom_skips_the_pressure_check():
     pc.generate(A1, A1_FULL, 16)
     pc.generate(B1, B1_FULL, 16)
     assert pc.stats()["slots"] == 2
+
+
+# ---- miss diagnostics: lcp ---------------------------------------------------
+#
+# On a miss, how far the new render agreed with the closest slot this owner
+# holds — the number that says WHERE two Claude Code renders diverged (inside
+# the tool block: the tool array differs; after it: the system text differs
+# and no tools fork was resident) without logging a single token id.
+
+
+def test_a_miss_records_the_longest_common_prefix_with_this_owners_slots():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)  # forks at T and HA, turn slot AX1
+    # A render whose tool block differs at position 1000: every resident slot
+    # shares exactly the first 1000 tokens with it.
+    other = [*T[:1000], 99999, *T[1001:], 8001, 8002, 501]
+    pc.generate(other, [*other, 90, 91], 16, fork_at=BOUNDS_A)
+    s = pc.stats()
+    assert s["misses"] == 2
+    assert s["miss_lcp"] == 1000
+
+
+def test_a_miss_that_diverges_in_the_system_text_records_the_tool_block_length():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=[len(HA)])  # header fork only: no tools fork resident
+    # Same tool block, different system text: the closest slot shares the
+    # whole tool block plus nothing of the text.
+    pc.generate(BX1, BX1_FULL, 16, fork_at=[len(HB)])
+    assert pc.stats()["misses"] == 2
+    assert pc.stats()["miss_lcp"] == TOOLS_AT
+
+
+def test_a_miss_with_nothing_resident_records_zero():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    assert pc.stats()["miss_lcp"] == 0
+
+
+def test_a_hit_leaves_the_last_miss_lcp_alone():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    other = [*T[:1000], 99999, *T[1001:], 8001, 8002, 501]
+    pc.generate(other, [*other, 90, 91], 16, fork_at=BOUNDS_A)  # miss: 1000
+    pc.generate(AX1_NEXT, AX1_NEXT_FULL, 16, fork_at=BOUNDS_A)  # turn-slot hit
+    assert pc.stats()["hits"] == 1
+    assert pc.stats()["miss_lcp"] == 1000
+
+
+def test_another_owners_slots_do_not_count_toward_the_miss_lcp():
+    """The same owner filter as lookup: a slot this thread could never reuse
+    would only make the diagnostic lie about what was available."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    stop = threading.Event()
+    ready = threading.Event()
+
+    def holder():
+        pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+        ready.set()
+        stop.wait(5)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    ready.wait(5)
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)  # main thread: nothing of its own
+    assert pc.stats(owner=threading.current_thread())["miss_lcp"] == 0
+    stop.set()
+    t.join(5)

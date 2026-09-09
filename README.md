@@ -260,7 +260,10 @@ turn gives up, stated plainly:
 Each `/v1/messages` turn served locally logs one metadata-only line to the
 daemon's stderr — method, model, stream flag, status, token counts, stop
 reason, cache `hit`/`fork`/`miss` (`fork`: the turn started from a copied
-fork slot — ~45–56K reused tokens is a tools fork, ~57K a header fork),
+fork slot — ~45–56K reused tokens is a tools fork, ~57K a header fork; a
+`miss` adds `lcp=`, how many leading tokens the render shared with the
+closest resident slot: below the tool block's length the tool array
+differed, above it the system text did),
 seconds — plus one line naming the Anthropic tool *types* it
 dropped, when any. Each forwarded request logs one line too:
 `upstream`, method, path, the model id when the body named one, the

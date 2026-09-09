@@ -644,11 +644,15 @@ class Gateway:
         self, chat: ChatRequest, result: TurnResult, assembler: TurnAssembler, *, stream: bool
     ) -> None:
         cache = "fork" if result.forked else "hit" if result.cache_hit else "miss"
+        # A hit already says how much was reused; a miss says how far the
+        # render agreed with the closest slot, which is the number that tells
+        # a changed tool array from a changed system text.
+        lcp = f" lcp={result.lcp}" if cache == "miss" else ""
         _log(
             f"POST /v1/messages model={_model_label(chat)} stream={int(stream)} status=200 "
             f"input_tokens={result.input_tokens} output_tokens={result.output_tokens} "
             f"stop={assembler.stop_reason} cache={cache} "
-            f"reused_tokens={result.reused_tokens} seconds={result.seconds:.1f}"
+            f"reused_tokens={result.reused_tokens}{lcp} seconds={result.seconds:.1f}"
         )
 
 

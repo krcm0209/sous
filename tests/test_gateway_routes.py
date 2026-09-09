@@ -707,6 +707,31 @@ def test_the_log_says_cache_fork_when_the_turn_started_from_a_copy(tmp_path: Pat
     assert "cache=fork" in lines[1]
 
 
+def test_the_log_carries_lcp_only_on_a_miss(tmp_path: Path, capsys):
+    """A miss says how far the render agreed with the closest resident slot —
+    the one number that tells a tool-array change from a system-text change
+    — and a hit, which has reused_tokens for that, says nothing extra."""
+    inner = FakeEngine(["a reply", "another reply"])
+    inner.stats = {"hits": 0, "fork_hits": 0, "reused_tokens": 0, "miss_lcp": 0}
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 1:
+            inner.stats = {"hits": 0, "fork_hits": 0, "reused_tokens": 0, "miss_lcp": 1200}
+        if len(inner.calls) == 2:
+            inner.stats = {"hits": 1, "fork_hits": 0, "reused_tokens": 4000, "miss_lcp": 1200}
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    app = _app(tmp_path, inner)
+    assert _post(app, _body()).status_code == 200
+    assert _post(app, _body()).status_code == 200
+    lines = [line for line in capsys.readouterr().err.splitlines() if "POST /v1/messages" in line]
+    assert "cache=miss" in lines[0] and "lcp=1200" in lines[0]
+    assert "cache=hit" in lines[1] and "lcp=" not in lines[1]
+
+
 def test_mounting_pins_the_sse_logger_above_debug(tmp_path: Path, monkeypatch):
     """sse-starlette logs every frame it sends at DEBUG — the model's reply,
     verbatim. Mounting the gateway pins that logger, so the no-bodies rule does

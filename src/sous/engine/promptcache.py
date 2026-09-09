@@ -42,6 +42,25 @@ def reuse_length(cached_ids: Sequence[int], new_ids: Sequence[int]) -> int:
     return n if head == (cached_ids if isinstance(cached_ids, list) else list(cached_ids)) else 0
 
 
+def common_prefix_length(a: Sequence[int], b: Sequence[int]) -> int:
+    """How many leading tokens `a` and `b` share. The miss diagnostic: with
+    the fork boundaries known, where a new render stopped agreeing with the
+    closest resident slot says whether the tool array or the system text
+    differed — without keeping a token of either.
+
+    A binary search over slice compares, not a Python loop over elements: the
+    inputs are ~50K-token lists and this runs under the bookkeeping lock.
+    """
+    lo, hi = 0, min(len(a), len(b))
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if a[:mid] == b[:mid]:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
 def all_trimmable(cache: Sequence[Any]) -> bool:
     # Sequence[Any] rather than a Protocol: mlx-lm and mlx-vlm ship their own
     # cache classes with no shared base and no type stubs, and trim/offset exist
@@ -239,6 +258,9 @@ def auto_cache_budget(*, working_set: int, active: int, reserve_bytes: int) -> i
     return max(0, working_set - active - reserve_bytes - CACHE_BUDGET_SLACK)
 
 
+_GAUGES = frozenset({"snapshot_bytes", "miss_lcp"})
+
+
 @dataclass
 class PromptCacheStats:
     hits: int = 0  # every warm run, from a turn slot or a fork copy
@@ -249,6 +271,9 @@ class PromptCacheStats:
     fork_hits: int = 0  # the subset of hits served by copying a fork slot
     forks: int = 0  # fork slots created
     evictions: int = 0  # slots dropped for budget, count or pressure
+    # Gauge, assigned per miss: how many leading tokens the missed render
+    # shared with the closest slot this owner held (0 when it held none).
+    miss_lcp: int = 0
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -256,16 +281,15 @@ class PromptCacheStats:
     def add(self, other: PromptCacheStats) -> None:
         """Fold `other`'s counters into these.
 
-        Every field is a running count and sums — except `snapshot_bytes`,
-        which is a gauge assigned per turn (the last non-trimmable turn's copy
-        cost). Summing it would make the daemon-wide view grow with the number
-        of owners rather than report a size, so the largest reading wins.
+        Every field is a running count and sums — except the gauges,
+        `snapshot_bytes` (the last non-trimmable turn's copy cost) and
+        `miss_lcp` (the last miss's shared prefix), which are assigned per
+        turn. Summing a gauge would make the daemon-wide view grow with the
+        number of owners rather than report a reading, so the largest wins.
         """
         for f in dataclasses.fields(self):
             mine, theirs = getattr(self, f.name), getattr(other, f.name)
-            setattr(
-                self, f.name, max(mine, theirs) if f.name == "snapshot_bytes" else mine + theirs
-            )
+            setattr(self, f.name, max(mine, theirs) if f.name in _GAUGES else mine + theirs)
 
 
 _MEMO_SLOTS = ("stable", "full", "header", "tools")
@@ -696,6 +720,19 @@ class PrefixCache:
             # task vs the gateway's long-lived one) gets a cold miss rather
             # than a warm run doomed to the cross-thread mlx failure.
             slot = self._take(owner, stable_ids)
+            if slot is None:
+                # The diagnostic for a miss, taken against the same slots
+                # lookup just refused: a slot another thread owns could never
+                # have served this turn, so it says nothing about what was
+                # available. ~17 slice compares per slot, still list work.
+                stats.miss_lcp = max(
+                    (
+                        common_prefix_length(s.held, stable_ids)
+                        for s in self._slots
+                        if s.owner is owner
+                    ),
+                    default=0,
+                )
             # Whatever is still in the map is not going to serve this turn,
             # and this turn's own cache is about to be prefilled to full size
             # beside it. Bring the map under its caps here rather than only at
