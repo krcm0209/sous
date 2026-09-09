@@ -416,8 +416,59 @@ def test_streamed_text_turn_has_the_anthropic_event_sequence(tmp_path: Path):
     assert events[5][1] == {
         "type": "message_delta",
         "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-        "usage": {"output_tokens": 2},
+        "usage": {
+            "input_tokens": start["usage"]["input_tokens"],
+            "cache_read_input_tokens": 0,
+            "output_tokens": 2,
+        },
     }
+
+
+def _hit_after_first_turn(inner: FakeEngine, reused: int) -> None:
+    """Make every turn after the first a cache hit that reused `reused` tokens,
+    as the engine's owner-scoped counters would report it."""
+    inner.stats = {"hits": 0, "fork_hits": 0, "reused_tokens": 0}
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) >= 2:
+            inner.stats = {"hits": 1, "fork_hits": 0, "reused_tokens": reused}
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+
+
+def test_a_streamed_hit_reports_the_reuse_as_a_disjoint_cache_read(tmp_path: Path):
+    """message_start goes out before the cache decision and carries the whole
+    count; message_delta carries the corrected split, which is where Claude
+    Code's SDK reads the input-side fields from when they are present."""
+    inner = FakeEngine(["Hello there", "Hello again"])
+    _hit_after_first_turn(inner, reused=3)
+    app = _app(tmp_path, inner)
+    assert _post(app, _body(stream=True)).status_code == 200
+    events = _events(_post(app, _body(stream=True)).text)
+    start = events[1][1]["message"]
+    total = start["usage"]["input_tokens"]
+    assert total > 3
+    delta = next(payload for kind, payload in events if payload.get("type") == "message_delta")
+    assert delta["usage"] == {
+        "input_tokens": total - 3,
+        "cache_read_input_tokens": 3,
+        "output_tokens": delta["usage"]["output_tokens"],
+    }
+
+
+def test_a_non_streamed_hit_reports_the_same_split(tmp_path: Path):
+    inner = FakeEngine(["Hello there", "Hello again"])
+    _hit_after_first_turn(inner, reused=3)
+    app = _app(tmp_path, inner)
+    first = _post(app, _body()).json()
+    second = _post(app, _body()).json()
+    total = first["usage"]["input_tokens"]
+    assert first["usage"]["cache_read_input_tokens"] == 0
+    assert second["usage"]["input_tokens"] == total - 3
+    assert second["usage"]["cache_read_input_tokens"] == 3
 
 
 def test_streamed_tool_call_turn(tmp_path: Path):

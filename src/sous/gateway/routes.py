@@ -547,7 +547,9 @@ class Gateway:
             )
             return _error_response(status, error_type, message)
         assembler.start(result.input_tokens)
-        assembler.finish(result.text, result.output_tokens, result.finish_reason)
+        assembler.finish(
+            result.text, result.output_tokens, result.finish_reason, result.reused_tokens
+        )
         self._log_turn(chat, result, assembler, stream=False)
         return JSONResponse(assembler.message())
 
@@ -619,7 +621,7 @@ class Gateway:
                         yield _frame(event)
                 elif kind == "done":
                     for event in assembler.finish(
-                        value.text, value.output_tokens, value.finish_reason
+                        value.text, value.output_tokens, value.finish_reason, value.reused_tokens
                     ):
                         yield _frame(event)
                     self._log_turn(chat, value, assembler, stream=True)

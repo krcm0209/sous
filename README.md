@@ -252,6 +252,14 @@ turn gives up, stated plainly:
   drops them with the model.
   Two subagents still run one at a time;
   batching is a later phase.
+- **Usage is split the way Anthropic's is.** `cache_read_input_tokens` is what
+  the turn served from a resident cache slot and `input_tokens` the rest, so a
+  warm subagent turn shows a few hundred input tokens and ~57K cache reads.
+  `message_start` carries the whole count (it is sent before the cache
+  decision); `message_delta` and the non-streaming body carry the split,
+  which is where the SDKs read the input-side fields from when present. No
+  `cache_creation_input_tokens`: every prompt stays resident, so it would only
+  double-count the uncached tokens.
 - **A client that disconnects does not stop the model.** A local turn runs to
   completion (so the next request never waits on a wedged lock); aborting
   mid-generation comes with batching, later. A forwarded stream, by contrast,

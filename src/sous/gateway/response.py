@@ -110,6 +110,10 @@ class TurnAssembler:
         self.model = model
         self.input_tokens = 0
         self.output_tokens = 0
+        # Tokens the turn served from a resident cache slot; known only once
+        # the turn has run, so message_start (sent before prefill) cannot
+        # carry the split and message_delta does.
+        self.reused_tokens = 0
         self.stop_reason = "end_turn"
         self._toolset = toolset
         self._splitter = TextSplitter()
@@ -146,10 +150,14 @@ class TurnAssembler:
         self.output_tokens = max(self.output_tokens, delta.output_tokens)
         return self._emit_text(self._splitter.feed(delta.text))
 
-    def finish(self, text: str, output_tokens: int, finish_reason: str | None) -> list[dict]:
+    def finish(
+        self, text: str, output_tokens: int, finish_reason: str | None, reused_tokens: int = 0
+    ) -> list[dict]:
         """Close the turn. `text` is the engine's whole reply; whatever the
         deltas did not carry (all of it, on the non-streaming path) is fed
-        first so both paths see identical text."""
+        first so both paths see identical text. `reused_tokens` is what the
+        prompt cache served warm, reported as a cache read."""
+        self.reused_tokens = reused_tokens
         events: list[dict] = []
         if len(text) > self._fed_len:
             events += self._emit_text(self._splitter.feed(text[self._fed_len :]))
@@ -208,11 +216,27 @@ class TurnAssembler:
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": self.output_tokens},
+                "usage": self._usage(),
             }
         )
         events.append({"type": "message_stop"})
         return events
+
+    def _usage(self) -> dict:
+        """Anthropic's usage fields are disjoint: `input_tokens` is what was
+        NOT served from cache. message_start carries the whole count because
+        the split is unknown until the turn has run; the SDKs overwrite the
+        input-side fields from message_delta when it carries them. No
+        `cache_creation_input_tokens`: every prompt stays resident here, so
+        it would equal the uncached count and double-count for a consumer
+        that sums the three. The clamp guards a disagreement between the
+        cache's and count_tokens' tokenization that cannot happen today."""
+        reused = min(self.reused_tokens, self.input_tokens)
+        return {
+            "input_tokens": self.input_tokens - reused,
+            "cache_read_input_tokens": reused,
+            "output_tokens": self.output_tokens,
+        }
 
     def message(self) -> dict:
         self._materialize_text()
@@ -224,10 +248,7 @@ class TurnAssembler:
             "content": [dict(block) for block in self._blocks],
             "stop_reason": self.stop_reason,
             "stop_sequence": None,
-            # No cache accounting fields (the SDKs read absent ones as null):
-            # a truthful split needs the per-turn reuse count, which arrives
-            # with keyed cache slots (Phase 3a). message_start says the same.
-            "usage": {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens},
+            "usage": self._usage(),
         }
 
     def _emit_text(self, text: str) -> list[dict]:
