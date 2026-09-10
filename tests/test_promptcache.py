@@ -1907,6 +1907,21 @@ def test_a_hit_leaves_the_last_miss_lcp_alone():
     assert pc.stats()["miss_lcp"] == 1000
 
 
+def test_a_miss_that_never_reaches_lookup_resets_the_gauge():
+    """The 'full prompt is not the stable render plus a suffix' miss returns
+    before any slot is examined. It must not leave the previous miss's
+    reading in place for the gateway to log as this turn's."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    other = [*T[:1000], 99999, *T[1001:], 8001, 8002, 501]
+    pc.generate(other, [*other, 90, 91], 16, fork_at=BOUNDS_A)  # miss: 1000
+    with pytest.warns(UserWarning, match="not the stable render"):
+        pc.generate(AX1, [7, 7, 7], 16, fork_at=BOUNDS_A)  # a miss that looks nothing up
+    assert pc.stats()["misses"] == 3
+    assert pc.stats()["miss_lcp"] == 0
+
+
 def test_another_owners_slots_do_not_count_toward_the_miss_lcp():
     """The same owner filter as lookup: a slot this thread could never reuse
     would only make the diagnostic lie about what was available."""

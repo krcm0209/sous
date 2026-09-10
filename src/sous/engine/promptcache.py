@@ -48,17 +48,16 @@ def common_prefix_length(a: Sequence[int], b: Sequence[int]) -> int:
     closest resident slot says whether the tool array or the system text
     differed — without keeping a token of either.
 
-    A binary search over slice compares, not a Python loop over elements: the
-    inputs are ~50K-token lists and this runs under the bookkeeping lock.
+    A plain scan, on purpose. A binary search over slice compares looks
+    smarter but each slice copies and INCREFs every element it covers, and on
+    two ~57K-token lists it measured 2.5 ms against 0.6 ms for this loop
+    (Python 3.14, M5 Pro); the C-level `map(ne)`/`compress` form was no faster.
     """
-    lo, hi = 0, min(len(a), len(b))
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if a[:mid] == b[:mid]:
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
 
 
 def all_trimmable(cache: Sequence[Any]) -> bool:
@@ -707,6 +706,9 @@ class PrefixCache:
         # one to reuse.
         if reuse_length(stable_ids, full_ids) == 0:
             stats.misses += 1
+            # Nothing was looked up, so the gauge must not keep an earlier
+            # miss's reading for the gateway to log as this turn's.
+            stats.miss_lcp = 0
             warnings.warn(
                 "sous prompt cache: full prompt is not the stable render "
                 "plus a generation suffix; decoding cold this turn",
@@ -720,19 +722,15 @@ class PrefixCache:
             # task vs the gateway's long-lived one) gets a cold miss rather
             # than a warm run doomed to the cross-thread mlx failure.
             slot = self._take(owner, stable_ids)
-            if slot is None:
-                # The diagnostic for a miss, taken against the same slots
-                # lookup just refused: a slot another thread owns could never
-                # have served this turn, so it says nothing about what was
-                # available. ~17 slice compares per slot, still list work.
-                stats.miss_lcp = max(
-                    (
-                        common_prefix_length(s.held, stable_ids)
-                        for s in self._slots
-                        if s.owner is owner
-                    ),
-                    default=0,
-                )
+            # The miss diagnostic is measured against the same slots lookup
+            # just refused: a slot another thread owns could never have
+            # served this turn, so it says nothing about what was available.
+            # Only the references are taken here — the scan itself runs after
+            # the lock is released (below): ~0.6 ms per 57K-token slot is not
+            # the list-and-dict work this lock is scoped to, and a slot's
+            # `held` is never mutated after publish, so reading it unlocked
+            # is safe even if the map changes meanwhile.
+            candidates = [s.held for s in self._slots if s.owner is owner] if slot is None else []
             # Whatever is still in the map is not going to serve this turn,
             # and this turn's own cache is about to be prefilled to full size
             # beside it. Bring the map under its caps here rather than only at
@@ -745,6 +743,10 @@ class PrefixCache:
             # slot is not, and dropping the very slot this turn just chose to
             # share would defeat the point of having forked it.
             self._evict_caps(protect=(slot,) if slot is not None and slot.kind == "fork" else ())
+        if slot is None:
+            stats.miss_lcp = max(
+                (common_prefix_length(held, stable_ids) for held in candidates), default=0
+            )
         warm: list | None = None
         if slot is not None and slot.kind == "fork":
             # The slot stays for the next conversation; this turn works on its
