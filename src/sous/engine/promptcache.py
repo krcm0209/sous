@@ -247,6 +247,26 @@ def fork_copy(src: Sequence[Any], dst: Sequence[Any], copy_array: Callable) -> N
         d.meta_state = s.meta_state
 
 
+def metal_headroom(*, working_set: int, active: int) -> int:
+    """Bytes this process can still put on the GPU without Metal paging its own
+    buffers: the device's recommended working set minus what mlx holds. The
+    question the pressure valve's first half asks — room for one more window.
+    Process-local on purpose: whether the rest of the machine is squeezed is
+    the kernel's call (see `CacheHooks.pressure`), not an arithmetic one; the
+    psutil `available` figure that used to stand in for it counts a freshly
+    loaded model's file-backed pages as used and evicted the forks a cold turn
+    had just made."""
+    return max(0, working_set - active)
+
+
+# macOS's own memory-pressure classifier (`kern.memorystatus_vm_pressure_level`):
+# 1 normal, 2 warn, 4 critical. Read after each publish; the kernel updates it on
+# its own cadence, not in step with our frees, so the valve acts once per
+# publish rather than looping until it clears.
+KERNEL_PRESSURE_WARN = 2
+KERNEL_PRESSURE_CRITICAL = 4
+
+
 def auto_cache_budget(*, working_set: int, active: int, reserve_bytes: int) -> int:
     """Bytes resident slots may hold beyond the in-flight turn: what Metal
     serves without paging, minus what mlx already holds (the weights, when
@@ -269,10 +289,14 @@ class PromptCacheStats:
     cold_retries: int = 0
     fork_hits: int = 0  # the subset of hits served by copying a fork slot
     forks: int = 0  # fork slots created
-    evictions: int = 0  # slots dropped for budget, count or pressure
+    evictions: int = 0  # every slot dropped, for budget, count or pressure
     # Gauge, assigned per miss: how many leading tokens the missed render
     # shared with the closest slot this owner held (0 when it held none).
     miss_lcp: int = 0
+    # The subset of `evictions` the pressure valve took (Metal headroom short
+    # of a window, or the kernel at warn/critical) — what says, after a
+    # restart, whether pressure or the byte cap emptied the map.
+    pressure_evictions: int = 0
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -344,6 +368,11 @@ class CacheHooks(Protocol):
     # drop triggers — all bounded — and this is the one engine call the
     # eviction path makes.
     def headroom(self) -> int | None: ...
+    # The kernel's memory-pressure level (KERNEL_PRESSURE_WARN / _CRITICAL, or
+    # 1 for normal), or None where it cannot be read. Same rules as headroom():
+    # owner thread, no cache lock held, no lock of its own, no thread-state
+    # release.
+    def pressure(self) -> int | None: ...
 
 
 @dataclass
@@ -443,10 +472,13 @@ class PrefixCache:
         # two ~50K-token id lists (and two caches) per candidate.
         return [s for s in self._slots if not any(s is p for p in protect)]
 
-    def _drop_lru(self, protect: Sequence[Slot]) -> None:
+    def _drop_lru(self, protect: Sequence[Slot], *, pressure: bool = False) -> None:
         victim = min(self._evictable(protect), key=lambda s: s.last_used)
         self._slots.remove(victim)
-        self._stats_for(victim.owner).evictions += 1
+        stats = self._stats_for(victim.owner)
+        stats.evictions += 1
+        if pressure:
+            stats.pressure_evictions += 1
         # `victim` dies with this frame: the slot's cache is freed the moment
         # nothing else references it, which is what the pressure re-read in
         # _evict_pressure relies on.
@@ -584,25 +616,42 @@ class PrefixCache:
         return True
 
     def _evict_pressure(self, protect: Sequence[Slot]) -> None:
-        """Shrink the map until the machine has `reserve_bytes` free again,
-        never touching a slot in `protect` — the slot just published and this
-        turn's earlier forks.
+        """Shrink the map when the machine says so, never touching a slot in
+        `protect` — the slot just published and this turn's earlier forks.
+
+        Two readings, two questions. Metal's headroom asks whether this
+        process can still hold one more window: while it cannot, drop LRU one
+        at a time and re-read. The kernel's pressure level asks whether the
+        rest of the machine is being squeezed: at warn, drop one slot per
+        publish, so the map stops growing and shrinks a slot a turn; at
+        critical, drop everything unprotected. Once per publish, not until
+        the level clears — the kernel re-evaluates on its own cadence, and a
+        loop on it would empty the map before it could answer.
 
         Takes the lock one drop at a time instead of holding it across the
-        loop, because `headroom()` is an engine call (an mlx memory query, on
-        a real engine). The bookkeeping lock covers list and dict work plus
-        the deallocation a drop triggers, all bounded; that is the whole
-        reason reset() can promise never to wait on a generation, and it would
-        stop being true the moment an engine call ran underneath it. Dropping
-        the lock between readings is safe: every iteration re-reads both the
-        headroom and the map, so a concurrent publish or reset just changes
-        what the next pass sees.
+        loop, because `headroom()` and `pressure()` are engine calls (an mlx
+        memory query and a sysctl, on a real engine). The bookkeeping lock
+        covers list and dict work plus the deallocation a drop triggers, all
+        bounded; that is the whole reason reset() can promise never to wait
+        on a generation, and it would stop being true the moment an engine
+        call ran underneath it. Dropping the lock between readings is safe:
+        every iteration re-reads both the reading and the map, so a
+        concurrent publish or reset just changes what the next pass sees.
         """
         while (headroom := self._hooks.headroom()) is not None and headroom < self.reserve_bytes:
             with self._lock:
                 if not self._evictable(protect):
                     return
-                self._drop_lru(protect)
+                self._drop_lru(protect, pressure=True)
+        level = self._hooks.pressure()
+        if level is None or level < KERNEL_PRESSURE_WARN:
+            return
+        with self._lock:
+            victims = len(self._evictable(protect)) if level >= KERNEL_PRESSURE_CRITICAL else 1
+            for _ in range(victims):
+                if not self._evictable(protect):
+                    return
+                self._drop_lru(protect, pressure=True)
 
     def _plant(self, cache: list, held: list[int], kind: str = "turn") -> None:
         """Test seam: publish a slot for the calling thread directly."""

@@ -163,6 +163,11 @@ class LMEngine:
 
         return live_headroom()
 
+    def pressure(self) -> int | None:
+        from sous.engine.base import kernel_memory_pressure
+
+        return kernel_memory_pressure()
+
     # ---- Engine ----------------------------------------------------------
 
     def generate(
