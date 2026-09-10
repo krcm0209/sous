@@ -623,8 +623,10 @@ class PrefixCache:
         process can still hold one more window: while it cannot, drop LRU one
         at a time and re-read. The kernel's pressure level asks whether the
         rest of the machine is being squeezed: at warn, drop one slot per
-        publish, so the map stops growing and shrinks a slot a turn; at
-        critical, drop everything unprotected. Once per publish, not until
+        publish, so the map stops growing and shrinks by one slot for each
+        slot a turn adds (up to three on a cold turn — two forks and the
+        turn slot — one on a warm turn); at critical, drop everything
+        unprotected. Once per publish, not until
         the level clears — the kernel re-evaluates on its own cadence, and a
         loop on it would empty the map before it could answer.
 

@@ -415,7 +415,9 @@ turn slot then evicts, so it pays the copy and never reuses it. Slots are
 evicted least-recently-used first when the budget, a count of 16, or memory
 pressure says so. Pressure is two readings: Metal's own headroom (room for one
 more window of KV), and the kernel's memory-pressure level — at *warn* each
-turn drops one slot, at *critical* every slot but the one that just ran. The
+publish drops one least-recently-used slot (a cold turn publishes up to three
+times: two forks and its turn slot; a warm turn once), at *critical* every
+slot but the one that just ran. The
 kernel's level is used rather than free RAM because a freshly loaded model
 leaves ~17 GB of its weight files in the page cache, which reads as "used"
 for a while and would evict the forks a cold turn had just made. The
