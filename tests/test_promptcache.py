@@ -23,6 +23,7 @@ from sous.engine.promptcache import (
     common_prefix_length,
     fork_copy,
     fork_point,
+    metal_headroom,
     restore,
     reuse_length,
     slot_bytes,
@@ -326,6 +327,7 @@ class FakeHooks:
         self.decoded: list[list[int]] = []
         self.generated = [7, 8, 9]
         self.headroom_value: int | None = None
+        self.pressure_value: int | None = None  # the kernel's level: 1 normal, 2 warn, 4 critical
 
     def new_cache(self) -> list:
         if self.on_new_cache is not None:
@@ -368,6 +370,9 @@ class FakeHooks:
 
     def headroom(self):
         return self.headroom_value
+
+    def pressure(self):
+        return self.pressure_value
 
 
 STABLE_1, FULL_1 = [1, 2, 3, 4], [1, 2, 3, 4, 90, 91]
@@ -876,6 +881,7 @@ def test_stats_as_dict_reports_every_counter():
         forks=1,
         evictions=3,
         miss_lcp=40,
+        pressure_evictions=2,
     )
     assert s.as_dict() == {
         "hits": 2,
@@ -887,7 +893,14 @@ def test_stats_as_dict_reports_every_counter():
         "forks": 1,
         "evictions": 3,
         "miss_lcp": 40,
+        "pressure_evictions": 2,
     }
+
+
+def test_stats_add_sums_pressure_evictions():
+    a = PromptCacheStats(evictions=3, pressure_evictions=1)
+    a.add(PromptCacheStats(evictions=2, pressure_evictions=2))
+    assert (a.evictions, a.pressure_evictions) == (5, 3)
 
 
 def test_stats_add_sums_the_counters_and_maxes_the_snapshot_gauge():
@@ -1838,6 +1851,7 @@ def test_pressure_evicts_until_headroom_covers_the_reserve():
     pc.generate([20, 21], [20, 21, 90, 91], 16)
     assert [s.held for s in pc.slots()] == [[20, 21]]  # both older slots gone
     assert pc.stats()["evictions"] == 2
+    assert pc.stats()["pressure_evictions"] == 2  # the valve, not the cap
 
 
 def test_pressure_never_evicts_the_slot_just_published():
@@ -1942,3 +1956,88 @@ def test_another_owners_slots_do_not_count_toward_the_miss_lcp():
     assert pc.stats(owner=threading.current_thread())["miss_lcp"] == 0
     stop.set()
     t.join(5)
+
+
+# ---- the kernel's memory-pressure level ------------------------------------
+#
+# The second half of the pressure valve. Metal's headroom says whether THIS
+# process can hold one more window; the kernel's level says whether the rest of
+# the machine is being squeezed. psutil's `available` used to stand in for the
+# latter and read low right after a model load (the weight files' pages sit in
+# the page cache as "active"), evicting the forks a cold turn had just made.
+
+
+def test_metal_headroom_is_the_working_set_minus_what_mlx_holds():
+    assert metal_headroom(working_set=100, active=60) == 40
+    assert metal_headroom(working_set=100, active=130) == 0  # never negative
+
+
+def test_a_normal_or_unknown_kernel_level_evicts_nothing():
+    for level in (1, None):
+        h = FakeHooks(trimmable=True)
+        pc = PrefixCache(h, max_bytes=ROOMY)
+        h.pressure_value = level
+        pc.generate(A1, A1_FULL, 16)
+        pc.generate(B1, B1_FULL, 16)
+        assert [s.held for s in pc.slots()] == [A1, B1], level
+        assert pc.stats()["pressure_evictions"] == 0
+
+
+def test_kernel_warn_drops_one_lru_slot_per_publish():
+    """At warn the map stops growing: each publish pays for itself by dropping
+    the least recently used slot. One per publish, not until the level clears
+    — the kernel re-evaluates on its own cadence, so a loop on it would empty
+    the map before the level could respond."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)
+    h.pressure_value = 2
+    pc.generate([20, 21], [20, 21, 90, 91], 16)
+    assert [s.held for s in pc.slots()] == [B1, [20, 21]]  # A1 was the LRU
+    assert pc.stats()["pressure_evictions"] == 1
+    assert pc.stats()["evictions"] == 1  # the subset relation: every drop counts here too
+
+
+def test_kernel_critical_drops_every_unprotected_slot():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)
+    h.pressure_value = 4
+    pc.generate([20, 21], [20, 21, 90, 91], 16)
+    assert [s.held for s in pc.slots()] == [[20, 21]]  # only the turn that just ran
+    assert pc.stats()["pressure_evictions"] == 2
+
+
+def test_kernel_pressure_never_evicts_the_slot_just_published():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    h.pressure_value = 4
+    pc.generate(A1, A1_FULL, 16)
+    assert [s.held for s in pc.slots()] == [A1]
+    assert pc.stats()["pressure_evictions"] == 0
+
+
+def test_kernel_warn_reaches_a_cold_turns_own_tools_fork_only_when_nothing_older_is_left():
+    """A cold turn publishes three slots. The two fork publishes protect each
+    other, so the valve reaches for older slots first; the turn-slot publish
+    protects only itself (the byte cap's rule), so once the older slots are
+    gone the third drop takes the turn's own tools fork. Under genuine
+    pressure that is the right slot to give back — a 3.4 GiB copy the next
+    cold session recreates."""
+    # Older conversations that share nothing with the cold turn's render (A1
+    # would not do: it is a prefix of T, so the turn would consume it as a hit).
+    p1, p1_full = [901, 902, 903, 904], [901, 902, 903, 904, 90, 91]
+    q1, q1_full = [911, 912, 913, 914], [911, 912, 913, 914, 90, 91]
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(p1, p1_full, 16)
+    pc.generate(q1, q1_full, 16)
+    h.pressure_value = 2
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)  # two fork publishes and a turn publish
+    held = [s.held for s in pc.slots()]
+    assert p1 not in held and q1 not in held  # the older slots went first
+    assert HA in held and AX1 in held
+    assert T not in held  # the third drop, with nothing older left
+    assert pc.stats()["pressure_evictions"] == 3

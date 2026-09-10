@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import queue
+import sys
 import threading
 import time
 import warnings
@@ -125,20 +126,51 @@ def measure_cache_budget(reserve_bytes: int) -> int:
 
 
 def live_headroom() -> int | None:
-    """Bytes a cache could still take without paging: the tighter of Metal's
-    working set minus what mlx holds and available RAM plus mlx's reclaimable
-    buffer cache (sous.context.auto_context_tokens' definition). Read on the
-    owner thread mid-turn; same no-release rule as measure_cache_budget. None
-    when the numbers are unavailable — the caller then skips its check."""
+    """Bytes a cache could still take without Metal paging this process's own
+    buffers: the device's recommended working set minus what mlx holds
+    (`promptcache.metal_headroom`). Process-local by design — the machine-wide
+    question goes to `kernel_memory_pressure`. Read on the owner thread
+    mid-turn; same no-release rule as measure_cache_budget. None when the
+    numbers are unavailable — the caller then skips its check."""
     try:
         import mlx.core as mx
-        import psutil
+
+        from sous.engine.promptcache import metal_headroom
 
         info = mx.device_info()
-        metal = int(info["max_recommended_working_set_size"]) - mx.get_active_memory()
-        system = psutil.virtual_memory().available + mx.get_cache_memory()
-        return max(0, min(metal, system))
+        return metal_headroom(
+            working_set=int(info["max_recommended_working_set_size"]),
+            active=mx.get_active_memory(),
+        )
     except Exception:  # noqa: BLE001 — mlx absent or API moved; a check we skip, not a failure
+        return None
+
+
+def kernel_memory_pressure() -> int | None:
+    """macOS's own memory-pressure classifier, `kern.memorystatus_vm_pressure_level`:
+    1 normal, 2 warn, 4 critical. It already discounts purgeable file cache —
+    the thing psutil's `available` counted as used right after a model load —
+    and it is the signal the kernel itself acts on when it starts compressing
+    and swapping. None anywhere it cannot be read (not macOS, sysctl missing),
+    and the valve then stays out of the way. A libc call, no subprocess."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        value = ctypes.c_int(0)
+        size = ctypes.c_size_t(ctypes.sizeof(value))
+        rc = libc.sysctlbyname(
+            b"kern.memorystatus_vm_pressure_level",
+            ctypes.byref(value),
+            ctypes.byref(size),
+            None,
+            0,
+        )
+        return value.value if rc == 0 else None
+    except Exception:  # noqa: BLE001 — a reading we skip, never a failure
         return None
 
 
