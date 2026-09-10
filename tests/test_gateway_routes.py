@@ -416,8 +416,59 @@ def test_streamed_text_turn_has_the_anthropic_event_sequence(tmp_path: Path):
     assert events[5][1] == {
         "type": "message_delta",
         "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-        "usage": {"output_tokens": 2},
+        "usage": {
+            "input_tokens": start["usage"]["input_tokens"],
+            "cache_read_input_tokens": 0,
+            "output_tokens": 2,
+        },
     }
+
+
+def _hit_after_first_turn(inner: FakeEngine, reused: int) -> None:
+    """Make every turn after the first a cache hit that reused `reused` tokens,
+    as the engine's owner-scoped counters would report it."""
+    inner.stats = {"hits": 0, "fork_hits": 0, "reused_tokens": 0}
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) >= 2:
+            inner.stats = {"hits": 1, "fork_hits": 0, "reused_tokens": reused}
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+
+
+def test_a_streamed_hit_reports_the_reuse_as_a_disjoint_cache_read(tmp_path: Path):
+    """message_start goes out before the cache decision and carries the whole
+    count; message_delta carries the corrected split, which is where Claude
+    Code's SDK reads the input-side fields from when they are present."""
+    inner = FakeEngine(["Hello there", "Hello again"])
+    _hit_after_first_turn(inner, reused=3)
+    app = _app(tmp_path, inner)
+    assert _post(app, _body(stream=True)).status_code == 200
+    events = _events(_post(app, _body(stream=True)).text)
+    start = events[1][1]["message"]
+    total = start["usage"]["input_tokens"]
+    assert total > 3
+    delta = next(payload for kind, payload in events if payload.get("type") == "message_delta")
+    assert delta["usage"] == {
+        "input_tokens": total - 3,
+        "cache_read_input_tokens": 3,
+        "output_tokens": delta["usage"]["output_tokens"],
+    }
+
+
+def test_a_non_streamed_hit_reports_the_same_split(tmp_path: Path):
+    inner = FakeEngine(["Hello there", "Hello again"])
+    _hit_after_first_turn(inner, reused=3)
+    app = _app(tmp_path, inner)
+    first = _post(app, _body()).json()
+    second = _post(app, _body()).json()
+    total = first["usage"]["input_tokens"]
+    assert first["usage"]["cache_read_input_tokens"] == 0
+    assert second["usage"]["input_tokens"] == total - 3
+    assert second["usage"]["cache_read_input_tokens"] == 3
 
 
 def test_streamed_tool_call_turn(tmp_path: Path):
@@ -705,6 +756,31 @@ def test_the_log_says_cache_fork_when_the_turn_started_from_a_copy(tmp_path: Pat
     lines = [line for line in capsys.readouterr().err.splitlines() if "POST /v1/messages" in line]
     assert "cache=miss" in lines[0]
     assert "cache=fork" in lines[1]
+
+
+def test_the_log_carries_lcp_only_on_a_miss(tmp_path: Path, capsys):
+    """A miss says how far the render agreed with the closest resident slot —
+    the one number that tells a tool-array change from a system-text change
+    — and a hit, which has reused_tokens for that, says nothing extra."""
+    inner = FakeEngine(["a reply", "another reply"])
+    inner.stats = {"hits": 0, "fork_hits": 0, "reused_tokens": 0, "miss_lcp": 0}
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 1:
+            inner.stats = {"hits": 0, "fork_hits": 0, "reused_tokens": 0, "miss_lcp": 1200}
+        if len(inner.calls) == 2:
+            inner.stats = {"hits": 1, "fork_hits": 0, "reused_tokens": 4000, "miss_lcp": 1200}
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    app = _app(tmp_path, inner)
+    assert _post(app, _body()).status_code == 200
+    assert _post(app, _body()).status_code == 200
+    lines = [line for line in capsys.readouterr().err.splitlines() if "POST /v1/messages" in line]
+    assert "cache=miss" in lines[0] and "lcp=1200" in lines[0]
+    assert "cache=hit" in lines[1] and "lcp=" not in lines[1]
 
 
 def test_mounting_pins_the_sse_logger_above_debug(tmp_path: Path, monkeypatch):

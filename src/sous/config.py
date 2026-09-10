@@ -99,10 +99,13 @@ class SousConfig:
     # affine-4bit model with the shipped sampling, up to ~2.4x greedy
     # (krcm0209/sous#55, #58). Empty id disables it. The
     # drafter must match the target architecture; when it doesn't (or fails to
-    # load), the engine logs and continues without it. Block size 0 lets the
-    # drafter's own policy pick the depth — the best-measured setting.
+    # load), the engine logs and continues without it. Block size 3 measured
+    # best on the M5 Pro against the drafter's adaptive policy (+3% on prose,
+    # +13% on code re-emission); 0 hands the choice back to that policy. Above
+    # 5 is clamped: mlx's fused attention kernel takes at most 5 verify rows
+    # at the default model's GQA ratio, and 6–8 rows run 5–6x slower per layer.
     speculative_draft_id: str = "z-lab/Qwen3.8-27B-DFlash2"
-    speculative_block_size: int = 0
+    speculative_block_size: int = 3
     # Reuse one KV cache across the turns of a task, prefilling only what the
     # conversation gained, instead of re-prefilling from scratch every turn.
     # Works because all of a task's generations share one GenerationSession
@@ -214,20 +217,39 @@ def _context_values(context: dict) -> tuple[str, float, int]:
     return mode, float(fraction), min_tokens
 
 
+SPECULATIVE_BLOCK_DEFAULT = 3
+# The largest verify block mlx's fused vector-attention kernel still takes at
+# the default model's GQA ratio (q_len <= 8 and q_len x gqa <= 32, gqa 6 →
+# 5 rows). 6–8 rows fall off the fused path and cost 5–6x per layer, which no
+# acceptance rate pays back.
+SPECULATIVE_BLOCK_MAX = 5
+
+
 def _speculative_block_size(model: dict) -> int:
-    """Validated [model].speculative_block_size, degrading to 0 (auto) with a
-    warning — same stance as [context]. This one is a silent-truncation knob:
-    mlx-vlm treats the value as the total verify-block size and ends its round
-    loop when it is <= 1, so a configured 1 (or a negative) would cap every
-    response at a single token without any error."""
-    value = model.get("speculative_block_size", 0)
+    """Validated [model].speculative_block_size: 0 (the drafter's own policy)
+    or 2..5, degrading to the default with a warning — same stance as
+    [context]. This one is a silent-truncation knob: mlx-vlm treats the value
+    as the total verify-block size and ends its round loop when it is <= 1,
+    so a configured 1 (or a negative) would cap every response at a single
+    token without any error. Above the maximum is clamped rather than
+    defaulted: the intent ("as deep as pays") is clear, only the number is
+    past where it pays."""
+    value = model.get("speculative_block_size", SPECULATIVE_BLOCK_DEFAULT)
     if isinstance(value, bool) or not isinstance(value, int) or value == 1 or value < 0:
         warnings.warn(
             f"sous config: [model].speculative_block_size {value!r} must be 0 (auto) "
-            "or an integer >= 2; using 0",
+            f"or an integer from 2 to {SPECULATIVE_BLOCK_MAX}; using {SPECULATIVE_BLOCK_DEFAULT}",
             stacklevel=3,
         )
-        return 0
+        return SPECULATIVE_BLOCK_DEFAULT
+    if value > SPECULATIVE_BLOCK_MAX:
+        warnings.warn(
+            f"sous config: [model].speculative_block_size {value!r} exceeds "
+            f"{SPECULATIVE_BLOCK_MAX}, the most verify rows mlx's fused attention kernel "
+            f"takes on this model; using {SPECULATIVE_BLOCK_MAX}",
+            stacklevel=3,
+        )
+        return SPECULATIVE_BLOCK_MAX
     return value
 
 

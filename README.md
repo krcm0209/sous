@@ -252,6 +252,14 @@ turn gives up, stated plainly:
   drops them with the model.
   Two subagents still run one at a time;
   batching is a later phase.
+- **Usage is split the way Anthropic's is.** `cache_read_input_tokens` is what
+  the turn served from a resident cache slot and `input_tokens` the rest, so a
+  warm subagent turn shows a few hundred input tokens and ~57K cache reads.
+  `message_start` carries the whole count (it is sent before the cache
+  decision); `message_delta` and the non-streaming body carry the split,
+  which is where the SDKs read the input-side fields from when present. No
+  `cache_creation_input_tokens`: every prompt stays resident, so it would only
+  double-count the uncached tokens.
 - **A client that disconnects does not stop the model.** A local turn runs to
   completion (so the next request never waits on a wedged lock); aborting
   mid-generation comes with batching, later. A forwarded stream, by contrast,
@@ -260,7 +268,10 @@ turn gives up, stated plainly:
 Each `/v1/messages` turn served locally logs one metadata-only line to the
 daemon's stderr — method, model, stream flag, status, token counts, stop
 reason, cache `hit`/`fork`/`miss` (`fork`: the turn started from a copied
-fork slot — ~45–56K reused tokens is a tools fork, ~57K a header fork),
+fork slot — ~45–56K reused tokens is a tools fork, ~57K a header fork; a
+`miss` adds `lcp=`, how many leading tokens the render shared with the
+closest resident slot: below the tool block's length the tool array
+differed, above it the system text did),
 seconds — plus one line naming the Anthropic tool *types* it
 dropped, when any. Each forwarded request logs one line too:
 `upstream`, method, path, the model id when the body named one, the
@@ -292,11 +303,14 @@ temperature = 0.7
 top_p = 0.8
 top_k = 20
 # Speculative decoding: ~1.8x decode on the default model with the shipped
-# sampling, up to ~2.4x greedy. "" disables it; block size 0 lets the
-# drafter's own policy pick the depth. Auto-disables with a warning when
-# the drafter can't serve the configured model.
+# sampling, up to ~2.4x greedy. "" disables it. Block size 3 measured best
+# on an M5 Pro (+3% on prose, +13% on code re-emission over the drafter's
+# adaptive policy); 0 lets that policy pick the depth; anything above 5 is
+# clamped, because mlx's fused attention kernel takes at most 5 verify rows
+# on this model and 6–8 rows run 5–6x slower per layer. Auto-disables with
+# a warning when the drafter can't serve the configured model.
 speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
-speculative_block_size = 0
+speculative_block_size = 3
 
 [budgets]
 max_turns = 40

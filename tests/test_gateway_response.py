@@ -120,10 +120,43 @@ def test_text_only_turn_streams_one_text_block():
     assert events[6] == {
         "type": "message_delta",
         "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-        "usage": {"output_tokens": 3},
+        "usage": {"input_tokens": 100, "cache_read_input_tokens": 0, "output_tokens": 3},
     }
     assert a.message()["content"] == [{"type": "text", "text": "Hello!"}]
     assert a.message()["stop_reason"] == "end_turn"
+
+
+def test_reused_tokens_are_reported_as_a_disjoint_cache_read():
+    """Anthropic's usage fields are disjoint: input_tokens is what was NOT
+    served from cache. The split is known only once the turn has run, so
+    message_start (sent first, before prefill) carries the whole count and
+    message_delta carries the corrected pair — the SDKs overwrite the
+    input-side fields from message_delta when present."""
+    a = TurnAssembler("msg_x", "sous-local", TOOLS)
+    start = a.start(100)[0]
+    assert start["message"]["usage"] == {"input_tokens": 100, "output_tokens": 0}
+    a.feed(Delta("Hello!", 3, "stop"))
+    events = a.finish("Hello!", 3, "stop", reused_tokens=60)
+    assert events[-2]["usage"] == {
+        "input_tokens": 40,
+        "cache_read_input_tokens": 60,
+        "output_tokens": 3,
+    }
+    assert a.message()["usage"] == {
+        "input_tokens": 40,
+        "cache_read_input_tokens": 60,
+        "output_tokens": 3,
+    }
+
+
+def test_a_reuse_count_beyond_the_prompt_never_reports_negative_input():
+    # The cache and count_tokens share a tokenizer, so this cannot happen in
+    # practice; the clamp keeps a future disagreement from producing a usage
+    # block no client would accept.
+    a = TurnAssembler("msg_x", "sous-local", TOOLS)
+    a.start(10)
+    a.finish("ok", 1, "stop", reused_tokens=12)
+    assert a.message()["usage"]["input_tokens"] == 0
 
 
 def test_tool_call_after_prose_streams_text_then_one_buffered_tool_use_block():
@@ -302,7 +335,11 @@ def test_final_empty_delta_still_updates_output_tokens():
     a.feed(Delta("", 2, "stop"))
     a.finish("hi", 2, "stop")
     assert a.output_tokens == 2
-    assert a.message()["usage"] == {"input_tokens": 1, "output_tokens": 2}
+    assert a.message()["usage"] == {
+        "input_tokens": 1,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 2,
+    }
 
 
 # --- non-streaming path is the same code path ----------------------------------------

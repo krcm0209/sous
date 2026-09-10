@@ -105,7 +105,15 @@ def test_real_model_streams_a_well_formed_turn_and_reuses_the_cache(tmp_path: Pa
         }
         r2 = _post(app, second)
         assert r2.status_code == 200
-        assert r2.json()["usage"]["input_tokens"] > start["usage"]["input_tokens"]
+        # Disjoint usage: the reused prefix is a cache read and input_tokens is
+        # the rest, so the two together are the longer prompt and the read is
+        # the hit made visible to the client.
+        usage = r2.json()["usage"]
+        assert usage["cache_read_input_tokens"] > 0, usage
+        assert (
+            usage["input_tokens"] + usage["cache_read_input_tokens"]
+            > start["usage"]["input_tokens"]
+        )
         stats = engines.get().prompt_cache_stats()
         assert stats["hits"] >= 1, stats
     finally:
