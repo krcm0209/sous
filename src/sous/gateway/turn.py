@@ -67,6 +67,11 @@ class TurnResult:
     reused_tokens: int
     seconds: float
     forked: bool = False  # the hit was served by copying a fork slot
+    # On a miss: how many leading tokens the render shared with the closest
+    # slot the session held (0 when it held none). Where two Claude Code
+    # renders diverged — inside the tool block or after it — without a token
+    # of either reaching the log. Always 0 on a hit.
+    lcp: int = 0
 
 
 class TurnRunner:
@@ -165,16 +170,21 @@ class TurnRunner:
                         engine.reset_prompt_cache(owner=stalled)
                     raise
                 after = engine.prompt_cache_stats(owner=session.thread)
+                cache_hit = after.get("hits", 0) > before.get("hits", 0)
                 return TurnResult(
                     text=text,
                     input_tokens=input_tokens,
                     output_tokens=final.output_tokens if final else 0,
                     finish_reason=final.finish_reason if final else "stop",
-                    cache_hit=after.get("hits", 0) > before.get("hits", 0),
+                    cache_hit=cache_hit,
                     forked=after.get("fork_hits", 0) > before.get("fork_hits", 0),
                     reused_tokens=max(
                         0, after.get("reused_tokens", 0) - before.get("reused_tokens", 0)
                     ),
+                    # miss_lcp is a gauge the engine assigns per miss, so
+                    # `after` holds this turn's value exactly when this turn
+                    # missed — and a stale one from an earlier miss otherwise.
+                    lcp=0 if cache_hit else after.get("miss_lcp", 0),
                     seconds=time.monotonic() - started,
                 )
         finally:

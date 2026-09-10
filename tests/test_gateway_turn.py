@@ -357,6 +357,30 @@ def test_count_tokens_uses_the_engine_and_releases(tmp_path: Path, monkeypatch):
     assert released == [True]
 
 
+def test_a_miss_reports_the_lcp_from_the_sessions_counters_and_a_hit_reports_none(tmp_path: Path):
+    """The miss diagnostic rides the same owner-scoped delta as the hit
+    counters: on a miss the turn carries how far the render agreed with the
+    closest resident slot; on a hit there is nothing to diagnose."""
+    inner = FakeEngine(["a", "b"])
+    inner.stats = {"hits": 0, "fork_hits": 0, "reused_tokens": 0, "miss_lcp": 0}
+    runner, _ = _runner(tmp_path, inner)
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 1:  # a miss whose closest slot shared 1234 tokens
+            inner.stats = {"hits": 0, "fork_hits": 0, "reused_tokens": 0, "miss_lcp": 1234}
+        if len(inner.calls) == 2:  # a hit: the stale gauge must not leak into the turn
+            inner.stats = {"hits": 1, "fork_hits": 0, "reused_tokens": 900, "miss_lcp": 1234}
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    first = runner.run(MSGS, [], 100, RecordingSink())
+    second = runner.run(MSGS, [], 100, RecordingSink())
+    assert (first.cache_hit, first.lcp) == (False, 1234)
+    assert (second.cache_hit, second.lcp) == (True, 0)
+
+
 def test_cache_hit_is_reported_from_the_sessions_own_counters(tmp_path: Path):
     inner = FakeEngine(["a", "b", "c"])
     inner.stats = {"hits": 0, "fork_hits": 0, "reused_tokens": 0}

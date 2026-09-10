@@ -37,6 +37,16 @@ def _load_quantized_drafter(model: object, draft_id: str) -> tuple[Any, str]:
     return drafter, kind
 
 
+def _pin_block_size(drafter: Any, block_size: int) -> None:
+    """Make a configured block size stick. mlx-vlm's DFlash controller re-picks
+    the depth from recent acceptance every round and treats the requested size
+    only as a ceiling — unless the drafter says to prefer the request. With
+    0 (the drafter's own policy) nothing is set, and with no drafter there is
+    nothing to pin."""
+    if drafter is not None and block_size > 0:
+        drafter.prefer_requested_block_size = True
+
+
 class VLMEngine:
     def __init__(
         self,
@@ -72,6 +82,7 @@ class VLMEngine:
                     f" {model_id} ({e}); generating without it",
                     stacklevel=2,
                 )
+            _pin_block_size(self._draft, draft_block_size)
         # Measured after load AND after the drafter, so the weights of both are
         # inside `active` and the budget is what the machine actually has left.
         if cache_budget is None:

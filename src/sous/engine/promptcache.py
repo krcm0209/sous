@@ -42,6 +42,24 @@ def reuse_length(cached_ids: Sequence[int], new_ids: Sequence[int]) -> int:
     return n if head == (cached_ids if isinstance(cached_ids, list) else list(cached_ids)) else 0
 
 
+def common_prefix_length(a: Sequence[int], b: Sequence[int]) -> int:
+    """How many leading tokens `a` and `b` share. The miss diagnostic: with
+    the fork boundaries known, where a new render stopped agreeing with the
+    closest resident slot says whether the tool array or the system text
+    differed — without keeping a token of either.
+
+    A plain scan, on purpose. A binary search over slice compares looks
+    smarter but each slice copies and INCREFs every element it covers, and on
+    two ~57K-token lists it measured 2.5 ms against 0.6 ms for this loop
+    (Python 3.14, M5 Pro); the C-level `map(ne)`/`compress` form was no faster.
+    """
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
+
+
 def all_trimmable(cache: Sequence[Any]) -> bool:
     # Sequence[Any] rather than a Protocol: mlx-lm and mlx-vlm ship their own
     # cache classes with no shared base and no type stubs, and trim/offset exist
@@ -239,6 +257,9 @@ def auto_cache_budget(*, working_set: int, active: int, reserve_bytes: int) -> i
     return max(0, working_set - active - reserve_bytes - CACHE_BUDGET_SLACK)
 
 
+_GAUGES = frozenset({"snapshot_bytes", "miss_lcp"})
+
+
 @dataclass
 class PromptCacheStats:
     hits: int = 0  # every warm run, from a turn slot or a fork copy
@@ -249,6 +270,9 @@ class PromptCacheStats:
     fork_hits: int = 0  # the subset of hits served by copying a fork slot
     forks: int = 0  # fork slots created
     evictions: int = 0  # slots dropped for budget, count or pressure
+    # Gauge, assigned per miss: how many leading tokens the missed render
+    # shared with the closest slot this owner held (0 when it held none).
+    miss_lcp: int = 0
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -256,16 +280,15 @@ class PromptCacheStats:
     def add(self, other: PromptCacheStats) -> None:
         """Fold `other`'s counters into these.
 
-        Every field is a running count and sums — except `snapshot_bytes`,
-        which is a gauge assigned per turn (the last non-trimmable turn's copy
-        cost). Summing it would make the daemon-wide view grow with the number
-        of owners rather than report a size, so the largest reading wins.
+        Every field is a running count and sums — except the gauges,
+        `snapshot_bytes` (the last non-trimmable turn's copy cost) and
+        `miss_lcp` (the last miss's shared prefix), which are assigned per
+        turn. Summing a gauge would make the daemon-wide view grow with the
+        number of owners rather than report a reading, so the largest wins.
         """
         for f in dataclasses.fields(self):
             mine, theirs = getattr(self, f.name), getattr(other, f.name)
-            setattr(
-                self, f.name, max(mine, theirs) if f.name == "snapshot_bytes" else mine + theirs
-            )
+            setattr(self, f.name, max(mine, theirs) if f.name in _GAUGES else mine + theirs)
 
 
 _MEMO_SLOTS = ("stable", "full", "header", "tools")
@@ -683,6 +706,9 @@ class PrefixCache:
         # one to reuse.
         if reuse_length(stable_ids, full_ids) == 0:
             stats.misses += 1
+            # Nothing was looked up, so the gauge must not keep an earlier
+            # miss's reading for the gateway to log as this turn's.
+            stats.miss_lcp = 0
             warnings.warn(
                 "sous prompt cache: full prompt is not the stable render "
                 "plus a generation suffix; decoding cold this turn",
@@ -696,6 +722,15 @@ class PrefixCache:
             # task vs the gateway's long-lived one) gets a cold miss rather
             # than a warm run doomed to the cross-thread mlx failure.
             slot = self._take(owner, stable_ids)
+            # The miss diagnostic is measured against the same slots lookup
+            # just refused: a slot another thread owns could never have
+            # served this turn, so it says nothing about what was available.
+            # Only the references are taken here — the scan itself runs after
+            # the lock is released (below): ~0.6 ms per 57K-token slot is not
+            # the list-and-dict work this lock is scoped to, and a slot's
+            # `held` is never mutated after publish, so reading it unlocked
+            # is safe even if the map changes meanwhile.
+            candidates = [s.held for s in self._slots if s.owner is owner] if slot is None else []
             # Whatever is still in the map is not going to serve this turn,
             # and this turn's own cache is about to be prefilled to full size
             # beside it. Bring the map under its caps here rather than only at
@@ -708,6 +743,10 @@ class PrefixCache:
             # slot is not, and dropping the very slot this turn just chose to
             # share would defeat the point of having forked it.
             self._evict_caps(protect=(slot,) if slot is not None and slot.kind == "fork" else ())
+        if slot is None:
+            stats.miss_lcp = max(
+                (common_prefix_length(held, stable_ids) for held in candidates), default=0
+            )
         warm: list | None = None
         if slot is not None and slot.kind == "fork":
             # The slot stays for the next conversation; this turn works on its
