@@ -63,6 +63,10 @@ Claude Code use stretches further — evaluate features against that goal.
   cannot.
   `base.measure_cache_budget`/`live_headroom` deliberately do not call
   `release_mlx_thread_state()`: they run on threads whose caches are live.
+  The pressure valve reads Metal's headroom and the kernel's
+  `kern.memorystatus_vm_pressure_level`, never psutil's free RAM: right after
+  a model load the weight files sit in the page cache as "active", that
+  figure read low, and the valve evicted the forks a cold turn had just made.
 - The gateway forwards every request it does not serve (`gateway/upstream.py`)
   as a transparent proxy: never re-serialize a forwarded body, never add or
   alter an end-to-end header (only `Host`, the hop-by-hop set and a buffered

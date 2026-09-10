@@ -412,8 +412,16 @@ for those forks and several conversations; a 48 GB machine should set it to
 conversation slot — about 8 GiB with the default model at ~57K tokens. A
 value between the two makes every cold turn take a fork copy that its own
 turn slot then evicts, so it pays the copy and never reuses it. Slots are
-evicted least-recently-used first when the budget, a count of 16, or live
-memory pressure says so; the conversation that just ran is never evicted by
+evicted least-recently-used first when the budget, a count of 16, or memory
+pressure says so. Pressure is two readings: Metal's own headroom (room for one
+more window of KV), and the kernel's memory-pressure level — at *warn* each
+publish drops one least-recently-used slot (a cold turn publishes up to three
+times: two forks and its turn slot; a warm turn once), at *critical* every
+slot but the one that just ran. The
+kernel's level is used rather than free RAM because a freshly loaded model
+leaves ~17 GB of its weight files in the page cache, which reads as "used"
+for a while and would evict the forks a cold turn had just made. The
+conversation that just ran is never evicted by
 its own turn, and a cold turn's second fork copy never evicts its first, so
 `0` means exactly one slot (the pre-3a behaviour) and a 32 GB machine
 degrades to that on its own. Forks live as long as the weights do:
@@ -421,7 +429,7 @@ degrades to that on its own. Forks live as long as the weights do:
 the model, so "every new session" means every new session inside that
 window.
 `server_status` reports `prompt_cache` — slots, resident bytes, hits, fork
-hits, evictions — counts only.
+hits, evictions and the subset the pressure valve took — counts only.
 
 `temperature`/`top_p`/`top_k` control the worker's sampler (Qwen's own
 documented non-thinking-mode defaults). Greedy decoding (temperature 0)

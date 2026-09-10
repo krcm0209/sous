@@ -717,3 +717,16 @@ def test_engine_manager_passes_the_configured_budget_and_the_larger_window(tmp_p
     EngineManager(_cfg(tmp_path, gateway_enabled=False, max_context_tokens=32768)).get()
     assert seen["cache_budget"] is None  # auto
     assert seen["reserve_tokens"] == 32768
+
+
+def test_kernel_memory_pressure_reads_the_kernels_level_or_none():
+    """macOS reports 1 (normal), 2 (warn) or 4 (critical); anywhere the sysctl
+    is missing the reader says None and the valve stays out of the way."""
+    import sys
+
+    from sous.engine.base import kernel_memory_pressure
+
+    level = kernel_memory_pressure()
+    assert level in (None, 1, 2, 4)
+    if sys.platform == "darwin":
+        assert isinstance(level, int)
