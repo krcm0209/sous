@@ -209,7 +209,7 @@ if still present. T6/T7 likewise: T7 prefills 1,681.
   and no preload is running, starts one daemon thread that calls `get()` and
   then `release_mlx_thread_state()` (the CLAUDE.md invariant: every thread that
   touched mlx releases its state before exit). Load failures are logged
-  (`sous engine: preload failed (<type>)`), never raised to the caller — a hold
+  (`sous.engine: preload failed (<type>)`), never raised to the caller — a hold
   is an optimization and the first turn's own `get()` reports the real error.
   Returns `{"loaded", "loading", "holders"}`.
 - `unload_if_idle`: before the idle test, prune holders whose PID is gone or
@@ -262,9 +262,9 @@ worker's own `get()`/`touch()` cadence).
 
 ### Observability hooks this spec adds
 
-Log lines (metadata only): `sous engine: hold pid=N (holders=M)`,
-`sous engine: hold released pid=N (holders=M)`, `sous engine: preloading
-<model_id>`, `sous engine: model loaded in N.N s`. PIDs are not secrets. The
+Log lines (metadata only): `sous.engine: hold pid=N (holders=M)`,
+`sous.engine: hold released pid=N (holders=M)`, `sous.engine: preloading
+<model_id>`, `sous.engine: model loaded in N.N s`. PIDs are not secrets. The
 prompt-cache counters `retained`/`moved` appear in `prompt_cache_stats` and,
 via the observability spec, on the turn line.
 

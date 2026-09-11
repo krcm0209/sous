@@ -23,6 +23,16 @@ already holds 38 restarts and 79 local turns. During a 13-minute turn the
 gateway itself says nothing; the model-load window is bracketed only by
 huggingface_hub's own chatter.
 
+That file's name is a launchd artefact, not a description: it is the
+`StandardErrorPath` from the plist `sous install-launchd` writes, and the
+split between it and `daemon.log` is by Unix stream, not severity. Python's
+logging module writes to stderr by default, the gateway's `_log` prints there
+on purpose, `warnings.warn` goes there, the MCP SDK installs a stderr handler
+at INFO (a `RichHandler` that wraps every line at 80 columns), and
+huggingface_hub's progress bars land there too. So the "error" file holds
+essentially everything and `daemon.log` holds the startup banner. CONTRIBUTING
+tells readers to watch `daemon.log` for gateway lines that never appear in it.
+
 The turn line carries `seconds` as one number. `started` is stamped *after*
 `TurnRunner._lock` is acquired, so it excludes the lock wait (measurably 9.6,
 2.1 and 2.5 s in the session studied, when Claude Code's progress-summary
@@ -62,22 +72,61 @@ a header value or a query string.
 - In-band progress events to the API client. Only `ping` is documented as
   skipped by both official SDKs; an unknown SSE event type risks Claude Code's
   accumulator.
-- Rotating `daemon.err.log`. launchd appends; the durable record moves to
-  SQLite (PR 3), and the log stays a log.
+- Rotating the daemon log. launchd appends; the file is 908 KB after a month
+  and 38 restarts; the durable record moves to SQLite (PR 3), and the log
+  stays a log.
 - Claude Desktop integration (not pursued).
 
 ## Design
 
 ### PR 1 — attribute a turn
 
-**Timestamps.** `routes._log` prefixes every line with an ISO-8601 UTC
-timestamp with milliseconds (`2026-09-10T19:26:14.025Z sous gateway: …`). The
-engine-side `sous engine:` lines from the continuity spec use the same helper.
+**Log streams: one file, one shape.** Five changes, all in this PR:
+
+1. *One file.* The plist `sous install-launchd` writes points both
+   `StandardOutPath` and `StandardErrorPath` at `~/.sous/daemon.log`; launchd
+   accepts the same path for both and interleaves writes in order.
+   `daemon.err.log` stops existing as a name.
+2. *Migration.* `sous install-launchd` learns to re-run: today it only
+   `bootstrap`s, which fails on an already-loaded label. It will `bootout` an
+   existing job first, then, with the daemon lock free (the `flock` probe
+   `sous status` already uses — a hand-started daemon still holding it makes
+   the command refuse, so no open descriptor keeps writing into an unlinked
+   file), append an existing `daemon.err.log` onto `daemon.log` and remove it,
+   then `bootstrap` the new plist. The history stays in the one file; the
+   misnomer goes. An unmanaged `sous serve` redirects wherever its launcher
+   said and is not sous's to migrate.
+3. *Every line sous emits carries a timestamp and a level.* `routes._log`
+   becomes a thin wrapper over a `logging` logger (`sous.gateway`; the
+   continuity spec's engine lines use `sous.engine`, the monitor
+   `sous.monitor`), and every record is formatted as
+   `2026-09-10T19:26:14.025Z INFO sous.gateway: …` — ISO-8601 UTC with
+   milliseconds, Python's level names. `INFO` for a served or forwarded
+   request; `WARNING` for a request sous refused (4xx, 529, abandoned while
+   queued) and for the dropped-tools note; `ERROR` for a failure sous produced
+   (5xx from an exception, an unreachable upstream). `grep ' ERROR '` then
+   means what the old filename promised.
+4. *Library lines take the same shape.* After `MCPServer(...)` is constructed
+   in `create_server`, the `RichHandler` the SDK's `configure_logging("INFO")`
+   installed on the root logger is replaced by a plain `StreamHandler` to
+   stderr with the formatter above, so MCP, uvicorn and huggingface_hub lines
+   stop wrapping at 80 columns and become greppable; `logging.captureWarnings
+   (True)` routes the prompt cache's `warnings.warn` through it as `WARNING
+   py.warnings: …`. The existing logger pins (sse-starlette at INFO, httpx and
+   httpcore at WARNING) stay exactly where they are, since the no-bodies rule
+   depends on them.
+5. *Docs.* README names the one file and the line shape and tells existing
+   installs to re-run `sous install-launchd`; CONTRIBUTING's two references
+   become true.
+
+The observability of a turn does not depend on where the line goes: a
+foreground `sous serve` prints the same lines to its terminal.
 
 **The turn line.** Success lines become:
 
 ```
-POST /v1/messages id=msg_… model=sous-local stream=1 status=200
+2026-09-10T19:26:14.025Z INFO sous.gateway:
+  POST /v1/messages id=msg_… model=sous-local stream=1 status=200
   input_tokens=84335 output_tokens=2887 stop=end_turn
   cache=hit took=turn@82647 reused_tokens=82647 prefilled_tokens=1681
   forks=0 evicted=1 pressure=0
@@ -279,6 +328,11 @@ convenience that may break with a Claude Code release.
 
 ### PR 4 — docs (folded)
 
+- README "Managing the daemon": `~/.sous/daemon.log` is the one log (both
+  streams), its line shape and level names, and that existing installs re-run
+  `sous install-launchd`, which folds the old `daemon.err.log` in and removes
+  it. CONTRIBUTING's "Watch `~/.sous/daemon.log`" lines are reworded to name
+  the level tokens now that they are true.
 - README "Gateway mode": the new turn line, field by field; the `/sous/`
   routes (loopback-only, what they return); `sous status --watch` /
   `sous top` with a screenshot-as-text; `sous statusline` and the settings
@@ -298,6 +352,9 @@ convenience that may break with a Claude Code release.
   line, a row, an SSE event or the TUI. Hashes are of rendered text, 8 hex
   chars. Model labels go through the existing `_log_token` bound.
 - All `/sous/` routes are loopback-only (Host and Origin), like the gateway's.
+- The logger pins that keep library bodies, URLs and header values out of the
+  log survive the handler swap: the swap replaces the root *handler*, never a
+  library logger's *level*.
 - Cache statistics are read owner-scoped on the turn thread; the registry is
   the only thing the event loop reads.
 - Sinks and registry updates never block or raise on the engine thread.
@@ -315,7 +372,16 @@ when a second turn waits on the lock; `load_s` > 0 exactly when the factory
 ran; `ttft_s` ≤ `seconds`; `tools`/`system` hashes stable across two identical
 requests and different when one tool description or one system character
 changes; `count_tokens` and failure lines carry `seconds`; the timestamp
-prefix parses as ISO-8601 UTC.
+prefix parses as ISO-8601 UTC. Log streams (`tests/test_cli.py`,
+`tests/test_server.py`): the generated plist has both standard paths equal to
+`<data_dir>/daemon.log`; `install-launchd` appends an existing
+`daemon.err.log` onto `daemon.log` byte for byte and removes it, does nothing
+when the file is absent, and refuses while the daemon lock is held; after
+`create_server` the root logger has no `RichHandler`, a record formats as
+`<iso-utc-ms>Z LEVEL name: message`, a `warnings.warn` arrives through it as
+`WARNING py.warnings`, and the sse-starlette/httpx/httpcore pins are intact;
+`_log` emits INFO for a 200 line, WARNING for a 4xx/529/abandoned line and
+ERROR for a 5xx line (asserted with `caplog`).
 
 **PR 2 (`tests/test_monitor.py`, `tests/test_tui.py`):** registry phases in
 order and removal on success, error and abandonment; `generated_tokens`
