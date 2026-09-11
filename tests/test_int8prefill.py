@@ -221,3 +221,264 @@ def test_qmm_rejects_untiled_shapes():
     ra = mx.zeros((1, 32), dtype=mx.int16)
     with pytest.raises(ValueError, match="N=48"):
         i8.qmm(qa, sa, ra, mx.zeros((48, 8), dtype=mx.uint32), mx.ones((48, 1)), mx.zeros((48, 1)))
+
+
+# ---- eligibility --------------------------------------------------------------
+
+
+def _qlinear(k, n, *, bias=False, dtype=mx.bfloat16, **quant):
+    parent = nn.Sequential(nn.Linear(k, n, bias=bias))
+    parent.set_dtype(dtype)
+    nn.quantize(parent, **{"group_size": 64, "bits": 4, **quant})
+    return parent.layers[0]
+
+
+def test_eligible_linear_table():
+    assert i8.eligible_linear(_qlinear(128, 256))
+    assert i8.eligible_linear(_qlinear(128, 256, dtype=mx.float16))
+    assert not i8.eligible_linear(_qlinear(128, 256, bits=8))
+    assert not i8.eligible_linear(_qlinear(128, 256, group_size=128))
+    assert not i8.eligible_linear(_qlinear(128, 256, group_size=32, mode="mxfp4"))
+    assert not i8.eligible_linear(_qlinear(128, 48)), "N must tile by 64"
+    assert not i8.eligible_linear(_qlinear(128, 256, bias=True))
+    assert not i8.eligible_linear(_qlinear(128, 256, dtype=mx.float32)), "fp32 scales"
+    assert not i8.eligible_linear(nn.Linear(128, 256)), "not quantized"
+
+
+# ---- routing (any Metal GPU: qmm is replaced by an exact-enough reference) ------
+
+
+def _reference_qmm(qa, sa, ra, w, scales, biases):
+    x_hat = _unreorder(qa).astype(mx.float32) * sa[:, None]
+    wd = mx.dequantize(w, scales, biases, group_size=64, bits=4, mode="affine")
+    return (x_hat @ wd.astype(mx.float32).T).astype(scales.dtype)
+
+
+class _TinyGDN(nn.Module):
+    """Stand-in with the projection names the GDN wrapper looks for."""
+
+    def __init__(self):
+        super().__init__()
+        self.in_proj_qkv = nn.Linear(128, 256, bias=False)
+        self.in_proj_z = nn.Linear(128, 128, bias=False)
+        self.in_proj_a = nn.Linear(128, 48, bias=False)
+        self.out_proj = nn.Linear(128, 128, bias=False)
+
+    def __call__(self, inputs, mask=None, cache=None):
+        mixed = self.in_proj_qkv(inputs)[..., :128] + self.in_proj_z(inputs)
+        return self.out_proj(mixed) + self.in_proj_a(inputs)[..., :1]
+
+
+class _Counter:
+    def __init__(self, monkeypatch):
+        self.stage_calls = 0
+        self.qmm_calls = 0
+        real_stage_a = i8.stage_a
+
+        def counting_stage_a(x):
+            self.stage_calls += 1
+            return real_stage_a(x)
+
+        def counting_qmm(*args):
+            self.qmm_calls += 1
+            return _reference_qmm(*args)
+
+        monkeypatch.setattr(i8, "stage_a", counting_stage_a)
+        monkeypatch.setattr(i8, "qmm", counting_qmm)
+
+
+def _mlp():
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
+
+    mlp = Qwen3_5MLP(128, 256)
+    mlp.set_dtype(mx.bfloat16)
+    nn.quantize(mlp, group_size=64, bits=4)
+    return mlp
+
+
+def _tag_all(module):
+    for _, m in module.named_modules():
+        if isinstance(m, nn.QuantizedLinear):
+            object.__setattr__(m, i8._TAG, True)
+
+
+@pytest.fixture
+def wrappers():
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
+
+    i8.install_wrappers([(Qwen3_5MLP, "mlp"), (_TinyGDN, "gdn")])
+
+
+def test_mlp_routes_with_one_shared_stage_above_the_floor(monkeypatch, wrappers):
+    counter = _Counter(monkeypatch)
+    mlp = _mlp()
+    x = (mx.random.normal((1, 130, 128)) * 0.5).astype(mx.bfloat16)
+    stock = mlp(x)
+    _tag_all(mlp)
+    routed = mlp(x)
+    assert (counter.stage_calls, counter.qmm_calls) == (2, 3), "gate+up share; down has its own"
+    rel = mx.sqrt(mx.mean((routed - stock).astype(mx.float32) ** 2)) / mx.sqrt(
+        mx.mean(stock.astype(mx.float32) ** 2)
+    )
+    assert rel.item() < 3e-2
+
+
+def test_rows_below_the_floor_take_the_stock_path(monkeypatch, wrappers):
+    counter = _Counter(monkeypatch)
+    mlp = _mlp()
+    _tag_all(mlp)
+    mlp((mx.random.normal((1, 127, 128)) * 0.5).astype(mx.bfloat16))
+    mlp((mx.random.normal((1, 1, 128)) * 0.5).astype(mx.bfloat16))
+    assert counter.qmm_calls == 0
+
+
+def test_untagged_modules_are_never_routed(monkeypatch, wrappers):
+    counter = _Counter(monkeypatch)
+    other = _mlp()  # same class, never tagged: a second resident model
+    other((mx.random.normal((1, 130, 128)) * 0.5).astype(mx.bfloat16))
+    assert counter.qmm_calls == 0
+
+
+def test_gdn_shares_one_stage_between_qkv_and_z_and_clears_it(monkeypatch, wrappers):
+    counter = _Counter(monkeypatch)
+    gdn = _TinyGDN()
+    gdn.set_dtype(mx.bfloat16)
+    nn.quantize(gdn, group_size=64, bits=4)
+    for name in ("in_proj_qkv", "in_proj_z", "out_proj"):
+        object.__setattr__(getattr(gdn, name), i8._TAG, True)
+    x = (mx.random.normal((1, 200, 128)) * 0.5).astype(mx.bfloat16)
+    gdn(x)
+    # one Stage A for qkv+z, one for out_proj; in_proj_a (N=48) untagged -> stock
+    assert (counter.stage_calls, counter.qmm_calls) == (2, 3)
+    assert getattr(gdn.in_proj_qkv, i8._STAGE) is None
+    assert getattr(gdn.in_proj_z, i8._STAGE) is None
+
+
+def test_install_wrappers_is_idempotent():
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
+
+    i8.install_wrappers([(Qwen3_5MLP, "mlp")])
+    first = Qwen3_5MLP.__call__
+    i8.install_wrappers([(Qwen3_5MLP, "mlp")])
+    assert Qwen3_5MLP.__call__ is first
+
+
+# ---- enable() -----------------------------------------------------------------------
+
+
+class _Layer(nn.Module):
+    def __init__(self, down_bits=4):
+        super().__init__()
+        self.mlp = _mlp()
+        if down_bits != 4:
+            self.mlp.down_proj = _qlinear(256, 128, bits=down_bits)
+        self.linear_attn = _TinyGDN()
+        self.linear_attn.set_dtype(mx.bfloat16)
+        nn.quantize(self.linear_attn, group_size=64, bits=4)
+        self.self_attn = nn.Sequential(nn.Linear(128, 256, bias=False))
+        self.self_attn.set_dtype(mx.bfloat16)
+        nn.quantize(self.self_attn, group_size=64, bits=4)
+
+
+class _Inner(nn.Module):
+    def __init__(self, layers):
+        super().__init__()
+        self.layers = layers
+
+
+class _LanguageModel(nn.Module):
+    def __init__(self, layers):
+        super().__init__()
+        self.model = _Inner(layers)
+        self.lm_head = _qlinear(128, 256)
+
+
+class _Model(nn.Module):
+    def __init__(self, layers):
+        super().__init__()
+        self.language_model = _LanguageModel(layers)
+
+
+def _tags(model):
+    return sorted(
+        path
+        for path, m in model.named_modules()
+        if isinstance(m, nn.QuantizedLinear) and getattr(m, i8._TAG, False)
+    )
+
+
+def test_enable_off_touches_nothing():
+    model = _Model([_Layer()])
+    assert i8.enable(model, enabled=False) == {"state": "off", "reason": None, "routed": 0}
+    assert _tags(model) == []
+
+
+def test_enable_unavailable_tags_nothing(monkeypatch):
+    monkeypatch.setattr(i8, "availability", lambda: i8.Availability(False, "no tensor units"))
+    model = _Model([_Layer()])
+    status = i8.enable(model, enabled=True)
+    assert status == {"state": "unavailable", "reason": "no tensor units", "routed": 0}
+    assert _tags(model) == []
+
+
+def test_enable_tags_mlp_and_gdn_but_not_attention_or_lm_head(monkeypatch):
+    monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
+    monkeypatch.setattr(i8, "_warm_up", lambda model: None)
+    model = _Model([_Layer(), _Layer()])
+    status = i8.enable(model, enabled=True)
+    assert status == {"state": "active", "reason": None, "routed": 12}
+    tagged = _tags(model)
+    assert len(tagged) == 12
+    assert all(".layers." in p for p in tagged)
+    assert not any("self_attn" in p or "lm_head" in p or "in_proj_a" in p for p in tagged)
+
+
+def test_enable_tags_an_mlp_all_or_nothing(monkeypatch):
+    monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
+    monkeypatch.setattr(i8, "_warm_up", lambda model: None)
+    model = _Model([_Layer(down_bits=8)])
+    status = i8.enable(model, enabled=True)
+    assert status["routed"] == 3, "only the GDN projections; the MLP with an 8-bit down stays stock"
+    assert not any(".mlp." in p for p in _tags(model))
+
+
+def test_enable_with_no_eligible_projection_is_unavailable(monkeypatch):
+    monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
+    model = _Model([])
+    status = i8.enable(model, enabled=True)
+    assert status["state"] == "unavailable"
+    assert status["reason"] is not None and "no eligible projections" in status["reason"]
+
+
+def test_enable_degrades_when_warm_up_fails(monkeypatch):
+    monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
+
+    def boom(model):
+        raise RuntimeError("compiler said no")
+
+    monkeypatch.setattr(i8, "_warm_up", boom)
+    model = _Model([_Layer()])
+    with pytest.warns(UserWarning, match="compiler said no"):
+        status = i8.enable(model, enabled=True)
+    assert status == {"state": "unavailable", "reason": "compiler said no", "routed": 0}
+    assert _tags(model) == []
+
+
+def test_warm_up_runs_one_int8_linear_per_distinct_shape(monkeypatch):
+    seen = []
+
+    def fake_linear_int8(linear, x, stage=None):
+        seen.append((x.shape, linear.weight.shape[0], x.dtype))
+        return mx.zeros((x.shape[0], linear.weight.shape[0]), dtype=x.dtype)
+
+    monkeypatch.setattr(i8, "linear_int8", fake_linear_int8)
+    model = _Model([_Layer(), _Layer()])
+    i8._tag(model)
+    i8._warm_up(model)
+    # gate/up (128->256), down (256->128), qkv (128->256), z (128->128), out (128->128):
+    # distinct (K, N, dtype) = {(128,256), (256,128), (128,128)}
+    assert set(seen) == {
+        ((128, 128), 256, mx.bfloat16),
+        ((128, 256), 128, mx.bfloat16),
+        ((128, 128), 128, mx.bfloat16),
+    }

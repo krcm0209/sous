@@ -24,7 +24,8 @@ from __future__ import annotations
 import logging
 import platform
 import re
-from collections.abc import Callable
+import warnings
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -383,3 +384,253 @@ def linear_int8(linear: Any, x: Any, stage: tuple[Any, Any, Any] | None = None) 
     qa, sa, ra = stage if stage is not None else stage_a(x)
     out = qmm(qa, sa, ra, linear.weight, linear.scales, linear.biases)
     return out.reshape(*x.shape[:-1], linear.weight.shape[0])
+
+
+# --------------------------------------------------------------------------------
+# Routing
+# --------------------------------------------------------------------------------
+
+# Set with object.__setattr__ so they live in the module's __dict__: nn.Module's own
+# __setattr__ would put a bool or a tuple of arrays INTO the parameter tree, where
+# parameters() and named_modules() would find it.
+_TAG = "_sous_int8_prefill"
+_STAGE = "_sous_int8_stage"
+
+
+def eligible_linear(linear: Any) -> bool:
+    """Affine Q4 gs64 ``nn.QuantizedLinear`` with fp16/bf16 scales, no bias, and a
+    column count the GEMM tiles by 64 — the only shape the kernel decodes."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    if not isinstance(linear, nn.QuantizedLinear) or "bias" in linear:
+        return False
+    if getattr(linear, "mode", None) != "affine":
+        return False
+    if getattr(linear, "bits", None) != 4 or getattr(linear, "group_size", None) != GROUP:
+        return False
+    weight = getattr(linear, "weight", None)
+    scales = getattr(linear, "scales", None)
+    biases = getattr(linear, "biases", None)
+    if weight is None or scales is None or biases is None:
+        return False
+    if weight.dtype != mx.uint32 or weight.ndim != 2 or scales.ndim != 2:
+        return False
+    if scales.dtype not in (mx.float16, mx.bfloat16) or biases.dtype != scales.dtype:
+        return False
+    if scales.shape != biases.shape or scales.shape[0] != weight.shape[0]:
+        return False
+    n = weight.shape[0]
+    k = scales.shape[1] * GROUP
+    return weight.shape[1] * 32 == k * 4 and n % BN == 0 and k % GROUP == 0
+
+
+def _tagged(module: Any) -> bool:
+    return bool(getattr(module, _TAG, False))
+
+
+def _rows_ok(x: Any) -> bool:
+    import mlx.core as mx
+
+    return x.ndim >= 2 and x.shape[-2] >= MIN_ROWS and x.dtype in (mx.bfloat16, mx.float16)
+
+
+def _root(model: Any) -> Any:
+    # mlx-vlm wraps the text model as `language_model`; mlx-lm's Model is the root.
+    return getattr(model, "language_model", model)
+
+
+def _is_mlp(module: Any) -> bool:
+    return all(hasattr(module, name) for name in ("gate_proj", "up_proj", "down_proj"))
+
+
+def _tag(model: Any) -> int:
+    """Tag eligible projections under the decoder layers; return how many."""
+    import mlx.nn as nn
+
+    count = 0
+    seen: set[int] = set()
+    for path, module in _root(model).named_modules():
+        if ".layers." not in f".{path}." or "self_attn" in path:
+            continue
+        if _is_mlp(module):
+            trio = (module.gate_proj, module.up_proj, module.down_proj)
+            # All or nothing: with only gate/up tagged the MLP wrapper would fall
+            # through to the original call, whose gate/up would then route alone.
+            if all(eligible_linear(m) for m in trio):
+                for m in trio:
+                    if id(m) not in seen:
+                        object.__setattr__(m, _TAG, True)
+                        seen.add(id(m))
+                        count += 1
+            continue
+        if isinstance(module, nn.QuantizedLinear) and eligible_linear(module):
+            if id(module) in seen or _in_mlp_path(path):
+                continue
+            object.__setattr__(module, _TAG, True)
+            seen.add(id(module))
+            count += 1
+    return count
+
+
+def _in_mlp_path(path: str) -> bool:
+    return path.rsplit(".", 1)[-1] in ("gate_proj", "up_proj", "down_proj")
+
+
+def _untag(model: Any) -> None:
+    for _, module in _root(model).named_modules():
+        if _TAG in getattr(module, "__dict__", {}):
+            object.__setattr__(module, _TAG, False)
+        if _STAGE in getattr(module, "__dict__", {}):
+            object.__setattr__(module, _STAGE, None)
+
+
+_WRAPPED: set[type] = set()
+_QUANTIZED_LINEAR_WRAPPED = False
+
+_TARGETS = (
+    ("mlx_vlm.models.qwen3_5.language", "Qwen3_5MLP", "mlp"),
+    ("mlx_vlm.models.qwen3_5.language", "Qwen3_5GatedDeltaNet", "gdn"),
+    ("mlx_lm.models.qwen3_5", "MLP", "mlp"),
+    ("mlx_lm.models.qwen3_5", "GatedDeltaNet", "gdn"),
+)
+
+
+def _resolve_targets() -> list[tuple[type, str]]:
+    import importlib
+
+    found: list[tuple[type, str]] = []
+    for module_name, class_name, kind in _TARGETS:
+        try:
+            cls = getattr(importlib.import_module(module_name), class_name)
+        except ImportError, AttributeError:
+            continue
+        found.append((cls, kind))
+    return found
+
+
+def _wrap_mlp(cls: type) -> None:
+    import mlx.nn as nn
+
+    orig = cls.__call__
+
+    def call(self: Any, x: Any, *args: Any, **kwargs: Any) -> Any:
+        if (
+            _rows_ok(x)
+            and _tagged(self.gate_proj)
+            and _tagged(self.up_proj)
+            and _tagged(self.down_proj)
+        ):
+            shared = stage_a(x)
+            gate = linear_int8(self.gate_proj, x, shared)
+            up = linear_int8(self.up_proj, x, shared)
+            return linear_int8(self.down_proj, nn.silu(gate) * up)
+        return orig(self, x, *args, **kwargs)
+
+    cls.__call__ = call  # ty: ignore[invalid-assignment]
+
+
+def _wrap_gdn(cls: type) -> None:
+    orig = cls.__call__
+
+    def call(self: Any, inputs: Any, *args: Any, **kwargs: Any) -> Any:
+        share = [
+            proj
+            for proj in (getattr(self, "in_proj_qkv", None), getattr(self, "in_proj_z", None))
+            if proj is not None and _tagged(proj)
+        ]
+        if not share or not _rows_ok(inputs):
+            return orig(self, inputs, *args, **kwargs)
+        stage = stage_a(inputs)
+        for proj in share:
+            object.__setattr__(proj, _STAGE, (inputs, stage))
+        try:
+            return orig(self, inputs, *args, **kwargs)
+        finally:
+            for proj in share:
+                object.__setattr__(proj, _STAGE, None)
+
+    cls.__call__ = call  # ty: ignore[invalid-assignment]
+
+
+def _wrap_quantized_linear() -> None:
+    import mlx.nn as nn
+
+    orig = nn.QuantizedLinear.__call__
+
+    def call(self: Any, x: Any) -> Any:
+        if _tagged(self) and _rows_ok(x):
+            handed = getattr(self, _STAGE, None)
+            # Identity, not equality: the GDN wrapper handed a stage for this exact
+            # input object; any other array gets its own Stage A.
+            stage = handed[1] if handed is not None and handed[0] is x else None
+            return linear_int8(self, x, stage)
+        return orig(self, x)
+
+    nn.QuantizedLinear.__call__ = call
+
+
+def install_wrappers(classes: Iterable[tuple[type, str]] | None = None) -> None:
+    """Wrap the MLP / GDN classes (default: the Qwen3.5 classes of mlx-vlm and
+    mlx-lm that import) and ``nn.QuantizedLinear``, once per process. Wrappers
+    act only on tagged modules, so installing them is behaviour-neutral for every
+    other model in the process."""
+    global _QUANTIZED_LINEAR_WRAPPED
+    for cls, kind in _resolve_targets() if classes is None else classes:
+        if cls in _WRAPPED:
+            continue
+        (_wrap_mlp if kind == "mlp" else _wrap_gdn)(cls)
+        _WRAPPED.add(cls)
+    if not _QUANTIZED_LINEAR_WRAPPED:
+        _wrap_quantized_linear()
+        _QUANTIZED_LINEAR_WRAPPED = True
+
+
+def _warm_up(model: Any) -> None:
+    """Compile every kernel instantiation the tagged projections need, on a zero
+    input of MIN_ROWS rows: first-turn latency stays flat, and a compiler that
+    rejects the source or a changed metal_kernel signature fails here, inside
+    enable()'s degradation path, rather than inside a user's turn."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    done: set[tuple[int, int, Any]] = set()
+    for _, module in _root(model).named_modules():
+        if not (isinstance(module, nn.QuantizedLinear) and _tagged(module)):
+            continue
+        k = module.scales.shape[1] * GROUP
+        key = (k, module.weight.shape[0], module.scales.dtype)
+        if key in done:
+            continue
+        done.add(key)
+        mx.eval(linear_int8(module, mx.zeros((MIN_ROWS, k), dtype=module.scales.dtype)))
+
+
+def enable(model: Any, *, enabled: bool) -> dict[str, Any]:
+    """Opt one loaded model in. Returns the status the engine exposes; never raises
+    — a model load must not fail because a prefill accelerator is missing."""
+    if not enabled:
+        return {"state": "off", "reason": None, "routed": 0}
+    avail = availability()
+    if not avail.available:
+        return {"state": "unavailable", "reason": avail.reason, "routed": 0}
+    try:
+        routed = _tag(model)
+        if routed == 0:
+            _untag(model)
+            return {
+                "state": "unavailable",
+                "reason": "no eligible projections (affine Q4 gs64 required)",
+                "routed": 0,
+            }
+        install_wrappers()
+        _warm_up(model)
+    except Exception as e:  # noqa: BLE001 — degrade, never block the model
+        _untag(model)
+        warnings.warn(
+            f"sous: int8 prefill unavailable ({e}); prefilling with stock kernels",
+            stacklevel=2,
+        )
+        return {"state": "unavailable", "reason": str(e), "routed": 0}
+    logger.info("int8 prefill: routed %d projections", routed)
+    return {"state": "active", "reason": None, "routed": routed}
