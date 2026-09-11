@@ -311,6 +311,11 @@ top_k = 20
 # a warning when the drafter can't serve the configured model.
 speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
 speculative_block_size = 3
+# INT8-activation prefill on the M5 tensor units (M5-family or newer, macOS 26.2+;
+# silently unavailable elsewhere). ~1.5x prefill on the default model, but int8
+# activations change numerics — measured drift is inside what 4-bit weights
+# already add — so it stays off until a tool-loop A/B says otherwise.
+int8_prefill = false
 
 [budgets]
 max_turns = 40
@@ -430,6 +435,18 @@ the model, so "every new session" means every new session inside that
 window.
 `server_status` reports `prompt_cache` — slots, resident bytes, hits, fork
 hits, evictions and the subset the pressure valve took — counts only.
+
+`[model].int8_prefill` (default `false`) runs the prefill matmuls of the MLP and
+linear-attention projections as INT8 activations against the checkpoint's packed
+4-bit weights on the M5 GPU's neural accelerators (Apache-2.0 kernel derived from
+oMLX, compiled at model load — no build step). Measured on an M5 Pro with the
+default model: 484 → 754 tok/s at 4K tokens, 386 → 580 tok/s at 32K. Decode and
+speculative verify are untouched. It changes prefill numerics (KL 0.033 vs the
+stock path on a code prompt; 4-bit weights alone are 0.052 vs 8-bit), which is
+why it ships off. Needs an M5-family or newer GPU and macOS 26.2+; anywhere else
+`sous status` reports `int8_prefill: unavailable` with the reason and prefill
+runs stock. Only affine 4-bit, group-size-64 checkpoints route (the default
+model does); mxfp4/mxfp8 ones fall through silently.
 
 `temperature`/`top_p`/`top_k` control the worker's sampler (Qwen's own
 documented non-thinking-mode defaults). Greedy decoding (temperature 0)

@@ -79,6 +79,19 @@ Claude Code use stretches further — evaluate features against that goal.
   each SSE frame, httpx the full upstream URL with its query string, httpcore
   response header values — and `MCPServer.__init__` installs a root stderr
   handler at INFO, so none of that is hypothetical.
+- `engine/int8prefill.py` is a runtime-compiled Metal kernel pair (Apache-2.0,
+  derived from oMLX — see THIRD_PARTY_NOTICES.md). The Python `reorder_k` and
+  the GEMM's nibble decode are two halves of one K-order contract (slot
+  `16c+4t+j` holds code `16c+8*(t>>1)+2j+(t&1)`): never change one alone; the
+  power-of-two bit-exactness test is what catches a mismatch. Only rows >= 128
+  route (decode/verify never do), only tagged modules route (tags are set with
+  `object.__setattr__` so they stay out of mlx's parameter tree), and only the
+  GEMM's header includes the Metal-4 `MetalPerformancePrimitives` header, which
+  needs macOS 26.2+ — the Stage-A kernel must keep compiling on any Metal GPU
+  so CI (macos-15, no tensor units) can test it.
+- `int8prefill.enable()` never raises and a model load never fails because of
+  it: every failure is one `warnings.warn` plus `state: unavailable`. Tests
+  that need the GEMM without tensor units monkeypatch `int8prefill.qmm`.
 
 ## Security boundary
 
