@@ -613,14 +613,25 @@ def enable(model: Any, *, enabled: bool) -> dict[str, Any]:
         return {"state": "off", "reason": None, "routed": 0}
     avail = availability()
     if not avail.available:
+        warnings.warn(
+            f"sous: int8 prefill requested but unavailable ({avail.reason}); "
+            "prefilling with stock kernels",
+            stacklevel=2,
+        )
         return {"state": "unavailable", "reason": avail.reason, "routed": 0}
     try:
         routed = _tag(model)
         if routed == 0:
             _untag(model)
+            reason = "no eligible projections (affine Q4 gs64 required)"
+            warnings.warn(
+                f"sous: int8 prefill requested but unavailable ({reason}); "
+                "prefilling with stock kernels",
+                stacklevel=2,
+            )
             return {
                 "state": "unavailable",
-                "reason": "no eligible projections (affine Q4 gs64 required)",
+                "reason": reason,
                 "routed": 0,
             }
         install_wrappers()

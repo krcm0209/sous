@@ -416,7 +416,8 @@ def test_enable_off_touches_nothing():
 def test_enable_unavailable_tags_nothing(monkeypatch):
     monkeypatch.setattr(i8, "availability", lambda: i8.Availability(False, "no tensor units"))
     model = _Model([_Layer()])
-    status = i8.enable(model, enabled=True)
+    with pytest.warns(UserWarning, match="no tensor units"):
+        status = i8.enable(model, enabled=True)
     assert status == {"state": "unavailable", "reason": "no tensor units", "routed": 0}
     assert _tags(model) == []
 
@@ -445,7 +446,8 @@ def test_enable_tags_an_mlp_all_or_nothing(monkeypatch):
 def test_enable_with_no_eligible_projection_is_unavailable(monkeypatch):
     monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
     model = _Model([])
-    status = i8.enable(model, enabled=True)
+    with pytest.warns(UserWarning, match="no eligible projections"):
+        status = i8.enable(model, enabled=True)
     assert status["state"] == "unavailable"
     assert status["reason"] is not None and "no eligible projections" in status["reason"]
 

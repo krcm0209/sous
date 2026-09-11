@@ -443,8 +443,8 @@ oMLX, compiled at model load — no build step). Measured on an M5 Pro with the
 default model: 484 → 754 tok/s at 4K tokens, 386 → 580 tok/s at 32K. Decode and
 speculative verify are untouched. It changes prefill numerics (KL 0.033 vs the
 stock path on a code prompt; 4-bit weights alone are 0.052 vs 8-bit), which is
-why it ships off. Needs an M5-family or newer GPU and macOS 26.2+; anywhere else
-`sous status` reports `int8_prefill: unavailable` with the reason and prefill
+why it ships off. Needs an M5-family or newer GPU and macOS 26.2+; anywhere else the
+`server_status` tool reports `int8_prefill: unavailable` with the reason and prefill
 runs stock. Only affine 4-bit, group-size-64 checkpoints route (the default
 model does); mxfp4/mxfp8 ones fall through silently.
 
