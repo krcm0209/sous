@@ -207,6 +207,7 @@ def _default_factory(
     draft_block_size: int = 0,
     cache_budget: int | None = None,
     reserve_tokens: int = 0,
+    int8_prefill: bool = False,
 ) -> Engine:
     from sous.context import kv_bytes_per_token
 
@@ -250,6 +251,7 @@ def _default_factory(
             draft_block_size=draft_block_size,
             cache_budget=cache_budget,
             reserve_bytes=reserve_bytes,
+            int8_prefill=int8_prefill,
         )
     # The drafter settings stop here: speculative decoding is an mlx-vlm
     # feature, and the mlx-lm backend has no parameter for it.
@@ -263,6 +265,7 @@ def _default_factory(
         prompt_cache=prompt_cache,
         cache_budget=cache_budget,
         reserve_bytes=reserve_bytes,
+        int8_prefill=int8_prefill,
     )
 
 
@@ -283,6 +286,11 @@ class ManagedEngine:
     @property
     def model_id(self) -> str:
         return self._inner.model_id
+
+    @property
+    def int8_prefill_status(self) -> dict | None:
+        # Optional on purpose: fakes and older engines have no such attribute.
+        return getattr(self._inner, "int8_prefill_status", None)
 
     def generate(
         self,
@@ -472,6 +480,7 @@ class EngineManager:
                     config.max_context_tokens,
                     config.gateway_max_context_tokens if config.gateway_enabled else 0,
                 ),
+                int8_prefill=config.int8_prefill,
             )
         )
         self._lock = threading.Lock()
@@ -536,4 +545,7 @@ class EngineManager:
             if self._engine is not None:
                 # Counts and byte totals only; never a token id.
                 out["prompt_cache"] = self._engine.prompt_cache_stats()
+                int8 = self._engine.int8_prefill_status
+                if int8 is not None:
+                    out["int8_prefill"] = dict(int8)
             return out

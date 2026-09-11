@@ -20,16 +20,19 @@ class LMEngine:
         prompt_cache: bool = False,
         cache_budget: int | None = None,
         reserve_bytes: int = 0,
+        int8_prefill: bool = False,
     ):
         from mlx_lm import load
         from mlx_lm.sample_utils import make_sampler
 
+        from sous.engine import int8prefill
         from sous.engine.base import measure_cache_budget
 
         self.model_id = model_id
         # mlx-lm ships no type stubs, so the (model, tokenizer) arity of load()
         # is not visible to the type checker.
         self._model, self._tokenizer = load(model_id)  # ty: ignore[invalid-assignment]
+        self.int8_prefill_status = int8prefill.enable(self._model, enabled=int8_prefill)
         self._sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
         self._memo = PromptMemo()
         self._tokenize_lock = threading.Lock()

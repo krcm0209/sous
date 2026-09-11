@@ -59,14 +59,19 @@ class VLMEngine:
         draft_block_size: int = 0,
         cache_budget: int | None = None,
         reserve_bytes: int = 0,
+        int8_prefill: bool = False,
     ):
         from mlx_vlm import load
         from mlx_vlm.sample_utils import make_sampler
 
+        from sous.engine import int8prefill
         from sous.engine.base import measure_cache_budget
 
         self.model_id = model_id
         self._model, self._processor = load(model_id)
+        # Before the drafter loads (so it is never tagged) and before the cache
+        # budget is measured (so warm-up temporaries are already released).
+        self.int8_prefill_status = int8prefill.enable(self._model, enabled=int8_prefill)
         self._sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
         self._memo = PromptMemo()
         self._tokenize_lock = threading.Lock()
