@@ -42,7 +42,7 @@ def _repeat_to(ids: list[int], n: int) -> list[int]:
 
 def _prefill_seconds(engine, ids: list[int]) -> float:
     best = float("inf")
-    for _ in range(2):
+    for _ in range(3):
         cache = engine.new_cache()
         mx.synchronize()
         t = time.perf_counter()
@@ -54,7 +54,7 @@ def _prefill_seconds(engine, ids: list[int]) -> float:
     return best
 
 
-def _last_logits(engine, ids: list[int], positions: int = 256):
+def _last_logits(engine, ids: list[int], positions: int = 256) -> mx.array:
     model, _ = engine._loaded()
     cache = engine.new_cache()
     out = model.language_model(mx.array(ids)[None], cache=cache)
@@ -76,6 +76,7 @@ def test_default_model_meets_the_acceptance_bars():
     stock = VLMEngine(DEFAULT_27B, cache_budget=0)
     assert stock.int8_prefill_status["state"] == "off"
     base = stock._encode(_standard_text())
+    assert len(base) >= 2048, "standard prompt shorter than the KL window"
     ids_4k, ids_32k, ids_2k = _repeat_to(base, 4096), _repeat_to(base, 32768), base[:2048]
     stock_4k = _prefill_seconds(stock, ids_4k)
     stock_32k = _prefill_seconds(stock, ids_32k)
