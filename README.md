@@ -312,7 +312,7 @@ top_k = 20
 speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
 speculative_block_size = 3
 # INT8-activation prefill on the M5 tensor units (M5-family or newer, macOS 26.2+;
-# silently unavailable elsewhere). ~1.5x prefill on the default model, but int8
+# silently unavailable elsewhere). ~1.4x prefill on the default model, but int8
 # activations change numerics — measured drift is inside what 4-bit weights
 # already add — so it stays off until a tool-loop A/B says otherwise.
 int8_prefill = false
@@ -440,8 +440,9 @@ hits, evictions and the subset the pressure valve took — counts only.
 linear-attention projections as INT8 activations against the checkpoint's packed
 4-bit weights on the M5 GPU's neural accelerators (Apache-2.0 kernel derived from
 oMLX, compiled at model load — no build step). Measured on an M5 Pro with the
-default model: 484 → 754 tok/s at 4K tokens, 386 → 580 tok/s at 32K. Decode and
-speculative verify are untouched. It changes prefill numerics (KL 0.033 vs the
+default model: 492 → 695 tok/s at 4K tokens, 410 → 570 tok/s at 32K (MLP and
+linear-attention projections; attention projections are not routed, see #76).
+Decode and speculative verify are untouched. It changes prefill numerics (KL 0.033 vs the
 stock path on a code prompt; 4-bit weights alone are 0.052 vs 8-bit), which is
 why it ships off. Needs an M5-family or newer GPU and macOS 26.2+; anywhere else the
 `server_status` tool reports `int8_prefill: unavailable` with the reason and prefill
