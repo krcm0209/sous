@@ -74,8 +74,8 @@ _STAGE_A_SOURCE = r"""
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float row_amax = 0.0f;
   UNROLL for (int i = 0; i < SG; ++i) row_amax = max(row_amax, partial_amax[i]);
-  // An all-zero row has no representable scale: emit zeros rather than NaN and
-  // let the affine bias term carry that row's output.
+  // An all-zero row has no representable scale: emit zero codes and sa = 0 rather than
+  // NaN — the row's true product is zero and sa = 0 makes the GEMM store exactly that.
   const float inv = row_amax > 0.0f ? (127.0f / row_amax) : 0.0f;
   if (simd_gid == 0 && simd_lid == 0) sa[row] = row_amax > 0.0f ? (row_amax / 127.0f) : 0.0f;
   for (int g = simd_gid; g < groups; g += SG) {

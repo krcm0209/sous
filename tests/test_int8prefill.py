@@ -156,12 +156,19 @@ def test_gemm_is_bit_exact_with_power_of_two_metadata(k, n, m):
     ra = qa_nat.astype(mx.int32).reshape(m, k // 64, 64).sum(axis=-1)  # [M, G]
     sa = mx.ones((m,), dtype=mx.float32)
     w = _random_words(n, k // 8)
-    s, b = 2.0**-8, -(2.0**-5)
-    scales = mx.full((n, k // 64), s, dtype=mx.bfloat16)
-    biases = mx.full((n, k // 64), b, dtype=mx.bfloat16)
+    n_idx = mx.arange(n).reshape(n, 1)
+    g_idx = mx.arange(k // 64).reshape(1, k // 64)
+    scales = (2.0 ** (-(8 + ((n_idx + g_idx) % 3)))).astype(mx.bfloat16)
+    biases = (-(2.0 ** (-(5 + ((n_idx + 2 * g_idx) % 3))))).astype(mx.bfloat16)
     # Integer-exact in fp32 on the CPU stream: |products| <= 127*15, sums < 2^24.
-    dots = mx.matmul(qa_nat.astype(mx.float32), _unpack_q4(w).astype(mx.float32).T, stream=mx.cpu)
-    ref = dots * s + ra.sum(axis=-1, keepdims=True).astype(mx.float32) * b
+    qa_g = qa_nat.astype(mx.float32).reshape(m, k // 64, 64)
+    w_g = _unpack_q4(w).astype(mx.float32).reshape(n, k // 64, 64)
+    dots_g = mx.stack(
+        [mx.matmul(qa_g[:, g], w_g[:, g].T, stream=mx.cpu) for g in range(k // 64)], axis=-1
+    )  # [M, N, G], exact integers
+    ref = mx.sum(dots_g * scales.astype(mx.float32)[None], axis=-1) + mx.sum(
+        ra.astype(mx.float32)[:, None, :] * biases.astype(mx.float32)[None], axis=-1
+    )
     got = i8.qmm(i8.reorder_k(qa_nat), sa, mx.contiguous(ra.astype(mx.int16).T), w, scales, biases)
     assert got.shape == (m, n) and got.dtype == mx.bfloat16
     assert mx.array_equal(got, ref.astype(mx.bfloat16)).item()
@@ -221,6 +228,9 @@ def test_qmm_rejects_untiled_shapes():
     ra = mx.zeros((1, 32), dtype=mx.int16)
     with pytest.raises(ValueError, match="N=48"):
         i8.qmm(qa, sa, ra, mx.zeros((48, 8), dtype=mx.uint32), mx.ones((48, 1)), mx.zeros((48, 1)))
+    qa = mx.zeros((32, 96), dtype=mx.int8)
+    with pytest.raises(ValueError, match="K=96"):
+        i8.qmm(qa, sa, ra, mx.zeros((64, 12), dtype=mx.uint32), mx.ones((64, 2)), mx.zeros((64, 2)))
 
 
 # ---- eligibility --------------------------------------------------------------

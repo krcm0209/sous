@@ -11,9 +11,11 @@ work under other licenses and keep their original terms.
 (author: PowerSpy), ported from an AOT-compiled extension to runtime-compiled
 `mx.fast.metal_kernel` sources with the Q5 and per-group-scaling variants removed.
 
-Copyright (c) oMLX contributors. Licensed under the Apache License, Version 2.0;
-you may not use those portions except in compliance with the License. You may
-obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0.
-Unless required by applicable law or agreed to in writing, software distributed
-under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-CONDITIONS OF ANY KIND, either express or implied.
+Attribution: oMLX contributors (the upstream files carry no copyright header).
+Licensed under the Apache License, Version 2.0 (a copy is in
+LICENSES/Apache-2.0.txt); you may not use those portions except in compliance
+with the License. You may obtain a copy of the License at
+http://www.apache.org/licenses/LICENSE-2.0. Unless required by applicable law or
+agreed to in writing, software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+or implied.
