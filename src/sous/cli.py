@@ -267,8 +267,13 @@ def launchd_plist(sous_executable: str, log_dir: Path) -> str:
             "ProgramArguments": [sous_executable, "serve"],
             "RunAtLoad": True,
             "KeepAlive": True,
+            # Both streams to one file, in write order. The stderr file was
+            # named daemon.err.log and held everything the daemon said — Python
+            # logging, the gateway's lines, warnings, the SDK's handler all
+            # write to stderr — while daemon.log held the banner. One file,
+            # and the level on every line (sous.logs) says what is an error.
             "StandardOutPath": f"{log_dir}/daemon.log",
-            "StandardErrorPath": f"{log_dir}/daemon.err.log",
+            "StandardErrorPath": f"{log_dir}/daemon.log",
         },
         sort_keys=False,
     ).decode()
@@ -508,12 +513,49 @@ def _cmd_uninstall_launchd() -> None:
         print("the running daemon is now unmanaged; stop it with: sous stop")
 
 
+def _fold_legacy_stderr_log(data_dir: Path) -> bool:
+    """Append a pre-one-file `daemon.err.log` onto `daemon.log` and remove it.
+
+    The history is worth keeping; the name is not — it was launchd's stderr
+    path, not an error log, and it will never be written again. Byte for
+    byte, so nothing in it is reformatted. Only ever called with no daemon
+    holding the lock: an open descriptor would keep writing into the unlinked
+    inode and those lines would be lost."""
+    legacy = data_dir / "daemon.err.log"
+    if not legacy.exists():
+        return False
+    target = data_dir / "daemon.log"
+    with legacy.open("rb") as src, target.open("ab") as dst:
+        shutil.copyfileobj(src, dst)
+    legacy.unlink()
+    print(f"folded {legacy.name} into {target.name}")
+    return True
+
+
 def _cmd_install_launchd() -> None:
     config = load_config()
     exe = shutil.which("sous") or sys.argv[0]
     plist_path = _plist_path()
-    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    # Out first, unconditionally: `bootstrap` fails on a label that is already
+    # loaded, so a re-run (a new plist — this release moved both log streams
+    # to daemon.log — or a moved executable) never applied. Same rule and
+    # same helper as uninstall: anything but "unloaded" or "was not loaded"
+    # leaves a live KeepAlive job, and writing a plist over it would report
+    # success for a daemon still running the old one.
+    code = _bootout(LABEL)
+    if code not in (0, _BOOTOUT_NOT_LOADED):
+        print(f"sous: launchctl bootout failed (exit {code}); not touching {plist_path}")
+        raise SystemExit(1)
+    if code == 0:
+        _await_port_closed(config.server_port, _UNLOAD_GRACE_SECONDS)
+    if _lock_is_held(config.data_dir):
+        # A daemon launchd did not start — `sous serve` by hand — is still
+        # writing its log files; folding one under it would lose lines.
+        print("sous: a daemon is running and holds the lock; stop it first: sous stop")
+        raise SystemExit(1)
     config.data_dir.mkdir(parents=True, exist_ok=True)
+    _fold_legacy_stderr_log(config.data_dir)
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(launchd_plist(exe, config.data_dir))
     print(f"wrote {plist_path}")
     cmd = ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)]

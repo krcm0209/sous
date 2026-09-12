@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from sous.cli import LABEL, launchd_plist
+from sous.cli import _BOOTOUT_NOT_LOADED, LABEL, launchd_plist
 
 
 def _free_cli_port() -> int:
@@ -25,7 +25,7 @@ def test_plist_is_valid_and_correct():
     assert data["RunAtLoad"] is True
     assert data["KeepAlive"] is True
     assert data["StandardOutPath"] == "/Users/x/.sous/daemon.log"
-    assert data["StandardErrorPath"] == "/Users/x/.sous/daemon.err.log"
+    assert data["StandardErrorPath"] == "/Users/x/.sous/daemon.log"
 
 
 def test_plist_sets_no_environment_variables():
@@ -45,7 +45,7 @@ def test_plist_escapes_xml_special_characters():
     data = plistlib.loads(xml.encode())
     assert data["ProgramArguments"] == ["/opt/a&b/sous", "serve"]
     assert data["StandardOutPath"] == "/Users/x/My & <Special> Docs/.sous/daemon.log"
-    assert data["StandardErrorPath"] == "/Users/x/My & <Special> Docs/.sous/daemon.err.log"
+    assert data["StandardErrorPath"] == "/Users/x/My & <Special> Docs/.sous/daemon.log"
 
 
 def test_status_reports_not_running(tmp_path, capsys, monkeypatch):
@@ -390,6 +390,85 @@ def test_uninstall_advises_stop_when_there_was_nothing_to_unload(tmp_path, capsy
         assert "sous stop" in capsys.readouterr().out
     finally:
         daemon.kill()
+
+
+def _install_env(tmp_path, monkeypatch, *, bootout_code: int, lock_held: bool):
+    """install-launchd with launchctl, the lock probe and the plist path faked."""
+    from sous import cli
+
+    plist = tmp_path / "com.sous.daemon.plist"
+    calls: dict = {"bootout": [], "run": []}
+    monkeypatch.setattr(cli, "load_config", lambda: _cfg(tmp_path, 1))
+    monkeypatch.setattr(cli, "_plist_path", lambda: plist)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/opt/sous")
+    monkeypatch.setattr(
+        cli, "_bootout", lambda label: (calls["bootout"].append(label), bootout_code)[1]
+    )
+    monkeypatch.setattr(cli, "_await_port_closed", lambda port, seconds: True)
+    monkeypatch.setattr(cli, "_lock_is_held", lambda data_dir: lock_held)
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, check: calls["run"].append(cmd))
+    return cli, plist, calls
+
+
+def test_install_launchd_boots_out_then_writes_and_bootstraps(tmp_path, capsys, monkeypatch):
+    """Re-running must work: bootstrap fails on an already-loaded label, and
+    a plist that changed (both streams now go to daemon.log) reloads only if
+    the old job is out first."""
+    cli, plist, calls = _install_env(tmp_path, monkeypatch, bootout_code=0, lock_held=False)
+    cli.main(["install-launchd"])
+    assert calls["bootout"] == [cli.LABEL]
+    data = plistlib.loads(plist.read_bytes())
+    assert data["StandardOutPath"] == data["StandardErrorPath"] == str(tmp_path / "daemon.log")
+    assert calls["run"] and calls["run"][0][:2] == ["launchctl", "bootstrap"]
+    assert calls["run"][0][-1] == str(plist)
+
+
+def test_install_launchd_when_nothing_was_loaded(tmp_path, capsys, monkeypatch):
+    """A first install: bootout reports "not loaded" and that is fine."""
+    cli, plist, calls = _install_env(
+        tmp_path, monkeypatch, bootout_code=_BOOTOUT_NOT_LOADED, lock_held=False
+    )
+    cli.main(["install-launchd"])
+    assert calls["bootout"] == [cli.LABEL]  # tried, and tolerated "not loaded"
+    assert plist.exists() and calls["run"]
+
+
+def test_install_launchd_refuses_while_a_daemon_holds_the_lock(tmp_path, capsys, monkeypatch):
+    """A hand-started daemon still writing daemon.err.log must not have the
+    file appended and unlinked under it; the user stops it first."""
+    cli, plist, calls = _install_env(
+        tmp_path, monkeypatch, bootout_code=_BOOTOUT_NOT_LOADED, lock_held=True
+    )
+    (tmp_path / "daemon.err.log").write_text("old\n")
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["install-launchd"])
+    assert exc.value.code == 1
+    assert "sous stop" in capsys.readouterr().out
+    assert not plist.exists() and (tmp_path / "daemon.err.log").exists() and not calls["run"]
+
+
+def test_install_launchd_folds_the_legacy_stderr_log_into_daemon_log(tmp_path, capsys, monkeypatch):
+    cli, plist, calls = _install_env(tmp_path, monkeypatch, bootout_code=0, lock_held=False)
+    (tmp_path / "daemon.log").write_bytes(b"out-1\n")
+    (tmp_path / "daemon.err.log").write_bytes(b"err-1\nerr-2\n")
+    cli.main(["install-launchd"])
+    assert (tmp_path / "daemon.log").read_bytes() == b"out-1\nerr-1\nerr-2\n"
+    assert not (tmp_path / "daemon.err.log").exists()
+    assert "folded daemon.err.log into daemon.log" in capsys.readouterr().out
+
+
+def test_install_launchd_without_a_legacy_log_touches_nothing(tmp_path, capsys, monkeypatch):
+    cli, plist, calls = _install_env(tmp_path, monkeypatch, bootout_code=0, lock_held=False)
+    cli.main(["install-launchd"])
+    assert not (tmp_path / "daemon.log").exists() or (tmp_path / "daemon.log").read_bytes() == b""
+    assert "folded" not in capsys.readouterr().out
+
+
+def test_install_launchd_keeps_the_plist_when_bootout_really_fails(tmp_path, capsys, monkeypatch):
+    cli, plist, calls = _install_env(tmp_path, monkeypatch, bootout_code=5, lock_held=False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["install-launchd"])
+    assert exc.value.code == 1 and not plist.exists() and not calls["run"]
 
 
 # --- wait ----------------------------------------------------------------------
