@@ -670,17 +670,112 @@ def test_every_failure_line_ends_with_seconds(tmp_path: Path, capsys):
     assert all(" seconds=" in line for line in lines), lines
 
 
-def test_a_served_count_logs_one_line_with_load_and_seconds(tmp_path: Path, capsys):
+def test_a_served_count_logs_one_line_with_load_count_and_client_seconds(tmp_path: Path, capsys):
     app = _app(tmp_path, FakeEngine([]))
     body = {"model": "sous-local", "messages": [{"role": "user", "content": "hi"}]}
     assert _post(app, body, path="/v1/messages/count_tokens").status_code == 200
     (line,) = _turn_lines(capsys.readouterr().err)
     assert "POST /v1/messages/count_tokens model=sous-local input_tokens=" in line
-    assert " load_s=" in line and " seconds=" in line
+    # load_s (the model load), count_s (the runner's own work) and seconds
+    # (client-visible, from request receipt) are all distinct keys.
+    assert " load_s=" in line and " count_s=" in line and " seconds=" in line
     assert "hi" not in line.split("input_tokens=")[0]  # body text never reaches the log
 
 
+class _SlowThenFastCountEngine(FakeEngine):
+    """The first `hold` calls to count_tokens signal `entered` and then block
+    on `release`; calls after that return immediately. Lets a test confirm
+    both `_counts` workers are occupied before submitting a third, queued
+    call, whose own tokenizing work is negligible next to its wait for a
+    free worker."""
+
+    def __init__(self, hold: int = 2):
+        super().__init__([])
+        self.hold = hold
+        self.entered = threading.Semaphore(0)
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+        self._calls = 0
+
+    def count_tokens(self, messages, tools):
+        with self._lock:
+            self._calls += 1
+            mine = self._calls
+        if mine <= self.hold:
+            self.entered.release()
+            self.release.wait(5)
+        return super().count_tokens(messages, tools)
+
+
+def test_count_tokens_seconds_includes_the_queue_wait_like_the_failure_lines(
+    tmp_path: Path, capsys
+):
+    """_counts is a 2-worker pool; MAX_PENDING_COUNTS admits up to 8, so a
+    third concurrent count queues behind the two already running. Every
+    other line on this endpoint (the two 400s, the 529 — all `_elapsed
+    (received)`) already counts that wait as `seconds`; the success line must
+    too, with the runner-internal figure kept visible as its own `count_s`."""
+    inner = _SlowThenFastCountEngine(hold=2)
+    app = _app(tmp_path, inner)
+    body = {"model": "sous-local", "messages": [{"role": "user", "content": "hi"}]}
+    results: list[httpx.Response] = []
+    lock = threading.Lock()
+
+    def fire() -> None:
+        r = _post(app, body, path="/v1/messages/count_tokens")
+        with lock:
+            results.append(r)
+
+    holders = [threading.Thread(target=fire) for _ in range(2)]
+    for t in holders:
+        t.start()
+    assert inner.entered.acquire(timeout=5)
+    assert inner.entered.acquire(timeout=5)  # both _counts workers now occupied
+
+    queued = threading.Thread(target=fire)
+    queued.start()
+    time.sleep(0.3)  # the queued call sits behind both workers for at least this long
+    inner.release.set()
+    for t in [*holders, queued]:
+        t.join(5)
+
+    assert len(results) == 3 and all(r.status_code == 200 for r in results)
+    lines = [
+        line
+        for line in _turn_lines(capsys.readouterr().err)
+        if "/v1/messages/count_tokens model=" in line and "input_tokens=" in line
+    ]
+    assert len(lines) == 3
+
+    def parse(line: str) -> tuple[float, float]:
+        count_s = float(line.split("count_s=")[1].split()[0])
+        seconds = float(line.split(" seconds=")[1].split()[0])
+        return count_s, seconds
+
+    parsed = [parse(line) for line in lines]
+    # Exactly one of the three calls did negligible runner-internal work
+    # (the queued one, picked up only once a worker freed) — the other two
+    # spent their whole runner-internal time blocked on `release`.
+    queued_only = [(c, s) for c, s in parsed if c < 0.15]
+    assert len(queued_only) == 1, parsed
+    count_s, seconds = queued_only[0]
+    assert seconds >= 0.25, parsed  # the client waited for a free worker
+    assert count_s < 0.15, parsed  # but the runner's own work was instant
+
+
 # --- turn admission (MAX_PENDING_TURNS) --------------------------------------------
+
+
+def test_turns_pool_has_exactly_max_pending_turns_workers(tmp_path: Path):
+    """queue_s on the turn line is only a complete accounting of the wait
+    when every admitted turn can start on its own worker at once — tie the
+    pool's size to MAX_PENDING_TURNS explicitly rather than leaving it to
+    ThreadPoolExecutor's own default (min(32, os.cpu_count() + 4)), which
+    would make queue_s's completeness depend on the host's core count."""
+    import sous.gateway.routes as routes
+
+    gateway, _app = _gateway_app(tmp_path, FakeEngine([]))
+    assert gateway._turns._max_workers == routes.MAX_PENDING_TURNS
 
 
 def test_a_full_queue_answers_529_with_an_anthropic_shaped_body(tmp_path: Path, monkeypatch):

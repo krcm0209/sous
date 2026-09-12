@@ -42,7 +42,7 @@ from sous.gateway.turn import (
     TurnResult,
     TurnRunner,
 )
-from sous.gateway.upstream import Upstream
+from sous.gateway.upstream import SynthesizedError, Upstream
 from sous.protocol import ToolSet
 
 # Anthropic's own request cap. The MCP transport's 4 MiB limit wraps only the
@@ -166,6 +166,16 @@ def _error_response(status: int, error_type: str, message: str) -> JSONResponse:
     return JSONResponse(
         {"type": "error", "error": {"type": error_type, "message": message}}, status_code=status
     )
+
+
+def _log_refused(path: str, e: RequestError, received: float) -> JSONResponse:
+    """The shape shared by every RequestError caught before a chat request is
+    parsed (no `model=` yet): one metadata line, one Anthropic-shaped body."""
+    _log(
+        f"POST {path} status={e.status} error={e.error_type}{_elapsed(received)}",
+        level=_status_level(e.status),
+    )
+    return JSONResponse(e.body(), status_code=e.status)
 
 
 def _log_token(value: object, limit: int) -> str:
@@ -363,7 +373,16 @@ class Gateway:
         # in server.py) — but off the main thread, which is how the real-server
         # test drives it, it is: the pool is what lets that test observe the
         # graceful bound instead of the drain.
-        self._turns = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="sous-gateway-turn")
+        # Tied to MAX_PENDING_TURNS rather than left at the default worker
+        # count: the turn line's queue_s is only a complete accounting of the
+        # wait when every admitted turn can start on its own worker at once —
+        # otherwise a burst would queue inside the pool too, off the clock,
+        # on whatever core count the host happens to have. max() guards a
+        # test driving admission to zero (BoundedSemaphore(0) refuses every
+        # turn outright): the pool itself still needs at least one thread.
+        self._turns = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, MAX_PENDING_TURNS), thread_name_prefix="sous-gateway-turn"
+        )
         # count_tokens never takes TurnRunner._lock, so it must never queue
         # behind a turn parked waiting on that lock inside a saturated _turns
         # pool. A dedicated pool also keeps it off asyncio's default executor
@@ -444,7 +463,7 @@ class Gateway:
             f"model={model} status={response.status_code} "
             f"seconds={time.monotonic() - started:.1f}",
             level=_status_level(response.status_code)
-            if getattr(response, "sous_synthesized", False)
+            if isinstance(response, SynthesizedError)
             else logging.INFO,
         )
         return response
@@ -455,12 +474,7 @@ class Gateway:
             _check_loopback(request)
             raw = await _read_body(request)
         except RequestError as e:
-            _log(
-                f"POST /v1/messages/count_tokens status={e.status} error={e.error_type}"
-                f"{_elapsed(received)}",
-                level=_status_level(e.status),
-            )
-            return JSONResponse(e.body(), status_code=e.status)
+            return _log_refused("/v1/messages/count_tokens", e, received)
         body, model = self._route(raw)
         if body is None:
             return await self._forward(request, raw, model)
@@ -468,12 +482,7 @@ class Gateway:
             _check_depth(body)
             chat = parse_count_tokens_request(body)
         except RequestError as e:
-            _log(
-                f"POST /v1/messages/count_tokens status={e.status} error={e.error_type}"
-                f"{_elapsed(received)}",
-                level=_status_level(e.status),
-            )
-            return JSONResponse(e.body(), status_code=e.status)
+            return _log_refused("/v1/messages/count_tokens", e, received)
         # Same bounded-admission reasoning as messages()'s self._pending: a
         # queued count still holds its parsed body while the 2 _counts
         # workers serialize on the tokenizer, so bound it before any bytes
@@ -504,7 +513,7 @@ class Gateway:
         _log(
             f"POST /v1/messages/count_tokens model={_model_label(chat)} "
             f"input_tokens={result.count} load_s={result.load_seconds:.1f} "
-            f"seconds={result.seconds:.1f}"
+            f"count_s={result.seconds:.1f}{_elapsed(received)}"
         )
         return JSONResponse({"input_tokens": result.count})
 
@@ -514,11 +523,7 @@ class Gateway:
             _check_loopback(request)
             raw = await _read_body(request)
         except RequestError as e:
-            _log(
-                f"POST /v1/messages status={e.status} error={e.error_type}{_elapsed(received)}",
-                level=_status_level(e.status),
-            )
-            return JSONResponse(e.body(), status_code=e.status)
+            return _log_refused("/v1/messages", e, received)
         body, model = self._route(raw)
         if body is None:
             return await self._forward(request, raw, model)
@@ -526,11 +531,7 @@ class Gateway:
             _check_depth(body)
             chat = parse_messages_request(body)
         except RequestError as e:
-            _log(
-                f"POST /v1/messages status={e.status} error={e.error_type}{_elapsed(received)}",
-                level=_status_level(e.status),
-            )
-            return JSONResponse(e.body(), status_code=e.status)
+            return _log_refused("/v1/messages", e, received)
         if chat.dropped_tool_types:
             # Anthropic's type identifiers are a bounded, useful set, but a
             # client can put any string there, so cap the line: repr escapes a
@@ -589,7 +590,7 @@ class Gateway:
                 except TurnAbandoned:
                     _log(
                         f"POST /v1/messages model={_model_label(chat)} stream=1 "
-                        f"abandoned while queued{_elapsed(received)}",
+                        f"status=499 error=abandoned{_elapsed(received)}",
                         level=logging.WARNING,
                     )
                 except Exception as e:  # noqa: BLE001 — relayed as an in-band error event

@@ -500,7 +500,8 @@ class EngineManager:
                 # before it, only huggingface_hub's own chatter said a load
                 # happened, and a turn's `seconds` could not be split.
                 _logger.info(
-                    f"model loaded in {time.monotonic() - loading:.1f} s ({self._engine.model_id})"
+                    f"model_load seconds={time.monotonic() - loading:.1f} "
+                    f"model={self._engine.model_id}"
                 )
             self._last_used = time.monotonic()
             return self._engine

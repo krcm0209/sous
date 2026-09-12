@@ -1,3 +1,4 @@
+import os
 import plistlib
 import socket
 import subprocess
@@ -516,6 +517,29 @@ def test_install_launchd_reports_a_failed_fold_and_stops(tmp_path, capsys, monke
     assert "daemon.err.log" in out and "daemon.log" in out
     assert (tmp_path / "daemon.err.log").read_bytes() == b"err-1\n"
     assert not plist.exists() and not calls["run"]
+
+
+def test_fold_legacy_stderr_log_fsyncs_the_target_before_unlinking_the_source(
+    tmp_path, monkeypatch
+):
+    """The appended bytes sit in the page cache while the unlink is journaled
+    metadata; without an fsync in between, a panic in that window loses the
+    folded history even though the source is already gone."""
+    from sous import cli
+
+    (tmp_path / "daemon.err.log").write_bytes(b"err-1\nerr-2\n")
+    calls: list[int] = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        calls.append(fd)
+        assert (tmp_path / "daemon.err.log").exists()  # not unlinked yet
+        real_fsync(fd)
+
+    monkeypatch.setattr(cli.os, "fsync", spy)
+    assert cli._fold_legacy_stderr_log(tmp_path) is True
+    assert calls, "os.fsync was never called before folding the legacy log"
+    assert not (tmp_path / "daemon.err.log").exists()
 
 
 def test_install_launchd_exits_nonzero_when_bootstrap_fails(tmp_path, capsys, monkeypatch):

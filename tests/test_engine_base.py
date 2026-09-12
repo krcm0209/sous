@@ -102,7 +102,7 @@ def test_get_logs_the_load_once_with_its_duration(caplog):
         mgr.get()
     lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
     assert len(lines) == 1 and len(created) == 1
-    assert lines[0].startswith("model loaded in ") and lines[0].endswith(" s (fake/model)")
+    assert lines[0].startswith("model_load seconds=") and lines[0].endswith(" model=fake/model")
 
 
 class _BlockingEngine(FakeEngine):

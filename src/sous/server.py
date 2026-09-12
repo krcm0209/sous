@@ -574,7 +574,11 @@ def main() -> None:
     enable_warning_capture()
     from huggingface_hub.utils import disable_progress_bars
 
-    disable_progress_bars()
+    # launchd's stderr is a pipe with nobody to animate a bar for; a `sous
+    # serve` run by hand for a first multi-GB model download has a real
+    # terminal, and the download's own progress should still show there.
+    if not sys.stderr.isatty():
+        disable_progress_bars()
     store = TaskStore(config.data_dir / "tasks.db")
     interrupted = store.recover_interrupted(config.data_dir)
     if interrupted:

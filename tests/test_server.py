@@ -1,4 +1,5 @@
 import asyncio
+import io
 import os
 import socket
 import subprocess
@@ -584,6 +585,55 @@ def test_main_adopts_the_login_shell_path_before_serving(tmp_path: Path, monkeyp
         with pytest.raises(SystemExit):
             server.main()
     assert os.environ["PATH"] == "/resolved/bin:/usr/bin"
+
+
+class _FakeStderr(io.StringIO):
+    """A stream main() can log through (write/flush both work) whose isatty()
+    is controlled by the test, unlike a real TextIOWrapper's."""
+
+    def __init__(self, tty: bool):
+        super().__init__()
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+def _run_main_against_an_occupied_port(tmp_path: Path, monkeypatch, *, subdir: str) -> None:
+    """make serve() fail fast instead of actually serving, so main() runs its
+    startup steps and exits via the bind failure."""
+    import sous.server as server
+
+    data = tmp_path / subdir
+    data.mkdir()
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+        cfg = SousConfig(
+            data_dir=data,
+            config_path=tmp_path / f"{subdir}.toml",
+            server_port=occupied.getsockname()[1],
+        )
+        cfg.config_path.write_text("")
+        monkeypatch.setattr(server, "load_config", lambda: cfg)
+        with pytest.raises(SystemExit):
+            server.main()
+
+
+def test_main_disables_progress_bars_only_when_stderr_is_not_a_tty(tmp_path: Path, monkeypatch):
+    """Under launchd stderr is a pipe with nobody to animate a bar for; a
+    `sous serve` run by hand for a first multi-GB model download has a real
+    terminal, and the download's own progress should still show there."""
+    calls: list[bool] = []
+    monkeypatch.setattr("huggingface_hub.utils.disable_progress_bars", lambda: calls.append(True))
+
+    monkeypatch.setattr(sys, "stderr", _FakeStderr(tty=True))
+    _run_main_against_an_occupied_port(tmp_path, monkeypatch, subdir="tty")
+    assert calls == []  # interactive: progress bars stay on
+
+    monkeypatch.setattr(sys, "stderr", _FakeStderr(tty=False))
+    _run_main_against_an_occupied_port(tmp_path, monkeypatch, subdir="no-tty")
+    assert calls == [True]  # non-interactive: progress bars are silenced
 
 
 def test_server_status_reports_context_policy(svc):

@@ -279,6 +279,34 @@ def test_a_request_abandoned_while_queued_never_generates(tmp_path: Path):
         assert third.json()["content"] == [{"type": "text", "text": "third"}]
 
 
+def test_a_request_abandoned_while_queued_logs_status_and_error(tmp_path: Path, capsys):
+    """This was the only member of the /v1/messages family with no `status=`
+    and no `error=` — free prose among key=value tokens. It must read like
+    every other refusal on the endpoint."""
+    inner = ChunkedFakeEngine(["a|b|c|d|e|f", "third"], delay=0.4)
+    with (
+        _serve(_app(tmp_path, inner)) as (base, _server, _thread),
+        httpx.Client(timeout=30) as client,
+    ):
+
+        def first_turn() -> None:
+            with contextlib.suppress(Exception):
+                client.post(f"{base}/v1/messages", json=_body(stream=False))
+
+        first = threading.Thread(target=first_turn, daemon=True)
+        first.start()
+        _wait_for_generation(inner)  # the first turn holds the gateway lock
+        with client.stream("POST", f"{base}/v1/messages", json=_body()) as r:
+            assert r.status_code == 200  # headers and the first ping arrive while queued
+        # Leaving the block closed the second request while it was still queued.
+        first.join(10)
+        time.sleep(1.0)  # every chance for the abandoned turn's line to be written
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "model=sous-local stream=1" in line]
+    assert len(lines) == 1, err
+    assert "status=499 error=abandoned" in lines[0]
+
+
 def test_shutdown_is_bounded_while_a_non_streaming_turn_runs(tmp_path: Path):
     """uvicorn owns SIGTERM while it serves and, unbounded, waits for every open
     connection before sous's own handler runs; a non-streaming gateway turn

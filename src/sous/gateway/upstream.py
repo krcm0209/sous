@@ -108,9 +108,8 @@ class SynthesizedError(JSONResponse):
     """An Anthropic-shaped error the forwarder made itself (unreachable
     upstream, timeout, client gone) — as opposed to a status the upstream
     answered, which is forwarded verbatim. The gateway's log line tells the
-    two apart by this class, never by the number: a 502 can be either."""
-
-    sous_synthesized = True
+    two apart by this class (isinstance, not an attribute check), never by
+    the number: a 502 can be either."""
 
 
 def _error(status: int, message: str) -> SynthesizedError:

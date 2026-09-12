@@ -545,6 +545,12 @@ def _fold_legacy_stderr_log(data_dir: Path) -> bool:
     try:
         with legacy.open("rb") as src, target.open("ab") as dst:
             shutil.copyfileobj(src, dst)
+            # The appended bytes are only in the page cache at this point,
+            # while the unlink below is journaled metadata; without forcing
+            # them out first, a panic between the two loses the folded
+            # history even though the source is already gone.
+            dst.flush()
+            os.fsync(dst.fileno())
     except OSError as exc:
         # No rollback attempt: a partial append may already be in target, so a
         # retry after the underlying problem (full disk, an unwritable target)
