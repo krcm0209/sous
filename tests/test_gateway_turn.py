@@ -430,8 +430,8 @@ def test_cache_hit_is_reported_from_the_sessions_own_counters(tmp_path: Path):
 
 
 class _SlowCount(ChunkedFakeEngine):
-    """count_tokens costs 50 ms, so tokenize_s cannot be satisfied by the
-    probe term alone."""
+    """count_tokens costs 50 ms, so tokenize_seconds cannot be satisfied by
+    the probe term alone."""
 
     def count_tokens(self, messages, tools):
         time.sleep(0.05)
@@ -528,6 +528,53 @@ def test_counter_fields_are_deltas_not_totals(tmp_path: Path):
     second = runner.run(MSGS, [], 100, RecordingSink())
     assert (first.forks, first.evictions) == (0, 0)
     assert (second.forks, second.evictions, second.pressure_evictions) == (1, 0, 0)
+
+
+def test_gauge_fields_are_read_directly_not_as_deltas(tmp_path: Path):
+    """prefilled_tokens/took_len/bounds/prefill_seconds/decode_seconds (and,
+    folded into tokenize_seconds, probe_seconds) are the cache's own
+    per-turn gauges, reassigned whole on every generate() call — never a
+    before/after delta like forks/evictions/pressure_evictions are. A prior
+    turn's higher readings sitting in `before` must not leak into, or get
+    subtracted from, this turn's lower ones."""
+    inner = FakeEngine(["a"])
+    inner.stats = {
+        "hits": 0,
+        "fork_hits": 0,
+        "reused_tokens": 0,
+        "prefilled_tokens": 900,
+        "took_len": 900,
+        "bound_lo": 500,
+        "bound_hi": 600,
+        "probe_seconds": 5.0,
+        "prefill_seconds": 5.0,
+        "decode_seconds": 5.0,
+    }
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        inner.stats = {
+            **inner.stats,
+            "prefilled_tokens": 40,
+            "took_len": 40,
+            "bound_lo": 10,
+            "bound_hi": 20,
+            "probe_seconds": 3.0,
+            "prefill_seconds": 2.0,
+            "decode_seconds": 2.5,
+        }
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    runner, _ = _runner(tmp_path, inner)
+    result = runner.run(MSGS, [], 100, RecordingSink())
+    assert (result.prefilled_tokens, result.took_len, result.bounds) == (40, 40, (10, 20))
+    assert (result.prefill_seconds, result.decode_seconds) == (2.0, 2.5)
+    # probe_seconds is added into tokenize_seconds rather than exposed on its
+    # own; a delta (3.0 - 5.0, clamped to 0) would land near zero on a fast
+    # FakeEngine.count_tokens, far below this window.
+    assert 2.9 <= result.tokenize_seconds < 3.5
 
 
 def test_queue_seconds_is_the_wait_for_the_gateway_lock(tmp_path: Path):
