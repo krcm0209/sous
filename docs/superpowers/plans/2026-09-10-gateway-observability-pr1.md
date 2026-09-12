@@ -18,6 +18,7 @@
 - The gateway never logs a request body, a header value or a query string. Every new field is a count, a duration, an 8-hex-character hash of *rendered* text, or an identifier already bounded by `_log_token`.
 - Tests never touch the real `~/.sous` or `~/.claude`: every path comes from `tmp_path`.
 - Never edit, reformat or "sync" anything under `docs/superpowers/**` (this plan and its spec included) once committed.
+- **No plan language in committed code.** Code and test comments/docstrings must never cite a spec, a plan, a task or a step ("Task 1's helper", "Spec:", "the spec promises", "docs/superpowers/…"). Where a code block below carries such a reference, restate the underlying fact instead. Sweep before the PR: `grep -rnE 'Task [0-9]|Step [0-9]|[Ss]pec[: ]|docs/superpowers' src tests`.
 - Commits: Conventional Commits, imperative lowercase subject, *why* in the body, trailer exactly `Co-Authored-By: Claude <noreply@anthropic.com>`.
 - Verification before every commit: `set -o pipefail; uv run pytest -m "not model" -q 2>&1 | tail -3` (never pipe without `pipefail` — it masked a failure once), `uv run ty check`, `uv run ruff format .` then `uv run ruff check . && uv run ruff format --check .`. Several code blocks below are written wide for reading; `ruff format` reflows them (line length 100). `uv lock --check` after any `pyproject.toml` change (none expected here).
 - `ty` flags an unused `# ty: ignore[...]` as a diagnostic: add a pragma only when `ty check` names the rule.
@@ -603,7 +604,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 ### Task 3: seconds on every line; the `count_tokens` line; the model-load line
 
 **Files:**
-- Modify: `src/sous/gateway/turn.py` (`count_tokens` at lines 207–215; add `CountResult` next to `TurnResult`), `src/sous/gateway/routes.py` (`messages()` at 446–560, `count_tokens()` at 411–445, `_stream()` at ~590–640), `src/sous/engine/base.py` (`EngineManager.get` at lines 482–487)
+- Modify: `src/sous/gateway/turn.py` (`count_tokens` at lines 207–215; add `CountResult` next to `TurnResult`), `src/sous/gateway/routes.py` (`messages()` at 446–560, `count_tokens()` at 411–445, `_stream()` at ~590–640), `src/sous/engine/base.py` (`EngineManager.get` at lines 491–496)
 - Test: `tests/test_gateway_turn.py` (`test_count_tokens_uses_the_engine_and_releases` at ~line 349), `tests/test_gateway_routes.py`, `tests/test_engine_base.py`
 
 **Interfaces:**
