@@ -550,6 +550,16 @@ def serve(mcp: MCPServer, host: str, port: int) -> None:
 
 
 def main() -> None:
+    # The line shape from the first line on — load_config() below is about to
+    # warn on whatever is wrong with the user's config file, and that must
+    # already come out shaped and leveled, not as a raw UserWarning on stderr.
+    # Install the handler (create_server re-runs the idempotent installer
+    # after MCPServer.__init__ puts the SDK's RichHandler back) and route
+    # warnings.warn through logging (pytest owns showwarning in tests) before
+    # anything else runs. Neither depends on the config or the singleton lock
+    # below, so there is no reason for either to wait.
+    configure_daemon_logging()
+    enable_warning_capture()
     config = load_config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
     # Adopt the login shell's PATH before the worker exists: scrubbed_env()
@@ -563,15 +573,9 @@ def main() -> None:
     # model. The port bind at the end of this function is far too late to be
     # the guard. `_lock` is unused by design — it must stay open to hold it.
     _lock = _acquire_singleton_lock(config.data_dir)
-    # The line shape from the first line on: install the handler before the
-    # startup lines below (create_server re-runs the idempotent installer
-    # after MCPServer.__init__ puts the SDK's RichHandler back). Two more
-    # things only the daemon entry point may do to process-wide state: route
-    # warnings.warn through logging (pytest owns showwarning in tests), and
-    # silence huggingface_hub's tqdm bars — terminal animation that lands in
-    # a log file as garbage (`Fetching 13 files: 100%|██████████|`).
-    configure_daemon_logging()
-    enable_warning_capture()
+    # Only the daemon entry point silences huggingface_hub's tqdm bars —
+    # terminal animation that lands in a log file as garbage (`Fetching 13
+    # files: 100%|██████████|`).
     from huggingface_hub.utils import disable_progress_bars
 
     # launchd's stderr is a pipe with nobody to animate a bar for; a `sous

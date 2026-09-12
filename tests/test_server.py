@@ -535,6 +535,53 @@ def test_main_installs_the_shutdown_handler_before_serving(tmp_path: Path, monke
     assert installed, "main() served without installing the shutdown handler"
 
 
+def test_main_routes_config_load_warnings_through_the_daemon_shape(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """load_config() runs inside main(), which must already have installed the
+    warnings-to-logging redirect by the time it does — otherwise a config typo
+    reaches stderr as a raw `UserWarning`, unshaped and unleveled, while every
+    other line the daemon writes carries a timestamp and a level.
+    """
+    import dataclasses
+    import logging
+
+    import sous.server as server
+    from sous.config import load_config as real_load_config
+
+    data = tmp_path / "data"
+    data.mkdir()
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[nonsense]\n")  # unknown section: load_config warns
+
+    with socket.socket() as occupied:  # make mcp.run() fail fast instead of serving
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+
+        def fake_load_config():
+            # The real parser, so the warning is genuine — only the paths
+            # (never the real ~/.sous) and port are stood in for.
+            cfg = real_load_config(config_path)
+            return dataclasses.replace(cfg, data_dir=data, server_port=occupied.getsockname()[1])
+
+        monkeypatch.setattr(server, "load_config", fake_load_config)
+        # logging.captureWarnings(True) only rebinds warnings.showwarning the
+        # first time it is called in a process — a no-op on every later call
+        # while it thinks capture is already on. An earlier test in this same
+        # file already left it "on" from a stale rebinding, so reset it here
+        # (and restore that reset afterward) rather than depend on suite order.
+        logging.captureWarnings(False)
+        try:
+            with caplog.at_level("WARNING"), pytest.raises(SystemExit):
+                server.main()
+        finally:
+            logging.captureWarnings(False)
+
+    warning_records = [r for r in caplog.records if r.name == "py.warnings"]
+    assert warning_records, "config warning never reached logging as py.warnings"
+    assert "unknown section" in warning_records[0].getMessage()
+
+
 # --- login-shell PATH resolution ------------------------------------------------
 
 

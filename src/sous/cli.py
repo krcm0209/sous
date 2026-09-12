@@ -561,7 +561,20 @@ def _fold_legacy_stderr_log(data_dir: Path) -> bool:
             f"{legacy.name} left in place"
         )
         raise SystemExit(1) from None
-    legacy.unlink()
+    try:
+        legacy.unlink()
+    except OSError as exc:
+        # The append above already landed and was fsynced, so — same stance
+        # as the copy failure — there is nothing to roll back. Unlike that
+        # case, the fold itself succeeded here; say so, and name what a
+        # human needs to do before the next run appends this file's bytes
+        # a second time, rather than let the exception escape as a traceback.
+        print(
+            f"sous: folded {legacy.name} into {target.name}, but could not remove "
+            f"{legacy.name} ({exc}); delete it by hand before re-running or its "
+            f"contents will be appended twice"
+        )
+        raise SystemExit(1) from None
     print(f"folded {legacy.name} into {target.name}")
     return True
 

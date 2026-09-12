@@ -1,3 +1,4 @@
+import errno
 import os
 import plistlib
 import socket
@@ -516,6 +517,36 @@ def test_install_launchd_reports_a_failed_fold_and_stops(tmp_path, capsys, monke
     out = capsys.readouterr().out
     assert "daemon.err.log" in out and "daemon.log" in out
     assert (tmp_path / "daemon.err.log").read_bytes() == b"err-1\n"
+    assert not plist.exists() and not calls["run"]
+
+
+def test_install_launchd_reports_a_failed_unlink_and_stops(tmp_path, capsys, monkeypatch):
+    """Unlike the copy failure above, the append has already landed and been
+    fsynced by the time unlink can fail — rolling it back would trade a
+    duplicate for a loss, so this must fail safe the other way: say the fold
+    already happened, name both files, and tell the operator to delete the
+    old one by hand rather than let a raw OSError escape as a traceback."""
+    cli, plist, calls = _install_env(tmp_path, monkeypatch, bootout_code=0, lock_held=False)
+    (tmp_path / "daemon.log").write_bytes(b"out-1\n")
+    (tmp_path / "daemon.err.log").write_bytes(b"err-1\n")
+
+    real_unlink = Path.unlink
+
+    def failing_unlink(self, *args, **kwargs):
+        if self.name == "daemon.err.log":
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["install-launchd"])
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "daemon.err.log" in out and "daemon.log" in out
+    assert "delete it by hand" in out
+    # the append happened and was not rolled back
+    assert (tmp_path / "daemon.log").read_bytes() == b"out-1\nerr-1\n"
+    assert (tmp_path / "daemon.err.log").exists()  # unlink failed: still there
     assert not plist.exists() and not calls["run"]
 
 
