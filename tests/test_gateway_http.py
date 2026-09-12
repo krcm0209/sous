@@ -219,7 +219,7 @@ def test_pings_keep_flowing_while_the_model_is_silent(tmp_path: Path, monkeypatc
 
 
 def test_client_disconnect_drains_the_turn_and_never_wedges_the_next(tmp_path: Path):
-    """Spec Phase 1 requirement: an undrained producer holding the engine lock
+    """An undrained producer holding the engine lock
     would block every later generation. The thread finishes the turn after the
     client is gone, and the next request runs on the same session."""
     inner = ChunkedFakeEngine(["a|b|c|d|e", "second"], delay=0.3)

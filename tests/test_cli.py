@@ -693,7 +693,7 @@ def test_claude_passes_every_argument_through_including_help(tmp_path, monkeypat
 
 
 def test_claude_warns_about_a_credential_variable_but_still_launches(tmp_path, capsys, monkeypatch):
-    """Spec: warn, don't refuse — either variable moves the main loop from the
+    """Warn, don't refuse — either variable moves the main loop from the
     subscription to API-credit billing, and that is the user's call to make."""
     from sous import cli
 

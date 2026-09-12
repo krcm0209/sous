@@ -55,6 +55,7 @@ _KNOWN = {
         "prompt_cache_gb",
         "speculative_draft_id",
         "speculative_block_size",
+        "int8_prefill",
     },
     "budgets": {"max_turns", "max_minutes", "max_tokens_per_generation"},
     "commands": {"allowlist", "timeout_seconds", "approval_timeout_minutes"},
@@ -106,6 +107,13 @@ class SousConfig:
     # at the default model's GQA ratio, and 6–8 rows run 5–6x slower per layer.
     speculative_draft_id: str = "z-lab/Qwen3.8-27B-DFlash2"
     speculative_block_size: int = 3
+    # Prefill matmuls of affine-Q4/gs64 projections on the M5 tensor units with
+    # int8 activations: ~1.4x prefill measured on the M5 Pro (2026-09-11), but
+    # int8 activations change numerics (KL 0.033 vs stock on the standard prompt,
+    # inside the 4-bit weight envelope of 0.052), so it ships off until the
+    # tool-loop A/B says otherwise. Ignored, with a status reason, on GPUs
+    # without neural accelerators (pre-M5) or macOS < 26.2.
+    int8_prefill: bool = False
     # Reuse one KV cache across the turns of a task, prefilling only what the
     # conversation gained, instead of re-prefilling from scratch every turn.
     # Works because all of a task's generations share one GenerationSession
@@ -282,6 +290,20 @@ def _prompt_cache_gb(model: dict) -> float | None:
     return float(value)
 
 
+def _int8_prefill(model: dict) -> bool:
+    """[model].int8_prefill: true or false; anything else warns and means false,
+    the same stance as the other [model] knobs (a typo must not turn on a path
+    that changes numerics)."""
+    value = model.get("int8_prefill", False)
+    if isinstance(value, bool):
+        return value
+    warnings.warn(
+        f"sous config: [model].int8_prefill {value!r} must be true or false; using false",
+        stacklevel=3,
+    )
+    return False
+
+
 def _gateway_values(gateway: dict) -> tuple[bool, tuple[str, ...], int, int]:
     """Validated [gateway] values, each degrading to its default with a
     warning — except the window, which is clamped UP to the Claude Code floor:
@@ -306,7 +328,7 @@ def _gateway_values(gateway: dict) -> tuple[bool, tuple[str, ...], int, int]:
             stacklevel=3,
         )
         models = ["sous-local"]
-    # Spec: honest ids are mandatory. Claude Code ignores
+    # Honest ids are mandatory. Claude Code ignores
     # CLAUDE_CODE_MAX_CONTEXT_TOKENS for any id that canonicalizes to claude-*
     # and trusts its built-in window instead, so an impersonating id silently
     # forfeits the window control the gateway relies on (and, once routing
@@ -443,6 +465,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         prompt_cache_gb=_prompt_cache_gb(model),
         speculative_draft_id=model.get("speculative_draft_id", "z-lab/Qwen3.8-27B-DFlash2"),
         speculative_block_size=_speculative_block_size(model),
+        int8_prefill=_int8_prefill(model),
         max_turns=budgets.get("max_turns", 40),
         max_minutes=budgets.get("max_minutes", 15),
         max_tokens_per_generation=budgets.get("max_tokens_per_generation", 4096),

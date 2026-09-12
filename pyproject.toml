@@ -10,7 +10,7 @@ authors = [
     { name = "krcm0209", email = "17315774+krcm0209@users.noreply.github.com" }
 ]
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "LICENSES/Apache-2.0.txt"]
 requires-python = ">=3.14"
 keywords = [
     "claude",

@@ -388,7 +388,7 @@ def test_approval_flow_denied(env):
 
 def test_generation_timeout_at_wall_budget_is_budget_exhausted(env):
     """C1: the generation timeout IS the remaining wall-clock budget, so a
-    timeout with the deadline passed means the budget ran out — per spec that
+    timeout with the deadline passed means the budget ran out, which
     ends the task as done/budget-exhausted with a partial report, never
     failed. (Previously test_generation_stall_fails_task, which asserted
     FAILED/'stalled' for exactly this case.)"""

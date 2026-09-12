@@ -321,6 +321,34 @@ def test_prompt_cache_gb_rejects_garbage_with_a_warning(tmp_path: Path, bad: str
     assert cfg.prompt_cache_gb is None
 
 
+# ---- [model].int8_prefill -----------------------------------------------------
+
+
+def test_int8_prefill_defaults_off(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nid = 'x/y'\n")
+    assert load_config(p).int8_prefill is False
+    assert SousConfig().int8_prefill is False
+
+
+def test_int8_prefill_reads_true_without_an_unknown_key_warning(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nint8_prefill = true\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cfg = load_config(p)
+    assert cfg.int8_prefill is True
+
+
+@pytest.mark.parametrize("bad", ['"yes"', "1", "0.5"])
+def test_int8_prefill_rejects_non_booleans_with_a_warning(tmp_path: Path, bad: str):
+    p = tmp_path / "config.toml"
+    p.write_text(f"[model]\nint8_prefill = {bad}\n")
+    with pytest.warns(UserWarning, match=r"\[model\]\.int8_prefill"):
+        cfg = load_config(p)
+    assert cfg.int8_prefill is False
+
+
 def test_speculative_defaults(tmp_path: Path):
     cfg = load_config(tmp_path / "nope.toml")
     assert cfg.speculative_draft_id == "z-lab/Qwen3.8-27B-DFlash2"
@@ -480,8 +508,8 @@ def test_gateway_local_models_rejects_non_string_entries(tmp_path: Path):
 def test_gateway_local_models_rejects_claude_ids(tmp_path: Path):
     """Claude Code ignores CLAUDE_CODE_MAX_CONTEXT_TOKENS for ids that
     canonicalize to claude-*, so an impersonating id silently forfeits the
-    window control the gateway depends on — the spec makes honest ids
-    mandatory, not preferable."""
+    window control the gateway depends on — honest ids are mandatory, not
+    preferable."""
     p = tmp_path / "config.toml"
     p.write_text('[gateway]\nlocal_models = ["sous-local", "Claude-haiku-4-5"]\n')
     with warnings.catch_warnings(record=True) as caught:

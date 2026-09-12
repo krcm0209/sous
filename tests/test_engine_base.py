@@ -465,6 +465,99 @@ def test_engine_manager_threads_drafter_config_into_default_factory(monkeypatch)
     assert seen["kwargs"]["draft_block_size"] == 5
 
 
+# ---- int8 prefill plumbing --------------------------------------------------------
+
+
+def test_engine_manager_threads_int8_prefill_into_default_factory(monkeypatch):
+    import sous.engine.base as base
+
+    seen: dict[str, dict] = {}
+
+    def fake_default_factory(model_id, *args, **kwargs):
+        seen["kwargs"] = kwargs
+        return FakeEngine([])
+
+    monkeypatch.setattr(base, "_default_factory", fake_default_factory)
+    EngineManager(SousConfig(int8_prefill=True)).get()
+    assert seen["kwargs"]["int8_prefill"] is True
+
+
+def test_default_factory_passes_int8_prefill_to_both_engines(monkeypatch):
+    from sous.engine import base, lm, vlm
+
+    seen: dict[str, dict] = {}
+
+    class RecordingVLM:
+        def __init__(self, model_id, **kwargs):
+            seen["vlm"] = kwargs
+
+    class RecordingLM:
+        def __init__(self, model_id, **kwargs):
+            seen["lm"] = kwargs
+
+    monkeypatch.setattr(vlm, "VLMEngine", RecordingVLM)
+    monkeypatch.setattr(lm, "LMEngine", RecordingLM)
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"vision_config": {}})
+    monkeypatch.setattr("sous.context.kv_bytes_per_token", lambda cfg: 1024)
+    base._default_factory("m", 0.7, 0.8, 20, True, cache_budget=0, int8_prefill=True)
+    assert seen["vlm"]["int8_prefill"] is True
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"model_type": "qwen3_5"})
+    base._default_factory("m", 0.7, 0.8, 20, True, cache_budget=0, int8_prefill=True)
+    assert seen["lm"]["int8_prefill"] is True
+
+
+def test_status_carries_the_int8_prefill_view_when_the_engine_reports_one(tmp_path):
+    inner = FakeEngine([])
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    assert "int8_prefill" not in manager.status(), "fakes without the attribute stay silent"
+    inner.int8_prefill_status = {  # ty: ignore[unresolved-attribute]
+        "state": "active",
+        "reason": None,
+        "routed": 336,
+    }
+    assert manager.status()["int8_prefill"] == {"state": "active", "reason": None, "routed": 336}
+
+
+def test_vlm_engine_enables_int8_prefill_on_the_loaded_model(monkeypatch):
+    from sous.engine import int8prefill
+    from sous.engine.vlm import VLMEngine
+
+    model = types.SimpleNamespace(config=types.SimpleNamespace(model_type="fake"))
+    processor = types.SimpleNamespace(tokenizer=_RecordingTokenizer())
+    _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+    seen: dict[str, object] = {}
+
+    def fake_enable(m, *, enabled):
+        seen["model"], seen["enabled"] = m, enabled
+        return {"state": "off", "reason": None, "routed": 0}
+
+    monkeypatch.setattr(int8prefill, "enable", fake_enable)
+    engine = VLMEngine("test/model", cache_budget=0, int8_prefill=True)
+    assert seen == {"model": model, "enabled": True}
+    assert engine.int8_prefill_status == {"state": "off", "reason": None, "routed": 0}
+
+
+def test_lm_engine_enables_int8_prefill_on_the_loaded_model(monkeypatch):
+    from sous.engine import int8prefill
+    from sous.engine.lm import LMEngine
+
+    model = object()
+    _stub(monkeypatch, "mlx_lm", load=lambda model_id: (model, _RecordingTokenizer()))
+    _stub(monkeypatch, "mlx_lm.sample_utils", make_sampler=lambda **kw: None)
+    seen: dict[str, object] = {}
+
+    def fake_enable(m, *, enabled):
+        seen["model"], seen["enabled"] = m, enabled
+        return {"state": "unavailable", "reason": "test", "routed": 0}
+
+    monkeypatch.setattr(int8prefill, "enable", fake_enable)
+    engine = LMEngine("test/model", cache_budget=0, int8_prefill=False)
+    assert seen == {"model": model, "enabled": False}
+    assert engine.int8_prefill_status["state"] == "unavailable"
+
+
 # ---- streaming deltas (gateway) ---------------------------------------------
 
 

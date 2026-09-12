@@ -272,8 +272,8 @@ def auto_cache_budget(*, working_set: int, active: int, reserve_bytes: int) -> i
     serves without paging, minus what mlx already holds (the weights, when
     read at load), minus the largest cache one turn can build (`reserve_bytes`
     — the window times the KV cost of a token), minus a fixed slack. This is
-    the "reserved out of the generation budget" of the spec: the turn's own
-    cache is paid for first, slots get what is left."""
+    the reserve taken out of the generation budget: the turn's own cache is
+    paid for first, slots get what is left."""
     return max(0, working_set - active - reserve_bytes - CACHE_BUDGET_SLACK)
 
 
@@ -499,7 +499,7 @@ class PrefixCache:
         For the fork copy, which is charged before it is allocated rather than
         after: publishing first and evicting afterwards would put the copy and
         whatever it displaces on the machine at the same time — the transient
-        doubling the spec promises never happens. `protect` is the forks this
+        doubling that must never happen. `protect` is the forks this
         same turn already published: a second copy is never made room for by
         evicting the first, and when the budget cannot hold both the answer
         is False and the caller skips the copy rather than evicting into it.
@@ -878,7 +878,7 @@ class PrefixCache:
             # at the end of the except clause (PEP 3110) — retrying inside it
             # would keep the failed full-size cache pinned by that traceback
             # for the whole retry, on top of the cold replacement being
-            # prefilled: exactly the doubling the spec promises never happens.
+            # prefilled: exactly the doubling that must never happen.
             retry_reason = str(e)
 
         if retry_reason is not None:
