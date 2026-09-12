@@ -718,7 +718,7 @@ def test_a_full_count_queue_answers_529_and_releases_its_slot(tmp_path: Path, mo
 
 
 def test_log_lines_carry_metadata_only(tmp_path: Path, capsys):
-    """Spec security posture: bodies and header values never reach a log."""
+    """Security posture: bodies and header values never reach a log."""
     secret_text = "SECRET-PROMPT-TEXT-7f3a"
     secret_token = "sk-ant-oat01-SECRET-TOKEN-9c1d"
     app = _app(tmp_path, FakeEngine(["a reply"]))
