@@ -1430,6 +1430,142 @@ def test_a_claimed_model_id_cannot_forge_or_bloat_a_log_line(tmp_path: Path, cap
     lines = [line for line in err.splitlines() if "sous.gateway:" in line]
     assert lines, "expected at least one log line"
     for line in lines:
-        assert len(line) < 200, line
+        # The attributed turn line is ~410 chars with its prefix; the cap is
+        # here to catch an unbounded client string, not to pin a length.
+        assert len(line) < 500, line
+        assert "A" * 20 not in line, line  # the oversized id never reaches it
         if "model=" in line:
             assert "model=-" in line, line
+
+
+def _fields(line: str) -> dict[str, str]:
+    """`key=value` tokens of a turn line; `bounds=[a,b]` stays one token."""
+    return dict(tok.split("=", 1) for tok in line.split(" ") if "=" in tok)
+
+
+_ALL_GAUGES = {
+    "hits": 0,
+    "fork_hits": 0,
+    "reused_tokens": 0,
+    "miss_lcp": 0,
+    "forks": 0,
+    "evictions": 0,
+    "pressure_evictions": 0,
+    "prefilled_tokens": 0,
+    "took_len": 0,
+    "bound_lo": 0,
+    "bound_hi": 0,
+    "probe_seconds": 0.0,
+    "prefill_seconds": 0.0,
+    "decode_seconds": 0.0,
+}
+
+
+def test_the_turn_line_attributes_a_hit(tmp_path: Path, capsys):
+    inner = FakeEngine(["first", "second reply here"])
+    inner.stats = dict(_ALL_GAUGES)
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 2:
+            inner.stats = {
+                **_ALL_GAUGES,
+                "hits": 1,
+                "reused_tokens": 40,
+                "prefilled_tokens": 6,
+                "took_len": 40,
+                "bound_lo": 10,
+                "bound_hi": 30,
+                "forks": 1,
+                "evictions": 2,
+                "pressure_evictions": 1,
+                "prefill_seconds": 2.0,
+                "decode_seconds": 4.0,
+            }
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    app = _app(tmp_path, inner)
+    assert _post(app, _body(system="Be terse.", tools=[READ_TOOL])).status_code == 200
+    r = _post(app, _body(system="Be terse.", tools=[READ_TOOL]))
+    assert r.status_code == 200
+    line = _turn_lines(capsys.readouterr().err)[1]
+    f = _fields(line)
+    assert f["id"] == r.json()["id"] and f["id"].startswith("msg_")
+    assert f["cache"] == "hit" and f["took"] == "turn@40"
+    assert f["reused_tokens"] == "40" and f["prefilled_tokens"] == "6"
+    assert (f["forks"], f["evicted"], f["pressure"]) == ("1", "2", "1")
+    assert f["prefill_s"] == "2.0" and f["decode_s"] == "4.0"
+    # 6 prefilled tokens / 2.0 s; "second reply here" is 3 words = 3 output tokens / 4.0 s
+    assert f["prefill_tps"] == "3.0" and f["decode_tps"] == "0.8"
+    for key in ("load_s", "queue_s", "tokenize_s", "ttft_s", "seconds"):
+        assert key in f, key
+    assert len(f["tools"]) == 8 and len(f["system"]) == 8
+    assert "lcp" not in f and "bounds" not in f
+
+
+def test_the_turn_line_diagnoses_a_miss(tmp_path: Path, capsys):
+    inner = FakeEngine(["reply"])
+    inner.stats = {
+        **_ALL_GAUGES,
+        "miss_lcp": 25,
+        "bound_lo": 10,
+        "bound_hi": 30,
+        "prefilled_tokens": 50,
+    }
+    app = _app(tmp_path, inner)
+    assert _post(app, _body()).status_code == 200
+    f = _fields(_turn_lines(capsys.readouterr().err)[0])
+    assert f["cache"] == "miss" and f["took"] == "none"
+    assert (f["lcp"], f["lcp_region"], f["bounds"]) == ("25", "system", "[10,30]")
+    assert (f["tools"], f["system"]) == ("-", "-")  # no tools, no system text in _body()
+
+
+@pytest.mark.parametrize(
+    ("lcp", "lo", "hi", "region"),
+    [
+        (5, 10, 30, "tools"),
+        (15, 10, 30, "system"),
+        (35, 10, 30, "conversation"),
+        (15, 0, 30, "system"),
+        (35, 0, 30, "conversation"),
+        (15, 0, 0, "-"),
+    ],
+)
+def test_lcp_region_places_the_divergence(lcp, lo, hi, region):
+    from sous.gateway.routes import _lcp_region
+
+    assert _lcp_region(lcp, lo, hi) == region
+
+
+def test_rates_and_optional_fields_print_a_dash_when_undefined():
+    from sous.gateway.routes import _opt, _rate
+
+    assert _rate(100, 0.0) == "-" and _rate(100, 4.0) == "25.0" and _rate(59, 4.0) == "14.8"
+    assert _opt(None) == "-" and _opt(1.234) == "1.2"
+
+
+def test_a_fork_hit_prints_took_fork(tmp_path: Path, capsys):
+    inner = FakeEngine(["a", "b"])
+    inner.stats = dict(_ALL_GAUGES)
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 2:
+            inner.stats = {
+                **_ALL_GAUGES,
+                "hits": 1,
+                "fork_hits": 1,
+                "reused_tokens": 4000,
+                "took_len": 4000,
+            }
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    app = _app(tmp_path, inner)
+    _post(app, _body())
+    _post(app, _body())
+    f = _fields(_turn_lines(capsys.readouterr().err)[1])
+    assert f["cache"] == "fork" and f["took"] == "fork@4000"

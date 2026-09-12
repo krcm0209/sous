@@ -136,6 +136,28 @@ def _status_level(status: int) -> int:
     return logging.ERROR if status >= 500 and status != 529 else logging.WARNING
 
 
+def _lcp_region(lcp: int, lo: int, hi: int) -> str:
+    """Which part of the render a miss diverged in, given the two fork
+    boundaries the probe verified: below the tools boundary the tool array
+    changed, below the header the system text did, else the conversation.
+    `-` when the probe never ran (no fork budget)."""
+    if not hi:
+        return "-"
+    if lo and lcp < lo:
+        return "tools"
+    if lcp < hi:
+        return "system"
+    return "conversation"
+
+
+def _rate(count: int, seconds: float) -> str:
+    return "-" if seconds <= 0 else f"{count / seconds:.1f}"
+
+
+def _opt(value: float | None) -> str:
+    return "-" if value is None else f"{value:.1f}"
+
+
 def _elapsed(since: float) -> str:
     return f" seconds={time.monotonic() - since:.1f}"
 
@@ -701,15 +723,35 @@ class Gateway:
         self, chat: ChatRequest, result: TurnResult, assembler: TurnAssembler, *, stream: bool
     ) -> None:
         cache = "fork" if result.forked else "hit" if result.cache_hit else "miss"
+        took = (
+            "none"
+            if cache == "miss"
+            else f"{'fork' if cache == 'fork' else 'turn'}@{result.took_len}"
+        )
+        lo, hi = result.bounds
         # A hit already says how much was reused; a miss says how far the
-        # render agreed with the closest slot, which is the number that tells
-        # a changed tool array from a changed system text.
-        lcp = f" lcp={result.lcp}" if cache == "miss" else ""
+        # render agreed with the closest slot and in which region — the
+        # number that tells a changed tool array from a changed system text.
+        diag = ""
+        if cache == "miss":
+            bounds = ",".join(str(b) for b in (lo, hi) if b)
+            diag = (
+                f" lcp={result.lcp} lcp_region={_lcp_region(result.lcp, lo, hi)} bounds=[{bounds}]"
+            )
         _log(
-            f"POST /v1/messages model={_model_label(chat)} stream={int(stream)} status=200 "
+            f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
+            f"stream={int(stream)} status=200 "
             f"input_tokens={result.input_tokens} output_tokens={result.output_tokens} "
-            f"stop={assembler.stop_reason} cache={cache} "
-            f"reused_tokens={result.reused_tokens}{lcp} seconds={result.seconds:.1f}"
+            f"stop={assembler.stop_reason} cache={cache} took={took} "
+            f"reused_tokens={result.reused_tokens} prefilled_tokens={result.prefilled_tokens} "
+            f"forks={result.forks} evicted={result.evictions} pressure={result.pressure_evictions} "
+            f"load_s={result.load_seconds:.1f} queue_s={result.queue_seconds:.1f} "
+            f"tokenize_s={result.tokenize_seconds:.1f} ttft_s={_opt(result.ttft_seconds)} "
+            f"prefill_s={result.prefill_seconds:.1f} decode_s={result.decode_seconds:.1f} "
+            f"prefill_tps={_rate(result.prefilled_tokens, result.prefill_seconds)} "
+            f"decode_tps={_rate(result.output_tokens, result.decode_seconds)} "
+            f"seconds={result.seconds:.1f}{diag} "
+            f"tools={chat.tools_hash or '-'} system={chat.system_hash or '-'}"
         )
 
 
