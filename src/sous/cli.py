@@ -359,6 +359,23 @@ def _await_port_closed(port: int, seconds: float) -> bool:
     return not _port_open(port)
 
 
+def _await_lock_free(data_dir: Path, seconds: float) -> bool:
+    """Wait up to `seconds` for the daemon lock to be free.
+
+    The port closes as soon as launchd's listener stops accepting, but a
+    daemon unloading a resident model is still running lifespan shutdown —
+    and still holding the flock — for seconds after that. Poll the lock
+    itself rather than the port, since the lock is what the caller actually
+    needs free.
+    """
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not _lock_is_held(data_dir):
+            return True
+        time.sleep(0.2)
+    return not _lock_is_held(data_dir)
+
+
 def _launchd_loaded(label: str) -> bool:
     """Whether launchd is currently managing the daemon.
 
@@ -525,8 +542,19 @@ def _fold_legacy_stderr_log(data_dir: Path) -> bool:
     if not legacy.exists():
         return False
     target = data_dir / "daemon.log"
-    with legacy.open("rb") as src, target.open("ab") as dst:
-        shutil.copyfileobj(src, dst)
+    try:
+        with legacy.open("rb") as src, target.open("ab") as dst:
+            shutil.copyfileobj(src, dst)
+    except OSError as exc:
+        # No rollback attempt: a partial append may already be in target, so a
+        # retry after the underlying problem (full disk, an unwritable target)
+        # is fixed will duplicate that prefix — an accepted cost of not losing
+        # anything, since the legacy file is left in place either way.
+        print(
+            f"sous: could not fold {legacy.name} into {target.name} ({exc}); "
+            f"{legacy.name} left in place"
+        )
+        raise SystemExit(1) from None
     legacy.unlink()
     print(f"folded {legacy.name} into {target.name}")
     return True
@@ -547,11 +575,16 @@ def _cmd_install_launchd() -> None:
         print(f"sous: launchctl bootout failed (exit {code}); not touching {plist_path}")
         raise SystemExit(1)
     if code == 0:
-        _await_port_closed(config.server_port, _UNLOAD_GRACE_SECONDS)
+        _await_lock_free(config.data_dir, _UNLOAD_GRACE_SECONDS)
     if _lock_is_held(config.data_dir):
-        # A daemon launchd did not start — `sous serve` by hand — is still
-        # writing its log files; folding one under it would lose lines.
-        print("sous: a daemon is running and holds the lock; stop it first: sous stop")
+        # Either cause looks identical from here: a daemon started by hand
+        # (`sous serve`), or the job just unloaded above still mid-shutdown
+        # past the wait's grace period — folding a log out from under either
+        # one would lose lines.
+        print(
+            "sous: a daemon still holds the lock; if it was just unloaded, wait a "
+            "moment and retry — otherwise stop it first: sous stop"
+        )
         raise SystemExit(1)
     config.data_dir.mkdir(parents=True, exist_ok=True)
     _fold_legacy_stderr_log(config.data_dir)
@@ -563,8 +596,12 @@ def _cmd_install_launchd() -> None:
         subprocess.run(cmd, check=True)
         print("daemon loaded; it will start at login and stay alive")
     except subprocess.CalledProcessError, FileNotFoundError:
+        # Bootout above is unconditional now, so a failed load here is worse
+        # than the pre-existing state: exiting 0 would report success with no
+        # daemon running at all, not the previously-loaded job left in place.
         print("could not load automatically; run manually:")
         print("  " + " ".join(cmd))
+        raise SystemExit(1) from None
 
 
 def _arg_interval(text: str) -> float:

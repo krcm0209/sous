@@ -397,14 +397,18 @@ def _install_env(tmp_path, monkeypatch, *, bootout_code: int, lock_held: bool):
     from sous import cli
 
     plist = tmp_path / "com.sous.daemon.plist"
-    calls: dict = {"bootout": [], "run": []}
+    calls: dict = {"bootout": [], "run": [], "await_lock_free": []}
     monkeypatch.setattr(cli, "load_config", lambda: _cfg(tmp_path, 1))
     monkeypatch.setattr(cli, "_plist_path", lambda: plist)
     monkeypatch.setattr(cli.shutil, "which", lambda name: "/opt/sous")
     monkeypatch.setattr(
         cli, "_bootout", lambda label: (calls["bootout"].append(label), bootout_code)[1]
     )
-    monkeypatch.setattr(cli, "_await_port_closed", lambda port, seconds: True)
+    monkeypatch.setattr(
+        cli,
+        "_await_lock_free",
+        lambda data_dir, seconds: (calls["await_lock_free"].append((data_dir, seconds)), True)[1],
+    )
     monkeypatch.setattr(cli, "_lock_is_held", lambda data_dir: lock_held)
     monkeypatch.setattr(cli.subprocess, "run", lambda cmd, check: calls["run"].append(cmd))
     return cli, plist, calls
@@ -469,6 +473,66 @@ def test_install_launchd_keeps_the_plist_when_bootout_really_fails(tmp_path, cap
     with pytest.raises(SystemExit) as exc:
         cli.main(["install-launchd"])
     assert exc.value.code == 1 and not plist.exists() and not calls["run"]
+
+
+def test_install_launchd_waits_for_the_lock_only_after_a_real_bootout(tmp_path, monkeypatch):
+    """A resident model keeps the daemon in lifespan shutdown, and the flock
+    with it, for seconds after the port stops accepting — so the wait must
+    poll the lock, not the port, and only when a job was actually unloaded. A
+    regression that waited unconditionally would still pass a port-based
+    check here; it would not pass this one."""
+    cli, _, calls = _install_env(
+        tmp_path, monkeypatch, bootout_code=_BOOTOUT_NOT_LOADED, lock_held=False
+    )
+    cli.main(["install-launchd"])
+    assert calls["await_lock_free"] == []
+
+    cli, _, calls = _install_env(tmp_path, monkeypatch, bootout_code=0, lock_held=False)
+    cli.main(["install-launchd"])
+    assert calls["await_lock_free"] == [(tmp_path, cli._UNLOAD_GRACE_SECONDS)]
+
+
+def test_install_launchd_folds_into_a_freshly_created_daemon_log(tmp_path, capsys, monkeypatch):
+    """`"ab"` creates the target when it doesn't already exist — the shape a
+    user sees whose stdout log was rotated away but never had a stderr file."""
+    cli, plist, calls = _install_env(tmp_path, monkeypatch, bootout_code=0, lock_held=False)
+    (tmp_path / "daemon.err.log").write_bytes(b"err-1\nerr-2\n")
+    cli.main(["install-launchd"])
+    assert (tmp_path / "daemon.log").read_bytes() == b"err-1\nerr-2\n"
+    assert not (tmp_path / "daemon.err.log").exists()
+
+
+def test_install_launchd_reports_a_failed_fold_and_stops(tmp_path, capsys, monkeypatch):
+    """A copy failure must not crash out with a raw traceback, must not lose
+    or duplicate the legacy file, and must not proceed to write a plist over
+    a daemon that was just unloaded and now has nowhere to log."""
+    cli, plist, calls = _install_env(tmp_path, monkeypatch, bootout_code=0, lock_held=False)
+    (tmp_path / "daemon.log").mkdir()  # opening a directory for append raises OSError
+    (tmp_path / "daemon.err.log").write_bytes(b"err-1\n")
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["install-launchd"])
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "daemon.err.log" in out and "daemon.log" in out
+    assert (tmp_path / "daemon.err.log").read_bytes() == b"err-1\n"
+    assert not plist.exists() and not calls["run"]
+
+
+def test_install_launchd_exits_nonzero_when_bootstrap_fails(tmp_path, capsys, monkeypatch):
+    """A failed bootstrap now follows an unconditional bootout, so exiting 0
+    here would report success with the daemon unloaded and nothing in its
+    place — worse than the pre-existing job it just tore down."""
+    cli, plist, calls = _install_env(tmp_path, monkeypatch, bootout_code=0, lock_held=False)
+
+    def _fail(cmd, check):
+        raise FileNotFoundError("launchctl")
+
+    monkeypatch.setattr(cli.subprocess, "run", _fail)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["install-launchd"])
+    assert exc.value.code == 1
+    assert "run manually" in capsys.readouterr().out
+    assert plist.exists()  # the plist itself is still written; only the load failed
 
 
 # --- wait ----------------------------------------------------------------------
