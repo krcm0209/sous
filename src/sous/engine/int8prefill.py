@@ -40,6 +40,11 @@ TILE_WM = 1
 TILE_WN = 2
 BM = 2 * 16 * TILE_WM
 BN = 32 * TILE_WN
+# The dense Qwen3.5-family text model (Qwen3.6/3.8 checkpoints declare it too). The
+# MoE variant reuses the same GatedDeltaNet and MLP classes for its shared expert,
+# so the class wrappers would fire there as well; it is untested and refused by
+# model type rather than by class.
+SUPPORTED_MODEL_TYPES = frozenset({"qwen3_5"})
 
 _COMMON_HEADER = r"""
 #include <metal_stdlib>
@@ -438,6 +443,15 @@ def _root(model: Any) -> Any:
     return getattr(model, "language_model", model)
 
 
+def _model_type(model: Any) -> str:
+    # mlx-vlm keeps it on `config`; mlx-lm on the model and its `args`.
+    for holder in (getattr(model, "config", None), model, getattr(model, "args", None)):
+        value = getattr(holder, "model_type", None) if holder is not None else None
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def _is_mlp(module: Any) -> bool:
     return all(hasattr(module, name) for name in ("gate_proj", "up_proj", "down_proj"))
 
@@ -604,6 +618,16 @@ def _warm_up(model: Any) -> None:
         mx.eval(linear_int8(module, mx.zeros((MIN_ROWS, k), dtype=module.scales.dtype)))
 
 
+def _refuse(reason: str) -> dict[str, Any]:
+    """The requested accelerator cannot serve this load: say so once and report why.
+    A silently inert opt-in is worse than one warning line."""
+    warnings.warn(
+        f"sous: int8 prefill requested but unavailable ({reason}); prefilling with stock kernels",
+        stacklevel=3,
+    )
+    return {"state": "unavailable", "reason": reason, "routed": 0}
+
+
 def enable(model: Any, *, enabled: bool) -> dict[str, Any]:
     """Opt one loaded model in. Returns the status the engine exposes; never raises
     — a model load must not fail because a prefill accelerator is missing."""
@@ -611,35 +635,19 @@ def enable(model: Any, *, enabled: bool) -> dict[str, Any]:
         return {"state": "off", "reason": None, "routed": 0}
     avail = availability()
     if not avail.available:
-        warnings.warn(
-            f"sous: int8 prefill requested but unavailable ({avail.reason}); "
-            "prefilling with stock kernels",
-            stacklevel=2,
-        )
-        return {"state": "unavailable", "reason": avail.reason, "routed": 0}
+        return _refuse(avail.reason or "unavailable")
+    model_type = _model_type(model)
+    if model_type not in SUPPORTED_MODEL_TYPES:
+        return _refuse(f"unsupported model type {model_type or 'unknown'!r} (dense qwen3_5 only)")
     try:
         routed = _tag(model)
         if routed == 0:
             _untag(model)
-            reason = "no eligible projections (affine Q4 gs64 required)"
-            warnings.warn(
-                f"sous: int8 prefill requested but unavailable ({reason}); "
-                "prefilling with stock kernels",
-                stacklevel=2,
-            )
-            return {
-                "state": "unavailable",
-                "reason": reason,
-                "routed": 0,
-            }
+            return _refuse("no eligible projections (affine Q4 gs64 required)")
         install_wrappers()
         _warm_up(model)
     except Exception as e:  # noqa: BLE001 — degrade, never block the model
         _untag(model)
-        warnings.warn(
-            f"sous: int8 prefill unavailable ({e}); prefilling with stock kernels",
-            stacklevel=2,
-        )
-        return {"state": "unavailable", "reason": str(e), "routed": 0}
+        return _refuse(str(e))
     logger.info("int8 prefill: routed %d projections", routed)
     return {"state": "active", "reason": None, "routed": routed}

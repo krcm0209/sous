@@ -5,6 +5,8 @@ itself is exercised by the `nax`-gated tests at the bottom, which skip where the
 neural accelerators are absent and run on the M5 Pro.
 """
 
+import types
+
 import pytest
 
 mx = pytest.importorskip("mlx.core")
@@ -404,8 +406,10 @@ class _LanguageModel(nn.Module):
 
 
 class _Model(nn.Module):
-    def __init__(self, layers):
+    def __init__(self, layers, model_type="qwen3_5"):
         super().__init__()
+        # mlx-vlm keeps the architecture name on `config`, as a plain attribute.
+        self.config = types.SimpleNamespace(model_type=model_type)
         self.language_model = _LanguageModel(layers)
 
 
@@ -451,6 +455,29 @@ def test_enable_tags_an_mlp_all_or_nothing(monkeypatch):
     status = i8.enable(model, enabled=True)
     assert status["routed"] == 3, "only the GDN projections; the MLP with an 8-bit down stays stock"
     assert not any(".mlp." in p for p in _tags(model))
+
+
+def test_enable_refuses_the_moe_variant_that_reuses_the_dense_classes(monkeypatch):
+    """qwen3_5_moe imports Qwen3_5GatedDeltaNet and Qwen3_5MLP (its shared expert)
+    from the dense module, so a class-based walk would route parts of an untested
+    architecture; the gate is the model type."""
+    monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
+    monkeypatch.setattr(i8, "_warm_up", lambda model: None)
+    model = _Model([_Layer()], model_type="qwen3_5_moe")
+    with pytest.warns(UserWarning, match="qwen3_5_moe"):
+        status = i8.enable(model, enabled=True)
+    assert status["state"] == "unavailable"
+    assert status["reason"] is not None and "qwen3_5_moe" in status["reason"]
+    assert _tags(model) == []
+
+
+def test_model_type_is_read_from_config_then_model_then_args():
+    assert (
+        i8._model_type(types.SimpleNamespace(config=types.SimpleNamespace(model_type="a"))) == "a"
+    )
+    assert i8._model_type(types.SimpleNamespace(model_type="b")) == "b"
+    assert i8._model_type(types.SimpleNamespace(args=types.SimpleNamespace(model_type="c"))) == "c"
+    assert i8._model_type(types.SimpleNamespace()) == ""
 
 
 def test_enable_with_no_eligible_projection_is_unavailable(monkeypatch):

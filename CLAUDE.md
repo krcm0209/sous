@@ -85,7 +85,8 @@ Claude Code use stretches further — evaluate features against that goal.
   `16c+4t+j` holds code `16c+8*(t>>1)+2j+(t&1)`): never change one alone; the
   power-of-two bit-exactness test is what catches a mismatch. Only rows >= 128
   route (decode/verify never do), only tagged modules route (tags are set with
-  `object.__setattr__` so they stay out of mlx's parameter tree), and only the
+  `object.__setattr__` so they stay out of mlx's parameter tree) and only on
+  `model_type` `qwen3_5` (the MoE variant reuses the same classes and is refused), and only the
   GEMM's header includes the Metal-4 `MetalPerformancePrimitives` header, which
   needs macOS 26.2+ — the Stage-A kernel must keep compiling on any Metal GPU
   so CI (macos-15, no tensor units) can test it.

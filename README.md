@@ -446,7 +446,8 @@ on an M5 Pro with the default model: 492 → 695 tok/s at 4K tokens, 410 → 570
 vs the stock path on a code prompt; 4-bit weights alone are 0.052 vs 8-bit), which is
 why it ships off. Needs an M5-family or newer GPU and macOS 26.2+; anywhere else the
 `server_status` tool reports `int8_prefill: unavailable` with the reason and prefill
-runs stock. Only affine 4-bit, group-size-64 checkpoints route (the default model does);
+runs stock. Only dense Qwen3.5-family models (`model_type` `qwen3_5`, as the default
+model is) with affine 4-bit, group-size-64 weights route, and the MoE variant is refused;
 a checkpoint with no eligible projection warns once; in a mixed checkpoint, ineligible
 projections fall through per projection.
 
