@@ -5,7 +5,7 @@ work under other licenses and keep their original terms.
 
 ## oMLX INT8-activation prefill kernels
 
-`src/sous/engine/int8prefill.py` contains Metal kernel sources derived from oMLX
+`src/sous/engine/kernels/` holds Metal kernel sources derived from oMLX
 (https://github.com/jundot/omlx), files `omlx/custom_kernels/qwen35_prefill/csrc/qwen35_oq_a8.metal`,
 `qwen35_oq_a8_nax.metal` and `oq_a8_decode.h` as merged in jundot/omlx#3548
 (author: PowerSpy), ported from an AOT-compiled extension to runtime-compiled

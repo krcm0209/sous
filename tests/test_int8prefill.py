@@ -43,6 +43,25 @@ def test_reorder_k_round_trips():
     assert mx.array_equal(_unreorder(out), x).item()
 
 
+# ---- kernel sources ---------------------------------------------------------------
+
+
+def test_kernel_sources_ship_as_package_files():
+    """The Metal lives in kernels/ as files, not Python strings, and only the GEMM's
+    header pulls in the Metal-4 tensor-op include (Stage A must compile on any GPU)."""
+    from importlib.resources import files
+
+    root = files("sous.engine.kernels")
+    texts = {
+        n: root.joinpath(n).read_text()
+        for n in ("common.h", "nax.h", "stage_a.metal", "q4_int8_gemm.metal")
+    }
+    assert all(texts.values())
+    assert "MetalPerformancePrimitives" in texts["nax.h"]
+    assert "MetalPerformancePrimitives" not in texts["common.h"] + texts["stage_a.metal"]
+    assert "mpp::tensor_ops" in texts["q4_int8_gemm.metal"]
+
+
 # ---- Stage A --------------------------------------------------------------------
 
 

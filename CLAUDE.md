@@ -79,8 +79,8 @@ Claude Code use stretches further — evaluate features against that goal.
   each SSE frame, httpx the full upstream URL with its query string, httpcore
   response header values — and `MCPServer.__init__` installs a root stderr
   handler at INFO, so none of that is hypothetical.
-- `engine/int8prefill.py` is a runtime-compiled Metal kernel pair (Apache-2.0,
-  derived from oMLX — see THIRD_PARTY_NOTICES.md). The Python `reorder_k` and
+- `engine/int8prefill.py` compiles the Metal kernel pair in `engine/kernels/` at
+  model load (Apache-2.0, derived from oMLX — see THIRD_PARTY_NOTICES.md). The Python `reorder_k` and
   the GEMM's nibble decode are two halves of one K-order contract (slot
   `16c+4t+j` holds code `16c+8*(t>>1)+2j+(t&1)`): never change one alone; the
   power-of-two bit-exactness test is what catches a mismatch. Only rows >= 128
