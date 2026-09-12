@@ -122,6 +122,18 @@ daemons nothing is supervising — including one `sous mcp` started for you.
 Stopping the daemon also ends any running `sous mcp` bridges; their clients
 reconnect and start a fresh one on the next call.
 
+The daemon writes one log, `~/.sous/daemon.log`, both streams. Every line
+sous emits reads `2026-09-10T19:26:14.025Z INFO sous.gateway: …` — UTC
+timestamp with milliseconds, then `INFO` (served or forwarded), `WARNING`
+(a request sous refused: a 4xx, a 529, a client gone while queued, tools it
+had to drop) or `ERROR` (a failure sous produced), then which part spoke.
+Library lines (`mcp.…`, `uvicorn.error`, `huggingface_hub…`) take the same
+shape, and `warnings.warn` arrives as `WARNING py.warnings`. Earlier
+releases split stdout and stderr into `daemon.log` and `daemon.err.log`;
+re-run `sous install-launchd` once — it boots the old job out, waits for
+the lock to free, folds `daemon.err.log` onto `daemon.log`, removes it,
+writes the new plist and bootstraps it.
+
 ## What Claude gets
 
 | Tool | Purpose |
@@ -265,25 +277,60 @@ turn gives up, stated plainly:
   mid-generation comes with batching, later. A forwarded stream, by contrast,
   is closed upstream the moment the client hangs up.
 
-Each `/v1/messages` turn served locally logs one metadata-only line to the
-daemon's stderr — method, model, stream flag, status, token counts, stop
-reason, cache `hit`/`fork`/`miss` (`fork`: the turn started from a copied
-fork slot — ~45–56K reused tokens is a tools fork, ~57K a header fork; a
-`miss` adds `lcp=`, how many leading tokens the render shared with the
-closest resident slot: below the tool block's length the tool array
-differed, above it the system text did),
-seconds — plus one line naming the Anthropic tool *types* it
-dropped, when any. Each forwarded request logs one line too:
-`upstream`, method, path, the model id when the body named one, the
-upstream's status, and seconds to its headers. The daemon also disables
-uvicorn's access log, which would otherwise print every request target —
-query string included — at INFO. Nothing else is logged — not a request body,
-not a header value, not a query string, not a response — at any level. Errors sous produces itself are Anthropic-shaped
+Each `/v1/messages` turn served locally logs one metadata-only line, for
+example (wrapped here):
+
+```
+2026-09-10T19:26:14.025Z INFO sous.gateway: POST /v1/messages id=msg_… model=sous-local
+  stream=1 status=200 input_tokens=84335 output_tokens=2887 stop=end_turn
+  cache=hit took=turn@82647 reused_tokens=82647 prefilled_tokens=1681 forks=0 evicted=1 pressure=0
+  load_s=0.0 queue_s=2.5 tokenize_s=1.1 ttft_s=9.8 prefill_s=7.9 decode_s=196.6
+  prefill_tps=212.8 decode_tps=14.7 seconds=207.4 tools=1b21cd75 system=9f8e7d6c
+```
+
+`id` is the response's message id (the same one in `message_start`, so the
+line joins to Claude Code's transcript). `cache` is `hit` (this
+conversation's own slot), `fork` (a copy of a shared boundary — ~45–56K
+reused tokens is a tools fork, ~57K a header fork) or `miss`; `took` names
+the slot and its length. `prefilled_tokens` is what the turn had to
+prefill; `forks`/`evicted`/`pressure` are what it published and what was
+dropped under it (by budget, or by the pressure valve). `load_s` (a model
+load, ≈0 when resident), `queue_s` (the wait for the gateway lock — Claude
+Code's small background calls hold it too), `tokenize_s`, `ttft_s` (to the
+first token), `prefill_s` and `decode_s` say where the time went, as far as
+the prompt cache measures it — not a strict partition of `seconds`: a turn
+that starts from a copied fork slot times that copy into neither phase, so
+the phases can sum to less than the total. `prefill_tps`/`decode_tps` are
+that same attribution expressed as a rate, not a throughput measurement —
+`prefill_s` also carries fork copies and the snapshot, so a turn that
+publishes forks reports a lower `prefill_tps` than its real prefill speed.
+`seconds` is the total, running from the moment the turn takes the gateway
+lock, so client-visible latency is `seconds` plus `queue_s`. On a miss the
+line adds `lcp=` (how many leading tokens the render shared with the
+closest resident slot), `lcp_region=` (`tools` below the tools boundary —
+the tool array changed; `system` below the header — the system text did;
+else `conversation`) and `bounds=[tools,header]`, the boundaries the probe
+verified. `tools=` and `system=` are 8-hex-character hashes of the rendered
+tool array and system text: comparable across lines, not reversible.
+Refused requests log the same way at `WARNING` with `status=` and
+`seconds=`; a locally served `count_tokens` logs its `input_tokens`,
+`load_s` and `seconds`; the engine logs `model loaded in N.N s
+(<model_id>)` when it loads. One more line names the Anthropic tool
+*types* a turn dropped, when any.
+Each forwarded request logs one line too: `upstream`, method, path, the
+model id when the body named one, the upstream's status, and seconds to
+its headers — at `INFO` whatever the status, since that is the upstream's
+verdict; a `502`/`504`/`499` the forwarder itself produced (unreachable
+upstream, a timeout, a client gone) logs at `ERROR` or `WARNING` instead.
+The daemon also disables uvicorn's access log, which would otherwise print
+every request target — query string included — at INFO. Nothing else is
+logged — not a request body, not a header value, not a query string, not a
+response — at any level. Errors sous produces itself are Anthropic-shaped
 (`{"type": "error", "error": {"type": ..., "message": ...}}`): an oversized
 body (over 32 MiB) on `/v1/messages` is a `413 request_too_large`, a prompt
-that fills the local window an `invalid_request_error` saying `prompt is too
-long`, an unreachable upstream a `502 api_error`. Errors from the real API
-come back exactly as it sent them.
+that fills the local window an `invalid_request_error` saying `prompt is
+too long`, an unreachable upstream a `502 api_error`. Errors from the real
+API come back exactly as it sent them.
 
 ## Configuration — `~/.sous/config.toml`
 

@@ -93,6 +93,12 @@ Claude Code use stretches further — evaluate features against that goal.
 - `int8prefill.enable()` never raises and a model load never fails because of
   it: every failure is one `warnings.warn` plus `state: unavailable`. Tests
   that need the GEMM without tensor units monkeypatch `int8prefill.qmm`.
+- Prompt-cache per-turn gauges (`PromptCacheStats.begin_turn`, `_GAUGES`) are
+  assigned per turn and read back directly from the owner-scoped `after`
+  snapshot in `TurnRunner.run` — never as `after − before`. Counters
+  (`forks`, `evictions`, `pressure_evictions`, `reused_tokens`) are deltas.
+  Timers read `promptcache._clock` so tests can drive them; `Slot.last_used`
+  keeps the real clock.
 
 ## Security boundary
 
@@ -105,10 +111,14 @@ pass.
 
 `src/sous/gateway/` is deliberately outside that boundary: it never executes a
 tool (Claude Code does, under its own permissions) and never logs a request
-body, header value or query string. It forwards the client's credentials to
-`[gateway].upstream_url` and nowhere else, and stores none. `sous claude`
-(`cli.py`) never sets `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` or a tier
-variable. A change that makes any of these otherwise needs the spec
+body, header value or query string. Its lines go through `sous.logs` (one
+timestamped, levelled shape on the root handler); `_log_turn` runs on the
+event loop, so nothing that blocks (a database write) may ever be added to
+it — do such work on the turn's thread. It forwards the client's
+credentials to `[gateway].upstream_url` and nowhere else, and stores none.
+`sous claude` (`cli.py`) never sets `ANTHROPIC_AUTH_TOKEN`,
+`ANTHROPIC_API_KEY` or a tier variable. A change that makes any of these
+otherwise needs the spec
 (`docs/superpowers/specs/2026-08-26-hybrid-gateway-design.md`) changed first.
 
 ## Workflow

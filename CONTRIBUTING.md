@@ -145,7 +145,8 @@ setting is global and would cap the frontier main loop.
 `API_TIMEOUT_MS` covers model load plus a long prefill; `--disallowedTools
 LSP` keeps a language server from appending its schema mid-session and
 re-prefilling the whole conversation. Watch `~/.sous/daemon.log` for the
-`sous gateway:` lines. The main loop's turns should now report `cache=hit`
+`INFO sous.gateway:` lines (both streams land there; every line carries a
+timestamp and a level). The main loop's turns should now report `cache=hit`
 after the first: Claude Code's small background queries (titles, suggestions)
 get slots of their own instead of evicting the main loop's, and each
 `~80K`-token main turn prefills only what the conversation gained. A subagent
@@ -154,11 +155,12 @@ earlier subagent of the same type already prefilled that header, `cache=miss`
 otherwise. This session is where those claims get measured.
 
 To verify *forwarding* rather than the endpoint, `sous claude` plus
-`~/.sous/daemon.log` is enough: every forwarded request logs an `upstream
-<METHOD> <path> model=<id> status=<code>` line, every local turn a `POST
-/v1/messages model=sous-local ...` line. A hybrid session should show the
-main loop's `claude-*` requests forwarded and only the subagent's requests
-served locally.
+`~/.sous/daemon.log` is enough: every forwarded request logs an `INFO
+sous.gateway: upstream <METHOD> <path> model=<id> status=<code>` line,
+every local turn a `POST /v1/messages id=… model=sous-local …` line with
+its phase timings. A hybrid session should show the main loop's
+`claude-*` requests forwarded and only the subagent's requests served
+locally.
 
 ## Questions
 
