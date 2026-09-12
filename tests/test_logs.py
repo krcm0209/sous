@@ -74,7 +74,8 @@ def test_format_line_matches_the_formatter_shape():
 def test_formatter_appends_stack_info_like_logging_formatter_does():
     """`logging.Formatter.format` appends `record.stack_info` after any
     exception text; nothing sets it today, but a silent no-op later would be
-    a regression on a class nine later tasks format against."""
+    a regression against the class the rest of the daemon's logging formats
+    through."""
     record = logging.LogRecord("sous.test", logging.INFO, __file__, 1, "hello", None, None)
     record.stack_info = "Stack (most recent call last):\n  fake frame"
     text = UTCFormatter().format(record)

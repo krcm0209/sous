@@ -158,11 +158,11 @@ To verify *forwarding* rather than the endpoint, `sous claude` plus
 `~/.sous/daemon.log` is enough: every forwarded request logs an `INFO
 sous.gateway: upstream <METHOD> <path> model=<id> status=<code>` line,
 every local turn a `POST /v1/messages id=… model=sous-local …` line with
-its phase timings. That line drops to `ERROR` or `WARNING` only when the
-forwarder itself produced the status — an unreachable upstream, a timeout,
-a client gone — never for one the upstream returned. A hybrid session
-should show the main loop's `claude-*` requests forwarded and only the
-subagent's requests served locally.
+its phase timings. The forwarded `upstream` line drops to `ERROR` or
+`WARNING` only when the forwarder itself produced the status — an
+unreachable upstream, a timeout, a client gone — never for one the upstream
+returned. A hybrid session should show the main loop's `claude-*` requests
+forwarded and only the subagent's requests served locally.
 
 ## Questions
 
