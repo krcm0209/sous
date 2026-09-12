@@ -9,6 +9,8 @@ cache.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -66,6 +68,10 @@ def _invalid(message: str) -> RequestError:
     return RequestError(400, "invalid_request_error", message)
 
 
+def _digest(text: str) -> str:
+    return hashlib.blake2b(text.encode(), digest_size=4).hexdigest()
+
+
 @dataclass
 class ChatRequest:
     """What the engine needs from a /v1/messages body, plus what the response
@@ -78,6 +84,11 @@ class ChatRequest:
     max_tokens: int
     stream: bool
     dropped_tool_types: list[str] = field(default_factory=list)
+    # 8 hex chars of blake2b over the rendered tool array and system text:
+    # enough to see "same tools, different system" across log lines, and
+    # nothing a reader could turn back into either. Empty when absent.
+    tools_hash: str = ""
+    system_hash: str = ""
 
 
 def strip_volatile(text: str) -> str:
@@ -319,8 +330,19 @@ def parse_messages_request(body: object) -> ChatRequest:
     if not isinstance(stream, bool):
         raise _invalid("stream: must be true or false")
     tools, dropped = chat_tools(body.get("tools"))
+    rendered = chat_messages(body.get("system"), messages)
+    system_text = rendered[0]["content"] if rendered and rendered[0]["role"] == "system" else ""
     return ChatRequest(
-        model, chat_messages(body.get("system"), messages), tools, max_tokens, stream, dropped
+        model,
+        rendered,
+        tools,
+        max_tokens,
+        stream,
+        dropped,
+        tools_hash=_digest(json.dumps(tools, sort_keys=True, separators=(",", ":")))
+        if tools
+        else "",
+        system_hash=_digest(system_text) if system_text else "",
     )
 
 
