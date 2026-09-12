@@ -277,7 +277,24 @@ def auto_cache_budget(*, working_set: int, active: int, reserve_bytes: int) -> i
     return max(0, working_set - active - reserve_bytes - CACHE_BUDGET_SLACK)
 
 
-_GAUGES = frozenset({"snapshot_bytes", "miss_lcp"})
+_GAUGES = frozenset(
+    {
+        "snapshot_bytes",
+        "miss_lcp",
+        "prefilled_tokens",
+        "took_len",
+        "bound_lo",
+        "bound_hi",
+        "probe_seconds",
+        "prefill_seconds",
+        "decode_seconds",
+    }
+)
+
+# The clock the per-turn timers read. A module attribute rather than a bare
+# time.monotonic so a test can swap in a hand-advanced one and assert exact
+# phase durations; Slot.last_used keeps the real clock.
+_clock = time.monotonic
 
 
 @dataclass
@@ -297,18 +314,33 @@ class PromptCacheStats:
     # of a window, or the kernel at warn/critical) — what says, after a
     # restart, whether pressure or the byte cap emptied the map.
     pressure_evictions: int = 0
+    # Per-turn gauges, zeroed by begin_turn() at the top of every generate()
+    # and assigned as the turn runs, so a turn that bypasses _run (cache off,
+    # render not a strict prefix) reports zeros rather than the last turn's.
+    prefilled_tokens: int = 0  # stable tokens this turn had to prefill
+    took_len: int = 0  # length of the slot _take returned; 0 on a miss
+    bound_lo: int = 0  # the probe's lower boundary (tools), 0 when absent
+    bound_hi: int = 0  # the probe's upper boundary (header), 0 when absent
+    probe_seconds: float = 0.0
+    prefill_seconds: float = 0.0  # every hooks.prefill, plus fork copies and the snapshot
+    decode_seconds: float = 0.0  # hooks.decode, plus the restore
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
 
+    def begin_turn(self) -> None:
+        self.prefilled_tokens = self.took_len = self.bound_lo = self.bound_hi = 0
+        self.probe_seconds = self.prefill_seconds = self.decode_seconds = 0.0
+
     def add(self, other: PromptCacheStats) -> None:
         """Fold `other`'s counters into these.
 
-        Every field is a running count and sums — except the gauges,
-        `snapshot_bytes` (the last non-trimmable turn's copy cost) and
-        `miss_lcp` (the last miss's shared prefix), which are assigned per
-        turn. Summing a gauge would make the daemon-wide view grow with the
-        number of owners rather than report a reading, so the largest wins.
+        Every field is a running count and sums — except the gauges
+        (`_GAUGES`), which are assigned per turn (`snapshot_bytes`, the last
+        non-trimmable turn's copy cost; `miss_lcp`, the last miss's shared
+        prefix; and the per-turn phase timings and slot geometry below).
+        Summing a gauge would make the daemon-wide view grow with the number
+        of owners rather than report a reading, so the largest wins.
         """
         for f in dataclasses.fields(self):
             mine, theirs = getattr(self, f.name), getattr(other, f.name)
@@ -538,6 +570,7 @@ class PrefixCache:
 
     def _fork_boundaries(
         self,
+        stats: PromptCacheStats,
         owner: threading.Thread,
         stable_ids: list[int],
         fork_at: Sequence[int] | Callable[[], Sequence[int]],
@@ -573,6 +606,7 @@ class PrefixCache:
         if isinstance(fork_at, Sequence):
             candidates = list(fork_at)
         else:
+            started = _clock()
             try:
                 candidates = list(fork_at())
             except Exception as e:
@@ -585,9 +619,18 @@ class PrefixCache:
                     stacklevel=2,
                 )
                 return []
-        wanted = sorted(
-            {b for b in candidates if b >= FORK_MIN_TOKENS and reuse < b < len(stable_ids)}
-        )
+            finally:
+                stats.probe_seconds += _clock() - started
+        # The boundaries the probe verified inside this render, ascending —
+        # recorded before the `reuse < b` filter so a warm turn that started
+        # past one still reports where both sit (the log's lcp_region needs
+        # them on the *next* turn's miss line).
+        inside = sorted({b for b in candidates if b >= FORK_MIN_TOKENS and b < len(stable_ids)})
+        if len(inside) >= 2:
+            stats.bound_lo, stats.bound_hi = inside[0], inside[-1]
+        elif inside:
+            stats.bound_lo, stats.bound_hi = 0, inside[0]
+        wanted = sorted({b for b in inside if reuse < b})
         if not wanted:
             return []
         with self._lock:
@@ -743,6 +786,7 @@ class PrefixCache:
             # thread reaches a late write after that, it lands on this
             # orphaned object instead of on counters a later reader sees.
             stats = self._stats_for(owner)
+            stats.begin_turn()
             epoch = self._epoch
 
         # `_run`'s anchor (`len(stable_ids)`) only means what it assumes: that
@@ -826,6 +870,7 @@ class PrefixCache:
                 stats.fork_hits += 1
         if slot is not None:
             reuse = len(slot.held)
+            stats.took_len = reuse  # the slot this turn took; stays 0 on a miss
             if warm is None:
                 warm = slot.cache
             stats.hits += 1
@@ -925,12 +970,15 @@ class PrefixCache:
     ) -> str:
         hooks = self._hooks
         anchor = len(stable_ids)
+        entry_reuse = reuse
+        stats.prefilled_tokens += anchor - entry_reuse
         published: list[Slot] = []
-        for boundary in self._fork_boundaries(owner, stable_ids, fork_at, reuse):
+        for boundary in self._fork_boundaries(stats, owner, stable_ids, fork_at, reuse):
             # Stop at the boundary and continue from there: a fork is taken
             # while prefilling past it because no layer can be rewound to it
             # afterwards. Ascending order means no copy is ever wanted behind
             # a prefix already prefilled.
+            started = _clock()
             hooks.prefill(cache, list(stable_ids[reuse:boundary]))
             reuse = boundary
             # What the cache holds at the boundary is what the copy will hold,
@@ -976,6 +1024,8 @@ class PrefixCache:
                 # is cleared too, not just `copy`: `Slot.cache` is the copy, so
                 # a Slot left referenced by this frame keeps the whole copy
                 # alive across the decode below just as surely as `copy` would.
+                # The copy is part of building the cache, so it is prefill time.
+                stats.prefill_seconds += _clock() - started
                 copy = slot = None
         # The list existed to protect the copies from each other while they
         # were charged. Dropping it here means a fork that pressure or a reset
@@ -986,14 +1036,20 @@ class PrefixCache:
             # Everything rewinds, so (the rest of) prefill and decode fuse into
             # one pass and the generation block plus the generated tokens are
             # simply trimmed back off afterwards.
+            started = _clock()
             text = hooks.decode(cache, list(full_ids[reuse:]), max_tokens, on_delta)
             trim_to(cache, anchor)
+            stats.decode_seconds += _clock() - started
             return text
         # A recurrent layer cannot rewind, so stop at the anchor, record it,
         # and put the cache back there once the generation is done.
+        started = _clock()
         hooks.prefill(cache, list(stable_ids[reuse:]))
         snap, nbytes = snapshot(cache, hooks.copy_array)
         stats.snapshot_bytes = nbytes
+        stats.prefill_seconds += _clock() - started
+        started = _clock()
         text = hooks.decode(cache, list(full_ids[anchor:]), max_tokens, on_delta)
         restore(cache, snap, hooks.copy_array)
+        stats.decode_seconds += _clock() - started
         return text

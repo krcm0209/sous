@@ -481,6 +481,7 @@ def test_disabled_never_reuses_and_never_counts():
     pc.generate(STABLE_2, FULL_2, 16)
     assert len(h.caches) == 2
     assert pc.stats() == _empty_stats()
+    assert pc.stats()["prefill_seconds"] == 0.0 and pc.stats()["took_len"] == 0
 
 
 def test_disabled_never_reads_stable_ids():
@@ -894,6 +895,13 @@ def test_stats_as_dict_reports_every_counter():
         "evictions": 3,
         "miss_lcp": 40,
         "pressure_evictions": 2,
+        "prefilled_tokens": 0,
+        "took_len": 0,
+        "bound_lo": 0,
+        "bound_hi": 0,
+        "probe_seconds": 0.0,
+        "prefill_seconds": 0.0,
+        "decode_seconds": 0.0,
     }
 
 
@@ -2041,3 +2049,153 @@ def test_kernel_warn_reaches_a_cold_turns_own_tools_fork_only_when_nothing_older
     assert HA in held and AX1 in held
     assert T not in held  # the third drop, with nothing older left
     assert pc.stats()["pressure_evictions"] == 3
+
+
+# ---- per-turn gauges -------------------------------------------------------
+
+
+class FakeClock:
+    """A monotonic clock the fakes advance by hand, so phase timings are exact."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class TimedHooks(FakeHooks):
+    """Every prefill takes 2 s, every decode 5 s, on the fake clock."""
+
+    def __init__(self, clock: FakeClock, **kw):
+        super().__init__(**kw)
+        self.clock = clock
+
+    def prefill(self, cache, token_ids):
+        self.clock.advance(2.0)
+        super().prefill(cache, token_ids)
+
+    def decode(self, cache, token_ids, max_tokens, on_delta=None):
+        self.clock.advance(5.0)
+        return super().decode(cache, token_ids, max_tokens, on_delta)
+
+
+@pytest.fixture()
+def clock(monkeypatch) -> FakeClock:
+    import sous.engine.promptcache as promptcache
+
+    c = FakeClock()
+    monkeypatch.setattr(promptcache, "_clock", c)
+    return c
+
+
+def test_a_cold_non_trimmable_turn_splits_prefill_and_decode(clock):
+    h = TimedHooks(clock, trimmable=False)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    s = pc.stats()
+    assert s["prefilled_tokens"] == len(STABLE_1)
+    assert s["prefill_seconds"] == pytest.approx(2.0)  # one prefill to the anchor
+    assert s["decode_seconds"] == pytest.approx(5.0)
+    assert s["took_len"] == 0
+
+
+def test_a_warm_turn_reports_the_slot_it_took_and_only_the_new_tokens(clock):
+    h = TimedHooks(clock, trimmable=False)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    pc.generate(STABLE_2, FULL_2, 16)
+    s = pc.stats()
+    assert s["took_len"] == len(STABLE_1)
+    assert s["prefilled_tokens"] == len(STABLE_2) - len(STABLE_1)
+
+
+def test_gauges_are_zeroed_when_a_turn_bypasses_the_cache(clock):
+    """A render that is not a strict prefix of its own full prompt decodes
+    cold without touching _run; the gauges must not keep the previous turn's."""
+    h = TimedHooks(clock, trimmable=False)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    assert pc.stats()["prefill_seconds"] > 0
+    with pytest.warns(UserWarning, match="not the stable render"):
+        pc.generate([1, 2, 3], [9, 9, 9], 16)
+    s = pc.stats()
+    assert (s["prefill_seconds"], s["decode_seconds"], s["prefilled_tokens"], s["took_len"]) == (
+        0.0,
+        0.0,
+        0,
+        0,
+    )
+
+
+def test_trimmable_reports_the_fused_pass_as_decode(clock):
+    h = TimedHooks(clock, trimmable=True)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    s = pc.stats()
+    assert s["prefill_seconds"] == 0.0 and s["decode_seconds"] == pytest.approx(5.0)
+    assert s["prefilled_tokens"] == len(STABLE_1)
+
+
+def test_the_probe_is_timed_and_the_bounds_recorded(clock):
+    long = list(range(1, FORK_MIN_TOKENS * 3))
+    tools_at, header_at = FORK_MIN_TOKENS + 10, FORK_MIN_TOKENS * 2
+
+    def probe():
+        clock.advance(0.5)
+        return [header_at, tools_at]  # any order; the cache sorts
+
+    h = TimedHooks(clock, trimmable=False)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(long, long + [90, 91], 16, fork_at=probe)
+    s = pc.stats()
+    assert s["probe_seconds"] == pytest.approx(0.5)
+    assert (s["bound_lo"], s["bound_hi"]) == (tools_at, header_at)
+    assert s["forks"] == 2
+
+
+def test_one_boundary_is_reported_as_the_upper_bound(clock):
+    long = list(range(1, FORK_MIN_TOKENS * 2))
+    h = TimedHooks(clock, trimmable=False)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(long, long + [90, 91], 16, fork_at=[FORK_MIN_TOKENS + 5])
+    s = pc.stats()
+    assert (s["bound_lo"], s["bound_hi"]) == (0, FORK_MIN_TOKENS + 5)
+
+
+def test_no_budget_means_no_bounds(clock):
+    long = list(range(1, FORK_MIN_TOKENS * 2))
+    h = TimedHooks(clock, trimmable=False)
+    pc = PrefixCache(h)  # max_bytes=0: the probe is never resolved
+    pc.generate(long, long + [90, 91], 16, fork_at=lambda: [FORK_MIN_TOKENS + 5])
+    s = pc.stats()
+    assert (s["bound_lo"], s["bound_hi"], s["probe_seconds"]) == (0, 0, 0.0)
+
+
+def test_fork_copies_and_the_snapshot_count_as_prefill(clock):
+    """The copy at a boundary and the pre-decode snapshot are prefill-side
+    costs of building the cache, not decode."""
+    long = list(range(1, FORK_MIN_TOKENS * 2))
+    h = TimedHooks(clock, trimmable=False)
+
+    def slow_copy(hooks, a):
+        clock.advance(0.1)
+        # The module-level fake, never h.copy_array: that method dispatches
+        # back into copy_impl and would recurse forever.
+        return copy_array(a)
+
+    h.copy_impl = slow_copy
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(long, long + [90, 91], 16, fork_at=[FORK_MIN_TOKENS + 5])
+    s = pc.stats()
+    assert s["prefill_seconds"] > 4.0  # two prefills (2 s each) plus copies
+    assert s["decode_seconds"] == pytest.approx(5.0, abs=0.5)  # decode plus restore copies
+
+
+def test_gauges_fold_by_max_like_the_existing_ones():
+    a = PromptCacheStats(prefill_seconds=3.0, took_len=10, bound_hi=500)
+    a.add(PromptCacheStats(prefill_seconds=1.0, took_len=40, bound_hi=200))
+    assert (a.prefill_seconds, a.took_len, a.bound_hi) == (3.0, 40, 500)
