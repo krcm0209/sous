@@ -427,3 +427,147 @@ def test_cache_hit_is_reported_from_the_sessions_own_counters(tmp_path: Path):
     # unaffected by a worker task's counters or resets.
     session_thread = inner.generate_threads[0]
     assert inner.stats_owners and all(o is session_thread for o in inner.stats_owners)
+
+
+class _SlowCount(ChunkedFakeEngine):
+    """count_tokens costs 50 ms, so tokenize_s cannot be satisfied by the
+    probe term alone."""
+
+    def count_tokens(self, messages, tools):
+        time.sleep(0.05)
+        return super().count_tokens(messages, tools)
+
+
+class _Gated(ChunkedFakeEngine):
+    """Sets `entered` from inside generate(), i.e. once the caller holds the
+    gateway lock — the handshake test_busy_gateway_gives_up_after_the_timeout
+    already uses instead of a sleep that races the scheduler."""
+
+    def __init__(self, script, delay):
+        super().__init__(script, delay)
+        self.entered = threading.Event()
+
+    def generate(self, messages, tools, max_tokens, on_delta=None):
+        self.entered.set()
+        return super().generate(messages, tools, max_tokens, on_delta)
+
+
+def test_a_turn_carries_its_phase_timings(tmp_path: Path):
+    inner = _SlowCount(["Hel|lo|there"], delay=0.02)
+    inner.stats = {
+        "hits": 0,
+        "fork_hits": 0,
+        "reused_tokens": 0,
+        "forks": 0,
+        "evictions": 0,
+        "pressure_evictions": 0,
+        "prefilled_tokens": 0,
+        "took_len": 0,
+        "bound_lo": 0,
+        "bound_hi": 0,
+        "probe_seconds": 0.0,
+        "prefill_seconds": 0.0,
+        "decode_seconds": 0.0,
+    }
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        inner.stats = {
+            **inner.stats,
+            "forks": 2,
+            "evictions": 1,
+            "pressure_evictions": 1,
+            "prefilled_tokens": 321,
+            "took_len": 0,
+            "bound_lo": 100,
+            "bound_hi": 200,
+            "probe_seconds": 0.25,
+            "prefill_seconds": 1.5,
+            "decode_seconds": 4.0,
+        }
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    runner, _ = _runner(tmp_path, inner)
+    result = runner.run(MSGS, [], 100, RecordingSink())
+    assert result.queue_seconds >= 0 and result.queue_seconds < 0.5
+    assert result.load_seconds >= 0
+    # 0.05 s of count_tokens plus the 0.25 s probe gauge; the upper bound only
+    # guards against a wildly wrong sum on a loaded runner.
+    assert 0.30 <= result.tokenize_seconds < 0.80
+    assert result.ttft_seconds is not None and 0.02 <= result.ttft_seconds < result.seconds
+    assert (result.prefill_seconds, result.decode_seconds) == (1.5, 4.0)
+    assert (result.prefilled_tokens, result.took_len, result.bounds) == (321, 0, (100, 200))
+    assert (result.forks, result.evictions, result.pressure_evictions) == (2, 1, 1)
+
+
+def test_counter_fields_are_deltas_not_totals(tmp_path: Path):
+    """forks/evictions/pressure are this turn's, read as owner-scoped
+    before/after deltas like reused_tokens already is."""
+    inner = FakeEngine(["a", "b"])
+    inner.stats = {
+        "hits": 0,
+        "fork_hits": 0,
+        "reused_tokens": 0,
+        "forks": 5,
+        "evictions": 3,
+        "pressure_evictions": 1,
+    }
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 2:
+            inner.stats = {**inner.stats, "forks": 6, "evictions": 3, "pressure_evictions": 1}
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    runner, _ = _runner(tmp_path, inner)
+    first = runner.run(MSGS, [], 100, RecordingSink())
+    second = runner.run(MSGS, [], 100, RecordingSink())
+    assert (first.forks, first.evictions) == (0, 0)
+    assert (second.forks, second.evictions, second.pressure_evictions) == (1, 0, 0)
+
+
+def test_queue_seconds_is_the_wait_for_the_gateway_lock(tmp_path: Path):
+    inner = _Gated(["slow|turn", "fast"], delay=0.1)
+    runner, _ = _runner(tmp_path, inner)
+    results: dict[str, TurnResult] = {}
+
+    def first():
+        results["first"] = runner.run(MSGS, [], 100, RecordingSink())
+
+    t = threading.Thread(target=first)
+    t.start()
+    assert inner.entered.wait(5)  # the first turn holds the lock
+    results["second"] = runner.run(MSGS, [], 100, RecordingSink())
+    t.join()
+    assert results["first"].queue_seconds < 0.05
+    # The first turn still has ≥ 0.1 s of scripted generation ahead of it when
+    # the second arrives; the gate, not the clock, is what this test pins.
+    assert results["second"].queue_seconds > 0.05
+
+
+def test_a_turn_with_no_delta_has_no_ttft(tmp_path: Path):
+    class Silent(FakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            return self._take(messages, tools, max_tokens)  # never calls on_delta
+
+    runner, _ = _runner(tmp_path, Silent(["ok"]))
+    result = runner.run(MSGS, [], 100, RecordingSink())
+    assert result.ttft_seconds is None and result.output_tokens == 0
+
+
+def test_load_seconds_is_paid_once(tmp_path: Path):
+    inner = FakeEngine(["a", "b"])
+
+    def slow_factory(model_id: str):
+        time.sleep(0.05)
+        return inner
+
+    engines = EngineManager(_cfg(tmp_path), engine_factory=slow_factory)
+    runner = TurnRunner(engines, _cfg(tmp_path))
+    first = runner.run(MSGS, [], 100, RecordingSink())
+    second = runner.run(MSGS, [], 100, RecordingSink())
+    assert first.load_seconds >= 0.05 and second.load_seconds < 0.05
