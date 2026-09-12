@@ -9,6 +9,7 @@ import pytest
 from sous.config import SousConfig
 from sous.engine.base import Delta, EngineManager, GenerationStalled, ReplaySafe
 from sous.gateway.turn import (
+    CountResult,
     GatewayBusy,
     PromptTooLong,
     TurnAbandoned,
@@ -353,8 +354,27 @@ def test_count_tokens_uses_the_engine_and_releases(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(turn, "release_mlx_thread_state", lambda: released.append(True))
     inner = FakeEngine([])
     runner, _ = _runner(tmp_path, inner)
-    assert runner.count_tokens(MSGS, []) == inner.count_tokens(MSGS, [])
+    result = runner.count_tokens(MSGS, [])
+    assert isinstance(result, CountResult)
+    assert result.count == inner.count_tokens(MSGS, [])
+    assert result.load_seconds >= 0 and result.seconds >= result.load_seconds
     assert released == [True]
+
+
+def test_count_tokens_reports_the_load_it_paid_for(tmp_path: Path):
+    """A count can be the request that loads the model; the line must say so."""
+    inner = FakeEngine([])
+
+    def slow_factory(model_id: str):
+        time.sleep(0.05)
+        return inner
+
+    engines = EngineManager(_cfg(tmp_path), engine_factory=slow_factory)
+    runner = TurnRunner(engines, _cfg(tmp_path))
+    first = runner.count_tokens(MSGS, [])
+    second = runner.count_tokens(MSGS, [])
+    assert first.load_seconds >= 0.05
+    assert second.load_seconds < 0.05
 
 
 def test_a_miss_reports_the_lcp_from_the_sessions_counters_and_a_hit_reports_none(tmp_path: Path):

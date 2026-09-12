@@ -93,6 +93,18 @@ def test_status_when_never_loaded():
     assert s["loaded"] is False and s["model_id"]
 
 
+def test_get_logs_the_load_once_with_its_duration(caplog):
+    import logging
+
+    mgr, created = _manager()
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert len(lines) == 1 and len(created) == 1
+    assert lines[0].startswith("model loaded in ") and lines[0].endswith(" s (fake/model)")
+
+
 class _BlockingEngine(FakeEngine):
     def __init__(self):
         super().__init__([])

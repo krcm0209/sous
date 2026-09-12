@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import queue
 import sys
 import threading
@@ -14,6 +15,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from sous.config import SousConfig
+
+_logger = logging.getLogger("sous.engine")
 
 
 @dataclass(frozen=True)
@@ -491,7 +494,14 @@ class EngineManager:
     def get(self) -> ManagedEngine:
         with self._lock:
             if self._engine is None:
+                loading = time.monotonic()
                 self._engine = ManagedEngine(self._factory(self._config.model_id))
+                # The one line that brackets a cold start in the daemon log —
+                # before it, only huggingface_hub's own chatter said a load
+                # happened, and a turn's `seconds` could not be split.
+                _logger.info(
+                    f"model loaded in {time.monotonic() - loading:.1f} s ({self._engine.model_id})"
+                )
             self._last_used = time.monotonic()
             return self._engine
 

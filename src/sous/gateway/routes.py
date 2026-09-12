@@ -136,6 +136,10 @@ def _status_level(status: int) -> int:
     return logging.ERROR if status >= 500 and status != 529 else logging.WARNING
 
 
+def _elapsed(since: float) -> str:
+    return f" seconds={time.monotonic() - since:.1f}"
+
+
 def _error_response(status: int, error_type: str, message: str) -> JSONResponse:
     return JSONResponse(
         {"type": "error", "error": {"type": error_type, "message": message}}, status_code=status
@@ -424,10 +428,16 @@ class Gateway:
         return response
 
     async def count_tokens(self, request: Request) -> Response:
+        received = time.monotonic()
         try:
             _check_loopback(request)
             raw = await _read_body(request)
         except RequestError as e:
+            _log(
+                f"POST /v1/messages/count_tokens status={e.status} error={e.error_type}"
+                f"{_elapsed(received)}",
+                level=_status_level(e.status),
+            )
             return JSONResponse(e.body(), status_code=e.status)
         body, model = self._route(raw)
         if body is None:
@@ -436,6 +446,11 @@ class Gateway:
             _check_depth(body)
             chat = parse_count_tokens_request(body)
         except RequestError as e:
+            _log(
+                f"POST /v1/messages/count_tokens status={e.status} error={e.error_type}"
+                f"{_elapsed(received)}",
+                level=_status_level(e.status),
+            )
             return JSONResponse(e.body(), status_code=e.status)
         # Same bounded-admission reasoning as messages()'s self._pending: a
         # queued count still holds its parsed body while the 2 _counts
@@ -444,12 +459,12 @@ class Gateway:
         if not self._pending_counts.acquire(blocking=False):
             _log(
                 f"POST /v1/messages/count_tokens model={_model_label(chat)} "
-                "status=529 error=overloaded_error",
+                f"status=529 error=overloaded_error{_elapsed(received)}",
                 level=logging.WARNING,
             )
             return _error_response(529, "overloaded_error", "too many token counts queued")
         try:
-            count = await self._submit(
+            result = await self._submit(
                 self._counts,
                 self._pending_counts,
                 self._runner.count_tokens,
@@ -457,16 +472,28 @@ class Gateway:
                 chat.tools,
             )
         except Exception as e:  # noqa: BLE001 — every failure becomes an Anthropic error body
-            return _error_response(*_classify(e))
-        return JSONResponse({"input_tokens": count})
+            status, error_type, message = _classify(e)
+            _log(
+                f"POST /v1/messages/count_tokens model={_model_label(chat)} status={status} "
+                f"error={error_type}{_elapsed(received)}",
+                level=_status_level(status),
+            )
+            return _error_response(status, error_type, message)
+        _log(
+            f"POST /v1/messages/count_tokens model={_model_label(chat)} "
+            f"input_tokens={result.count} load_s={result.load_seconds:.1f} "
+            f"seconds={result.seconds:.1f}"
+        )
+        return JSONResponse({"input_tokens": result.count})
 
     async def messages(self, request: Request) -> Response:
+        received = time.monotonic()
         try:
             _check_loopback(request)
             raw = await _read_body(request)
         except RequestError as e:
             _log(
-                f"POST /v1/messages status={e.status} error={e.error_type}",
+                f"POST /v1/messages status={e.status} error={e.error_type}{_elapsed(received)}",
                 level=_status_level(e.status),
             )
             return JSONResponse(e.body(), status_code=e.status)
@@ -478,7 +505,7 @@ class Gateway:
             chat = parse_messages_request(body)
         except RequestError as e:
             _log(
-                f"POST /v1/messages status={e.status} error={e.error_type}",
+                f"POST /v1/messages status={e.status} error={e.error_type}{_elapsed(received)}",
                 level=_status_level(e.status),
             )
             return JSONResponse(e.body(), status_code=e.status)
@@ -504,7 +531,7 @@ class Gateway:
         if not self._pending.acquire(blocking=False):
             _log(
                 f"POST /v1/messages model={_model_label(chat)} stream={int(chat.stream)} "
-                "status=529 error=overloaded_error",
+                f"status=529 error=overloaded_error{_elapsed(received)}",
                 level=logging.WARNING,
             )
             return _error_response(529, "overloaded_error", "too many turns queued")
@@ -540,7 +567,7 @@ class Gateway:
                 except TurnAbandoned:
                     _log(
                         f"POST /v1/messages model={_model_label(chat)} stream=1 "
-                        "abandoned while queued",
+                        f"abandoned while queued{_elapsed(received)}",
                         level=logging.WARNING,
                     )
                 except Exception as e:  # noqa: BLE001 — relayed as an in-band error event
@@ -548,7 +575,7 @@ class Gateway:
 
             self._submit(self._turns, self._pending, turn)
             return EventSourceResponse(
-                self._stream(chat, assembler, queue, abandoned),
+                self._stream(chat, assembler, queue, abandoned, received),
                 ping=PING_INTERVAL_SECONDS,
                 ping_message_factory=lambda: _PING,
                 sep=_SEP,
@@ -568,7 +595,7 @@ class Gateway:
             status, error_type, message = _classify(e)
             _log(
                 f"POST /v1/messages model={_model_label(chat)} stream=0 "
-                f"status={status} error={error_type}",
+                f"status={status} error={error_type}{_elapsed(received)}",
                 level=_status_level(status),
             )
             return _error_response(status, error_type, message)
@@ -631,6 +658,7 @@ class Gateway:
         assembler: TurnAssembler,
         queue: asyncio.Queue,
         abandoned: threading.Event,
+        received: float,
     ) -> AsyncIterator[ServerSentEvent]:
         # Pure consumer: the turn was already submitted (and the pending slot
         # already tied to its future) by messages() before this generator was
@@ -656,7 +684,7 @@ class Gateway:
                     status, error_type, message = _classify(value)
                     _log(
                         f"POST /v1/messages model={_model_label(chat)} stream=1 status=200 "
-                        f"error={error_type}",
+                        f"error={error_type}{_elapsed(received)}",
                         level=_status_level(status),
                     )
                     yield _frame(

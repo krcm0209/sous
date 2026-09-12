@@ -650,6 +650,36 @@ def test_count_tokens(tmp_path: Path):
     assert fake.requests[0]["path"] == "/v1/messages/count_tokens"
 
 
+def _turn_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if "sous.gateway: POST /v1/messages" in line]
+
+
+def test_every_failure_line_ends_with_seconds(tmp_path: Path, capsys):
+    """A refusal's wall time matters as much as a success's: a 529 that took
+    ten seconds to be refused is a different problem from one that took none."""
+    app = _app(tmp_path, FakeEngine([]))
+    assert _post(app, _body(max_tokens=0)).status_code == 400
+    assert (
+        _post(
+            app, {"model": "sous-local", "max_tokens": 4}, path="/v1/messages/count_tokens"
+        ).status_code
+        == 400
+    )
+    lines = _turn_lines(capsys.readouterr().err)
+    assert len(lines) == 2
+    assert all(" seconds=" in line for line in lines), lines
+
+
+def test_a_served_count_logs_one_line_with_load_and_seconds(tmp_path: Path, capsys):
+    app = _app(tmp_path, FakeEngine([]))
+    body = {"model": "sous-local", "messages": [{"role": "user", "content": "hi"}]}
+    assert _post(app, body, path="/v1/messages/count_tokens").status_code == 200
+    (line,) = _turn_lines(capsys.readouterr().err)
+    assert "POST /v1/messages/count_tokens model=sous-local input_tokens=" in line
+    assert " load_s=" in line and " seconds=" in line
+    assert "hi" not in line.split("input_tokens=")[0]  # body text never reaches the log
+
+
 # --- turn admission (MAX_PENDING_TURNS) --------------------------------------------
 
 

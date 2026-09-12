@@ -74,6 +74,15 @@ class TurnResult:
     lcp: int = 0
 
 
+@dataclass(frozen=True)
+class CountResult:
+    count: int
+    # A count can be the request that loads the model — seconds of work the
+    # client sees as latency and the log must attribute.
+    load_seconds: float
+    seconds: float
+
+
 class TurnRunner:
     def __init__(self, engines: EngineManager, config: SousConfig):
         self._engines = engines
@@ -204,13 +213,17 @@ class TurnRunner:
             # is what makes it checkable.
             release_mlx_thread_state()
 
-    def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
+    def count_tokens(self, messages: list[dict], tools: list[dict]) -> CountResult:
+        started = time.monotonic()
         try:
             # Same race as run(): this whole call happens outside _gen_lock.
             with self._engines.lease():
-                count = self._engines.get().count_tokens(messages, tools)
+                loading = time.monotonic()
+                engine = self._engines.get()
+                load_seconds = time.monotonic() - loading
+                count = engine.count_tokens(messages, tools)
             self._engines.touch()
-            return count
+            return CountResult(count, load_seconds, time.monotonic() - started)
         finally:
             release_mlx_thread_state()
 
