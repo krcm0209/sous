@@ -72,12 +72,14 @@ Claude Code use stretches further — evaluate features against that goal.
   snapshot in `TurnRunner.run` — never as `after − before`. Counters
   (`forks`, `evictions`, `pressure_evictions`, `reused_tokens`) are deltas.
   Timers read `promptcache._clock` so tests can drive them; `Slot.last_used`
-  keeps the real clock. `sous status` and a task result carry these same
-  fields folded daemon-wide by `PromptCacheStats.add`, which takes the `max`
-  across every owner ever seen, retired ones included — so a daemon-wide
-  `prefill_seconds` reads as the largest last-turn prefill of any owner ever,
-  not a meaningful aggregate; the gauges only mean something read per turn,
-  owner-scoped, the way the gateway's turn line reads them.
+  keeps the real clock. `sous status` (`EngineManager.status`, no `owner`)
+  folds these same fields daemon-wide via `PromptCacheStats.add`'s `max()`
+  across every owner ever seen, retired ones included — so its
+  `prefill_seconds` reads as the largest last-turn prefill of any owner
+  ever, not a meaningful aggregate. A task result's `prompt_cache` block
+  (`worker.py` always passes its task's own `owner=`) is not folded this
+  way: it is that one task's owner-scoped reading, as meaningful as the
+  gateway's turn line's gauges.
 - The gateway forwards every request it does not serve (`gateway/upstream.py`)
   as a transparent proxy: never re-serialize a forwarded body, never add or
   alter an end-to-end header (only `Host`, the hop-by-hop set and a buffered

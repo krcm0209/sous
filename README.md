@@ -327,18 +327,21 @@ the 4096-token floor, so this can also read `bounds=[57123]` (only the header
 boundary) or `bounds=[]` (no probe ran). `tools=` and `system=` are
 8-hex-character hashes of the rendered tool array and system text: comparable
 across lines, not reversible. Refused requests log the same way at `WARNING`
-with `status=` and `seconds=` — but a refusal never takes the gateway lock,
-so its `seconds` is measured from request receipt and already *is*
+with `status=` and `seconds=` — but there `seconds` is measured from
+request receipt, not from the gateway lock, so it already *is*
 client-visible latency, with nothing to add. A streaming turn that fails
 after its SSE headers already went out logs `status=200` — the status the
 client actually received — with an `error=` naming the failure; alerting on
 `status=5..` alone misses these, so watch `error=` on streamed turns too. A
-locally served `count_tokens` logs its `input_tokens`, `load_s` (the model
-load it paid for), `count_s` (time inside the runner) and `seconds`
-(client-visible, from request receipt — it includes any wait for a free
-worker that `count_s` does not); the engine logs `model_load seconds=N.N
-model=<model_id>` when it loads. One more line names the Anthropic tool
-*types* a turn dropped, when any.
+client that disconnects while its turn is still queued behind another logs
+`status=499 error=abandoned` the same way — a *local* 499, distinct from
+the forwarder's own synthesized `499` for a client gone mid-forward
+(below). A locally served `count_tokens` logs its `input_tokens`, `load_s`
+(the model load it paid for), `count_s` (time inside the runner) and
+`seconds` (client-visible, from request receipt — it includes any wait for
+a free worker that `count_s` does not); the engine logs `model_load
+seconds=N.N model=<model_id>` when it loads. One more line names the
+Anthropic tool *types* a turn dropped, when any.
 Each forwarded request logs one line too: `upstream`, method, path, the
 model id when the body named one, the upstream's status, and seconds to
 its headers — at `INFO` whatever the status, since that is the upstream's
