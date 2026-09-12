@@ -2,8 +2,10 @@
 handler that follows sys.stderr so pytest's capture sees it, installed
 idempotently over whatever the MCP SDK put on the root logger."""
 
+import io
 import logging
 import re
+import sys
 import warnings
 from datetime import UTC, datetime
 
@@ -69,6 +71,16 @@ def test_format_line_matches_the_formatter_shape():
     assert " WARNING sous.test: hello" in text
 
 
+def test_formatter_appends_stack_info_like_logging_formatter_does():
+    """`logging.Formatter.format` appends `record.stack_info` after any
+    exception text; nothing sets it today, but a silent no-op later would be
+    a regression on a class nine later tasks format against."""
+    record = logging.LogRecord("sous.test", logging.INFO, __file__, 1, "hello", None, None)
+    record.stack_info = "Stack (most recent call last):\n  fake frame"
+    text = UTCFormatter().format(record)
+    assert text.endswith("\nStack (most recent call last):\n  fake frame")
+
+
 def test_configure_is_idempotent_and_installs_exactly_one_handler():
     configure_daemon_logging()
     configure_daemon_logging()
@@ -92,6 +104,20 @@ def test_handler_writes_to_the_current_sys_stderr(capsys):
     logging.getLogger("sous.test").info("hello")
     err = capsys.readouterr().err
     assert LINE.match(err.strip()), err
+
+
+def test_handler_follows_a_stream_swap_after_construction(monkeypatch):
+    """capsys already swaps sys.stderr during fixture setup, before the test
+    body runs — so the test above passes even for a handler that captured
+    its stream once at construction, since construction (inside this test
+    body) sees the same already-swapped object. Swapping stderr again here,
+    after configure_daemon_logging() has already built the handler, is the
+    one thing a construction-time-bound stream cannot follow."""
+    configure_daemon_logging()
+    replacement = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", replacement)
+    logging.getLogger("sous.test").info("hello")
+    assert LINE.match(replacement.getvalue().strip()), replacement.getvalue()
 
 
 def test_levels_are_spelled_out_in_the_line(capsys):

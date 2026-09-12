@@ -20,8 +20,8 @@ SOUS_HANDLER_NAME = "sous-daemon-log"
 
 class UTCFormatter(logging.Formatter):
     """`2026-09-10T19:26:14.025Z INFO sous.gateway: …` — UTC, milliseconds,
-    Python's level names. Exceptions are appended the way logging always
-    formats them."""
+    Python's level names. Exception and stack info are appended the way
+    logging always formats them."""
 
     def format(self, record: logging.LogRecord) -> str:
         line = format_line(
@@ -29,6 +29,8 @@ class UTCFormatter(logging.Formatter):
         )
         if record.exc_info:
             line = f"{line}\n{self.formatException(record.exc_info)}"
+        if record.stack_info:
+            line = f"{line}\n{self.formatStack(record.stack_info)}"
         return line
 
 
