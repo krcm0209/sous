@@ -1,0 +1,8 @@
+# The kernels in src/sous/engine/kernels/ are Metal, compiled by mlx at model
+# load and never by a C/C++ toolchain. Their two headers are the only reason
+# GitHub reports C and C++ here, and that report makes code scanning schedule a
+# c-cpp analysis, which indexes the tree, counts a .metal file as neither source
+# nor header, finds no compilation unit and fails. Hiding the headers from
+# language detection stops that analysis being scheduled. The .metal files stay
+# detectable: CodeQL has no Metal extractor, so Metal alone triggers nothing.
+src/sous/engine/kernels/*.h linguist-detectable=false
