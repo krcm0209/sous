@@ -104,8 +104,17 @@ def _target_path(request: Request) -> bytes:
     return path + b"?" + query if query else path
 
 
-def _error(status: int, message: str) -> JSONResponse:
-    return JSONResponse(
+class SynthesizedError(JSONResponse):
+    """An Anthropic-shaped error the forwarder made itself (unreachable
+    upstream, timeout, client gone) — as opposed to a status the upstream
+    answered, which is forwarded verbatim. The gateway's log line tells the
+    two apart by this class, never by the number: a 502 can be either."""
+
+    sous_synthesized = True
+
+
+def _error(status: int, message: str) -> SynthesizedError:
+    return SynthesizedError(
         {"type": "error", "error": {"type": "api_error", "message": message}},
         status_code=status,
         headers={"via": VIA},

@@ -16,7 +16,6 @@ import json
 import logging
 import math
 import re
-import sys
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -120,8 +119,21 @@ _LOG_PATH_CHARS = 80
 _MCP_PATH = "/mcp"
 
 
-def _log(message: str) -> None:
-    print(f"sous gateway: {message}", file=sys.stderr, flush=True)
+_logger = logging.getLogger("sous.gateway")
+
+
+def _log(message: str, level: int = logging.INFO) -> None:
+    """One metadata line per event, at a level that means something: INFO for
+    a request served or forwarded, WARNING for one sous refused (a 4xx, a
+    529, a client gone while queued, tools it had to drop), ERROR for a
+    failure sous produced (a 5xx from an exception, an unreachable upstream).
+    The root handler (sous.logs) adds the timestamp and the name."""
+    _logger.log(level, message)
+
+
+def _status_level(status: int) -> int:
+    # 529 is back-pressure both official SDKs retry with backoff, not a fault.
+    return logging.ERROR if status >= 500 and status != 529 else logging.WARNING
 
 
 def _error_response(status: int, error_type: str, message: str) -> JSONResponse:
@@ -404,7 +416,10 @@ class Gateway:
         _log(
             f"upstream {request.method} {_log_token(request.url.path, _LOG_PATH_CHARS)} "
             f"model={model} status={response.status_code} "
-            f"seconds={time.monotonic() - started:.1f}"
+            f"seconds={time.monotonic() - started:.1f}",
+            level=_status_level(response.status_code)
+            if getattr(response, "sous_synthesized", False)
+            else logging.INFO,
         )
         return response
 
@@ -429,7 +444,8 @@ class Gateway:
         if not self._pending_counts.acquire(blocking=False):
             _log(
                 f"POST /v1/messages/count_tokens model={_model_label(chat)} "
-                "status=529 error=overloaded_error"
+                "status=529 error=overloaded_error",
+                level=logging.WARNING,
             )
             return _error_response(529, "overloaded_error", "too many token counts queued")
         try:
@@ -449,7 +465,10 @@ class Gateway:
             _check_loopback(request)
             raw = await _read_body(request)
         except RequestError as e:
-            _log(f"POST /v1/messages status={e.status} error={e.error_type}")
+            _log(
+                f"POST /v1/messages status={e.status} error={e.error_type}",
+                level=_status_level(e.status),
+            )
             return JSONResponse(e.body(), status_code=e.status)
         body, model = self._route(raw)
         if body is None:
@@ -458,7 +477,10 @@ class Gateway:
             _check_depth(body)
             chat = parse_messages_request(body)
         except RequestError as e:
-            _log(f"POST /v1/messages status={e.status} error={e.error_type}")
+            _log(
+                f"POST /v1/messages status={e.status} error={e.error_type}",
+                level=_status_level(e.status),
+            )
             return JSONResponse(e.body(), status_code=e.status)
         if chat.dropped_tool_types:
             # Anthropic's type identifiers are a bounded, useful set, but a
@@ -470,7 +492,8 @@ class Gateway:
                 shown.append(f"… (+{hidden} more)")
             _log(
                 f"dropped {len(chat.dropped_tool_types)} tool(s) with no client-supplied "
-                f"schema (Anthropic server-side or built-in): {', '.join(shown)}"
+                f"schema (Anthropic server-side or built-in): {', '.join(shown)}",
+                level=logging.WARNING,
             )
         assembler = TurnAssembler(
             new_message_id(), chat.model, ToolSet.from_tools(chat.tools, strict=False)
@@ -481,7 +504,8 @@ class Gateway:
         if not self._pending.acquire(blocking=False):
             _log(
                 f"POST /v1/messages model={_model_label(chat)} stream={int(chat.stream)} "
-                "status=529 error=overloaded_error"
+                "status=529 error=overloaded_error",
+                level=logging.WARNING,
             )
             return _error_response(529, "overloaded_error", "too many turns queued")
         if chat.stream:
@@ -516,7 +540,8 @@ class Gateway:
                 except TurnAbandoned:
                     _log(
                         f"POST /v1/messages model={_model_label(chat)} stream=1 "
-                        "abandoned while queued"
+                        "abandoned while queued",
+                        level=logging.WARNING,
                     )
                 except Exception as e:  # noqa: BLE001 — relayed as an in-band error event
                     sink.put(("error", e))
@@ -543,7 +568,8 @@ class Gateway:
             status, error_type, message = _classify(e)
             _log(
                 f"POST /v1/messages model={_model_label(chat)} stream=0 "
-                f"status={status} error={error_type}"
+                f"status={status} error={error_type}",
+                level=_status_level(status),
             )
             return _error_response(status, error_type, message)
         assembler.start(result.input_tokens)
@@ -630,7 +656,8 @@ class Gateway:
                     status, error_type, message = _classify(value)
                     _log(
                         f"POST /v1/messages model={_model_label(chat)} stream=1 status=200 "
-                        f"error={error_type}"
+                        f"error={error_type}",
+                        level=_status_level(status),
                     )
                     yield _frame(
                         {"type": "error", "error": {"type": error_type, "message": message}}

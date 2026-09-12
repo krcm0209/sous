@@ -729,7 +729,7 @@ def test_log_lines_carry_metadata_only(tmp_path: Path, capsys):
     )
     assert r.status_code == 200
     err = capsys.readouterr().err
-    assert "sous gateway: POST /v1/messages" in err
+    assert "sous.gateway: POST /v1/messages" in err
     assert "model=sous-local" in err and "stream=1" in err and "input_tokens=" in err
     assert secret_text not in err
     assert secret_token not in err and "oauth-2025-04-20" not in err
@@ -783,6 +783,91 @@ def test_the_log_carries_lcp_only_on_a_miss(tmp_path: Path, capsys):
     assert "cache=hit" in lines[1] and "lcp=" not in lines[1]
 
 
+def _gateway_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == "sous.gateway"]
+
+
+def test_a_served_turn_logs_at_info(tmp_path: Path, caplog):
+    app = _app(tmp_path, FakeEngine(["ok"]))
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        assert _post(app, _body()).status_code == 200
+    turn = [r for r in _gateway_records(caplog) if "POST /v1/messages" in r.getMessage()]
+    assert turn and turn[-1].levelno == logging.INFO
+
+
+def test_a_refused_request_logs_at_warning(tmp_path: Path, caplog):
+    """4xx and 529 are refusals sous chose — a client's malformed body, or
+    back-pressure the SDKs retry — not failures."""
+    app = _app(tmp_path, FakeEngine([]))
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        assert _post(app, _body(max_tokens=0)).status_code == 400
+    assert [r.levelno for r in _gateway_records(caplog)] == [logging.WARNING]
+
+
+def test_a_failure_sous_produced_logs_at_error(tmp_path: Path, caplog):
+    class Boom(FakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            raise RuntimeError("engine exploded")
+
+    app = _app(tmp_path, Boom([]))
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        assert _post(app, _body()).status_code == 500
+    assert logging.ERROR in [r.levelno for r in _gateway_records(caplog)]
+
+
+def test_a_full_queue_logs_at_warning_not_error(tmp_path: Path, monkeypatch, caplog):
+    """529 is the one 5xx that is back-pressure, not a fault."""
+    import sous.gateway.routes as routes
+
+    monkeypatch.setattr(routes, "MAX_PENDING_TURNS", 0)
+    app = _app(tmp_path, FakeEngine([]))
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        assert _post(app, _body()).status_code == 529
+    assert [r.levelno for r in _gateway_records(caplog)] == [logging.WARNING]
+
+
+def test_status_level_splits_refusals_from_failures():
+    from sous.gateway.routes import _status_level
+
+    assert _status_level(400) == _status_level(413) == _status_level(529) == logging.WARNING
+    assert _status_level(500) == _status_level(502) == _status_level(504) == logging.ERROR
+
+
+def test_an_unreachable_upstream_logs_at_error_but_a_forwarded_status_at_info(
+    tmp_path: Path, caplog
+):
+    """502/504 the forwarder synthesizes are sous's failures; a 5xx the real
+    upstream answered is the upstream's verdict and stays INFO — the same
+    number, told apart by the marker `_error` sets, never by status."""
+    from sous.gateway.upstream import Upstream
+
+    unreachable = Upstream("https://127.0.0.1:9")  # the discard port: refused at once
+    app = _app(tmp_path, FakeEngine([]), upstream=unreachable)
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        r = _post(app, _body(model="claude-opus-5"))
+    assert r.status_code == 502
+    upstream_lines = [r for r in _gateway_records(caplog) if "upstream POST" in r.getMessage()]
+    assert [r.levelno for r in upstream_lines] == [logging.ERROR]
+
+    caplog.clear()
+    app = _app(tmp_path, FakeEngine([]))  # FakeUpstream answers 200
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        assert _post(app, _body(model="claude-opus-5")).status_code == 200
+    upstream_lines = [r for r in _gateway_records(caplog) if "upstream POST" in r.getMessage()]
+    assert [r.levelno for r in upstream_lines] == [logging.INFO]
+
+
+def test_mounting_pins_the_noisy_library_loggers(tmp_path: Path, monkeypatch):
+    """The handler swap (sous.logs) replaces the root handler, never a library
+    logger's level — the no-bodies rule rests on these three pins."""
+    for name in ("sse_starlette", "httpx", "httpcore"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.DEBUG)
+    _app(tmp_path, FakeEngine([]))  # create_server → configure_daemon_logging → mount_gateway
+    assert logging.getLogger("sse_starlette").level == logging.INFO
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
+
+
 def test_mounting_pins_the_sse_logger_above_debug(tmp_path: Path, monkeypatch):
     """sse-starlette logs every frame it sends at DEBUG — the model's reply,
     verbatim. Mounting the gateway pins that logger, so the no-bodies rule does
@@ -822,7 +907,7 @@ def test_a_dropped_tool_type_cannot_forge_a_log_line(tmp_path: Path, capsys):
     write whatever line the client chose into the daemon log. Short enough here
     to survive the length cap, so the escaping is what has to stop it."""
     app = _app(tmp_path, FakeEngine(["ok"]))
-    forged = "x\nsous gateway: POST /v1/messages status=200"
+    forged = "x\nsous.gateway: POST /v1/messages status=200"
     body = _body(tools=[{"type": forged, "name": "web_search"}])
     assert _post(app, body).status_code == 200
     err = capsys.readouterr().err
@@ -1274,16 +1359,15 @@ def test_forwarding_logs_one_bounded_metadata_line_and_never_a_body_header_or_qu
         _post(app, json.dumps(_body(model="m" * 65)).encode())
         _post(app, b"not json")
     err = capsys.readouterr().err
-    lines = [line for line in err.splitlines() if line.startswith("sous gateway: upstream")]
-    assert lines[0].startswith(
-        "sous gateway: upstream POST /v1/messages model=claude-opus-5 status=200 seconds="
+    lines = [line for line in err.splitlines() if "sous.gateway: upstream" in line]
+    assert (
+        "sous.gateway: upstream POST /v1/messages model=claude-opus-5 status=200 seconds="
+        in lines[0]
     )
-    assert lines[1].startswith(
-        "sous gateway: upstream GET /api/oauth/usage model=- status=200 seconds="
-    )
-    assert lines[2].startswith("sous gateway: upstream POST /v1/messages model=- status=200")
-    assert lines[3].startswith("sous gateway: upstream POST /v1/messages model=- status=200")
-    assert lines[4].startswith("sous gateway: upstream POST /v1/messages model=- status=200")
+    assert "sous.gateway: upstream GET /api/oauth/usage model=- status=200 seconds=" in lines[1]
+    assert "sous.gateway: upstream POST /v1/messages model=- status=200" in lines[2]
+    assert "sous.gateway: upstream POST /v1/messages model=- status=200" in lines[3]
+    assert "sous.gateway: upstream POST /v1/messages model=- status=200" in lines[4]
     assert len(lines) == 5
     for canary in ("BODY-CANARY", "HEADER-CANARY", "QUERY-CANARY", "x y", "m" * 65):
         assert canary not in err, canary
@@ -1303,7 +1387,7 @@ def test_a_claimed_model_id_cannot_forge_or_bloat_a_log_line(tmp_path: Path, cap
     reach a log line unbounded, the way a forwarded id already can't."""
     fake = FakeUpstream()
     app = _app(tmp_path, FakeEngine(["ok", "ok"]), upstream=fake.upstream())
-    forged = "sous-local[\nsous gateway: FORGED status=200]"
+    forged = "sous-local[\nsous.gateway: FORGED status=200]"
     oversized = "sous-local[" + "A" * 100 + "]"
     for raw_id in (forged, oversized):
         r = _post(app, _body(model=raw_id))
@@ -1313,7 +1397,7 @@ def test_a_claimed_model_id_cannot_forge_or_bloat_a_log_line(tmp_path: Path, cap
     assert fake.requests == []
     err = capsys.readouterr().err
     assert "FORGED" not in err
-    lines = [line for line in err.splitlines() if line.startswith("sous gateway:")]
+    lines = [line for line in err.splitlines() if "sous.gateway:" in line]
     assert lines, "expected at least one log line"
     for line in lines:
         assert len(line) < 200, line
