@@ -1,6 +1,6 @@
 """Runtime gate for int8 prefill: real weights, real tensor units, local only.
 
-Acceptance from the spec: routed count 336 on the default model, >= 1.3x prefill
+Acceptance bars: routed count 336 on the default model, >= 1.3x prefill
 at 4,096 tokens and >= 1.3x at 32,768, KL(stock || int8) <= 0.06 nats on the
 standard prompt, and a generation session that exits cleanly with the kernels on.
 Takes ~6 minutes on the M5 Pro (two 27B loads, two 32K prefills).

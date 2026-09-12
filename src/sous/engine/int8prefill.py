@@ -8,13 +8,11 @@ kernels live here as source strings and are compiled by mlx at model load
 
 Derived from oMLX (jundot/omlx#3548, Apache License 2.0): qwen35_oq_a8.metal,
 qwen35_oq_a8_nax.metal and oq_a8_decode.h. See THIRD_PARTY_NOTICES.md.
-
-Spec: docs/superpowers/specs/2026-09-11-int8-activation-prefill-design.md.
 """
 
 # The GEMM kernel source (_GEMM_SOURCE below) is foreign C++/Metal text embedded
 # verbatim as a raw string, ported line-for-line from oMLX for a fragment layout
-# and K-order that must match Task 1's reorder_k exactly: ruff's Python line-length
+# and K-order that must match reorder_k below exactly: ruff's Python line-length
 # convention has no bearing on it, and wrapping it to fit would just be cosmetic
 # risk against a correctness-sensitive transcription.
 # ruff: noqa: E501

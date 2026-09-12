@@ -108,7 +108,7 @@ class SousConfig:
     speculative_draft_id: str = "z-lab/Qwen3.8-27B-DFlash2"
     speculative_block_size: int = 3
     # Prefill matmuls of affine-Q4/gs64 projections on the M5 tensor units with
-    # int8 activations (spec 2026-09-11): ~1.4x prefill measured on the M5 Pro, but
+    # int8 activations: ~1.4x prefill measured on the M5 Pro (2026-09-11), but
     # int8 activations change numerics (KL 0.033 vs stock on the standard prompt,
     # inside the 4-bit weight envelope of 0.052), so it ships off until the
     # tool-loop A/B says otherwise. Ignored, with a status reason, on GPUs
@@ -328,7 +328,7 @@ def _gateway_values(gateway: dict) -> tuple[bool, tuple[str, ...], int, int]:
             stacklevel=3,
         )
         models = ["sous-local"]
-    # Spec: honest ids are mandatory. Claude Code ignores
+    # Honest ids are mandatory. Claude Code ignores
     # CLAUDE_CODE_MAX_CONTEXT_TOKENS for any id that canonicalizes to claude-*
     # and trusts its built-in window instead, so an impersonating id silently
     # forfeits the window control the gateway relies on (and, once routing

@@ -508,8 +508,8 @@ def test_gateway_local_models_rejects_non_string_entries(tmp_path: Path):
 def test_gateway_local_models_rejects_claude_ids(tmp_path: Path):
     """Claude Code ignores CLAUDE_CODE_MAX_CONTEXT_TOKENS for ids that
     canonicalize to claude-*, so an impersonating id silently forfeits the
-    window control the gateway depends on — the spec makes honest ids
-    mandatory, not preferable."""
+    window control the gateway depends on — honest ids are mandatory, not
+    preferable."""
     p = tmp_path / "config.toml"
     p.write_text('[gateway]\nlocal_models = ["sous-local", "Claude-haiku-4-5"]\n')
     with warnings.catch_warnings(record=True) as caught:

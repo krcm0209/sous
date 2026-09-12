@@ -336,9 +336,9 @@ class GenerationSession:
     """One task's generations, all on one daemon thread (issue #34).
 
     mlx KV cache arrays are usable only from the thread whose streams created
-    them (streams are thread-scoped for use — probed empirically, see the
-    design spec), and every thread that touched mlx must call
-    release_mlx_thread_state() before it exits (ml-explore/mlx#4327). A fresh
+    them (streams are thread-scoped for use — probed empirically), and every
+    thread that touched mlx must call release_mlx_thread_state() before it
+    exits (ml-explore/mlx#4327). A fresh
     thread per generation therefore killed the prompt cache every turn; one
     thread per task lets turn N+1 reuse turn N's cache. The cache slot itself
     now records which thread built it, so a session on any other thread gets

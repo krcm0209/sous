@@ -125,8 +125,8 @@ class LMEngine:
             return
         # Chunked at generate_step's own prefill_step_size (mlx_lm/generate.py:316
         # defaults to 2048). One unchunked call would materialise attention over
-        # the whole delta at once, which is exactly the peak the spec promises not
-        # to move.
+        # the whole delta at once, which is exactly the memory peak the prompt cache
+        # must not move.
         step = 2048
         for i in range(0, len(token_ids), step):
             model(mx.array(token_ids[i : i + step])[None], cache=cache)
