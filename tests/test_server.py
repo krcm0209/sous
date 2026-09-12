@@ -639,3 +639,38 @@ def test_uvicorn_config_bounds_graceful_shutdown():
     # uvicorn's access log prints the raw request target, query string
     # included, at INFO — the daemon's own level.
     assert cfg.access_log is False
+
+
+def test_create_server_installs_the_daemon_log_handler_and_drops_the_rich_one(svc):
+    import logging
+
+    from sous.logs import SOUS_HANDLER_NAME
+    from sous.server import create_server
+
+    class RichHandler(logging.Handler):  # the SDK's, matched by class name
+        def emit(self, record: logging.LogRecord) -> None:
+            pass
+
+    service, store, _ = svc
+    root = logging.getLogger()
+    root.addHandler(RichHandler())
+    try:
+        create_server(store, service.engines, service.config)
+        names = [h.get_name() for h in root.handlers]
+        assert names.count(SOUS_HANDLER_NAME) == 1
+        assert not [h for h in root.handlers if type(h).__name__ == "RichHandler"]
+    finally:
+        for h in list(root.handlers):
+            if h.get_name() == SOUS_HANDLER_NAME or type(h).__name__ == "RichHandler":
+                root.removeHandler(h)
+
+
+def test_uvicorn_config_leaves_logging_to_the_daemon():
+    """uvicorn's default dictConfig gives its loggers their own handlers and
+    stops propagation, so its lines would keep the `INFO:     …` shape
+    instead of the daemon's. log_config=None lets them reach the root."""
+    from sous.server import uvicorn_config
+
+    cfg = uvicorn_config(object(), "127.0.0.1", 0)
+    assert cfg.log_config is None
+    assert cfg.access_log is False

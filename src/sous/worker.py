@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import sys
+import logging
 import threading
 import time
 from pathlib import Path
@@ -471,5 +471,5 @@ def _worker_loop(
             # the MCP main thread keeps serving, so a dead worker thread would
             # wedge the queue forever with no launchd self-heal. Log, back
             # off one poll interval, keep looping.
-            print(f"sous: worker loop error (continuing): {e}", file=sys.stderr)
+            logging.getLogger("sous.worker").error(f"worker loop error (continuing): {e}")
             stop.wait(poll_interval)
