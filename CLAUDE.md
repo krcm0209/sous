@@ -67,6 +67,12 @@ Claude Code use stretches further — evaluate features against that goal.
   `kern.memorystatus_vm_pressure_level`, never psutil's free RAM: right after
   a model load the weight files sit in the page cache as "active", that
   figure read low, and the valve evicted the forks a cold turn had just made.
+- Prompt-cache per-turn gauges (`PromptCacheStats.begin_turn`, `_GAUGES`) are
+  assigned per turn and read back directly from the owner-scoped `after`
+  snapshot in `TurnRunner.run` — never as `after − before`. Counters
+  (`forks`, `evictions`, `pressure_evictions`, `reused_tokens`) are deltas.
+  Timers read `promptcache._clock` so tests can drive them; `Slot.last_used`
+  keeps the real clock.
 - The gateway forwards every request it does not serve (`gateway/upstream.py`)
   as a transparent proxy: never re-serialize a forwarded body, never add or
   alter an end-to-end header (only `Host`, the hop-by-hop set and a buffered
@@ -93,12 +99,6 @@ Claude Code use stretches further — evaluate features against that goal.
 - `int8prefill.enable()` never raises and a model load never fails because of
   it: every failure is one `warnings.warn` plus `state: unavailable`. Tests
   that need the GEMM without tensor units monkeypatch `int8prefill.qmm`.
-- Prompt-cache per-turn gauges (`PromptCacheStats.begin_turn`, `_GAUGES`) are
-  assigned per turn and read back directly from the owner-scoped `after`
-  snapshot in `TurnRunner.run` — never as `after − before`. Counters
-  (`forks`, `evictions`, `pressure_evictions`, `reused_tokens`) are deltas.
-  Timers read `promptcache._clock` so tests can drive them; `Slot.last_used`
-  keeps the real clock.
 
 ## Security boundary
 

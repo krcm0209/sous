@@ -128,11 +128,17 @@ timestamp with milliseconds, then `INFO` (served or forwarded), `WARNING`
 (a request sous refused: a 4xx, a 529, a client gone while queued, tools it
 had to drop) or `ERROR` (a failure sous produced), then which part spoke.
 Library lines (`mcp.…`, `uvicorn.error`, `huggingface_hub…`) take the same
-shape, and `warnings.warn` arrives as `WARNING py.warnings`. Earlier
-releases split stdout and stderr into `daemon.log` and `daemon.err.log`;
-re-run `sous install-launchd` once — it boots the old job out, waits for
-the lock to free, folds `daemon.err.log` onto `daemon.log`, removes it,
-writes the new plist and bootstraps it.
+shape, and `warnings.warn` arrives as `WARNING py.warnings`.
+Earlier releases split stdout and stderr into `daemon.log` and
+`daemon.err.log`; re-run `sous install-launchd` once — it boots the old job
+out, waits for the lock to free, folds `daemon.err.log` onto `daemon.log`,
+removes it, writes the new plist and bootstraps it. That re-run needs the
+daemon stopped first if it was started by hand (`sous serve`, the normal case
+on a machine with no launchd job installed yet): finding the lock still held,
+the command refuses and writes nothing — `sous stop`, then retry. A failed
+`launchctl bootstrap` after the plist is written — the old job is already
+unloaded by then — prints the bootstrap command to run by hand and exits
+nonzero rather than claiming success.
 
 ## What Claude gets
 
@@ -292,31 +298,39 @@ example (wrapped here):
 line joins to Claude Code's transcript). `cache` is `hit` (this
 conversation's own slot), `fork` (a copy of a shared boundary — ~45–56K
 reused tokens is a tools fork, ~57K a header fork) or `miss`; `took` names
-the slot and its length. `prefilled_tokens` is what the turn had to
-prefill; `forks`/`evicted`/`pressure` are what it published and what was
-dropped under it (by budget, or by the pressure valve). `load_s` (a model
-load, ≈0 when resident), `queue_s` (the wait for the gateway lock — Claude
-Code's small background calls hold it too), `tokenize_s`, `ttft_s` (to the
-first token), `prefill_s` and `decode_s` say where the time went, as far as
+the slot and its length. `prefilled_tokens` is what the turn had to prefill;
+`forks`/`evicted`/`pressure` are what it published and what was dropped under
+it — `evicted` counts every drop, budget or pressure, and `pressure` is the
+subset of those `evicted` the pressure valve forced (not a second, disjoint
+count). `load_s` (a model load, ≈0 when resident), `queue_s` (the wait for
+the gateway lock — Claude Code's small background calls hold it too),
+`tokenize_s`, `prefill_s` and `decode_s` say where the time went, as far as
 the prompt cache measures it — not a strict partition of `seconds`: a turn
 that starts from a copied fork slot times that copy into neither phase, so
-the phases can sum to less than the total. `prefill_tps`/`decode_tps` are
-that same attribution expressed as a rate, not a throughput measurement —
-`prefill_s` also carries fork copies and the snapshot, so a turn that
-publishes forks reports a lower `prefill_tps` than its real prefill speed.
-`seconds` is the total, running from the moment the turn takes the gateway
-lock, so client-visible latency is `seconds` plus `queue_s`. On a miss the
-line adds `lcp=` (how many leading tokens the render shared with the
-closest resident slot), `lcp_region=` (`tools` below the tools boundary —
-the tool array changed; `system` below the header — the system text did;
-else `conversation`) and `bounds=[tools,header]`, the boundaries the probe
-verified. `tools=` and `system=` are 8-hex-character hashes of the rendered
-tool array and system text: comparable across lines, not reversible.
-Refused requests log the same way at `WARNING` with `status=` and
-`seconds=`; a locally served `count_tokens` logs its `input_tokens`,
-`load_s` and `seconds`; the engine logs `model loaded in N.N s
-(<model_id>)` when it loads. One more line names the Anthropic tool
-*types* a turn dropped, when any.
+the phases can sum to less than the total. `ttft_s` is not one more slice
+alongside them: it spans from the start of generation to the first token,
+overlapping `prefill_s` and however much of `decode_s` ran before that token,
+so adding every field this way can just as easily run past `seconds` as fall
+short of it. `prefill_tps`/`decode_tps` are that same phase attribution
+expressed as a rate, not a throughput measurement — `prefill_s` also carries
+fork copies and the snapshot, so a turn that publishes forks reports a lower
+`prefill_tps` than its real prefill speed. `seconds` is the total, running
+from the moment the turn takes the gateway lock, so client-visible latency is
+`seconds` plus `queue_s`. On a miss the line adds `lcp=` (how many leading
+tokens the render shared with the closest resident slot), `lcp_region=`
+(`tools` below the tools boundary — the tool array changed; `system` below
+the header — the system text did; `conversation` otherwise; `-` when the
+probe found no boundary at all, whether for lack of fork budget or because
+nothing cleared the 4096-token floor) and `bounds=[tools,header]`, the
+boundaries the probe verified — either one is left out when it never cleared
+the 4096-token floor, so this can also read `bounds=[57123]` (only the header
+boundary) or `bounds=[]` (no probe ran). `tools=` and `system=` are
+8-hex-character hashes of the rendered tool array and system text: comparable
+across lines, not reversible. Refused requests log the same way at `WARNING`
+with `status=` and `seconds=`; a locally served `count_tokens` logs its
+`input_tokens`, `load_s` and `seconds`; the engine logs
+`model loaded in N.N s (<model_id>)` when it loads. One more line names
+the Anthropic tool *types* a turn dropped, when any.
 Each forwarded request logs one line too: `upstream`, method, path, the
 model id when the body named one, the upstream's status, and seconds to
 its headers — at `INFO` whatever the status, since that is the upstream's
