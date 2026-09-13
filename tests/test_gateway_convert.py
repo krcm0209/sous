@@ -122,13 +122,34 @@ def test_an_inline_system_message_after_tool_results_renders_as_a_user_turn_afte
     deferred tools) as a `role: "system"` message after the preceding user
     message. Rendered where Claude Code's own fallback for models without that
     feature puts it — a <system-reminder> block in that user message — it lands
-    after the tool turns, and the request without it renders a strict prefix,
-    so the earlier turn's cache slot still serves this one."""
+    after the tool turns. Claude Code sends it in the request that first
+    carries that user message, so every later request renders it the same
+    way; here, with nothing but the marker after the tool results, even the
+    request without it renders a strict prefix."""
     without = chat_messages(None, _tool_exchange())
     with_it = chat_messages(None, _tool_exchange({"role": "system", "content": LISTING}))
     assert with_it[: len(without)] == without
     assert with_it[len(without) :] == [{"role": "user", "content": WRAPPED_LISTING}]
     assert without[-1] == {"role": "tool", "content": "A"}
+
+
+def test_real_text_after_the_tool_results_absorbs_the_reminder_into_its_turn():
+    """Claude Code's own <system-reminder> blocks are real text after the tool
+    results; the attachment joins that turn, newline-joined like any two text
+    blocks of one user message, rather than starting another — Claude Code's
+    legacy merge, not a strict extension of the turn without it."""
+    messages = _tool_exchange()
+    tool_message = {
+        **messages[-1],
+        "content": [*messages[-1]["content"], {"type": "text", "text": "R"}],
+    }
+    out = chat_messages(
+        None, [*messages[:-1], tool_message, {"role": "system", "content": LISTING}]
+    )
+    assert out[-2:] == [
+        {"role": "tool", "content": "A"},
+        {"role": "user", "content": f"R\n{WRAPPED_LISTING}"},
+    ]
 
 
 def test_consecutive_inline_system_messages_merge_in_order_one_block_each():
@@ -145,6 +166,14 @@ def test_consecutive_inline_system_messages_merge_in_order_one_block_each():
 def test_a_pre_wrapped_inline_system_message_is_not_wrapped_again():
     out = chat_messages(None, _tool_exchange({"role": "system", "content": WRAPPED_LISTING}))
     assert out[-1] == {"role": "user", "content": WRAPPED_LISTING}
+
+
+def test_an_inline_system_message_that_only_opens_with_a_reminder_is_wrapped_whole():
+    """Only text Claude Code wrapped whole is left alone: a reminder with text
+    after its close tag would otherwise reach the model half outside it."""
+    text = f"{WRAPPED_LISTING}\ntrailing"
+    out = chat_messages(None, _tool_exchange({"role": "system", "content": text}))
+    assert out[-1] == {"role": "user", "content": _wrapped(text)}
 
 
 def test_a_marker_only_inline_system_message_renders_nothing():
@@ -197,6 +226,32 @@ def test_the_request_body_is_not_mutated_by_placement():
     before = json.dumps(messages, sort_keys=True)
     chat_messages(None, messages)
     assert json.dumps(messages, sort_keys=True) == before
+
+
+def test_a_leading_inline_system_message_is_stripped_with_the_canonical_field_as_one_text():
+    """Folded exactly as the hoist did: joined first, stripped once, so the
+    marker's own-line rule sees the join's newlines."""
+    marker_led = {"role": "system", "content": "<total_tokens>9 tokens left</total_tokens>\nC"}
+    out = chat_messages("A", [marker_led, {"role": "user", "content": "q"}])
+    assert out[0] == {"role": "system", "content": "A\nC"}
+
+
+def test_whitespace_beside_the_marker_after_tool_results_adds_no_user_turn():
+    """Stripped block by block, a whitespace-only sibling of the marker block
+    would survive on its own; judged as one text, it is residue."""
+    content = [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "A"},
+        {"type": "text", "text": "<total_tokens>1 tokens left</total_tokens>"},
+        {"type": "text", "text": "\n"},
+    ]
+    assert chat_messages(None, [{"role": "user", "content": content}]) == [
+        {"role": "tool", "content": "A"}
+    ]
+    marker_then_blank = [
+        {"type": "text", "text": "<total_tokens>1 tokens left</total_tokens>"},
+        {"type": "text", "text": "   "},
+    ]
+    assert chat_messages(None, [{"role": "user", "content": marker_then_blank}]) == []
 
 
 def test_a_marker_block_followed_by_a_text_block_leaves_no_leading_newline():

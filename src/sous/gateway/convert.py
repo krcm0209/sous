@@ -44,9 +44,15 @@ _BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 # marker, and tolerates trailing spaces or a CR before the line end so a
 # marker with an unexpected line ending cannot stay behind and thrash the cache.
 _TOTAL_TOKENS_RE = re.compile(r"(?m)\n{0,2}^<total_tokens>\d+ tokens left</total_tokens>[ \t]*\r?$")
+# The tag Claude Code delivers system text inside a user message with, and
+# the shape sous gives a mid-conversation system message (`_reminder`).
+_REMINDER_OPEN = "<system-reminder>"
+_REMINDER_CLOSE = "</system-reminder>"
 # One of Claude Code's assembly paths wraps that marker in a system-reminder;
 # stripping the marker leaves the hollow shell, which goes too.
-_EMPTY_REMINDER_RE = re.compile(r"\n{0,2}<system-reminder>\s*</system-reminder>")
+_EMPTY_REMINDER_RE = re.compile(
+    rf"\n{{0,2}}{re.escape(_REMINDER_OPEN)}\s*{re.escape(_REMINDER_CLOSE)}"
+)
 
 _ROLES = ("user", "assistant", "system")
 _OMITTED = "[{kind} omitted: sous serves text only]"
@@ -129,16 +135,15 @@ def _text_parts(content: object, *, drop_billing: bool) -> list[str]:
     return parts
 
 
-_REMINDER_OPEN = "<system-reminder>"
-
-
 def _reminder(text: str) -> str:
     """System text delivered inside a user message, in the shape Claude Code
     itself uses for models without mid-conversation system support. Text it
-    already wrapped (it does so for one model id) is left alone."""
-    if text.startswith(_REMINDER_OPEN):
+    already wrapped whole (it does so for one model id) is left alone; text
+    that merely opens with the tag is wrapped like any other, so nothing
+    reaches the model outside a reminder."""
+    if text.startswith(_REMINDER_OPEN) and text.rstrip().endswith(_REMINDER_CLOSE):
         return text
-    return f"{_REMINDER_OPEN}\n{text}\n</system-reminder>"
+    return f"{_REMINDER_OPEN}\n{text}\n{_REMINDER_CLOSE}"
 
 
 def _with_block(msg: dict, block: dict) -> dict:
@@ -159,42 +164,46 @@ def _place_inline_system(messages: list[dict]) -> tuple[list[str], list[dict]]:
     accepts a system turn at index 0 only, and hoisting a later one there
     moves the whole system block: every cached prefix behind it dies on the
     turn the attachment arrives. So: before any user or assistant message it
-    joins the system prompt; after a user message it becomes a text block on
-    that message (rendered after that message's tool results, as a user
-    turn); after an assistant message it becomes a user message of its own.
-    Consecutive ones land in the same place, in order; one that strips to
-    nothing lands nowhere, so the render equals the request's without it.
-    Returns the leading texts and the rewritten list; `messages` is not
-    mutated."""
+    joins the system prompt (its raw parts, for `_system_text` to join and
+    strip with the canonical field as one text, exactly as a hoist would);
+    after a user message it becomes a text block on that message (rendered
+    after that message's tool results, as a user turn); after an assistant
+    message it becomes a user message of its own. Consecutive ones land in
+    the same place, in order; one that strips to nothing lands nowhere, so
+    the render equals the request's without it. Returns the leading parts
+    and the rewritten list; `messages` is not mutated."""
     leading: list[str] = []
     placed: list[dict] = []
-    # Index in `placed` of the user message the next system message appends
-    # to; None while nothing precedes it or an assistant message was last.
-    target: int | None = None
+    # Whether the last placed message is a user message the next system
+    # message appends to: not while nothing precedes it, nor after an
+    # assistant message.
+    appendable = False
     for msg in messages:
         role = msg.get("role")
         if role != "system":
             placed.append(msg)
-            target = len(placed) - 1 if role == "user" else None
+            appendable = role == "user"
             continue
-        text = strip_volatile("\n\n".join(_text_parts(msg.get("content"), drop_billing=True)))
+        parts = _text_parts(msg.get("content"), drop_billing=True)
+        if not placed:
+            leading.extend(parts)
+            continue
+        text = strip_volatile("\n\n".join(parts))
         if not text:
             continue
-        if not placed:
-            leading.append(text)
-            continue
         block = {"type": "text", "text": _reminder(text)}
-        if target is None:
-            placed.append({"role": "user", "content": [block]})
-            target = len(placed) - 1
+        if appendable:
+            placed[-1] = _with_block(placed[-1], block)
         else:
-            placed[target] = _with_block(placed[target], block)
+            placed.append({"role": "user", "content": [block]})
+            appendable = True
     return leading, placed
 
 
 def _system_text(system: object, leading: list[str]) -> str:
-    """One system prompt from the canonical field plus the inline system
-    messages that precede every user and assistant message, canonical first."""
+    """One system prompt from the canonical field plus the parts of the
+    inline system messages that precede every user and assistant message,
+    canonical first, stripped as one text."""
     parts = _text_parts(system, drop_billing=True) if system is not None else []
     return strip_volatile("\n\n".join([*parts, *leading]))
 
@@ -233,12 +242,18 @@ def _user_turns(content: object) -> list[dict]:
         # Claude Code appends the <total_tokens> marker as its own text block
         # after every tool-result batch. Stripped block by block, a marker-only
         # block contributes nothing — not even the join's newline in front of
-        # a block that follows it — and an empty user turn right after the
-        # tool responses would read to the model as "the user said nothing".
-        stripped = [t for t in (strip_volatile(t) for t in texts) if t]
+        # a block that follows it. What the strip leaves is then judged as
+        # one text, the way a string content is: whitespace beside a marker
+        # is residue and makes no turn (an empty user turn right after the
+        # tool responses would read to the model as "the user said nothing"),
+        # while a whitespace-only message that carried no marker keeps its
+        # turn.
+        stripped = [strip_volatile(t) for t in texts]
+        marked = any(s != t for s, t in zip(stripped, texts, strict=True))
         texts.clear()
-        if stripped:
-            out.append({"role": "user", "content": "\n".join(stripped)})
+        text = "\n".join(s for s in stripped if s)
+        if text and (text.strip() or not marked):
+            out.append({"role": "user", "content": text})
 
     for block in content:
         if not isinstance(block, dict):
