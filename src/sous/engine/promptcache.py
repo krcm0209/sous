@@ -683,15 +683,38 @@ class PrefixCache:
         it): a slot is never evicted by its own publish, so on a machine with
         room for exactly one slot that one survives — and a cold turn's second
         fork never evicts its first.
+
+        The lineage drop runs under the same lock, before the caps, so the
+        caps see the map the conversation actually needs.
         """
         keep = (slot, *protect)
         with self._lock:
             if epoch != self._epoch or slot.owner in self._retired:
                 return False
             self._slots.append(slot)
+            self._drop_grandparent(slot)
             self._evict_caps(protect=keep)
         self._evict_pressure(protect=keep)
         return True
+
+    def _drop_grandparent(self, slot: Slot) -> None:
+        """Keep a linear conversation at its current and previous lengths.
+        Every retained take leaves the predecessor in place, so without this
+        a ten-turn subagent would hold ten copies of itself: when `slot`
+        extends a retained turn slot that itself extended one, that
+        grandparent goes, charged to `evictions` — neither the budget nor
+        pressure asked for it. A branch (a progress-summary call descends
+        from the same parent as the real conversation's next turn) is not on
+        this chain and stays until LRU takes it. Forks are shared and never
+        dropped by lineage. Lock held by the caller."""
+        parent = slot.parent() if slot.parent is not None else None
+        if parent is None or parent.parent is None:
+            return
+        grand = parent.parent()
+        if grand is None or grand.kind != "turn" or not any(s is grand for s in self._slots):
+            return
+        self._slots = [s for s in self._slots if s is not grand]
+        self._stats_for(grand.owner).evictions += 1
 
     def _evict_pressure(self, protect: Sequence[Slot]) -> None:
         """Shrink the map when the machine says so, never touching a slot in

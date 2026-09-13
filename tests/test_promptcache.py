@@ -1294,9 +1294,81 @@ def test_the_parent_link_does_not_pin_a_predecessor_that_left_the_map():
     h.pressure_value = KERNEL_PRESSURE_WARN  # one unprotected drop per publish
     a3 = [*A2, 7]
     pc.generate(a3, [*a3, 90, 91], 16)
-    assert [s.held for s in pc.slots()] == [A2, a3]  # A1's slot was the LRU victim
+    # A1's slot goes to the lineage bound (a3's publish drops its grandparent)
+    # and A2's — `child`, which this test still holds — to the valve, as the
+    # LRU of what was left.
+    assert [s.held for s in pc.slots()] == [a3]
     gc.collect()
     assert child.parent() is None
+
+
+def test_a_linear_conversation_keeps_only_its_current_and_previous_lengths():
+    """Each retained take leaves the predecessor in place; without a bound a
+    ten-turn subagent would hold ten copies of itself. Publishing a turn slot
+    drops its grandparent, charged to evictions (the budget did not ask for
+    it, and neither did pressure)."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    a3 = [*A2, 7]
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([A1, A2])
+    pc.generate(a3, [*a3, 90, 91], 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([A2, a3])
+    s = pc.stats()
+    assert (s["evictions"], s["pressure_evictions"], s["retained"]) == (1, 0, 2)
+    assert s["resident_bytes"] == sum(x.nbytes for x in pc.slots())
+
+
+def test_a_dropped_grandparent_is_freed_not_pinned_by_lineage():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    a3 = [*A2, 7]
+    pc.generate(A1, A1_FULL, 16)
+    (first,) = pc.slots()
+    gone = weakref.ref(first)
+    del first
+    pc.generate(A2, A2_FULL, 16)
+    pc.generate(a3, [*a3, 90, 91], 16)
+    gc.collect()
+    assert gone() is None
+
+
+def test_lineage_never_drops_a_fork():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
+    pc.generate(C1_NEXT, C1_NEXT_FULL, 16, fork_at=[FORK])
+    c1_third = [*C1_NEXT, 702]
+    pc.generate(c1_third, [*c1_third, 90, 91], 16, fork_at=[FORK])
+    assert [s.held for s in pc.slots() if s.kind == "fork"] == [H]
+    assert sorted(s.held for s in pc.slots() if s.kind == "turn") == sorted([C1_NEXT, c1_third])
+
+
+def test_a_branch_keeps_its_own_slot_until_lru_takes_it():
+    """Lineage is by reference: the summary call's slot descends from A1's,
+    not from the real conversation's next turn, so nothing drops it but LRU."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    summary = [*A1, 500]
+    a3 = [*A2, 7]
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(summary, [*summary, 90, 91], 16)
+    pc.generate(A2, A2_FULL, 16)
+    pc.generate(a3, [*a3, 90, 91], 16)  # drops A1's slot, the grandparent
+    assert sorted(s.held for s in pc.slots()) == sorted([summary, A2, a3])
+
+
+def test_a_moved_slot_carries_no_lineage():
+    """At a budget of 0 nothing is retained, so there is never a grandparent
+    to drop and the evictions counter stays what the cap pass makes it."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    a3 = [*A2, 7]
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)
+    pc.generate(a3, [*a3, 90, 91], 16)
+    assert pc.stats()["evictions"] == 0
 
 
 def test_pressure_eviction_never_holds_the_lock_across_a_headroom_call():
