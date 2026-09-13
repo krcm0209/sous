@@ -294,7 +294,7 @@ turn gives up, stated plainly:
   fallback for models without the feature does — a `<system-reminder>` block
   in the user turn before it (after that turn's tool results). The model sees
   the same text in the same place a frontier model without the feature would;
-  nothing is lost, and the conversation stays a strict extension of the
+  nothing the model needs is lost, and the conversation stays a strict extension of the
   previous turn's, which is what keeps it warm.
 - **A client that disconnects does not stop the model.** A local turn runs to
   completion (so the next request never waits on a wedged lock); aborting
@@ -523,17 +523,17 @@ left once the weights, one full context window of KV (the larger of
 27 GiB on a 64 GB machine with the default model and gateway window, room
 for those forks and several conversations; each live conversation under the
 auto budget also keeps its previous length resident (the slot a branch of it
-starts from), so count ~4 GiB per conversation at 63K tokens beyond the
-forks; a 48 GB machine should set it to `0` (forks off, one slot), or to at
+starts from), so a live conversation is two slots, ~8 GiB at 63K tokens,
+beyond the forks; a 48 GB machine should set it to `0` (forks off, one slot), or to at
 least twice one conversation slot — about 8 GiB with the default model at
 ~57K tokens — because the copy that keeps a conversation's previous length
 resident is taken only when twice the slot fits; below that every hit moves
 its slot, and a branch of the conversation (a progress-summary call) starts
 from the fork instead. The copy's room comes from least-recently-used slots,
 forks included, so keeping a fork resident beside a retaining conversation
-wants about four slots' worth, ~14 GiB. A value between the two makes every
-cold turn take a fork copy that its own turn slot then evicts, so it pays
-the copy and never reuses it. Slots are
+wants about four slots' worth, ~14 GiB. A value below ~14 GiB makes every
+cold turn take a fork copy that a later turn then evicts to make room for
+its own copy, so it pays the fork and never reuses it. Slots are
 evicted least-recently-used first when the budget, a count of 16, or memory
 pressure says so. Pressure is two readings: Metal's own headroom (room for one
 more window of KV), and the kernel's memory-pressure level — at *warn* each
