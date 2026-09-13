@@ -6,6 +6,7 @@ affects correctness is made here, against fakes.
 
 from __future__ import annotations
 
+import gc
 import threading
 import weakref
 from typing import cast
@@ -1208,6 +1209,94 @@ def test_a_slot_another_owner_evicted_after_the_take_is_not_copied():
         pc._slots = []  # what another owner's eviction does to the map
     assert pc._make_room(slot.nbytes, protect=(slot,), require=slot) is False
     assert pc._make_room(slot.nbytes, protect=(slot,)) is True  # only the residency rule refused
+
+
+def test_a_retained_take_publishes_a_slot_whose_parent_is_its_predecessor():
+    """`parent` names the slot this one was copied from and extended, and only
+    a retained take has one: the two slots are the same conversation at two
+    lengths, and a reader of the map has no other way to tell that apart from
+    two unrelated conversations that happen to share a prefix."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    (first,) = pc.slots()
+    pc.generate(A2, A2_FULL, 16)
+    (child,) = [s for s in pc.slots() if s.held == A2]
+    assert child.parent is not None
+    assert child.parent() is first  # the slot object itself, not an equal one
+    assert first.parent is None  # the conversation's first turn extended nothing
+
+
+def test_a_miss_publishes_a_slot_with_no_parent():
+    """A turn that took no slot extended none — including one that missed with
+    another conversation's slot resident beside it."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)  # a miss, with A1's slot in the map
+    assert [s.parent for s in pc.slots()] == [None, None]
+
+
+def test_a_moved_take_publishes_a_slot_with_no_parent():
+    """A moved slot is gone from the map, and the turn that adopted its arrays
+    is the same cache under a longer key — there is no predecessor left to
+    point at."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    (slot,) = pc.slots()
+    pc.max_bytes = slot.nbytes  # room for the original, not for a copy beside it
+    pc.generate(A2, A2_FULL, 16)
+    (child,) = pc.slots()
+    assert (child.held, child.parent) == (A2, None)
+
+
+def test_a_failed_turn_slot_copy_publishes_a_slot_with_no_parent():
+    """The copy that failed is what a parent link would name: the turn fell
+    back to extending the original arrays, so the published slot is the moved
+    case and carries no parent."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    _fail_next_copy(h)
+    with pytest.warns(UserWarning, match="turn-slot copy failed"):
+        pc.generate(A2, A2_FULL, 16)
+    (child,) = pc.slots()
+    assert (child.held, child.parent) == (A2, None)
+
+
+def test_a_cold_retry_publishes_a_slot_with_no_parent():
+    """The warm attempt that took the slot was abandoned: the cache published
+    at the end was built from nothing, so the parent the take had set must be
+    cleared before the retry's slot carries it."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    h.fail_once = True
+    with pytest.warns(UserWarning, match="retrying cold"):
+        pc.generate(A2, A2_FULL, 16)
+    assert pc.stats()["cold_retries"] == 1
+    assert h.decoded[-1] == A2_FULL  # the retry fed the whole prompt
+    (child,) = [s for s in pc.slots() if s.held == A2]
+    assert child.parent is None
+
+
+def test_the_parent_link_does_not_pin_a_predecessor_that_left_the_map():
+    """Weak by design: a conversation publishes a slot per turn, so a strong
+    chain would keep every cache it ever held alive for as long as its newest
+    one — the eviction that dropped the predecessor would free nothing."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)
+    (child,) = [s for s in pc.slots() if s.held == A2]
+    assert child.parent is not None and child.parent() is not None
+    h.pressure_value = KERNEL_PRESSURE_WARN  # one unprotected drop per publish
+    a3 = [*A2, 7]
+    pc.generate(a3, [*a3, 90, 91], 16)
+    assert [s.held for s in pc.slots()] == [A2, a3]  # A1's slot was the LRU victim
+    gc.collect()
+    assert child.parent() is None
 
 
 def test_pressure_eviction_never_holds_the_lock_across_a_headroom_call():
