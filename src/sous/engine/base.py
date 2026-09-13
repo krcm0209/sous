@@ -493,24 +493,43 @@ class EngineManager:
             )
         )
         self._lock = threading.Lock()
+        # A load or an unload is never done under _lock (minutes for a 27B):
+        # get() and unload_if_idle() mark which is in progress and wait on
+        # this for it to finish, so status() and every other short call on
+        # the lock answer meanwhile.
+        self._changed = threading.Condition(self._lock)
         self._engine: ManagedEngine | None = None
+        self._loading = False
+        self._unloading = False
         self._last_used: float | None = None
         self._leases = 0
 
     def get(self) -> ManagedEngine:
-        with self._lock:
-            if self._engine is None:
-                loading = time.monotonic()
-                self._engine = ManagedEngine(self._factory(self._config.model_id))
-                # The one line that brackets a cold start in the daemon log —
-                # before it, only huggingface_hub's own chatter said a load
-                # happened, and a turn's `seconds` could not be split.
-                _logger.info(
-                    f"model_load seconds={time.monotonic() - loading:.1f} "
-                    f"model={self._engine.model_id}"
-                )
+        with self._changed:
+            while self._loading or self._unloading:
+                self._changed.wait()
+            if self._engine is not None:
+                self._last_used = time.monotonic()
+                return self._engine
+            self._loading = True
+        loading = time.monotonic()
+        try:
+            engine = ManagedEngine(self._factory(self._config.model_id))
+        except BaseException:
+            with self._changed:
+                self._loading = False
+                self._changed.notify_all()
+            raise
+        with self._changed:
+            self._engine = engine
+            self._loading = False
             self._last_used = time.monotonic()
-            return self._engine
+            self._changed.notify_all()
+        # The one line that brackets a cold start in the daemon log —
+        # before it, only huggingface_hub's own chatter said a load
+        # happened, and a turn's `seconds` could not be split.
+        _logger.info(f"model_load seconds={time.monotonic() - loading:.1f} model={engine.model_id}")
+        return engine
 
     def touch(self) -> None:
         with self._lock:
@@ -536,7 +555,9 @@ class EngineManager:
                 self._leases -= 1
 
     def unload_if_idle(self) -> bool:
-        with self._lock:
+        with self._changed:
+            # _engine is None while a load or an unload is in progress too,
+            # so both are refused here without a second check.
             if self._engine is None or self._last_used is None:
                 return False
             if self._engine.generation_in_flight() or self._leases:
@@ -545,17 +566,24 @@ class EngineManager:
                 # holding this engine across calls that take no _gen_lock.
                 return False
             idle = time.monotonic() - self._last_used
-            if idle > self._config.idle_unload_minutes * 60:
-                self._engine.unload()
-                self._engine = None
-                return True
-            return False
+            if idle <= self._config.idle_unload_minutes * 60:
+                return False
+            engine, self._engine = self._engine, None
+            self._unloading = True
+        try:
+            engine.unload()
+        finally:
+            with self._changed:
+                self._unloading = False
+                self._changed.notify_all()
+        return True
 
     def status(self) -> dict:
         with self._lock:
             idle = (time.monotonic() - self._last_used) if self._last_used else None
             out = {
                 "loaded": self._engine is not None,
+                "loading": self._loading,
                 "model_id": self._config.model_id,
                 "idle_seconds": idle,
             }

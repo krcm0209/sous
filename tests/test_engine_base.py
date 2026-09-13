@@ -105,6 +105,191 @@ def test_get_logs_the_load_once_with_its_duration(caplog):
     assert lines[0].startswith("model_load seconds=") and lines[0].endswith(" model=fake/model")
 
 
+class _GatedFactory:
+    """A model factory that blocks until released, so a test can look at the
+    manager mid-load. `started` is set once the factory has been entered."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.created: list[FakeEngine] = []
+
+    def __call__(self, model_id: str) -> FakeEngine:
+        self.started.set()
+        assert self.release.wait(10)
+        engine = FakeEngine([])
+        self.created.append(engine)
+        return engine
+
+
+def _gated_manager(idle_minutes: int = 30) -> tuple[EngineManager, _GatedFactory]:
+    factory = _GatedFactory()
+    return EngineManager(
+        SousConfig(idle_unload_minutes=idle_minutes), engine_factory=factory
+    ), factory
+
+
+def test_status_answers_while_the_model_loads():
+    """The worker's get() used to hold the manager lock for the whole load —
+    minutes for a 27B — so status() (and everything else on the lock) waited
+    it out. A load in progress must be reportable, not a blocking call."""
+    mgr, factory = _gated_manager()
+    loader = threading.Thread(target=mgr.get, daemon=True)
+    loader.start()
+    try:
+        assert factory.started.wait(5)
+        t0 = time.monotonic()
+        s = mgr.status()
+        assert time.monotonic() - t0 < 1.0
+        assert s["loaded"] is False and s["loading"] is True
+    finally:
+        factory.release.set()
+    loader.join(5)
+    assert not loader.is_alive()
+    s = mgr.status()
+    assert s["loaded"] is True and s["loading"] is False
+
+
+def test_concurrent_gets_share_one_load():
+    mgr, factory = _gated_manager()
+    engines: list = []
+    threads = [
+        threading.Thread(target=lambda: engines.append(mgr.get()), daemon=True) for _ in range(3)
+    ]
+    for t in threads:
+        t.start()
+    try:
+        assert factory.started.wait(5)
+    finally:
+        factory.release.set()
+    for t in threads:
+        t.join(5)
+        assert not t.is_alive()
+    assert len(factory.created) == 1
+    assert all(e is engines[0] for e in engines)
+
+
+def test_a_failed_load_leaves_the_manager_empty_and_loadable():
+    calls: list[str] = []
+
+    def factory(model_id: str):
+        calls.append(model_id)
+        if len(calls) == 1:
+            raise RuntimeError("weights missing")
+        return FakeEngine([])
+
+    mgr = EngineManager(SousConfig(), engine_factory=factory)
+    with pytest.raises(RuntimeError):
+        mgr.get()
+    s = mgr.status()
+    assert s["loaded"] is False and s["loading"] is False
+    assert mgr.get() is mgr.get() and len(calls) == 2
+
+
+def test_a_failed_load_releases_the_threads_waiting_on_it():
+    """A waiter parks until the load in progress ends; a load that ends by
+    raising must wake it too, or the daemon is wedged behind one bad load.
+    Each waiter then finds nothing loaded and loads on its own."""
+    entered = threading.Event()
+    proceed = threading.Event()
+    calls: list[str] = []
+
+    def factory(model_id: str):
+        calls.append(model_id)
+        if len(calls) == 1:
+            entered.set()
+            assert proceed.wait(10)
+            raise RuntimeError("weights missing")
+        return FakeEngine([])
+
+    mgr = EngineManager(SousConfig(), engine_factory=factory)
+    failed = threading.Event()
+
+    def load_and_fail():
+        try:
+            mgr.get()
+        except RuntimeError:
+            failed.set()
+
+    loader = threading.Thread(target=load_and_fail, daemon=True)
+    loader.start()
+    assert entered.wait(5)
+    got: list = []
+    waiter = threading.Thread(target=lambda: got.append(mgr.get()), daemon=True)
+    waiter.start()
+    proceed.set()
+    loader.join(5)
+    assert failed.is_set()
+    waiter.join(5)
+    assert not waiter.is_alive(), "a failed load left its waiter parked"
+    assert len(calls) == 2 and got[0] is mgr.get()
+
+
+def test_unload_if_idle_is_refused_at_once_during_a_load():
+    """Refused, and refused without waiting: the sweep runs on the worker's
+    thread every poll, and parking it behind a load for minutes is the
+    stall the lock change removes."""
+    mgr, factory = _gated_manager(idle_minutes=0)
+    loader = threading.Thread(target=mgr.get, daemon=True)
+    loader.start()
+    try:
+        assert factory.started.wait(5)
+        t0 = time.monotonic()
+        assert mgr.unload_if_idle() is False
+        assert time.monotonic() - t0 < 1.0
+    finally:
+        factory.release.set()
+    loader.join(5)
+    assert not loader.is_alive()
+
+
+class _SlowUnloadEngine(FakeEngine):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.unloading = threading.Event()
+        self.release = threading.Event()
+
+    def unload(self) -> None:
+        self.unloading.set()
+        assert self.release.wait(10)
+        super().unload()
+
+
+def test_get_during_an_unload_waits_for_it_and_loads_fresh():
+    """Freeing a 27B takes seconds and get() must never hand out an engine
+    that is being torn down, nor load a second copy beside it: it waits, then
+    loads. status() meanwhile reports neither loaded nor loading."""
+    slow = _SlowUnloadEngine()
+    second_started = threading.Event()
+    made: list[FakeEngine] = []
+
+    def factory(model_id: str):
+        if made:
+            second_started.set()
+        made.append(slow if not made else FakeEngine([]))
+        return made[-1]
+
+    mgr = EngineManager(SousConfig(idle_unload_minutes=0), engine_factory=factory)
+    mgr.get()
+    time.sleep(0.01)
+    sweeper = threading.Thread(target=mgr.unload_if_idle, daemon=True)
+    sweeper.start()
+    assert slow.unloading.wait(5)
+    got: list = []
+    getter = threading.Thread(target=lambda: got.append(mgr.get()), daemon=True)
+    getter.start()
+    # Parked behind the unload, not loading a second copy beside it.
+    assert not second_started.wait(0.2)
+    assert got == []
+    s = mgr.status()
+    assert s["loading"] is False and s["loaded"] is False
+    slow.release.set()
+    sweeper.join(5)
+    getter.join(5)
+    assert not getter.is_alive()
+    assert len(made) == 2 and got[0] is not slow and slow.unloaded is True
+
+
 class _BlockingEngine(FakeEngine):
     def __init__(self):
         super().__init__([])

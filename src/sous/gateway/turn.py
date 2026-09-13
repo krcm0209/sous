@@ -155,9 +155,9 @@ class TurnRunner:
                     # cannot be interrupted and the lock discipline depends on it.)
                     raise TurnAbandoned
                 engine = self._engines.get()
-                # From `started`, not from here: entering the lease waits out
-                # a load or unload another thread is in the middle of, which
-                # costs this turn exactly what loading the model itself would.
+                # From `started`, not from here: get() waits out a load or
+                # unload another thread is in the middle of, which costs this
+                # turn exactly what loading the model itself would.
                 load_seconds = time.monotonic() - started
                 session = self._session_for(engine)
                 counting = time.monotonic()
