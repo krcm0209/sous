@@ -6,6 +6,7 @@ affects correctness is made here, against fakes.
 
 from __future__ import annotations
 
+import gc
 import threading
 import weakref
 from typing import cast
@@ -15,6 +16,7 @@ import pytest
 from sous.engine.base import Delta
 from sous.engine.promptcache import (
     FORK_MIN_TOKENS,
+    KERNEL_PRESSURE_WARN,
     PrefixCache,
     PromptCacheStats,
     PromptMemo,
@@ -883,6 +885,8 @@ def test_stats_as_dict_reports_every_counter():
         evictions=3,
         miss_lcp=40,
         pressure_evictions=2,
+        retained=2,
+        moved=1,
     )
     assert s.as_dict() == {
         "hits": 2,
@@ -895,8 +899,11 @@ def test_stats_as_dict_reports_every_counter():
         "evictions": 3,
         "miss_lcp": 40,
         "pressure_evictions": 2,
+        "retained": 2,
+        "moved": 1,
         "prefilled_tokens": 0,
         "took_len": 0,
+        "took_kind": "",
         "bound_lo": 0,
         "bound_hi": 0,
         "probe_seconds": 0.0,
@@ -909,6 +916,12 @@ def test_stats_add_sums_pressure_evictions():
     a = PromptCacheStats(evictions=3, pressure_evictions=1)
     a.add(PromptCacheStats(evictions=2, pressure_evictions=2))
     assert (a.evictions, a.pressure_evictions) == (5, 3)
+
+
+def test_stats_add_sums_retained_and_moved():
+    a = PromptCacheStats(retained=1, moved=2)
+    a.add(PromptCacheStats(retained=3, moved=1))
+    assert (a.retained, a.moved) == (4, 3)
 
 
 def test_stats_add_sums_the_counters_and_maxes_the_snapshot_gauge():
@@ -991,16 +1004,9 @@ def test_two_interleaved_conversations_both_reuse():
     assert pc.stats()["misses"] == 2
     assert h.decoded[2] == A2_FULL[len(A1) :]
     assert h.decoded[3] == B2_FULL[len(B1) :]
-    assert len(h.caches) == 2  # one cache per conversation, each extended in place
-
-
-def test_a_turn_slot_is_consumed_by_the_turn_that_extends_it():
-    h = FakeHooks(trimmable=True)
-    pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(A1, A1_FULL, 16)
-    pc.generate(A2, A2_FULL, 16)
-    held = [s.held for s in pc.slots()]
-    assert held == [A2]  # not [A1, A2]: the old key is gone with the cache it named
+    # each warm turn works on a copy of its slot; the slot itself stays for a
+    # branch to find
+    assert len(h.caches) == 4
 
 
 def test_the_longest_matching_slot_wins():
@@ -1055,6 +1061,334 @@ def test_a_fork_the_turn_selected_survives_the_pre_turn_eviction_pass():
     # after.
     assert pc.stats()["evictions"] == 1
     assert [s.kind for s in pc.slots()] == ["turn"]
+
+
+def test_a_turn_slot_is_retained_when_the_budget_holds_the_copy():
+    """Claude Code branches a running subagent's conversation with progress
+    summary calls: the same prefix, a different last turn. A slot the
+    extending turn consumed would leave the next real turn nothing to start
+    from; copied and left in place, both branches start warm."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([A1, A2])
+    s = pc.stats()
+    assert (s["hits"], s["retained"], s["moved"], s["reused_tokens"]) == (1, 1, 0, len(A1))
+    assert h.decoded[-1] == A2_FULL[len(A1) :]
+    turn1, turn2 = [c for c in h.caches]
+    assert cast(FakeTrimmable, turn1[0]).offset == len(A1)  # the original is untouched
+    assert cast(FakeTrimmable, turn2[0]).offset == len(A2)
+
+
+def test_a_retained_slot_serves_a_branch_and_then_the_real_conversation():
+    """real → summary → real → real: the summary call takes A1's slot and
+    publishes its own; the real conversation still finds A1's, then its own."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    summary = [*A1, 500]
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(summary, [*summary, 90, 91], 16)
+    pc.generate(A2, A2_FULL, 16)
+    a3 = [*A2, 7]
+    pc.generate(a3, [*a3, 90, 91], 16)
+    s = pc.stats()
+    assert (s["hits"], s["misses"], s["retained"]) == (3, 1, 3)
+    assert h.decoded[1] == [500, 90, 91]
+    assert h.decoded[2] == A2_FULL[len(A1) :]
+    assert h.decoded[3] == [7, 90, 91]
+
+
+def test_a_turn_slot_is_moved_when_the_budget_cannot_hold_the_copy():
+    """The copy is charged before it is allocated, like a fork's: when the
+    budget cannot hold it beside the original, the slot is removed and its
+    arrays adopted — today's behaviour, and the only path at a budget of 0."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    (slot,) = pc.slots()
+    pc.max_bytes = slot.nbytes  # room for the original, not for a copy beside it
+    pc.generate(A2, A2_FULL, 16)
+    assert [s.held for s in pc.slots()] == [A2]
+    s = pc.stats()
+    assert (s["hits"], s["retained"], s["moved"], s["evictions"]) == (1, 0, 1, 0)
+    assert len(h.caches) == 1  # no copy: the arrays were adopted
+    assert h.decoded[-1] == A2_FULL[len(A1) :]
+
+
+def test_at_a_budget_of_zero_a_turn_slot_is_always_moved():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)  # max_bytes=0: exactly one slot
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)
+    a3 = [*A2, 7]
+    pc.generate(a3, [*a3, 90, 91], 16)
+    assert [s.held for s in pc.slots()] == [a3]
+    s = pc.stats()
+    assert (s["hits"], s["moved"], s["retained"]) == (2, 2, 0)
+    assert len(h.caches) == 1
+
+
+def test_a_failed_turn_slot_copy_falls_back_to_moving_it():
+    """A copy failure is an optimization failure: the turn still runs warm,
+    on the original arrays, and the slot is moved rather than retained."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    _fail_next_copy(h)
+    with pytest.warns(UserWarning, match="turn-slot copy failed"):
+        pc.generate(A2, A2_FULL, 16)
+    assert [s.held for s in pc.slots()] == [A2]
+    s = pc.stats()
+    assert (s["hits"], s["retained"], s["moved"], s["cold_retries"]) == (1, 0, 1, 0)
+    assert h.decoded[-1] == A2_FULL[len(A1) :]
+
+
+def test_the_taken_turn_slot_survives_the_pre_turn_cap_pass():
+    """Between the take and the retain-or-move decision the slot is still in
+    the map, and a map can be over budget when a turn starts (a slot is never
+    evicted by its own publish). The cap pass in that window must not drop
+    the very slot the turn chose: its arrays live on in the turn either way,
+    so dropping it would count an eviction the conversation never had."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    (slot,) = pc.slots()
+    pc.max_bytes = slot.nbytes - 1  # over budget before the next turn starts
+    pc.generate(A2, A2_FULL, 16)
+    s = pc.stats()
+    assert (s["hits"], s["moved"], s["evictions"]) == (1, 1, 0)
+    assert [x.held for x in pc.slots()] == [A2]
+
+
+def test_the_pressure_valve_can_still_take_a_retained_slot():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    h.pressure_value = KERNEL_PRESSURE_WARN  # one drop per publish, the new slot protected
+    pc.generate(A2, A2_FULL, 16)
+    assert [s.held for s in pc.slots()] == [A2]
+    s = pc.stats()
+    assert (s["retained"], s["pressure_evictions"]) == (1, 1)
+
+
+def test_a_take_that_ends_in_a_move_does_not_charge_the_moved_bytes_against_other_slots():
+    """A moved slot's bytes leave the map, so the cap pass for a turn take
+    runs after the retain-or-move decision: a budget that holds exactly one
+    slot must not evict another conversation's slot to make room for bytes
+    that were about to leave anyway."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)
+    (a_slot,) = [s for s in pc.slots() if s.held == A1]
+    pc.max_bytes = a_slot.nbytes  # one slot's worth: the copy is refused, so A1's slot is moved
+    seen: dict = {}
+
+    def look_while_the_turn_runs(hooks, cache, token_ids, max_tokens):
+        seen["held"] = [s.held for s in pc.slots()]
+        hooks.decoded.append(list(token_ids))
+        return "text"
+
+    h.decode_impl = look_while_the_turn_runs
+    pc.generate(A2, A2_FULL, 16)
+    assert seen["held"] == [B1]  # A1's slot moved out; B1's was not evicted to make room for it
+    assert pc.stats()["moved"] == 1
+
+
+def test_a_slot_reset_out_of_the_map_after_the_take_is_not_copied():
+    """The lock is released between the take and the copy decision, and the
+    gateway can retire the owner in that window (`reset(owner)` for a
+    generation it abandoned as stalled), emptying its slots. The decision
+    re-checks residency under its own lock and refuses the copy: a full copy
+    for a publish that will be refused is the wrong answer."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    (slot,) = pc.slots()
+    with pc._lock:
+        pc._slots = []  # what reset(owner) does to the map
+    assert pc._make_room(slot.nbytes, protect=(slot,), require=slot) is False
+    assert pc._make_room(slot.nbytes, protect=(slot,)) is True  # only the residency rule refused
+
+
+def test_a_take_retires_the_lengths_below_the_slot_it_takes():
+    """The lengths below the taken slot are this turn's grandparents: its
+    publish would retire them anyway, so they go at the take, and their bytes
+    fund the copy — not another conversation's slot, which is what LRU would
+    otherwise reach for."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    a3 = [*A2, 7]
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)  # retains A1's slot, now the LRU is B1's
+    a1, b1, a2 = (next(s for s in pc.slots() if s.held == held) for held in (A1, B1, A2))
+    # Room for B1's, A2's and a3's slots — but not with A1's still resident.
+    pc.max_bytes = b1.nbytes + a2.nbytes + a2.nbytes * len(a3) // len(A2)
+    pc.generate(a3, [*a3, 90, 91], 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([B1, A2, a3])
+    s = pc.stats()
+    assert (s["retained"], s["evictions"]) == (2, 1)  # A1's slot, at a3's take
+    assert a1.nbytes > 0  # the object this test holds; the map let go of it
+
+
+def test_a_miss_beside_another_conversation_drops_nothing():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)  # a miss, with A1's slot in the map
+    assert sorted(s.held for s in pc.slots()) == sorted([A1, B1])
+    assert pc.stats()["evictions"] == 0
+
+
+def test_a_copy_the_publish_could_not_keep_beside_the_original_is_not_taken():
+    """The slot this turn publishes is the copy plus this turn's tokens, so
+    the room the copy needs is forecast at that size: a budget of exactly
+    twice the original would fund the copy and then evict the original at
+    publish — a full copy paid for nothing. Refused, the turn moves the
+    slot, as it would at a budget of 0."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    (slot,) = pc.slots()
+    pc.max_bytes = 2 * slot.nbytes
+    pc.generate(A2, A2_FULL, 16)
+    assert [s.held for s in pc.slots()] == [A2]
+    s = pc.stats()
+    assert (s["retained"], s["moved"], s["evictions"]) == (0, 1, 0)
+    assert len(h.caches) == 1  # no copy: the arrays were adopted
+    # The original beside the slot this turn publishes: that is the copy's price.
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    (slot,) = pc.slots()
+    pc.max_bytes = slot.nbytes + slot.nbytes * len(A2) // len(A1)
+    pc.generate(A2, A2_FULL, 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([A1, A2])
+    s = pc.stats()
+    assert (s["retained"], s["moved"], s["evictions"]) == (1, 0, 0)
+
+
+def test_a_cold_retry_keeps_the_conversation_at_two_lengths():
+    """The warm attempt that took the slot was abandoned and the published
+    cache built from nothing — but it is still the next length of the slot
+    it took, which is what the two-length rule is about: the original stays
+    for a branch, and the next turn retires it like any predecessor."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    h.fail_once = True
+    with pytest.warns(UserWarning, match="retrying cold"):
+        pc.generate(A2, A2_FULL, 16)
+    assert pc.stats()["cold_retries"] == 1
+    assert h.decoded[-1] == A2_FULL  # the retry fed the whole prompt
+    assert sorted(s.held for s in pc.slots()) == sorted([A1, A2])
+    a3 = [*A2, 7]
+    a4 = [*a3, 8]
+    pc.generate(a3, [*a3, 90, 91], 16)
+    pc.generate(a4, [*a4, 90, 91], 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([a3, a4])
+
+
+def test_a_linear_conversation_keeps_only_its_current_and_previous_lengths():
+    """Each retained take leaves the predecessor in place; without a bound a
+    ten-turn subagent would hold ten copies of itself. Taking a turn slot
+    retires the lengths below it, charged to evictions (the budget did not
+    ask for it, and neither did pressure)."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    a3 = [*A2, 7]
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([A1, A2])
+    pc.generate(a3, [*a3, 90, 91], 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([A2, a3])
+    s = pc.stats()
+    assert (s["evictions"], s["pressure_evictions"], s["retained"]) == (1, 0, 2)
+    assert s["resident_bytes"] == sum(x.nbytes for x in pc.slots())
+
+
+def test_extending_a_slot_whose_predecessor_already_left_the_map_drops_nothing():
+    """a3's take retires A1 and its publish loses A2 to the valve, so by the
+    time a4 extends a3 there is nothing below a3 in the map: the ancestor
+    lookup must find nothing to drop rather than raising or charging a
+    second eviction for a slot that is already gone."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    a3 = [*A2, 7]
+    a4 = [*a3, 8]
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)
+    h.pressure_value = KERNEL_PRESSURE_WARN  # one unprotected drop per publish
+    pc.generate(a3, [*a3, 90, 91], 16)
+    # A1 goes at a3's take (the length below the slot it took) and A2 to the
+    # valve, as the only slot left once A1 is gone: nothing keeps A2's Slot
+    # alive after this call.
+    assert [s.held for s in pc.slots()] == [a3]
+    gc.collect()
+    h.pressure_value = 1  # normal again: a4 must not trigger another drop
+    pc.generate(a4, [*a4, 90, 91], 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([a3, a4])
+    s = pc.stats()
+    # `evictions` counts every drop regardless of cause (A1 as a retired
+    # length, A2 by the valve); `pressure_evictions` is the subset the valve
+    # took. Both are charged once, during a3, and a4 must not add to either:
+    # that is what "no double charge" for the already-gone A2 means here.
+    assert (s["evictions"], s["pressure_evictions"]) == (2, 1)
+
+
+def test_a_retired_length_is_freed_not_pinned():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    a3 = [*A2, 7]
+    pc.generate(A1, A1_FULL, 16)
+    (first,) = pc.slots()
+    gone = weakref.ref(first)
+    del first
+    pc.generate(A2, A2_FULL, 16)
+    pc.generate(a3, [*a3, 90, 91], 16)
+    gc.collect()
+    assert gone() is None
+
+
+def test_retiring_a_conversations_lengths_never_drops_a_fork():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
+    pc.generate(C1_NEXT, C1_NEXT_FULL, 16, fork_at=[FORK])
+    c1_third = [*C1_NEXT, 702]
+    pc.generate(c1_third, [*c1_third, 90, 91], 16, fork_at=[FORK])
+    assert [s.held for s in pc.slots() if s.kind == "fork"] == [H]
+    assert sorted(s.held for s in pc.slots() if s.kind == "turn") == sorted([C1_NEXT, c1_third])
+
+
+def test_a_branch_keeps_its_own_slot_until_lru_takes_it():
+    """The summary call's slot and the real conversation's next turn both
+    extend A1's; neither extends the other, so nothing drops the branch but
+    LRU."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    summary = [*A1, 500]
+    a3 = [*A2, 7]
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(summary, [*summary, 90, 91], 16)
+    pc.generate(A2, A2_FULL, 16)
+    pc.generate(a3, [*a3, 90, 91], 16)  # its take retires A1's slot, the length below A2's
+    assert sorted(s.held for s in pc.slots()) == sorted([summary, A2, a3])
+
+
+def test_at_a_budget_of_zero_there_is_never_a_length_to_retire():
+    """At a budget of 0 nothing is retained, so a take never finds a length
+    below its slot and the evictions counter stays what the cap pass makes
+    it."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    a3 = [*A2, 7]
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)
+    pc.generate(a3, [*a3, 90, 91], 16)
+    assert pc.stats()["evictions"] == 0
 
 
 def test_pressure_eviction_never_holds_the_lock_across_a_headroom_call():
@@ -1321,9 +1655,10 @@ def test_a_cold_retry_still_forks():
 
 
 def _fail_next_copy(h: FakeHooks) -> None:
-    """Make the very next array copy raise, once. A fork's copy is the first
-    one any turn takes — snapshot's, on the non-trimmable path, comes after
-    the whole fork block."""
+    """Make the very next array copy raise, once. The first copy any turn
+    takes is the one a test aims at — a taken slot's on a warm turn, a
+    fork's on a cold one; snapshot's, on the non-trimmable path, comes after
+    both."""
 
     def impl(hooks, a):
         hooks.copy_impl = None
@@ -2158,7 +2493,7 @@ def test_a_cold_retry_reports_only_the_attempt_that_produced_the_text(clock):
         pc.generate(STABLE_2, FULL_2, 16)
     s = pc.stats()
     assert s["cold_retries"] == 1
-    assert (s["took_len"], s["prefilled_tokens"]) == (0, len(STABLE_2))
+    assert (s["took_len"], s["took_kind"], s["prefilled_tokens"]) == (0, "", len(STABLE_2))
     assert s["prefill_seconds"] == pytest.approx(2.0)  # the cold attempt's one prefill
     assert s["decode_seconds"] == pytest.approx(5.0)
 
@@ -2166,10 +2501,13 @@ def test_a_cold_retry_reports_only_the_attempt_that_produced_the_text(clock):
 def test_begin_turn_resets_exactly_the_turn_gauges():
     from sous.engine.promptcache import TURN_GAUGES, without_turn_gauges
 
-    stats = PromptCacheStats(**dict.fromkeys(TURN_GAUGES, 7), hits=3, miss_lcp=9)
+    stats = PromptCacheStats(hits=3, miss_lcp=9)
+    for name in TURN_GAUGES:  # every gauge off its default, whatever its type
+        setattr(stats, name, "x" if isinstance(getattr(stats, name), str) else 7)
     stats.begin_turn()
     after = stats.as_dict()
-    assert all(after[name] == 0 for name in TURN_GAUGES)
+    fresh = PromptCacheStats().as_dict()
+    assert all(after[name] == fresh[name] for name in TURN_GAUGES)
     assert (after["hits"], after["miss_lcp"]) == (3, 9)
     assert TURN_GAUGES.isdisjoint(without_turn_gauges({**after, "slots": 1}))
     assert without_turn_gauges({**after, "slots": 1})["slots"] == 1
@@ -2237,6 +2575,54 @@ def test_fork_copies_and_the_snapshot_count_as_prefill(clock):
     s = pc.stats()
     assert s["prefill_seconds"] > 4.0  # two prefills (2 s each) plus copies
     assert s["decode_seconds"] == pytest.approx(5.0, abs=0.5)  # decode plus restore copies
+
+
+def test_the_copies_a_warm_turn_takes_count_as_prefill(clock):
+    """A retained turn slot's copy and a fork's clone are the one allocation
+    a warm turn makes before it prefills: without them on the prefill side
+    the turn line's phases would leave the copy unaccounted for."""
+    h = TimedHooks(clock, trimmable=True)
+
+    def slow_copy(hooks, a):
+        clock.advance(0.1)
+        return copy_array(a)
+
+    h.copy_impl = slow_copy
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(STABLE_1, FULL_1, 16)
+    assert pc.stats()["prefill_seconds"] == 0.0  # trimmable: one fused pass, all decode
+    pc.generate(STABLE_2, FULL_2, 16)
+    s = pc.stats()
+    assert s["took_kind"] == "turn"
+    assert s["prefill_seconds"] == pytest.approx(0.1 * h.layers)  # the copy, one array per layer
+    assert s["decode_seconds"] == pytest.approx(5.0)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
+    pc.generate(C2, C2_FULL, 16, fork_at=[FORK])
+    s = pc.stats()
+    assert s["took_kind"] == "fork"
+    assert s["prefill_seconds"] == pytest.approx(0.1 * h.layers)
+
+
+def test_took_kind_names_the_slot_the_turn_took():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    assert pc.stats()["took_kind"] == ""
+    pc.generate(A2, A2_FULL, 16)
+    assert pc.stats()["took_kind"] == "turn"
+    (slot,) = [s for s in pc.slots() if s.held == A2]
+    pc.max_bytes = slot.nbytes  # room for the original, not for a copy beside it
+    a3 = [*A2, 7]
+    pc.generate(a3, [*a3, 90, 91], 16)
+    assert pc.stats()["took_kind"] == "turn-moved"
+    b2 = [*B1, 11]
+    pc.max_bytes = ROOMY
+    pc.generate(B1, B1_FULL, 16)
+    assert pc.stats()["took_kind"] == ""  # a miss beside another conversation
+    h.fail_once = True
+    with pytest.warns(UserWarning, match="retrying cold"):
+        pc.generate(b2, [*b2, 90, 91], 16)
+    assert pc.stats()["took_kind"] == ""  # the retry took no slot in the end
 
 
 def test_gauges_fold_by_max_like_the_existing_ones():

@@ -429,6 +429,27 @@ def test_cache_hit_is_reported_from_the_sessions_own_counters(tmp_path: Path):
     assert inner.stats_owners and all(o is session_thread for o in inner.stats_owners)
 
 
+def test_took_kind_is_read_from_the_after_snapshot(tmp_path: Path):
+    """A gauge the cache assigns per turn, like took_len: read directly, not
+    as a delta, and "" when the turn took no slot."""
+    inner = FakeEngine(["one", "two"])
+    inner.stats = {"hits": 0, "took_kind": ""}
+    runner, _ = _runner(tmp_path, inner)
+    first = runner.run([{"role": "user", "content": "hi"}], [], 8, RecordingSink())
+    assert first.took_kind == ""
+
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        inner.stats = {"hits": 1, "took_kind": "turn-moved", "took_len": 40}
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    second = runner.run([{"role": "user", "content": "hi again"}], [], 8, RecordingSink())
+    assert (second.took_kind, second.took_len, second.cache_hit) == ("turn-moved", 40, True)
+
+
 class _SlowCount(ChunkedFakeEngine):
     """count_tokens costs 50 ms, so tokenize_seconds cannot be satisfied by
     the probe term alone."""
