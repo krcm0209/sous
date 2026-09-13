@@ -63,8 +63,12 @@ Claude Code use stretches further — evaluate features against that goal.
   a background subagent's conversation every 30 s with a progress-summary
   call, and a consumed slot left the real conversation only the header
   fork), and *moved* — removed, its arrays adopted — when it cannot, always
-  at `prompt_cache_gb = 0`; `Slot.parent` lineage drops the grandparent at
-  publish. Inline `role:"system"` messages after the first user message
+  at `prompt_cache_gb = 0`. The copy is priced at the size the turn will
+  publish (the parent's own size passes budgets the publish then cannot
+  honour), and a take retires the lengths below its slot
+  (`_retire_ancestors`, read off `held`, never recorded), so a conversation
+  holds its current and previous lengths and a chain a cold retry breaks
+  heals on the next take. Inline `role:"system"` messages after the first user message
   render as `<system-reminder>` blocks in the preceding user turn (after its
   tool results), or as a user turn of their own after an assistant turn
   (`gateway/convert._place_inline_system`), never hoisted into the system

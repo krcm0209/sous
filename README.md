@@ -325,8 +325,8 @@ on a hit whose warm attempt failed and was rebuilt cold (a
 `prefilled_tokens` and the phases below describe that cold attempt.
 `prefilled_tokens` is what the turn had to prefill;
 `forks`/`evicted`/`pressure` are what it published and what was dropped under
-it — `evicted` counts every drop — budget, pressure, or a retained
-predecessor two turns back that lineage retires — and `pressure` is the
+it — `evicted` counts every drop — budget, pressure, or the lengths below
+the slot a turn takes, which the take retires — and `pressure` is the
 subset of those `evicted` the pressure valve forced (not a second, disjoint
 count). `load_s` (a model load, ≈0 when resident — including one this turn
 only waited out, started by another request), `queue_s` (the wait for the
@@ -505,7 +505,8 @@ time flat instead of growing. Set it to `false` to prefill every turn from
 scratch.
 
 `[model].prompt_cache_gb` (default `"auto"`) bounds the caches kept resident
-*beyond* the turn that is running: one slot per conversation, plus *fork*
+*beyond* the turn that is running: each conversation's current length, its
+previous one when the budget holds both (see below), plus *fork*
 slots at every boundary long enough to be worth copying (4096 tokens or
 more): one at the end of the tool block, shared by every Claude Code session
 and project that presents the same tool array, and one at the end of the
@@ -524,12 +525,14 @@ left once the weights, one full context window of KV (the larger of
 for those forks and several conversations; each live conversation under the
 auto budget also keeps its previous length resident (the slot a branch of it
 starts from), so a live conversation is two slots, ~8 GiB at 63K tokens,
-beyond the forks; a 48 GB machine should set it to `0` (forks off, one slot), or to at
-least twice one conversation slot — about 8 GiB with the default model at
-~57K tokens — because the copy that keeps a conversation's previous length
-resident is taken only when twice the slot fits; below that every hit moves
-its slot, and a branch of the conversation (a progress-summary call) starts
-from the fork instead. The copy's room comes from least-recently-used slots,
+beyond the forks; a 48 GB machine should set it to `0` (forks off, one slot), or to
+more than twice one conversation slot at the length its conversations reach
+— a little over 8 GiB with the default model at ~57K tokens — because the
+copy that keeps a conversation's previous length resident is taken only
+when that length and the longer one the turn publishes both fit; below that
+every hit moves its slot, and a branch of the conversation (a
+progress-summary call) starts from the fork instead. The copy's room comes
+from least-recently-used slots,
 forks included, so keeping a fork resident beside a retaining conversation
 wants about four slots' worth, ~14 GiB. A value below ~14 GiB makes every
 cold turn take a fork copy that a later turn then evicts to make room for
@@ -702,7 +705,7 @@ that Qwen3 emits and the hermes JSON format used by other MLX models.
   exercises the plumbing, not model competence. The real-model runs above are
   the meaningful end-to-end evidence.
 - Gateway mode (experimental) serves one local turn at a time on a
-  keyed prompt cache (one slot per conversation plus tools and header forks, budgeted
+  keyed prompt cache (a conversation's last two lengths plus tools and header forks, budgeted
   by `[model].prompt_cache_gb`), drops Anthropic server-side and built-in tool
   types from local turns (the ones that carry no client-supplied schema),
   ignores request-level sampling and thinking, and finishes a local turn
