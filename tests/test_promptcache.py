@@ -15,6 +15,7 @@ import pytest
 from sous.engine.base import Delta
 from sous.engine.promptcache import (
     FORK_MIN_TOKENS,
+    KERNEL_PRESSURE_WARN,
     PrefixCache,
     PromptCacheStats,
     PromptMemo,
@@ -883,6 +884,8 @@ def test_stats_as_dict_reports_every_counter():
         evictions=3,
         miss_lcp=40,
         pressure_evictions=2,
+        retained=2,
+        moved=1,
     )
     assert s.as_dict() == {
         "hits": 2,
@@ -895,6 +898,8 @@ def test_stats_as_dict_reports_every_counter():
         "evictions": 3,
         "miss_lcp": 40,
         "pressure_evictions": 2,
+        "retained": 2,
+        "moved": 1,
         "prefilled_tokens": 0,
         "took_len": 0,
         "bound_lo": 0,
@@ -909,6 +914,12 @@ def test_stats_add_sums_pressure_evictions():
     a = PromptCacheStats(evictions=3, pressure_evictions=1)
     a.add(PromptCacheStats(evictions=2, pressure_evictions=2))
     assert (a.evictions, a.pressure_evictions) == (5, 3)
+
+
+def test_stats_add_sums_retained_and_moved():
+    a = PromptCacheStats(retained=1, moved=2)
+    a.add(PromptCacheStats(retained=3, moved=1))
+    assert (a.retained, a.moved) == (4, 3)
 
 
 def test_stats_add_sums_the_counters_and_maxes_the_snapshot_gauge():
@@ -991,16 +1002,9 @@ def test_two_interleaved_conversations_both_reuse():
     assert pc.stats()["misses"] == 2
     assert h.decoded[2] == A2_FULL[len(A1) :]
     assert h.decoded[3] == B2_FULL[len(B1) :]
-    assert len(h.caches) == 2  # one cache per conversation, each extended in place
-
-
-def test_a_turn_slot_is_consumed_by_the_turn_that_extends_it():
-    h = FakeHooks(trimmable=True)
-    pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(A1, A1_FULL, 16)
-    pc.generate(A2, A2_FULL, 16)
-    held = [s.held for s in pc.slots()]
-    assert held == [A2]  # not [A1, A2]: the old key is gone with the cache it named
+    # each warm turn works on a copy of its slot; the slot itself stays for a
+    # branch to find
+    assert len(h.caches) == 4
 
 
 def test_the_longest_matching_slot_wins():
@@ -1055,6 +1059,155 @@ def test_a_fork_the_turn_selected_survives_the_pre_turn_eviction_pass():
     # after.
     assert pc.stats()["evictions"] == 1
     assert [s.kind for s in pc.slots()] == ["turn"]
+
+
+def test_a_turn_slot_is_retained_when_the_budget_holds_the_copy():
+    """Claude Code branches a running subagent's conversation with progress
+    summary calls: the same prefix, a different last turn. A slot the
+    extending turn consumed would leave the next real turn nothing to start
+    from; copied and left in place, both branches start warm."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([A1, A2])
+    s = pc.stats()
+    assert (s["hits"], s["retained"], s["moved"], s["reused_tokens"]) == (1, 1, 0, len(A1))
+    assert h.decoded[-1] == A2_FULL[len(A1) :]
+    turn1, turn2 = [c for c in h.caches]
+    assert cast(FakeTrimmable, turn1[0]).offset == len(A1)  # the original is untouched
+    assert cast(FakeTrimmable, turn2[0]).offset == len(A2)
+
+
+def test_a_retained_slot_serves_a_branch_and_then_the_real_conversation():
+    """real → summary → real → real: the summary call takes A1's slot and
+    publishes its own; the real conversation still finds A1's, then its own."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    summary = [*A1, 500]
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(summary, [*summary, 90, 91], 16)
+    pc.generate(A2, A2_FULL, 16)
+    a3 = [*A2, 7]
+    pc.generate(a3, [*a3, 90, 91], 16)
+    s = pc.stats()
+    assert (s["hits"], s["misses"], s["retained"]) == (3, 1, 3)
+    assert h.decoded[1] == [500, 90, 91]
+    assert h.decoded[2] == A2_FULL[len(A1) :]
+    assert h.decoded[3] == [7, 90, 91]
+
+
+def test_a_turn_slot_is_moved_when_the_budget_cannot_hold_the_copy():
+    """The copy is charged before it is allocated, like a fork's: when the
+    budget cannot hold it beside the original, the slot is removed and its
+    arrays adopted — today's behaviour, and the only path at a budget of 0."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    (slot,) = pc.slots()
+    pc.max_bytes = slot.nbytes  # room for the original, not for a copy beside it
+    pc.generate(A2, A2_FULL, 16)
+    assert [s.held for s in pc.slots()] == [A2]
+    s = pc.stats()
+    assert (s["hits"], s["retained"], s["moved"], s["evictions"]) == (1, 0, 1, 0)
+    assert len(h.caches) == 1  # no copy: the arrays were adopted
+    assert h.decoded[-1] == A2_FULL[len(A1) :]
+
+
+def test_at_a_budget_of_zero_a_turn_slot_is_always_moved():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)  # max_bytes=0: exactly one slot
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)
+    a3 = [*A2, 7]
+    pc.generate(a3, [*a3, 90, 91], 16)
+    assert [s.held for s in pc.slots()] == [a3]
+    s = pc.stats()
+    assert (s["hits"], s["moved"], s["retained"]) == (2, 2, 0)
+    assert len(h.caches) == 1
+
+
+def test_a_failed_turn_slot_copy_falls_back_to_moving_it():
+    """A copy failure is an optimization failure: the turn still runs warm,
+    on the original arrays, and the slot is moved rather than retained."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    _fail_next_copy(h)
+    with pytest.warns(UserWarning, match="turn-slot copy failed"):
+        pc.generate(A2, A2_FULL, 16)
+    assert [s.held for s in pc.slots()] == [A2]
+    s = pc.stats()
+    assert (s["hits"], s["retained"], s["moved"], s["cold_retries"]) == (1, 0, 1, 0)
+    assert h.decoded[-1] == A2_FULL[len(A1) :]
+
+
+def test_the_taken_turn_slot_survives_the_pre_turn_cap_pass():
+    """Between the take and the retain-or-move decision the slot is still in
+    the map, and a map can be over budget when a turn starts (a slot is never
+    evicted by its own publish). The cap pass in that window must not drop
+    the very slot the turn chose: its arrays live on in the turn either way,
+    so dropping it would count an eviction the conversation never had."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    (slot,) = pc.slots()
+    pc.max_bytes = slot.nbytes - 1  # over budget before the next turn starts
+    pc.generate(A2, A2_FULL, 16)
+    s = pc.stats()
+    assert (s["hits"], s["moved"], s["evictions"]) == (1, 1, 0)
+    assert [x.held for x in pc.slots()] == [A2]
+
+
+def test_the_pressure_valve_can_still_take_a_retained_slot():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    h.pressure_value = KERNEL_PRESSURE_WARN  # one drop per publish, the new slot protected
+    pc.generate(A2, A2_FULL, 16)
+    assert [s.held for s in pc.slots()] == [A2]
+    s = pc.stats()
+    assert (s["retained"], s["pressure_evictions"]) == (1, 1)
+
+
+def test_a_take_that_ends_in_a_move_does_not_charge_the_moved_bytes_against_other_slots():
+    """A moved slot's bytes leave the map, so the cap pass for a turn take
+    runs after the retain-or-move decision: a budget that holds exactly one
+    slot must not evict another conversation's slot to make room for bytes
+    that were about to leave anyway."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)
+    (a_slot,) = [s for s in pc.slots() if s.held == A1]
+    pc.max_bytes = a_slot.nbytes  # one slot's worth: the copy is refused, so A1's slot is moved
+    seen: dict = {}
+
+    def look_while_the_turn_runs(hooks, cache, token_ids, max_tokens):
+        seen["held"] = [s.held for s in pc.slots()]
+        hooks.decoded.append(list(token_ids))
+        return "text"
+
+    h.decode_impl = look_while_the_turn_runs
+    pc.generate(A2, A2_FULL, 16)
+    assert seen["held"] == [B1]  # A1's slot moved out; B1's was not evicted to make room for it
+    assert pc.stats()["moved"] == 1
+
+
+def test_a_slot_another_owner_evicted_after_the_take_is_not_copied():
+    """LRU is daemon-wide and the lock is released between the take and the
+    copy decision, so another owner's publish can drop the taken slot in
+    that window. The decision re-checks residency under its own lock and
+    refuses the copy: a full copy of a slot nobody can take again, made
+    under the very pressure that evicted it, is the wrong answer."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    (slot,) = pc.slots()
+    with pc._lock:
+        pc._slots = []  # what another owner's eviction does to the map
+    assert pc._make_room(slot.nbytes, protect=(slot,), require=slot) is False
+    assert pc._make_room(slot.nbytes, protect=(slot,)) is True  # only the residency rule refused
 
 
 def test_pressure_eviction_never_holds_the_lock_across_a_headroom_call():
