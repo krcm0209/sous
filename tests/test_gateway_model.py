@@ -124,12 +124,6 @@ def test_real_model_streams_a_well_formed_turn_and_reuses_the_cache(tmp_path: Pa
     engines.get().unload()
 
 
-def _seeded(n: int) -> None:
-    import mlx.core as mx
-
-    mx.random.seed(n)
-
-
 def _usage(r: httpx.Response) -> dict:
     return r.json()["usage"]
 
@@ -144,14 +138,18 @@ MODELS = [
 
 def _engine(model_id: str, backend: str):
     # An explicit budget: the factory bypasses [model].prompt_cache_gb, and a
-    # budget of 0 would move T1's slot instead of retaining it.
+    # budget of 0 would move T1's slot instead of retaining it. temperature=0.0
+    # makes decoding greedy (make_sampler(temp=0) is argmax): the test below
+    # compares warm and cold generations token-for-token, and only greedy
+    # decoding makes that comparison meaningful — sampling at any temperature
+    # above zero is not pinned by seeding the global mlx RNG.
     if backend == "vlm":
         from sous.engine.vlm import VLMEngine
 
-        return VLMEngine(model_id, prompt_cache=True, cache_budget=8 << 30)
+        return VLMEngine(model_id, temperature=0.0, prompt_cache=True, cache_budget=8 << 30)
     from sous.engine.lm import LMEngine
 
-    return LMEngine(model_id, prompt_cache=True, cache_budget=8 << 30)
+    return LMEngine(model_id, temperature=0.0, prompt_cache=True, cache_budget=8 << 30)
 
 
 @pytest.mark.parametrize(("model_id", "backend"), MODELS)
@@ -161,8 +159,8 @@ def test_an_attachment_keeps_the_conversation_warm_and_bit_exact(
     """T1 a brief; T3 the same conversation plus a tool exchange and a
     role:system attachment after the tool result. T3 must be served from
     T1's slot (cache_read_input_tokens covers T1's whole render) and produce
-    exactly what a cold run of the same prompt produces with the same seed —
-    the render is the same text in the same place, only warm. Then a branch
+    exactly what a cold run of the same prompt produces under greedy decoding
+    — the render is the same text in the same place, only warm. Then a branch
     of T1 (a summary-shaped last turn) is served from the retained slot and
     is bit-exact against its own cold run too."""
     cfg = SousConfig(
@@ -215,14 +213,11 @@ def test_an_attachment_keeps_the_conversation_warm_and_bit_exact(
         }
 
     try:
-        _seeded(1)
         first = _post(app, body(t1))
         assert first.status_code == 200
-        _seeded(2)
         warm = _post(app, body(t3))
         assert warm.status_code == 200
         assert _usage(warm)["cache_read_input_tokens"] > 0
-        _seeded(3)
         branch_warm = _post(app, body(branch))
         assert (
             _usage(branch_warm)["cache_read_input_tokens"]
@@ -230,12 +225,10 @@ def test_an_attachment_keeps_the_conversation_warm_and_bit_exact(
         )
 
         engines.get().reset_prompt_cache()
-        _seeded(2)
         cold = _post(app, body(t3))
         assert _usage(cold)["cache_read_input_tokens"] == 0
         assert cold.json()["content"] == warm.json()["content"]
         engines.get().reset_prompt_cache()
-        _seeded(3)
         branch_cold = _post(app, body(branch))
         assert branch_cold.json()["content"] == branch_warm.json()["content"]
     finally:
