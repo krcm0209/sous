@@ -122,3 +122,123 @@ def test_real_model_streams_a_well_formed_turn_and_reuses_the_cache(tmp_path: Pa
         assert time.monotonic() - t0 < 2.5  # bounded: no turn is in flight here
         assert gateway._runner._session is None
     engines.get().unload()
+
+
+def _seeded(n: int) -> None:
+    import mlx.core as mx
+
+    mx.random.seed(n)
+
+
+def _usage(r: httpx.Response) -> dict:
+    return r.json()["usage"]
+
+
+MODELS = [
+    pytest.param(TINY, "lm", id="tiny"),
+    # The hybrid model the copy-then-extend shape exists for: its recurrent
+    # layers cannot rewind, so a retained slot is a real second cache.
+    pytest.param("mlx-community/Qwen3.8-27B-4bit", "vlm", id="27b"),
+]
+
+
+def _engine(model_id: str, backend: str):
+    # An explicit budget: the factory bypasses [model].prompt_cache_gb, and a
+    # budget of 0 would move T1's slot instead of retaining it.
+    if backend == "vlm":
+        from sous.engine.vlm import VLMEngine
+
+        return VLMEngine(model_id, prompt_cache=True, cache_budget=8 << 30)
+    from sous.engine.lm import LMEngine
+
+    return LMEngine(model_id, prompt_cache=True, cache_budget=8 << 30)
+
+
+@pytest.mark.parametrize(("model_id", "backend"), MODELS)
+def test_an_attachment_keeps_the_conversation_warm_and_bit_exact(
+    tmp_path: Path, model_id: str, backend: str
+):
+    """T1 a brief; T3 the same conversation plus a tool exchange and a
+    role:system attachment after the tool result. T3 must be served from
+    T1's slot (cache_read_input_tokens covers T1's whole render) and produce
+    exactly what a cold run of the same prompt produces with the same seed —
+    the render is the same text in the same place, only warm. Then a branch
+    of T1 (a summary-shaped last turn) is served from the retained slot and
+    is bit-exact against its own cold run too."""
+    cfg = SousConfig(
+        data_dir=tmp_path / "data", config_path=tmp_path / "config.toml", gateway_enabled=True
+    )
+    engines = EngineManager(cfg, engine_factory=lambda mid: _engine(model_id, backend))
+    mcp = MCPServer("test")
+    gateway = mount_gateway(mcp, engines, cfg)
+    app = mcp.streamable_http_app()
+    read_tool = {
+        "name": "Read",
+        "description": "Read a file",
+        "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+    }
+    system = [{"type": "text", "text": "You are a terse assistant. " * 40}]
+    t1 = [{"role": "user", "content": "Read the file notes.txt and tell me its first word."}]
+    t3 = [
+        *t1,
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "a", "name": "Read", "input": {"file_path": "notes.txt"}}
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "banana bread recipe"},
+                {"type": "text", "text": "<total_tokens>900 tokens left</total_tokens>\n"},
+            ],
+        },
+        {
+            "role": "system",
+            "content": "Available agent types for the Agent tool:\n- Explore: read-only",
+        },
+    ]
+    branch = [
+        *t1,
+        {"role": "assistant", "content": "Reading."},
+        {"role": "user", "content": "Describe your most recent action in 3-5 words."},
+    ]
+
+    def body(messages: list[dict]) -> dict:
+        return {
+            "model": "sous-local",
+            "max_tokens": 24,
+            "tools": [read_tool],
+            "system": system,
+            "messages": messages,
+        }
+
+    try:
+        _seeded(1)
+        first = _post(app, body(t1))
+        assert first.status_code == 200
+        _seeded(2)
+        warm = _post(app, body(t3))
+        assert warm.status_code == 200
+        assert _usage(warm)["cache_read_input_tokens"] > 0
+        _seeded(3)
+        branch_warm = _post(app, body(branch))
+        assert (
+            _usage(branch_warm)["cache_read_input_tokens"]
+            == _usage(warm)["cache_read_input_tokens"]
+        )
+
+        engines.get().reset_prompt_cache()
+        _seeded(2)
+        cold = _post(app, body(t3))
+        assert _usage(cold)["cache_read_input_tokens"] == 0
+        assert cold.json()["content"] == warm.json()["content"]
+        engines.get().reset_prompt_cache()
+        _seeded(3)
+        branch_cold = _post(app, body(branch))
+        assert branch_cold.json()["content"] == branch_warm.json()["content"]
+    finally:
+        gateway.close()
+        assert gateway._runner._session is None
+    engines.get().unload()
