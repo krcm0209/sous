@@ -93,6 +93,18 @@ def test_status_when_never_loaded():
     assert s["loaded"] is False and s["model_id"]
 
 
+def test_get_logs_the_load_once_with_its_duration(caplog):
+    import logging
+
+    mgr, created = _manager()
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert len(lines) == 1 and len(created) == 1
+    assert lines[0].startswith("model_load seconds=") and lines[0].endswith(" model=fake/model")
+
+
 class _BlockingEngine(FakeEngine):
     def __init__(self):
         super().__init__([])
@@ -684,6 +696,16 @@ def test_status_carries_the_prompt_cache_view_once_loaded(tmp_path):
     assert "prompt_cache" not in manager.status()
     manager.get()
     assert manager.status()["prompt_cache"] == {"hits": 1, "slots": 2, "resident_bytes": 3}
+
+
+def test_status_leaves_out_the_per_turn_gauges(tmp_path):
+    """server_status hands this block to the frontier model; daemon-wide, a
+    per-turn gauge is a max over every owner ever seen — tokens for nothing."""
+    inner = FakeEngine([])
+    inner.stats = {"hits": 1, "prefill_seconds": 1.4974267615067218, "took_len": 900}
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    assert manager.status()["prompt_cache"] == {"hits": 1}
 
 
 def test_default_factory_threads_the_cache_budget_and_reserve(monkeypatch):
