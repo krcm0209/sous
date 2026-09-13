@@ -582,3 +582,49 @@ def test_gate_capture_shape_converts_cleanly():
         },
         {"role": "user", "content": "Agent prompt.\nEnvironment."},
     ]
+
+
+# --- content hashes: comparable across log lines, never reversible --------------
+
+
+def test_hashes_are_eight_hex_chars_of_rendered_tools_and_system():
+    req = parse_messages_request(_body(system="Be terse.", tools=[READ_TOOL]))
+    assert len(req.tools_hash) == 8 and int(req.tools_hash, 16) >= 0
+    assert len(req.system_hash) == 8 and int(req.system_hash, 16) >= 0
+    assert req.tools_hash != req.system_hash
+
+
+def test_hashes_are_stable_and_change_with_one_character():
+    a = parse_messages_request(_body(system="Be terse.", tools=[READ_TOOL]))
+    b = parse_messages_request(_body(system="Be terse.", tools=[READ_TOOL]))
+    assert (a.tools_hash, a.system_hash) == (b.tools_hash, b.system_hash)
+    c = parse_messages_request(_body(system="Be terse!", tools=[READ_TOOL]))
+    assert c.system_hash != a.system_hash and c.tools_hash == a.tools_hash
+    tweaked = {**READ_TOOL, "description": "Read a file."}
+    d = parse_messages_request(_body(system="Be terse.", tools=[tweaked]))
+    assert d.tools_hash != a.tools_hash and d.system_hash == a.system_hash
+
+
+def test_hashes_are_empty_when_there_is_nothing_to_hash():
+    req = parse_messages_request(_body())
+    assert (req.tools_hash, req.system_hash) == ("", "")
+
+
+def test_a_lone_surrogate_in_the_system_text_still_hashes():
+    """json.loads accepts a `\\ud800` escape (a client that split an emoji
+    pair sends one); strict UTF-8 does not. The hash is for the log, so it
+    must not be what fails the request."""
+    req = parse_messages_request(_body(system="hi \ud800"))
+    assert len(req.system_hash) == 8 and int(req.system_hash, 16) >= 0
+    assert req.system_hash != parse_messages_request(_body(system="hi")).system_hash
+
+
+def test_the_system_hash_is_over_the_rendered_text_after_volatile_stripping():
+    """Two requests that differ only by the <total_tokens> marker render the
+    same system text, so they must hash the same — the marker is what the
+    stripping exists to hide from the cache."""
+    a = parse_messages_request(_body(system="Be terse."))
+    b = parse_messages_request(
+        _body(system="Be terse.\n\n<total_tokens>1234 tokens left</total_tokens>")
+    )
+    assert a.system_hash == b.system_hash != ""
