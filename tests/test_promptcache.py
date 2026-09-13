@@ -1320,6 +1320,35 @@ def test_a_linear_conversation_keeps_only_its_current_and_previous_lengths():
     assert s["resident_bytes"] == sum(x.nbytes for x in pc.slots())
 
 
+def test_extending_a_slot_whose_parent_already_left_the_map_is_a_no_op():
+    """a3's own publish drops A1 by lineage and then A2 by the valve, so by
+    the time a4 extends a3, a3's parent link resolves to nothing: the
+    grandparent lookup must treat that as nothing to drop rather than
+    raising or charging a second eviction for a slot that is already gone."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    a3 = [*A2, 7]
+    a4 = [*a3, 8]
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)
+    h.pressure_value = KERNEL_PRESSURE_WARN  # one unprotected drop per publish
+    pc.generate(a3, [*a3, 90, 91], 16)
+    # A1 goes to the lineage bound (a3's publish drops its grandparent) and
+    # A2 to the valve, as the only slot left once A1 is gone: nothing keeps
+    # A2's Slot alive after this call.
+    assert [s.held for s in pc.slots()] == [a3]
+    gc.collect()
+    h.pressure_value = 1  # normal again: a4 must not trigger another drop
+    pc.generate(a4, [*a4, 90, 91], 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([a3, a4])
+    s = pc.stats()
+    # `evictions` counts every drop regardless of cause (A1 by lineage, A2 by
+    # the valve); `pressure_evictions` is the subset the valve took. Both are
+    # charged once, at a3's publish, and a4 must not add to either: that is
+    # what "no double charge" for the already-gone A2 means here.
+    assert (s["evictions"], s["pressure_evictions"]) == (2, 1)
+
+
 def test_a_dropped_grandparent_is_freed_not_pinned_by_lineage():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
