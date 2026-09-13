@@ -429,6 +429,26 @@ def test_cache_hit_is_reported_from_the_sessions_own_counters(tmp_path: Path):
     assert inner.stats_owners and all(o is session_thread for o in inner.stats_owners)
 
 
+def test_moved_is_a_delta_of_the_moved_counter(tmp_path: Path):
+    inner = FakeEngine(["one", "two"])
+    inner.stats = {"hits": 0, "moved": 3}
+    runner, _ = _runner(tmp_path, inner)
+    first = runner.run([{"role": "user", "content": "hi"}], [], 8, RecordingSink())
+    assert first.moved is False  # 3 before and 3 after: nothing moved on this turn
+    inner.stats = {"hits": 1, "moved": 4}
+
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        inner.stats = {"hits": 2, "moved": 5}
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    second = runner.run([{"role": "user", "content": "hi again"}], [], 8, RecordingSink())
+    assert second.moved is True and second.cache_hit is True
+
+
 class _SlowCount(ChunkedFakeEngine):
     """count_tokens costs 50 ms, so tokenize_seconds cannot be satisfied by
     the probe term alone."""

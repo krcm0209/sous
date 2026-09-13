@@ -1712,6 +1712,8 @@ _ALL_GAUGES = {
     "probe_seconds": 0.0,
     "prefill_seconds": 0.0,
     "decode_seconds": 0.0,
+    "retained": 0,
+    "moved": 0,
 }
 
 
@@ -1848,3 +1850,31 @@ def test_a_hit_retried_cold_prints_took_none(tmp_path: Path, capsys):
     _post(app, _body())
     f = _fields(_turn_lines(capsys.readouterr().err)[1])
     assert f["cache"] == "hit" and f["took"] == "none"
+
+
+def test_a_moved_turn_slot_prints_took_turn_moved(tmp_path: Path, capsys):
+    """Copied and left in place is `turn@N`; removed and adopted — the only
+    path at prompt_cache_gb = 0 — is `turn-moved@N`, so the log says whether
+    a branch of this conversation could still start warm."""
+    inner = FakeEngine(["a", "b"])
+    inner.stats = dict(_ALL_GAUGES)
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 2:
+            inner.stats = {
+                **_ALL_GAUGES,
+                "hits": 1,
+                "moved": 1,
+                "reused_tokens": 40,
+                "took_len": 40,
+            }
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    app = _app(tmp_path, inner)
+    _post(app, _body())
+    _post(app, _body())
+    f = _fields(_turn_lines(capsys.readouterr().err)[1])
+    assert f["cache"] == "hit" and f["took"] == "turn-moved@40"

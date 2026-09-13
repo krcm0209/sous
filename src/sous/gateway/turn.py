@@ -67,6 +67,9 @@ class TurnResult:
     reused_tokens: int
     seconds: float
     forked: bool = False  # the hit was served by copying a fork slot
+    # The hit moved its turn slot (removed and adopted, because the budget
+    # could not hold a copy beside the live cache) rather than copying it.
+    moved: bool = False
     # On a miss: how many leading tokens the render shared with the closest
     # slot the session held (0 when it held none). Where two Claude Code
     # renders diverged — inside the tool block or after it — without a token
@@ -220,6 +223,7 @@ class TurnRunner:
                     finish_reason=final.finish_reason if final else "stop",
                     cache_hit=cache_hit,
                     forked=after.get("fork_hits", 0) > before.get("fork_hits", 0),
+                    moved=delta_of("moved") > 0,
                     reused_tokens=delta_of("reused_tokens"),
                     # miss_lcp is a gauge the engine assigns per miss, so
                     # `after` holds this turn's value exactly when this turn
