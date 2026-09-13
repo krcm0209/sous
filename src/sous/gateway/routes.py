@@ -140,13 +140,16 @@ def _lcp_region(lcp: int, lo: int, hi: int) -> str:
     """Which part of the render a miss diverged in, given the two fork
     boundaries the probe verified: below the tools boundary the tool array
     changed, below the header the system text did, else the conversation.
-    `-` when the probe never ran (no fork budget)."""
-    if not hi:
+    With one boundary known (a tool block under the fork floor, or a template
+    that renders the tools inside the system block) nothing below it tells the
+    two apart. `-` when the probe never ran (no fork budget) or there was no
+    slot to compare with (an lcp of 0)."""
+    if not hi or not lcp:
         return "-"
     if lo and lcp < lo:
         return "tools"
     if lcp < hi:
-        return "system"
+        return "system" if lo else "tools-or-system"
     return "conversation"
 
 
@@ -395,6 +398,9 @@ class Gateway:
         self._pending = threading.BoundedSemaphore(MAX_PENDING_TURNS)
         self._pending_counts = threading.BoundedSemaphore(MAX_PENDING_COUNTS)
         self._upstream = upstream or Upstream(config.gateway_upstream_url)
+        # The event loop holds its tasks weakly; these log a turn whose client
+        # left mid-stream (_stream), and must outlive the request that made them.
+        self._drains: set[asyncio.Task] = set()
 
     def close(self, timeout: float = 2.0) -> None:
         """Best-effort shutdown, called from the app's lifespan hook. Never
@@ -553,8 +559,8 @@ class Gateway:
         # what does is guarded below, so a failure there still releases.
         if not self._pending.acquire(blocking=False):
             _log(
-                f"POST /v1/messages model={_model_label(chat)} stream={int(chat.stream)} "
-                f"status=529 error=overloaded_error{_elapsed(received)}",
+                f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
+                f"stream={int(chat.stream)} status=529 error=overloaded_error{_elapsed(received)}",
                 level=logging.WARNING,
             )
             return _error_response(529, "overloaded_error", "too many turns queued")
@@ -589,10 +595,12 @@ class Gateway:
                     )
                 except TurnAbandoned:
                     _log(
-                        f"POST /v1/messages model={_model_label(chat)} stream=1 "
-                        f"status=499 error=abandoned{_elapsed(received)}",
+                        f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
+                        f"stream=1 status=499 error=abandoned{_elapsed(received)}",
                         level=logging.WARNING,
                     )
+                    # Ends the drain _stream left waiting for this turn's outcome.
+                    sink.put(("abandoned", None))
                 except Exception as e:  # noqa: BLE001 — relayed as an in-band error event
                     sink.put(("error", e))
 
@@ -617,8 +625,8 @@ class Gateway:
         except Exception as e:  # noqa: BLE001 — every failure becomes an Anthropic error body
             status, error_type, message = _classify(e)
             _log(
-                f"POST /v1/messages model={_model_label(chat)} stream=0 "
-                f"status={status} error={error_type}{_elapsed(received)}",
+                f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
+                f"stream=0 status={status} error={error_type}{_elapsed(received)}",
                 level=_status_level(status),
             )
             return _error_response(status, error_type, message)
@@ -686,6 +694,7 @@ class Gateway:
         # Pure consumer: the turn was already submitted (and the pending slot
         # already tied to its future) by messages() before this generator was
         # even constructed — see the comment at that submission site.
+        outcome_seen = False
         try:
             yield _PING
             while True:
@@ -697,19 +706,20 @@ class Gateway:
                     for event in assembler.feed(value):
                         yield _frame(event)
                 elif kind == "done":
-                    for event in assembler.finish(
+                    outcome_seen = True
+                    events = assembler.finish(
                         value.text, value.output_tokens, value.finish_reason, value.reused_tokens
-                    ):
-                        yield _frame(event)
+                    )
+                    # Before the last frames, so a client that hangs up on
+                    # them still leaves its turn on record.
                     self._log_turn(chat, value, assembler, stream=True)
+                    for event in events:
+                        yield _frame(event)
                     return
                 else:
+                    outcome_seen = True
                     status, error_type, message = _classify(value)
-                    _log(
-                        f"POST /v1/messages model={_model_label(chat)} stream=1 status=200 "
-                        f"error={error_type}{_elapsed(received)}",
-                        level=_status_level(status),
-                    )
+                    self._log_stream_failure(chat, assembler, value, received)
                     yield _frame(
                         {"type": "error", "error": {"type": error_type, "message": message}}
                     )
@@ -719,14 +729,57 @@ class Gateway:
             # CancelledError lands at queue.get) and on generator close: a turn
             # still waiting for the lock sees this and never starts.
             abandoned.set()
+            # A turn that already started drains to completion with nobody
+            # reading its queue; without a reader its outcome never reaches
+            # the log, and the next turn's queue_s waits on something unnamed.
+            # (No running loop means the daemon is going down: nobody to log.)
+            if not outcome_seen:
+                with contextlib.suppress(RuntimeError):
+                    drain = asyncio.get_running_loop().create_task(
+                        self._log_when_drained(chat, assembler, queue, received)
+                    )
+                    self._drains.add(drain)
+                    drain.add_done_callback(self._drains.discard)
+
+    async def _log_when_drained(
+        self, chat: ChatRequest, assembler: TurnAssembler, queue: asyncio.Queue, received: float
+    ) -> None:
+        """The line `_stream` would have written, for a client that left while
+        its turn ran: the rest of the queue, consumed without a reader."""
+        while True:
+            kind, value = await queue.get()
+            if kind == "done":
+                assembler.finish(
+                    value.text, value.output_tokens, value.finish_reason, value.reused_tokens
+                )
+                self._log_turn(chat, value, assembler, stream=True)
+                return
+            if kind == "error":
+                self._log_stream_failure(chat, assembler, value, received)
+                return
+            if kind == "abandoned":
+                return  # still queued when the client left: turn() logged its 499
+
+    def _log_stream_failure(
+        self, chat: ChatRequest, assembler: TurnAssembler, exc: Exception, received: float
+    ) -> None:
+        status, error_type, _ = _classify(exc)
+        # status=200 because the SSE headers already went out; the level
+        # follows the failure itself.
+        _log(
+            f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} stream=1 "
+            f"status=200 error={error_type}{_elapsed(received)}",
+            level=_status_level(status),
+        )
 
     def _log_turn(
         self, chat: ChatRequest, result: TurnResult, assembler: TurnAssembler, *, stream: bool
     ) -> None:
         cache = "fork" if result.forked else "hit" if result.cache_hit else "miss"
+        # A hit retried cold took no slot in the end: its took_len is 0.
         took = (
             "none"
-            if cache == "miss"
+            if cache == "miss" or not result.took_len
             else f"{'fork' if cache == 'fork' else 'turn'}@{result.took_len}"
         )
         lo, hi = result.bounds
@@ -747,6 +800,7 @@ class Gateway:
             f"reused_tokens={result.reused_tokens} prefilled_tokens={result.prefilled_tokens} "
             f"forks={result.forks} evicted={result.evictions} pressure={result.pressure_evictions} "
             f"load_s={result.load_seconds:.1f} queue_s={result.queue_seconds:.1f} "
+            f"engine_wait_s={result.engine_wait_seconds:.1f} "
             f"tokenize_s={result.tokenize_seconds:.1f} ttft_s={_opt(result.ttft_seconds)} "
             f"prefill_s={result.prefill_seconds:.1f} decode_s={result.decode_seconds:.1f} "
             f"prefill_tps={_rate(result.prefilled_tokens, result.prefill_seconds)} "

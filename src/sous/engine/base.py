@@ -381,6 +381,10 @@ class GenerationSession:
         self._replies: queue.Queue = queue.Queue(maxsize=1)
         self._abandoned = threading.Event()
         self._closed = False
+        # How long the latest request waited for _gen_lock — behind a delegated
+        # task's generation, say. Written before the reply is queued, so the
+        # caller reads it once generate() returns; nothing else can see it.
+        self.lock_wait_seconds = 0.0
         # Kept as an attribute so tests can join it; production never joins —
         # a wedged generation must not block task teardown.
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -398,7 +402,9 @@ class GenerationSession:
                 req = self._requests.get()
                 if req is _CLOSE:
                     return
+                waiting = time.monotonic()
                 with self._managed._gen_lock:
+                    self.lock_wait_seconds = time.monotonic() - waiting
                     if self._abandoned.is_set():
                         return
                     try:
@@ -554,8 +560,11 @@ class EngineManager:
                 "idle_seconds": idle,
             }
             if self._engine is not None:
+                # promptcache imports this module, so the import cannot be global.
+                from sous.engine.promptcache import without_turn_gauges
+
                 # Counts and byte totals only; never a token id.
-                out["prompt_cache"] = self._engine.prompt_cache_stats()
+                out["prompt_cache"] = without_turn_gauges(self._engine.prompt_cache_stats())
                 int8 = self._engine.int8_prefill_status
                 if int8 is not None:
                     out["int8_prefill"] = dict(int8)

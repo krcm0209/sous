@@ -606,6 +606,48 @@ def test_a_turn_with_no_delta_has_no_ttft(tmp_path: Path):
     assert result.ttft_seconds is None and result.output_tokens == 0
 
 
+def test_load_seconds_includes_waiting_out_another_threads_load(tmp_path: Path):
+    """engines.lease() waits on the lock get() holds for a whole load, so a
+    turn or a count that arrives mid-load pays for that load as surely as if
+    it had started it — and must say so."""
+    inner = FakeEngine(["a"])
+    loading, release = threading.Event(), threading.Event()
+
+    def gated_factory(model_id: str):
+        loading.set()
+        release.wait(5)
+        return inner
+
+    engines = EngineManager(_cfg(tmp_path), engine_factory=gated_factory)
+    runner = TurnRunner(engines, _cfg(tmp_path))
+    loader = threading.Thread(target=engines.get)
+    loader.start()
+    assert loading.wait(5)
+    counts = []
+    counter = threading.Thread(target=lambda: counts.append(runner.count_tokens(MSGS, [])))
+    counter.start()
+    threading.Timer(0.3, release.set).start()
+    result = runner.run(MSGS, [], 100, RecordingSink())
+    counter.join(5)
+    loader.join(5)
+    assert result.load_seconds >= 0.25
+    assert counts and counts[0].load_seconds >= 0.25
+
+
+def test_a_turn_reports_its_wait_for_the_engine_lock(tmp_path: Path):
+    """A delegated task's generation holds the engine's lock; a gateway turn
+    behind it waits inside generate(), past the gateway lock and every phase
+    timer — the one place that wait can be seen is the session thread."""
+    runner, engines = _runner(tmp_path, FakeEngine(["ok", "again"]))
+    managed = engines.get()
+    managed._gen_lock.acquire()
+    threading.Timer(0.3, managed._gen_lock.release).start()
+    result = runner.run(MSGS, [], 100, RecordingSink())
+    assert result.engine_wait_seconds >= 0.25
+    assert result.queue_seconds < 0.25
+    assert runner.run(MSGS, [], 100, RecordingSink()).engine_wait_seconds < 0.25
+
+
 def test_load_seconds_is_paid_once(tmp_path: Path):
     inner = FakeEngine(["a", "b"])
 

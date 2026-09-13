@@ -1,5 +1,6 @@
 import asyncio
 import io
+import logging
 import os
 import socket
 import subprocess
@@ -13,6 +14,15 @@ from sous.engine.base import EngineManager
 from sous.server import SousService
 from sous.tasks import TaskStore
 from tests.fake_engine import FakeEngine
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_warning_capture():
+    """server.main() turns logging.captureWarnings on for the process. Left on,
+    a later captureWarnings(True) anywhere in the suite is a no-op once pytest
+    has restored showwarning — and that test passes or fails by file order."""
+    yield
+    logging.captureWarnings(False)
 
 
 @pytest.fixture()
@@ -681,6 +691,12 @@ def test_main_disables_progress_bars_only_when_stderr_is_not_a_tty(tmp_path: Pat
     monkeypatch.setattr(sys, "stderr", _FakeStderr(tty=False))
     _run_main_against_an_occupied_port(tmp_path, monkeypatch, subdir="no-tty")
     assert calls == [True]  # non-interactive: progress bars are silenced
+
+    # fd 2 closed at exec (`sous serve 2>&-`): Python sets sys.stderr to None,
+    # and the daemon must still start rather than die silently on isatty().
+    monkeypatch.setattr(sys, "stderr", None)
+    _run_main_against_an_occupied_port(tmp_path, monkeypatch, subdir="no-stderr")
+    assert calls == [True, True]
 
 
 def test_server_status_reports_context_policy(svc):

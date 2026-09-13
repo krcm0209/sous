@@ -67,19 +67,17 @@ Claude Code use stretches further — evaluate features against that goal.
   `kern.memorystatus_vm_pressure_level`, never psutil's free RAM: right after
   a model load the weight files sit in the page cache as "active", that
   figure read low, and the valve evicted the forks a cold turn had just made.
-- Prompt-cache per-turn gauges (`PromptCacheStats.begin_turn`, `_GAUGES`) are
-  assigned per turn and read back directly from the owner-scoped `after`
-  snapshot in `TurnRunner.run` — never as `after − before`. Counters
+- Prompt-cache per-turn gauges (`promptcache.TURN_GAUGES`, reset by
+  `PromptCacheStats.begin_turn` on every `generate()` and again on a cold
+  retry) are assigned per turn and read back directly from the owner-scoped
+  `after` snapshot in `TurnRunner.run` — never as `after − before`. Counters
   (`forks`, `evictions`, `pressure_evictions`, `reused_tokens`) are deltas.
   Timers read `promptcache._clock` so tests can drive them; `Slot.last_used`
-  keeps the real clock. `sous status` (`EngineManager.status`, no `owner`)
-  folds these same fields daemon-wide via `PromptCacheStats.add`'s `max()`
-  across every owner ever seen, retired ones included — so its
-  `prefill_seconds` reads as the largest last-turn prefill of any owner
-  ever, not a meaningful aggregate. A task result's `prompt_cache` block
-  (`worker.py` always passes its task's own `owner=`) is not folded this
-  way: it is that one task's owner-scoped reading, as meaningful as the
-  gateway's turn line's gauges.
+  keeps the real clock. The gauges exist for the gateway's turn line only:
+  every MCP-facing `prompt_cache` block (a task report, `server_status` via
+  `EngineManager.status`) goes through `without_turn_gauges`, because there a
+  gauge is a task's last `generate()` beside task-long counters, or a max
+  over every owner ever seen — tokens the frontier model pays to read nothing.
 - The gateway forwards every request it does not serve (`gateway/upstream.py`)
   as a transparent proxy: never re-serialize a forwarded body, never add or
   alter an end-to-end header (only `Host`, the hop-by-hop set and a buffered

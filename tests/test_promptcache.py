@@ -1375,6 +1375,22 @@ def test_a_failed_fork_clone_prefills_cold_and_leaves_the_fork_resident():
     assert pc.stats()["fork_hits"] == before["fork_hits"] + 1
 
 
+def test_a_failed_fork_clone_measures_its_own_miss():
+    """The lcp scan used to run only when the lookup found nothing, so a fork
+    whose copy then failed kept an earlier miss's reading — and the turn line
+    placed the divergence wherever that stale number fell."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
+    other = [*H[:100], 99999, *H[101:], 801]
+    pc.generate(other, [*other, 90, 91], 16)
+    assert pc.stats()["miss_lcp"] == 100
+    _fail_next_copy(h)
+    with pytest.warns(UserWarning, match="fork clone failed"):
+        pc.generate(C2, C2_FULL, 16, fork_at=[FORK])
+    assert pc.stats()["miss_lcp"] == FORK  # the render matched the whole fork
+
+
 def test_a_fork_is_not_taken_when_the_fork_exists_but_this_turn_missed_it():
     """Owner filter: a fork owned by another thread is invisible, so this
     thread forks its own. The two coexist under different owners."""
@@ -2129,6 +2145,34 @@ def test_gauges_are_zeroed_when_a_turn_bypasses_the_cache(clock):
         0,
         0,
     )
+
+
+def test_a_cold_retry_reports_only_the_attempt_that_produced_the_text(clock):
+    """The failed warm attempt must neither add its planned prefill to the
+    retry's nor leave took_len naming the slot it abandoned."""
+    h = TimedHooks(clock, trimmable=False)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    h.fail_once = True
+    with pytest.warns(UserWarning, match="retrying cold"):
+        pc.generate(STABLE_2, FULL_2, 16)
+    s = pc.stats()
+    assert s["cold_retries"] == 1
+    assert (s["took_len"], s["prefilled_tokens"]) == (0, len(STABLE_2))
+    assert s["prefill_seconds"] == pytest.approx(2.0)  # the cold attempt's one prefill
+    assert s["decode_seconds"] == pytest.approx(5.0)
+
+
+def test_begin_turn_resets_exactly_the_turn_gauges():
+    from sous.engine.promptcache import TURN_GAUGES, without_turn_gauges
+
+    stats = PromptCacheStats(**dict.fromkeys(TURN_GAUGES, 7), hits=3, miss_lcp=9)
+    stats.begin_turn()
+    after = stats.as_dict()
+    assert all(after[name] == 0 for name in TURN_GAUGES)
+    assert (after["hits"], after["miss_lcp"]) == (3, 9)
+    assert TURN_GAUGES.isdisjoint(without_turn_gauges({**after, "slots": 1}))
+    assert without_turn_gauges({**after, "slots": 1})["slots"] == 1
 
 
 def test_trimmable_reports_the_fused_pass_as_decode(clock):

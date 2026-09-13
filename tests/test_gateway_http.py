@@ -218,10 +218,11 @@ def test_pings_keep_flowing_while_the_model_is_silent(tmp_path: Path, monkeypatc
     assert text == "slowreply"
 
 
-def test_client_disconnect_drains_the_turn_and_never_wedges_the_next(tmp_path: Path):
+def test_client_disconnect_drains_the_turn_and_never_wedges_the_next(tmp_path: Path, capsys):
     """An undrained producer holding the engine lock
     would block every later generation. The thread finishes the turn after the
-    client is gone, and the next request runs on the same session."""
+    client is gone, and the next request runs on the same session — and the
+    drained turn still logs its line, or the lock it held is unexplained."""
     inner = ChunkedFakeEngine(["a|b|c|d|e", "second"], delay=0.3)
     with (
         _serve(_app(tmp_path, inner)) as (base, _server, _thread),
@@ -238,6 +239,10 @@ def test_client_disconnect_drains_the_turn_and_never_wedges_the_next(tmp_path: P
         assert second.json()["content"] == [{"type": "text", "text": "second"}]
         assert time.monotonic() - t0 < 5
     assert inner.generate_threads[0] is inner.generate_threads[1]
+    err = capsys.readouterr().err
+    drained = [line for line in err.splitlines() if "model=sous-local stream=1" in line]
+    assert len(drained) == 1, err
+    assert "status=200" in drained[0] and "output_tokens=5" in drained[0]
 
 
 def test_non_streaming_over_a_real_socket(tmp_path: Path):

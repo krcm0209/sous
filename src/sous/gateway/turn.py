@@ -79,8 +79,11 @@ class TurnResult:
     forks: int = 0  # fork slots this turn published
     evictions: int = 0  # slots dropped while it ran, charged to this session
     pressure_evictions: int = 0  # of which by the pressure valve
-    load_seconds: float = 0.0  # engines.get(): the model load, ≈0 when resident
+    load_seconds: float = 0.0  # lease + engines.get(): a model load, ours or one we waited out
     queue_seconds: float = 0.0  # wait for the gateway lock, before `seconds` starts
+    # Wait for the engine's own lock, which a delegated task's generation
+    # holds; inside ttft_s and `seconds`, and in no phase below.
+    engine_wait_seconds: float = 0.0
     tokenize_seconds: float = 0.0  # count_tokens plus the fork probe's renders
     ttft_seconds: float | None = None  # generate() entry → first delta; None if none came
     prefill_seconds: float = 0.0
@@ -146,9 +149,11 @@ class TurnRunner:
                     # behind it. (A turn that has started still drains — the GPU
                     # cannot be interrupted and the lock discipline depends on it.)
                     raise TurnAbandoned
-                loading = time.monotonic()
                 engine = self._engines.get()
-                load_seconds = time.monotonic() - loading
+                # From `started`, not from here: entering the lease waits out
+                # a load or unload another thread is in the middle of, which
+                # costs this turn exactly what loading the model itself would.
+                load_seconds = time.monotonic() - started
                 session = self._session_for(engine)
                 counting = time.monotonic()
                 input_tokens = engine.count_tokens(messages, tools)
@@ -229,6 +234,7 @@ class TurnRunner:
                     pressure_evictions=delta_of("pressure_evictions"),
                     load_seconds=load_seconds,
                     queue_seconds=queue_seconds,
+                    engine_wait_seconds=session.lock_wait_seconds,
                     tokenize_seconds=tokenize_seconds + after.get("probe_seconds", 0.0),
                     ttft_seconds=None if first_delta_at is None else first_delta_at - generating,
                     prefill_seconds=after.get("prefill_seconds", 0.0),
@@ -257,9 +263,8 @@ class TurnRunner:
         try:
             # Same race as run(): this whole call happens outside _gen_lock.
             with self._engines.lease():
-                loading = time.monotonic()
                 engine = self._engines.get()
-                load_seconds = time.monotonic() - loading
+                load_seconds = time.monotonic() - started  # the lease wait too, as in run()
                 count = engine.count_tokens(messages, tools)
             self._engines.touch()
             return CountResult(count, load_seconds, time.monotonic() - started)

@@ -359,6 +359,13 @@ def _await_port_closed(port: int, seconds: float) -> bool:
     return not _port_open(port)
 
 
+# How long install-launchd waits for the daemon it just unloaded to let go of
+# the lock. Past the port closing, that daemon still runs uvicorn's graceful
+# bound (server.GRACEFUL_SHUTDOWN_SECONDS), the gateway runner's close and the
+# teardown of a resident model — well past _UNLOAD_GRACE_SECONDS.
+_DAEMON_EXIT_SECONDS = 30.0
+
+
 def _await_lock_free(data_dir: Path, seconds: float) -> bool:
     """Wait up to `seconds` for the daemon lock to be free.
 
@@ -542,6 +549,21 @@ def _fold_legacy_stderr_log(data_dir: Path) -> bool:
     if not legacy.exists():
         return False
     target = data_dir / "daemon.log"
+    if target.exists() and os.path.samefile(legacy, target):
+        # One file under both names, linked by hand: appending it to itself
+        # would read back its own writes until the disk filled. Drop the old
+        # name only where that cannot take the data with it — not when
+        # daemon.log is the link and daemon.err.log the only real copy.
+        if target.is_symlink() or not (legacy.is_symlink() or legacy.stat().st_nlink > 1):
+            print(f"{legacy.name} and {target.name} are already one file; left as they are")
+            return False
+        try:
+            legacy.unlink()
+        except OSError as exc:
+            print(f"sous: could not remove {legacy.name}, a link to {target.name} ({exc})")
+            raise SystemExit(1) from None
+        print(f"removed {legacy.name}, a link to {target.name}")
+        return True
     try:
         with legacy.open("rb") as src, target.open("ab") as dst:
             shutil.copyfileobj(src, dst)
@@ -590,25 +612,40 @@ def _cmd_install_launchd() -> None:
     # leaves a live KeepAlive job, and writing a plist over it would report
     # success for a daemon still running the old one.
     code = _bootout(LABEL)
-    if code not in (0, _BOOTOUT_NOT_LOADED):
+    # launchctl answers a job it cannot find with codes other than
+    # _BOOTOUT_NOT_LOADED too — a domain error over SSH with no GUI login,
+    # for one — so only a job launchd still lists makes a failure fatal.
+    if code not in (0, _BOOTOUT_NOT_LOADED) and _launchd_loaded(LABEL):
         print(f"sous: launchctl bootout failed (exit {code}); not touching {plist_path}")
         raise SystemExit(1)
-    if code == 0:
-        _await_lock_free(config.data_dir, _UNLOAD_GRACE_SECONDS)
-    if _lock_is_held(config.data_dir):
-        # Either cause looks identical from here: a daemon started by hand
-        # (`sous serve`), or the job just unloaded above still mid-shutdown
-        # past the wait's grace period — folding a log out from under either
-        # one would lose lines.
+    # Nothing below reloads the job a successful bootout just unloaded, so
+    # every failure from here on has to say so: otherwise the daemon, and
+    # every `sous claude` session's upstream with it, is simply gone.
+    unloaded = "; the launchd job is unloaded until install-launchd succeeds" if code == 0 else ""
+    if code == 0 and not _await_lock_free(config.data_dir, _DAEMON_EXIT_SECONDS):
         print(
-            "sous: a daemon still holds the lock; if it was just unloaded, wait a "
-            "moment and retry — otherwise stop it first: sous stop"
+            f"sous: the unloaded daemon still holds the lock after {_DAEMON_EXIT_SECONDS:.0f}s"
+            f"{unloaded}; retry once it exits"
         )
         raise SystemExit(1)
+    if _lock_is_held(config.data_dir):
+        # A daemon started by hand (`sous serve`): folding a log out from
+        # under it would lose lines.
+        print(f"sous: a daemon still holds the lock{unloaded}; stop it first: sous stop")
+        raise SystemExit(1)
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    _fold_legacy_stderr_log(config.data_dir)
-    plist_path.parent.mkdir(parents=True, exist_ok=True)
-    plist_path.write_text(launchd_plist(exe, config.data_dir))
+    try:
+        _fold_legacy_stderr_log(config.data_dir)
+    except SystemExit:
+        if unloaded:
+            print(unloaded.removeprefix("; "))
+        raise
+    try:
+        plist_path.parent.mkdir(parents=True, exist_ok=True)
+        plist_path.write_text(launchd_plist(exe, config.data_dir))
+    except OSError as exc:
+        print(f"sous: could not write {plist_path} ({exc}){unloaded}")
+        raise SystemExit(1) from None
     print(f"wrote {plist_path}")
     cmd = ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)]
     try:

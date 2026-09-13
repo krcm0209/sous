@@ -131,14 +131,17 @@ Library lines (`mcp.…`, `uvicorn.error`, `huggingface_hub…`) take the same
 shape, and `warnings.warn` arrives as `WARNING py.warnings`.
 Earlier releases split stdout and stderr into `daemon.log` and
 `daemon.err.log`; re-run `sous install-launchd` once — it boots the old job
-out, waits for the lock to free, folds `daemon.err.log` onto `daemon.log`,
-removes it, writes the new plist and bootstraps it. That re-run needs the
-daemon stopped first if it was started by hand (`sous serve`, the normal case
-on a machine with no launchd job installed yet): finding the lock still held,
-the command refuses and writes nothing — `sous stop`, then retry. A failed
-`launchctl bootstrap` after the plist is written — the old job is already
-unloaded by then — prints the bootstrap command to run by hand and exits
-nonzero rather than claiming success.
+out, waits up to 30 s for its daemon to free the lock, folds `daemon.err.log`
+onto `daemon.log` (or only removes the old name when it was already a link to
+`daemon.log`), removes it, writes the new plist and bootstraps it. That re-run
+needs the daemon stopped first if it was started by hand (`sous serve`, the
+normal case on a machine with no launchd job installed yet): finding the lock
+still held, the command refuses and writes nothing — `sous stop`, then retry.
+Once the old job is unloaded, a failure before the new one loads (a daemon
+still exiting after the wait, a fold or plist write that fails) says the job
+is unloaded and exits nonzero; fix the cause and re-run. A failed
+`launchctl bootstrap` after the plist is written prints the bootstrap command
+to run by hand and exits nonzero rather than claiming success.
 
 ## What Claude gets
 
@@ -290,7 +293,7 @@ example (wrapped here):
 2026-09-10T19:26:14.025Z INFO sous.gateway: POST /v1/messages id=msg_… model=sous-local
   stream=1 status=200 input_tokens=84335 output_tokens=2887 stop=end_turn
   cache=hit took=turn@82647 reused_tokens=82647 prefilled_tokens=1681 forks=0 evicted=1 pressure=0
-  load_s=0.0 queue_s=2.5 tokenize_s=1.1 ttft_s=9.8 prefill_s=7.9 decode_s=196.6
+  load_s=0.0 queue_s=2.5 engine_wait_s=0.0 tokenize_s=1.1 ttft_s=9.8 prefill_s=7.9 decode_s=196.6
   prefill_tps=212.8 decode_tps=14.7 seconds=207.4 tools=1b21cd75 system=9f8e7d6c
 ```
 
@@ -298,12 +301,18 @@ example (wrapped here):
 line joins to Claude Code's transcript). `cache` is `hit` (this
 conversation's own slot), `fork` (a copy of a shared boundary — ~45–56K
 reused tokens is a tools fork, ~57K a header fork) or `miss`; `took` names
-the slot and its length. `prefilled_tokens` is what the turn had to prefill;
+the slot and its length — `none` on a miss, and on a hit whose warm attempt
+failed and was rebuilt cold (a `WARNING py.warnings: … retrying cold` line
+comes first), where `prefilled_tokens` and the phases below describe that
+cold attempt. `prefilled_tokens` is what the turn had to prefill;
 `forks`/`evicted`/`pressure` are what it published and what was dropped under
 it — `evicted` counts every drop, budget or pressure, and `pressure` is the
 subset of those `evicted` the pressure valve forced (not a second, disjoint
-count). `load_s` (a model load, ≈0 when resident), `queue_s` (the wait for
-the gateway lock — Claude Code's small background calls hold it too),
+count). `load_s` (a model load, ≈0 when resident — including one this turn
+only waited out, started by another request), `queue_s` (the wait for the
+gateway lock — Claude Code's small background calls hold it too),
+`engine_wait_s` (the wait for the engine itself, which a delegated task's
+generation holds — part of `seconds` and `ttft_s`, in no phase below),
 `tokenize_s`, `prefill_s` and `decode_s` say where the time went, as far as
 the prompt cache measures it — not a strict partition of `seconds`: a turn
 that starts from a copied fork slot times that copy into neither phase, so
@@ -319,12 +328,15 @@ from the moment the turn takes the gateway lock, so client-visible latency is
 `seconds` plus `queue_s`. On a miss the line adds `lcp=` (how many leading
 tokens the render shared with the closest resident slot), `lcp_region=`
 (`tools` below the tools boundary — the tool array changed; `system` below
-the header — the system text did; `conversation` otherwise; `-` when the
-probe found no boundary at all, whether for lack of fork budget or because
-nothing cleared the 4096-token floor) and `bounds=[tools,header]`, the
-boundaries the probe verified — either one is left out when it never cleared
-the 4096-token floor, so this can also read `bounds=[57123]` (only the header
-boundary) or `bounds=[]` (no probe ran). `tools=` and `system=` are
+the header — the system text did; `tools-or-system` below the header when it
+is the only boundary, since a tool block under the floor, or one a template
+renders inside the system block, cannot be told apart from the text there;
+`conversation` otherwise; `-` when the probe found no boundary at all, whether
+for lack of fork budget or because nothing cleared the 4096-token floor, or
+when the session held no slot to compare with, `lcp=0`) and
+`bounds=[tools,header]`, the boundaries the probe verified — either one is
+left out when it never cleared the 4096-token floor, so this can also read
+`bounds=[57123]` (only the header boundary) or `bounds=[]` (no probe ran). `tools=` and `system=` are
 8-hex-character hashes of the rendered tool array and system text: comparable
 across lines, not reversible. Refused requests log the same way at `WARNING`
 with `status=` and `seconds=` — but there `seconds` is measured from
@@ -332,9 +344,13 @@ request receipt, not from the gateway lock, so it already *is*
 client-visible latency, with nothing to add. A streaming turn that fails
 after its SSE headers already went out logs `status=200` — the status the
 client actually received — with an `error=` naming the failure; alerting on
-`status=5..` alone misses these, so watch `error=` on streamed turns too. A
-client that disconnects while its turn is still queued behind another logs
-`status=499 error=abandoned` the same way — a *local* 499, distinct from
+`status=5..` alone misses these, so watch `error=` on streamed turns too.
+Once a request parses, its `529`, `499` and failure lines carry `id=` too —
+on a streamed failure, the id `message_start` already delivered. A client that
+disconnects mid-turn does not stop the turn, and its line is still written
+once the turn drains. A client that disconnects while its turn is still
+queued behind another logs `status=499 error=abandoned` the same way — a
+*local* 499, distinct from
 the forwarder's own synthesized `499` for a client gone mid-forward
 (below). A locally served `count_tokens` logs its `input_tokens`, `load_s`
 (the model load it paid for), `count_s` (time inside the runner) and

@@ -698,6 +698,16 @@ def test_status_carries_the_prompt_cache_view_once_loaded(tmp_path):
     assert manager.status()["prompt_cache"] == {"hits": 1, "slots": 2, "resident_bytes": 3}
 
 
+def test_status_leaves_out_the_per_turn_gauges(tmp_path):
+    """server_status hands this block to the frontier model; daemon-wide, a
+    per-turn gauge is a max over every owner ever seen — tokens for nothing."""
+    inner = FakeEngine([])
+    inner.stats = {"hits": 1, "prefill_seconds": 1.4974267615067218, "took_len": 900}
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    assert manager.status()["prompt_cache"] == {"hits": 1}
+
+
 def test_default_factory_threads_the_cache_budget_and_reserve(monkeypatch):
     """The reserve is one full window of KV at the model's per-token cost, for
     the larger of the worker's and the gateway's windows."""

@@ -277,10 +277,10 @@ def auto_cache_budget(*, working_set: int, active: int, reserve_bytes: int) -> i
     return max(0, working_set - active - reserve_bytes - CACHE_BUDGET_SLACK)
 
 
-_GAUGES = frozenset(
+# Per-turn readings for the gateway's turn line, reset by begin_turn() at the
+# top of every generate() and again when a failed warm attempt retries cold.
+TURN_GAUGES = frozenset(
     {
-        "snapshot_bytes",
-        "miss_lcp",
         "prefilled_tokens",
         "took_len",
         "bound_lo",
@@ -290,6 +290,16 @@ _GAUGES = frozenset(
         "decode_seconds",
     }
 )
+_GAUGES = frozenset({"snapshot_bytes", "miss_lcp"}) | TURN_GAUGES
+
+
+def without_turn_gauges(stats: dict) -> dict:
+    """`stats` for an MCP-facing report. The per-turn gauges mean something
+    only on the turn line: in a task's report they are its last generate()
+    beside task-long counters, daemon-wide a max over every owner — numbers
+    no reader can use, paid for in the frontier model's tokens."""
+    return {k: v for k, v in stats.items() if k not in TURN_GAUGES}
+
 
 # The clock the per-turn timers read. A module attribute rather than a bare
 # time.monotonic so a test can swap in a hand-advanced one and assert exact
@@ -329,8 +339,9 @@ class PromptCacheStats:
         return dataclasses.asdict(self)
 
     def begin_turn(self) -> None:
-        self.prefilled_tokens = self.took_len = self.bound_lo = self.bound_hi = 0
-        self.probe_seconds = self.prefill_seconds = self.decode_seconds = 0.0
+        for f in dataclasses.fields(self):
+            if f.name in TURN_GAUGES:
+                setattr(self, f.name, f.default)
 
     def add(self, other: PromptCacheStats) -> None:
         """Fold `other`'s counters into these.
@@ -824,8 +835,13 @@ class PrefixCache:
             # the lock is released (below): ~0.6 ms per 57K-token slot is not
             # the list-and-dict work this lock is scoped to, and a slot's
             # `held` is never mutated after publish, so reading it unlocked
-            # is safe even if the map changes meanwhile.
-            candidates = [s.held for s in self._slots if s.owner is owner] if slot is None else []
+            # is safe even if the map changes meanwhile. A fork take collects
+            # them too: its copy can still fail and turn this into a miss.
+            candidates = (
+                [s.held for s in self._slots if s.owner is owner]
+                if slot is None or slot.kind == "fork"
+                else []
+            )
             # Whatever is still in the map is not going to serve this turn,
             # and this turn's own cache is about to be prefilled to full size
             # beside it. Bring the map under its caps here rather than only at
@@ -838,10 +854,6 @@ class PrefixCache:
             # slot is not, and dropping the very slot this turn just chose to
             # share would defeat the point of having forked it.
             self._evict_caps(protect=(slot,) if slot is not None and slot.kind == "fork" else ())
-        if slot is None:
-            stats.miss_lcp = max(
-                (common_prefix_length(held, stable_ids) for held in candidates), default=0
-            )
         warm: list | None = None
         if slot is not None and slot.kind == "fork":
             # The slot stays for the next conversation; this turn works on its
@@ -878,6 +890,11 @@ class PrefixCache:
         else:
             reuse = 0
             stats.misses += 1
+            # Scanned here, after the clone, so a fork whose copy failed is
+            # measured like any other miss instead of keeping an earlier one's.
+            stats.miss_lcp = max(
+                (common_prefix_length(held, stable_ids) for held in candidates), default=0
+            )
             warm = hooks.new_cache()
         # Drop the only remaining reference to a consumed turn slot's cache
         # other than `warm` before anything else is allocated: on a miss with
@@ -936,6 +953,10 @@ class PrefixCache:
             # the same rule for auto sizing. Only a warm attempt is retried, so
             # a genuine engine error still surfaces at once.
             stats.cold_retries += 1
+            # The per-turn gauges describe the attempt that produced the text:
+            # left alone they would add the failed warm attempt to the retry
+            # and keep naming the slot it abandoned.
+            stats.begin_turn()
             warnings.warn(
                 f"sous prompt cache: warm generation failed ({retry_reason}); retrying cold",
                 stacklevel=2,

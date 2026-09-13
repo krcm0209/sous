@@ -41,6 +41,9 @@ def _sous_handlers() -> list[logging.Handler]:
 def _clean_root():
     root = logging.getLogger()
     before, level = list(root.handlers), root.level
+    # At setup too: captureWarnings(True) is a no-op while an earlier test's
+    # capture is still on, after pytest has already restored showwarning.
+    logging.captureWarnings(False)
     yield
     for h in list(root.handlers):
         if h not in before:
@@ -136,3 +139,15 @@ def test_warning_capture_routes_warnings_through_logging(caplog):
         warnings.warn("sous prompt cache: boom", stacklevel=1)
     assert any("sous prompt cache: boom" in r.getMessage() for r in caplog.records)
     assert all(r.name == "py.warnings" and r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_a_captured_warning_is_one_line(capsys):
+    """formatwarning appends the caller's source line and a newline: two more
+    physical lines with no timestamp and no level, which is not the shape."""
+    configure_daemon_logging()
+    enable_warning_capture()
+    warnings.warn("sous prompt cache: boom", stacklevel=1)  # from a file, so it has a source line
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 1, lines
+    assert " WARNING py.warnings: " in lines[0]
+    assert lines[0].endswith("UserWarning: sous prompt cache: boom")

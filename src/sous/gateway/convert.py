@@ -69,7 +69,10 @@ def _invalid(message: str) -> RequestError:
 
 
 def _digest(text: str) -> str:
-    return hashlib.blake2b(text.encode(), digest_size=4).hexdigest()
+    # surrogatepass: JSON can carry a lone surrogate escape that strict UTF-8
+    # refuses, and a hash for the log must never turn a body the engine would
+    # have answered (with its own, shaped error) into a bare 500.
+    return hashlib.blake2b(text.encode("utf-8", "surrogatepass"), digest_size=4).hexdigest()
 
 
 @dataclass

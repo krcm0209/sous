@@ -581,7 +581,8 @@ def main() -> None:
     # launchd's stderr is a pipe with nobody to animate a bar for; a `sous
     # serve` run by hand for a first multi-GB model download has a real
     # terminal, and the download's own progress should still show there.
-    if not sys.stderr.isatty():
+    # stderr is None when fd 2 was closed at exec (`sous serve 2>&-`).
+    if sys.stderr is None or not sys.stderr.isatty():
         disable_progress_bars()
     store = TaskStore(config.data_dir / "tasks.db")
     interrupted = store.recover_interrupted(config.data_dir)

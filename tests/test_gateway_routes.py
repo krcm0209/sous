@@ -940,6 +940,76 @@ def test_a_failure_sous_produced_logs_at_error(tmp_path: Path, caplog):
     assert logging.ERROR in [r.levelno for r in _gateway_records(caplog)]
 
 
+def test_a_streamed_failure_logs_the_id_its_client_already_has(tmp_path: Path, caplog):
+    """message_start carried the id before the engine failed; without it on
+    the failure line, the one turn most worth finding in the transcript is
+    the one the log cannot be joined to."""
+
+    class Boom(FakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            raise RuntimeError("engine exploded")
+
+    app = _app(tmp_path, Boom([]))
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        r = _post(app, _body(stream=True))
+    (started,) = [data for event, data in _events(r.text) if event == "message_start"]
+    (record,) = [rec for rec in _gateway_records(caplog) if "error=" in rec.getMessage()]
+    assert f"id={started['message']['id']} " in record.getMessage()
+    assert record.levelno == logging.ERROR  # status=200 on the line, a failure all the same
+
+
+@pytest.mark.parametrize("outcome", ["done", "error"])
+def test_a_turn_whose_client_left_mid_stream_still_logs_its_outcome(
+    tmp_path: Path, caplog, outcome
+):
+    """A disconnect cancels the SSE consumer at queue.get(), but a started turn
+    drains to completion regardless; its line must not go down with the
+    consumer that used to be the only thing writing it."""
+    from sous.engine.base import Delta
+    from sous.gateway.convert import parse_messages_request
+    from sous.gateway.response import TurnAssembler, new_message_id
+    from sous.gateway.turn import TurnResult
+    from sous.protocol import ToolSet
+
+    gateway, _ = _gateway_app(tmp_path, FakeEngine([]))
+    chat = parse_messages_request(_body(stream=True))
+    assembler = TurnAssembler(new_message_id(), chat.model, ToolSet.from_tools([], strict=False))
+
+    async def scenario() -> threading.Event:
+        queue: asyncio.Queue = asyncio.Queue()
+        abandoned = threading.Event()
+        stream = gateway._stream(chat, assembler, queue, abandoned, time.monotonic())
+        await anext(stream)  # the opening ping
+        queue.put_nowait(("started", 5))
+        await anext(stream)  # message_start
+        reader = asyncio.ensure_future(anext(stream))
+        await asyncio.sleep(0)  # parked at queue.get(), as a live stream is between deltas
+        reader.cancel()  # the client disconnects
+        with contextlib.suppress(asyncio.CancelledError):
+            await reader
+        queue.put_nowait(("delta", Delta("a", 1, None)))
+        if outcome == "done":
+            result = TurnResult("ab", 5, 2, "stop", cache_hit=False, reused_tokens=0, seconds=0.1)
+            queue.put_nowait(("done", result))
+        else:
+            queue.put_nowait(("error", RuntimeError("engine exploded")))
+        for _ in range(50):
+            if not gateway._drains:
+                break
+            await asyncio.sleep(0.01)
+        return abandoned
+
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        assert asyncio.run(scenario()).is_set()
+    (record,) = _gateway_records(caplog)
+    line = record.getMessage()
+    assert f"id={assembler.message_id} " in line and "stream=1 status=200" in line
+    if outcome == "done":
+        assert record.levelno == logging.INFO and "output_tokens=2" in line
+    else:
+        assert record.levelno == logging.ERROR and "error=api_error" in line
+
+
 def test_a_full_queue_logs_at_warning_not_error(tmp_path: Path, monkeypatch, caplog):
     """529 is the one 5xx that is back-pressure, not a fault."""
     import sous.gateway.routes as routes
@@ -1594,7 +1664,7 @@ def test_the_turn_line_attributes_a_hit(tmp_path: Path, capsys):
     assert f["prefill_s"] == "2.0" and f["decode_s"] == "4.0"
     # 6 prefilled tokens / 2.0 s; "second reply here" is 3 words = 3 output tokens / 4.0 s
     assert f["prefill_tps"] == "3.0" and f["decode_tps"] == "0.8"
-    for key in ("load_s", "queue_s", "tokenize_s", "ttft_s", "seconds"):
+    for key in ("load_s", "queue_s", "engine_wait_s", "tokenize_s", "ttft_s", "seconds"):
         assert key in f, key
     assert len(f["tools"]) == 8 and len(f["system"]) == 8
     assert "lcp" not in f and "bounds" not in f
@@ -1623,9 +1693,13 @@ def test_the_turn_line_diagnoses_a_miss(tmp_path: Path, capsys):
         (5, 10, 30, "tools"),
         (15, 10, 30, "system"),
         (35, 10, 30, "conversation"),
-        (15, 0, 30, "system"),
+        # One boundary: the tools one never cleared the fork floor (or the
+        # template renders the tools inside the system block), so below the
+        # header a tool change and a system change look the same.
+        (15, 0, 30, "tools-or-system"),
         (35, 0, 30, "conversation"),
         (15, 0, 0, "-"),
+        (0, 10, 30, "-"),  # nothing resident to compare with
     ],
 )
 def test_lcp_region_places_the_divergence(lcp, lo, hi, region):
@@ -1664,3 +1738,24 @@ def test_a_fork_hit_prints_took_fork(tmp_path: Path, capsys):
     _post(app, _body())
     f = _fields(_turn_lines(capsys.readouterr().err)[1])
     assert f["cache"] == "fork" and f["took"] == "fork@4000"
+
+
+def test_a_hit_retried_cold_prints_took_none(tmp_path: Path, capsys):
+    """The cache resets the per-turn gauges when a warm attempt fails and the
+    turn is rebuilt cold: no slot served the text, so none is named."""
+    inner = FakeEngine(["a", "b"])
+    inner.stats = dict(_ALL_GAUGES)
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 2:
+            inner.stats = {**_ALL_GAUGES, "hits": 1, "reused_tokens": 40, "prefilled_tokens": 46}
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    app = _app(tmp_path, inner)
+    _post(app, _body())
+    _post(app, _body())
+    f = _fields(_turn_lines(capsys.readouterr().err)[1])
+    assert f["cache"] == "hit" and f["took"] == "none"

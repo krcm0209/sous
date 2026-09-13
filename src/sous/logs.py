@@ -90,9 +90,18 @@ def configure_daemon_logging() -> None:
         root.setLevel(logging.INFO)
 
 
+def _first_line(record: logging.LogRecord) -> bool:
+    # warnings.formatwarning follows `path:line: Category: message` with the
+    # caller's source line and a newline — two more physical lines, neither
+    # with a timestamp or a level.
+    record.msg, record.args = record.getMessage().split("\n", 1)[0], None
+    return True
+
+
 def enable_warning_capture() -> None:
     """Route `warnings.warn` (the prompt cache's degradation notices) through
-    logging as `WARNING py.warnings: …`, so they take the line shape too.
-    Called from the daemon entry point only: under pytest the warnings plugin
-    owns `showwarning`, and tests assert on `pytest.warns`."""
+    logging as `WARNING py.warnings: …`, one line each, so they take the line
+    shape too. Called from the daemon entry point only: under pytest the
+    warnings plugin owns `showwarning`, and tests assert on `pytest.warns`."""
     logging.captureWarnings(True)
+    logging.getLogger("py.warnings").addFilter(_first_line)

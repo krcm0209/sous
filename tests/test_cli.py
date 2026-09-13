@@ -394,7 +394,15 @@ def test_uninstall_advises_stop_when_there_was_nothing_to_unload(tmp_path, capsy
         daemon.kill()
 
 
-def _install_env(tmp_path, monkeypatch, *, bootout_code: int, lock_held: bool):
+def _install_env(
+    tmp_path,
+    monkeypatch,
+    *,
+    bootout_code: int,
+    lock_held: bool,
+    loaded: bool = True,
+    lock_frees: bool = True,
+):
     """install-launchd with launchctl, the lock probe and the plist path faked."""
     from sous import cli
 
@@ -406,10 +414,14 @@ def _install_env(tmp_path, monkeypatch, *, bootout_code: int, lock_held: bool):
     monkeypatch.setattr(
         cli, "_bootout", lambda label: (calls["bootout"].append(label), bootout_code)[1]
     )
+    monkeypatch.setattr(cli, "_launchd_loaded", lambda label: loaded)
     monkeypatch.setattr(
         cli,
         "_await_lock_free",
-        lambda data_dir, seconds: (calls["await_lock_free"].append((data_dir, seconds)), True)[1],
+        lambda data_dir, seconds: (
+            calls["await_lock_free"].append((data_dir, seconds)),
+            lock_frees,
+        )[1],
     )
     monkeypatch.setattr(cli, "_lock_is_held", lambda data_dir: lock_held)
     monkeypatch.setattr(cli.subprocess, "run", lambda cmd, check: calls["run"].append(cmd))
@@ -477,6 +489,49 @@ def test_install_launchd_keeps_the_plist_when_bootout_really_fails(tmp_path, cap
     assert exc.value.code == 1 and not plist.exists() and not calls["run"]
 
 
+def test_install_launchd_installs_when_bootout_errors_on_a_job_launchd_does_not_list(
+    tmp_path, capsys, monkeypatch
+):
+    """A first install over SSH with no GUI login: bootout of gui/<uid>/… fails
+    with a domain error, not "not loaded" — and there is no job to protect, so
+    the plist still gets written (main's behaviour before bootout was added)."""
+    cli, plist, calls = _install_env(
+        tmp_path, monkeypatch, bootout_code=125, lock_held=False, loaded=False
+    )
+    cli.main(["install-launchd"])
+    assert plist.exists() and calls["run"]
+    assert calls["await_lock_free"] == []  # nothing was unloaded, so nothing to wait for
+
+
+def test_install_launchd_says_the_job_is_unloaded_when_its_daemon_outlives_the_wait(
+    tmp_path, capsys, monkeypatch
+):
+    """The bootout already took the job down; a daemon still shutting down past
+    the wait must not leave the user with a hedge and no daemon."""
+    cli, plist, calls = _install_env(
+        tmp_path, monkeypatch, bootout_code=0, lock_held=True, lock_frees=False
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["install-launchd"])
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "unloaded" in out and "retry" in out
+    assert not plist.exists() and not calls["run"]
+
+
+def test_install_launchd_reports_an_unwritable_plist_without_a_traceback(
+    tmp_path, capsys, monkeypatch
+):
+    cli, plist, calls = _install_env(tmp_path, monkeypatch, bootout_code=0, lock_held=False)
+    plist.mkdir()  # writing a file over a directory raises IsADirectoryError
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["install-launchd"])
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert str(plist) in out and "unloaded" in out
+    assert not calls["run"]
+
+
 def test_install_launchd_waits_for_the_lock_only_after_a_real_bootout(tmp_path, monkeypatch):
     """A resident model keeps the daemon in lifespan shutdown, and the flock
     with it, for seconds after the port stops accepting — so the wait must
@@ -491,7 +546,12 @@ def test_install_launchd_waits_for_the_lock_only_after_a_real_bootout(tmp_path, 
 
     cli, _, calls = _install_env(tmp_path, monkeypatch, bootout_code=0, lock_held=False)
     cli.main(["install-launchd"])
-    assert calls["await_lock_free"] == [(tmp_path, cli._UNLOAD_GRACE_SECONDS)]
+    assert calls["await_lock_free"] == [(tmp_path, cli._DAEMON_EXIT_SECONDS)]
+    from sous.server import GRACEFUL_SHUTDOWN_SECONDS
+
+    # Longer than the daemon's own graceful-shutdown bound plus the runner's
+    # close, or a busy daemon still exiting reads as a held lock.
+    assert cli._DAEMON_EXIT_SECONDS > GRACEFUL_SHUTDOWN_SECONDS + 2
 
 
 def test_install_launchd_folds_into_a_freshly_created_daemon_log(tmp_path, capsys, monkeypatch):
@@ -516,6 +576,7 @@ def test_install_launchd_reports_a_failed_fold_and_stops(tmp_path, capsys, monke
     assert exc.value.code == 1
     out = capsys.readouterr().out
     assert "daemon.err.log" in out and "daemon.log" in out
+    assert "unloaded" in out  # the bootout already happened; say so
     assert (tmp_path / "daemon.err.log").read_bytes() == b"err-1\n"
     assert not plist.exists() and not calls["run"]
 
@@ -571,6 +632,37 @@ def test_fold_legacy_stderr_log_fsyncs_the_target_before_unlinking_the_source(
     assert cli._fold_legacy_stderr_log(tmp_path) is True
     assert calls, "os.fsync was never called before folding the legacy log"
     assert not (tmp_path / "daemon.err.log").exists()
+
+
+@pytest.mark.parametrize("link", ["symlink", "hardlink"])
+def test_fold_drops_a_legacy_name_that_links_to_daemon_log(tmp_path, capsys, link):
+    """Appending a file onto itself never reaches EOF past the write buffer —
+    daemon.log would grow until the disk filled. A link is already one log."""
+    from sous import cli
+
+    log = tmp_path / "daemon.log"
+    log.write_bytes(b"x" * (1 << 18))  # past io.DEFAULT_BUFFER_SIZE
+    legacy = tmp_path / "daemon.err.log"
+    if link == "symlink":
+        legacy.symlink_to(log)
+    else:
+        legacy.hardlink_to(log)
+    assert cli._fold_legacy_stderr_log(tmp_path) is True
+    assert log.read_bytes() == b"x" * (1 << 18)
+    assert not legacy.exists() and not legacy.is_symlink()
+
+
+def test_fold_leaves_daemon_log_linked_to_the_legacy_file_alone(tmp_path, capsys):
+    """The reverse link: daemon.err.log is the only real copy, so removing it
+    would take all the history with it."""
+    from sous import cli
+
+    legacy = tmp_path / "daemon.err.log"
+    legacy.write_bytes(b"history\n")
+    (tmp_path / "daemon.log").symlink_to(legacy)
+    assert cli._fold_legacy_stderr_log(tmp_path) is False
+    assert legacy.read_bytes() == b"history\n"
+    assert (tmp_path / "daemon.log").read_bytes() == b"history\n"
 
 
 def test_install_launchd_exits_nonzero_when_bootstrap_fails(tmp_path, capsys, monkeypatch):
