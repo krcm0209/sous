@@ -543,8 +543,9 @@ def test_non_streaming_turn_matches_the_streamed_content(tmp_path: Path):
 
 
 def test_prompt_conversion_reaches_the_engine(tmp_path: Path):
-    """Inline system, billing header and the volatile marker: the engine sees
-    one stable system message, so the prefix cache can hold across turns."""
+    """Billing header and the volatile marker stripped, the inline system
+    message rendered into the user turn: the engine sees one stable system
+    message, so the prefix cache can hold across turns."""
     inner = FakeEngine(["ok"])
     app = _app(tmp_path, inner)
     body = _body(
@@ -560,8 +561,8 @@ def test_prompt_conversion_reaches_the_engine(tmp_path: Path):
     )
     assert _post(app, body).status_code == 200
     assert inner.calls[0] == [
-        {"role": "system", "content": "Canonical.\n\nInline."},
-        {"role": "user", "content": "task"},
+        {"role": "system", "content": "Canonical."},
+        {"role": "user", "content": "task\n<system-reminder>\nInline.\n</system-reminder>"},
     ]
     assert [t["function"]["name"] for t in inner.tools_seen[0]] == ["Read"]
 
@@ -906,6 +907,94 @@ def test_the_log_carries_lcp_only_on_a_miss(tmp_path: Path, capsys):
     lines = [line for line in capsys.readouterr().err.splitlines() if "POST /v1/messages" in line]
     assert "cache=miss" in lines[0] and "lcp=1200" in lines[0]
     assert "cache=hit" in lines[1] and "lcp=" not in lines[1]
+
+
+class _PrefixReuseEngine(FakeEngine):
+    """Reports a hit exactly when the render it receives strictly extends the
+    previous one, with `reused_tokens` the previous render's length — the
+    prompt cache's own rule, on a token-per-character stand-in."""
+
+    def __init__(self, script: list[str]):
+        super().__init__(script)
+        self._held: list[int] = []
+        self.lengths: list[int] = []  # each render's length, in the order served
+        self.stats = {"hits": 0, "misses": 0, "fork_hits": 0, "reused_tokens": 0}
+
+    def generate(self, messages, tools, max_tokens, on_delta=None):
+        from sous.engine.promptcache import reuse_length
+
+        ids = list(b"".join(json.dumps(m, sort_keys=True).encode() + b"\n" for m in messages))
+        reused = reuse_length(self._held, ids)
+        self.stats = {**self.stats, "reused_tokens": self.stats["reused_tokens"] + reused}
+        self.stats["hits" if reused else "misses"] += 1
+        self._held = ids
+        self.lengths.append(len(ids))
+        return super().generate(messages, tools, max_tokens, on_delta)
+
+
+def test_an_attachment_and_a_summary_call_leave_the_conversation_warm(tmp_path: Path, capsys):
+    """T1 the brief, T3 the same conversation plus a tool exchange and a
+    role:system attachment after the tool result, T5 one more exchange: each
+    render strictly extends the one before, so the second and third turns
+    are hits that reuse the whole previous render. Hoisting the attachment
+    into the system turn made T3 a miss at the header."""
+    inner = _PrefixReuseEngine(["one", "two", "three"])
+    app = _app(tmp_path, inner)
+    system = [{"type": "text", "text": "You are Claude Code."}]
+    t1 = [{"role": "user", "content": "Summarise the repo."}]
+    t3 = [
+        *t1,
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "a", "name": "Read", "input": {"file_path": "x"}}
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "contents of x"},
+                {"type": "text", "text": "<total_tokens>900 tokens left</total_tokens>\n"},
+            ],
+        },
+        {"role": "system", "content": "Available agent types for the Agent tool:\n- Explore"},
+    ]
+    t5 = [
+        *t3,
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "b", "name": "Read", "input": {"file_path": "y"}}
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "b", "content": "contents of y"},
+                {"type": "text", "text": "<total_tokens>800 tokens left</total_tokens>\n"},
+            ],
+        },
+    ]
+    for messages in (t1, t3, t5):
+        r = _post(app, _body(system=system, tools=[READ_TOOL], messages=messages))
+        assert r.status_code == 200
+    lines = [_fields(line) for line in _turn_lines(capsys.readouterr().err)]
+    assert [f["cache"] for f in lines] == ["miss", "hit", "hit"]
+    # Each hit reused exactly the previous render — the whole of it.
+    assert [f["reused_tokens"] for f in lines] == [
+        "0",
+        str(inner.lengths[0]),
+        str(inner.lengths[1]),
+    ]
+    assert lines[1]["system"] == lines[0]["system"] == lines[2]["system"]
+    # The attachment rendered as a user turn after the tool turn, not into the system block.
+    assert inner.calls[1][-1] == {
+        "role": "user",
+        "content": "<system-reminder>\nAvailable agent types for the Agent tool:\n- Explore\n"
+        "</system-reminder>",
+    }
+    assert inner.calls[1][: len(inner.calls[0])] == inner.calls[0]
+    assert inner.calls[2][: len(inner.calls[1])] == inner.calls[1]
 
 
 def _gateway_records(caplog) -> list[logging.LogRecord]:
@@ -1623,6 +1712,9 @@ _ALL_GAUGES = {
     "probe_seconds": 0.0,
     "prefill_seconds": 0.0,
     "decode_seconds": 0.0,
+    "retained": 0,
+    "moved": 0,
+    "took_kind": "",
 }
 
 
@@ -1640,6 +1732,7 @@ def test_the_turn_line_attributes_a_hit(tmp_path: Path, capsys):
                 "reused_tokens": 40,
                 "prefilled_tokens": 6,
                 "took_len": 40,
+                "took_kind": "turn",
                 "bound_lo": 10,
                 "bound_hi": 30,
                 "forks": 1,
@@ -1729,6 +1822,7 @@ def test_a_fork_hit_prints_took_fork(tmp_path: Path, capsys):
                 "fork_hits": 1,
                 "reused_tokens": 4000,
                 "took_len": 4000,
+                "took_kind": "fork",
             }
         return out
 
@@ -1759,3 +1853,32 @@ def test_a_hit_retried_cold_prints_took_none(tmp_path: Path, capsys):
     _post(app, _body())
     f = _fields(_turn_lines(capsys.readouterr().err)[1])
     assert f["cache"] == "hit" and f["took"] == "none"
+
+
+def test_a_moved_turn_slot_prints_took_turn_moved(tmp_path: Path, capsys):
+    """Copied and left in place is `turn@N`; removed and adopted — the only
+    path at prompt_cache_gb = 0 — is `turn-moved@N`, so the log says whether
+    a branch of this conversation could still start warm."""
+    inner = FakeEngine(["a", "b"])
+    inner.stats = dict(_ALL_GAUGES)
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 2:
+            inner.stats = {
+                **_ALL_GAUGES,
+                "hits": 1,
+                "moved": 1,
+                "took_kind": "turn-moved",
+                "reused_tokens": 40,
+                "took_len": 40,
+            }
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    app = _app(tmp_path, inner)
+    _post(app, _body())
+    _post(app, _body())
+    f = _fields(_turn_lines(capsys.readouterr().err)[1])
+    assert f["cache"] == "hit" and f["took"] == "turn-moved@40"

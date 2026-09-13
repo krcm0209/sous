@@ -1,6 +1,8 @@
 """Anthropic request → chat-template inputs. Pure; every Claude Code
 accommodation from the gateway spec's checklist is pinned here."""
 
+import json
+
 import pytest
 
 from sous.gateway.convert import (
@@ -62,14 +64,13 @@ def test_a_string_system_carrying_the_billing_header_is_dropped_too():
     assert chat_messages("Be terse.", [])[0] == {"role": "system", "content": "Be terse."}
 
 
-def test_inline_system_messages_fold_into_the_leading_system_message():
-    """Checklist item 1: Claude Code >= 2.1.154 puts system content in
-    messages[] (gate 2 saw a 7.8 KB string there); Qwen's template accepts a
-    system message only at index 0, canonical field first."""
+def test_a_leading_inline_system_message_folds_into_the_system_prompt():
+    """Nothing precedes it, so the template's one system turn (index 0) is
+    where it belongs — canonical field first, as before."""
     messages = [
-        {"role": "user", "content": [{"type": "text", "text": "task"}]},
         {"role": "system", "content": "Inline instructions."},
         {"role": "system", "content": [{"type": "text", "text": "More."}]},
+        {"role": "user", "content": [{"type": "text", "text": "task"}]},
     ]
     out = chat_messages([{"type": "text", "text": "Canonical."}], messages)
     assert out == [
@@ -78,11 +79,192 @@ def test_inline_system_messages_fold_into_the_leading_system_message():
     ]
 
 
-def test_inline_system_without_a_canonical_field_still_leads():
+def test_a_leading_inline_system_without_a_canonical_field_still_leads():
     out = chat_messages(
-        None, [{"role": "user", "content": "q"}, {"role": "system", "content": "S"}]
+        None, [{"role": "system", "content": "S"}, {"role": "user", "content": "q"}]
     )
     assert out[0] == {"role": "system", "content": "S"}
+
+
+def _tool_exchange(*trailing: dict) -> list[dict]:
+    """A user brief, one tool call, its result with the volatile marker after
+    it (Claude Code's shape), then whatever the test appends."""
+    return [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "A"},
+                {"type": "text", "text": "<total_tokens>123 tokens left</total_tokens>\n"},
+            ],
+        },
+        *trailing,
+    ]
+
+
+def _wrapped(*texts: str) -> str:
+    """The user-turn content the converter renders for inline system text:
+    one <system-reminder> block per message, newline-joined like any other
+    text blocks in a user message."""
+    return "\n".join(f"<system-reminder>\n{t}\n</system-reminder>" for t in texts)
+
+
+LISTING = "Available agent types for the Agent tool:\n- Explore: read-only"
+WRAPPED_LISTING = _wrapped(LISTING)
+
+
+def test_an_inline_system_message_after_tool_results_renders_as_a_user_turn_after_them():
+    """Claude Code inserts its attachments (agent listings, MCP instructions,
+    deferred tools) as a `role: "system"` message after the preceding user
+    message. Rendered where Claude Code's own fallback for models without that
+    feature puts it — a <system-reminder> block in that user message — it lands
+    after the tool turns. Claude Code sends it in the request that first
+    carries that user message, so every later request renders it the same
+    way; here, with nothing but the marker after the tool results, even the
+    request without it renders a strict prefix."""
+    without = chat_messages(None, _tool_exchange())
+    with_it = chat_messages(None, _tool_exchange({"role": "system", "content": LISTING}))
+    assert with_it[: len(without)] == without
+    assert with_it[len(without) :] == [{"role": "user", "content": WRAPPED_LISTING}]
+    assert without[-1] == {"role": "tool", "content": "A"}
+
+
+def test_real_text_after_the_tool_results_absorbs_the_reminder_into_its_turn():
+    """Claude Code's own <system-reminder> blocks are real text after the tool
+    results; the attachment joins that turn, newline-joined like any two text
+    blocks of one user message, rather than starting another — Claude Code's
+    legacy merge, not a strict extension of the turn without it."""
+    messages = _tool_exchange()
+    tool_message = {
+        **messages[-1],
+        "content": [*messages[-1]["content"], {"type": "text", "text": "R"}],
+    }
+    out = chat_messages(
+        None, [*messages[:-1], tool_message, {"role": "system", "content": LISTING}]
+    )
+    assert out[-2:] == [
+        {"role": "tool", "content": "A"},
+        {"role": "user", "content": f"R\n{WRAPPED_LISTING}"},
+    ]
+
+
+def test_consecutive_inline_system_messages_merge_in_order_one_block_each():
+    out = chat_messages(
+        None,
+        _tool_exchange(
+            {"role": "system", "content": "First."},
+            {"role": "system", "content": [{"type": "text", "text": "Second."}]},
+        ),
+    )
+    assert out[-1] == {"role": "user", "content": _wrapped("First.", "Second.")}
+
+
+def test_a_pre_wrapped_inline_system_message_is_not_wrapped_again():
+    out = chat_messages(None, _tool_exchange({"role": "system", "content": WRAPPED_LISTING}))
+    assert out[-1] == {"role": "user", "content": WRAPPED_LISTING}
+
+
+def test_an_inline_system_message_that_only_opens_with_a_reminder_is_wrapped_whole():
+    """Only text Claude Code wrapped whole is left alone: a reminder with text
+    after its close tag would otherwise reach the model half outside it."""
+    text = f"{WRAPPED_LISTING}\ntrailing"
+    out = chat_messages(None, _tool_exchange({"role": "system", "content": text}))
+    assert out[-1] == {"role": "user", "content": _wrapped(text)}
+
+
+def test_a_marker_only_inline_system_message_renders_nothing():
+    """The bare <total_tokens> reminder arrives as its own system message on
+    some paths; stripped, it is empty, and an empty block would still cost a
+    <system-reminder> wrapper the next request does not repeat byte for byte."""
+    marker = {"role": "system", "content": "<total_tokens>5 tokens left</total_tokens>"}
+    assert chat_messages(None, _tool_exchange(marker)) == chat_messages(None, _tool_exchange())
+    assert chat_messages("Sys.", [marker, {"role": "user", "content": "q"}]) == [
+        {"role": "system", "content": "Sys."},
+        {"role": "user", "content": "q"},
+    ]
+
+
+def test_an_inline_system_message_after_an_assistant_turn_is_its_own_user_turn():
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "Working."},
+        {"role": "system", "content": "Note."},
+        {"role": "system", "content": "Note 2."},
+    ]
+    assert chat_messages(None, messages)[2:] == [
+        {"role": "user", "content": _wrapped("Note.", "Note 2.")}
+    ]
+
+
+def test_an_inline_system_message_appends_to_a_string_user_message():
+    out = chat_messages(
+        None, [{"role": "user", "content": "hi"}, {"role": "system", "content": "S"}]
+    )
+    assert out == [{"role": "user", "content": "hi\n" + _wrapped("S")}]
+    empty = chat_messages(
+        None, [{"role": "user", "content": ""}, {"role": "system", "content": "S"}]
+    )
+    assert empty == [{"role": "user", "content": _wrapped("S")}]
+
+
+def test_nothing_after_index_zero_renders_as_a_system_turn():
+    """The chat template accepts a system message only at index 0."""
+    out = chat_messages(
+        "Sys.",
+        _tool_exchange({"role": "system", "content": LISTING}, {"role": "user", "content": "go"}),
+    )
+    assert [m["role"] for m in out[1:]].count("system") == 0
+    assert out[0]["role"] == "system"
+
+
+def test_the_request_body_is_not_mutated_by_placement():
+    messages = _tool_exchange({"role": "system", "content": LISTING})
+    before = json.dumps(messages, sort_keys=True)
+    chat_messages(None, messages)
+    assert json.dumps(messages, sort_keys=True) == before
+
+
+def test_a_leading_inline_system_message_is_stripped_with_the_canonical_field_as_one_text():
+    """Folded exactly as the hoist did: joined first, stripped once, so the
+    marker's own-line rule sees the join's newlines."""
+    marker_led = {"role": "system", "content": "<total_tokens>9 tokens left</total_tokens>\nC"}
+    out = chat_messages("A", [marker_led, {"role": "user", "content": "q"}])
+    assert out[0] == {"role": "system", "content": "A\nC"}
+
+
+def test_whitespace_beside_the_marker_after_tool_results_adds_no_user_turn():
+    """Stripped block by block, a whitespace-only sibling of the marker block
+    would survive on its own; judged as one text, it is residue."""
+    content = [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "A"},
+        {"type": "text", "text": "<total_tokens>1 tokens left</total_tokens>"},
+        {"type": "text", "text": "\n"},
+    ]
+    assert chat_messages(None, [{"role": "user", "content": content}]) == [
+        {"role": "tool", "content": "A"}
+    ]
+    marker_then_blank = [
+        {"type": "text", "text": "<total_tokens>1 tokens left</total_tokens>"},
+        {"type": "text", "text": "   "},
+    ]
+    assert chat_messages(None, [{"role": "user", "content": marker_then_blank}]) == []
+
+
+def test_a_marker_block_followed_by_a_text_block_leaves_no_leading_newline():
+    """Each text block is stripped on its own before the join: the marker is
+    the last block Claude Code writes, and the block appended after it must
+    not inherit the join's newline."""
+    content = [
+        {"type": "text", "text": "<total_tokens>1 tokens left</total_tokens>\n"},
+        {"type": "text", "text": "after"},
+    ]
+    assert chat_messages(None, [{"role": "user", "content": content}]) == [
+        {"role": "user", "content": "after"}
+    ]
 
 
 def test_total_tokens_markers_are_stripped_from_system_and_user_text():
@@ -537,7 +719,8 @@ def test_parse_count_tokens_request_needs_no_max_tokens_or_stream():
 def test_gate_capture_shape_converts_cleanly():
     """The structure gate 1 captured (comment 5440572099 / dump inspection):
     billing header first in a 3-block system list, cache_control on some
-    blocks, a two-block user turn, then a plain-string inline system message."""
+    blocks, a two-block user turn, then a plain-string inline system message,
+    rendered into the user turn."""
     body = _body(
         system=[
             {
@@ -576,11 +759,16 @@ def test_gate_capture_shape_converts_cleanly():
         {
             "role": "system",
             "content": (
-                "You are Claude Code, Anthropic's official CLI for Claude.\n\n"
-                "Long system prompt.\n\nInline subagent system text."
+                "You are Claude Code, Anthropic's official CLI for Claude.\n\nLong system prompt."
             ),
         },
-        {"role": "user", "content": "Agent prompt.\nEnvironment."},
+        {
+            "role": "user",
+            "content": (
+                "Agent prompt.\nEnvironment.\n"
+                "<system-reminder>\nInline subagent system text.\n</system-reminder>"
+            ),
+        },
     ]
 
 
