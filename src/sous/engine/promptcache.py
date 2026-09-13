@@ -237,8 +237,9 @@ def fork_copy(src: Sequence[Any], dst: Sequence[Any], copy_array: Callable) -> N
     only an offset for a layer it will later restore in place, a fork must
     copy the attention layers too — it is a second cache, not a bookmark.
 
-    Callers fork only after a prefill of at least FORK_MIN_TOKENS tokens, so
-    every layer is populated (an empty KVCache's `state` getter would raise).
+    Callers copy only a cache that has been prefilled — a fork after at least
+    FORK_MIN_TOKENS tokens, a taken slot holding at least one — so every
+    layer is populated (an empty KVCache's `state` getter would raise).
     Nested-tuple states (QuantizedKVCache) are not handled; sous never
     quantizes its KV.
     """
@@ -283,6 +284,7 @@ TURN_GAUGES = frozenset(
     {
         "prefilled_tokens",
         "took_len",
+        "took_kind",
         "bound_lo",
         "bound_hi",
         "probe_seconds",
@@ -327,7 +329,9 @@ class PromptCacheStats:
     # Turn-slot takes that copied the slot and left it in the map, and those
     # that removed it and adopted its arrays because the budget could not
     # hold a copy beside the live cache. Both are hits; the split says
-    # whether a branch of the conversation could still start warm.
+    # whether the take left the predecessor in place for a branch of the
+    # conversation to start from — a later eviction (`evictions`,
+    # `pressure_evictions`) can still take it before one arrives.
     retained: int = 0
     moved: int = 0
     # Per-turn gauges, zeroed by begin_turn() at the top of every generate()
@@ -335,6 +339,10 @@ class PromptCacheStats:
     # render not a strict prefix) reports zeros rather than the last turn's.
     prefilled_tokens: int = 0  # stable tokens this turn had to prefill
     took_len: int = 0  # length of the slot _take returned; 0 on a miss
+    # What kind of slot that was, as the turn line names it: "turn" (copied
+    # and left in place), "turn-moved" (removed, its arrays adopted), "fork";
+    # "" on a miss, and after a cold retry, which took no slot in the end.
+    took_kind: str = ""
     bound_lo: int = 0  # the probe's lower boundary (tools), 0 when absent
     bound_hi: int = 0  # the probe's upper boundary (header), 0 when absent
     probe_seconds: float = 0.0
@@ -434,8 +442,9 @@ class Slot:
     is "turn" (published when a turn ends; copied and left in place by the
     turn that extends it when the budget holds the copy, otherwise removed and
     its arrays adopted) or "fork" (a copy taken at a shared-prefix boundary;
-    copied on every hit, left in place). `parent` is set only on the copied
-    case."""
+    copied on every hit, left in place). Which turn slots are one
+    conversation at different lengths is read off `held` (`_ancestors`),
+    never recorded."""
 
     cache: list
     held: list[int]
@@ -443,11 +452,6 @@ class Slot:
     kind: str
     nbytes: int
     last_used: float = field(default_factory=time.monotonic)
-    # The turn slot this one was copied from and extended, when that slot was
-    # retained: a weak reference, so a predecessor that has left the map is
-    # freed rather than pinned by its descendants. Read only by the lineage
-    # rule at publish; never compared.
-    parent: weakref.ref[Slot] | None = field(default=None, compare=False, repr=False)
 
 
 class PrefixCache:
@@ -530,16 +534,25 @@ class PrefixCache:
         # two ~50K-token id lists (and two caches) per candidate.
         return [s for s in self._slots if not any(s is p for p in protect)]
 
-    def _drop_lru(self, protect: Sequence[Slot], *, pressure: bool = False) -> None:
-        victim = min(self._evictable(protect), key=lambda s: s.last_used)
-        self._slots.remove(victim)
+    def _holds(self, slot: Slot) -> bool:
+        return any(s is slot for s in self._slots)
+
+    def _remove(self, slot: Slot) -> None:
+        self._slots = [s for s in self._slots if s is not slot]
+
+    def _drop(self, victim: Slot, *, pressure: bool = False) -> None:
+        """Take `victim` out of the map and charge its owner. The caller's
+        reference is the last one: the slot's cache is freed the moment that
+        frame lets go, which is what the pressure re-read in _evict_pressure
+        relies on."""
+        self._remove(victim)
         stats = self._stats_for(victim.owner)
         stats.evictions += 1
         if pressure:
             stats.pressure_evictions += 1
-        # `victim` dies with this frame: the slot's cache is freed the moment
-        # nothing else references it, which is what the pressure re-read in
-        # _evict_pressure relies on.
+
+    def _drop_lru(self, protect: Sequence[Slot], *, pressure: bool = False) -> None:
+        self._drop(min(self._evictable(protect), key=lambda s: s.last_used), pressure=pressure)
 
     def _evict_caps(self, protect: Sequence[Slot]) -> None:
         """Bring the map under its count and byte caps, never touching a slot
@@ -559,26 +572,26 @@ class PrefixCache:
         For the fork copy, which is charged before it is allocated rather than
         after: publishing first and evicting afterwards would put the copy and
         whatever it displaces on the machine at the same time — the transient
-        doubling that must never happen. `protect` is the forks this
-        same turn already published: a second copy is never made room for by
-        evicting the first, and when the budget cannot hold both the answer
-        is False and the caller skips the copy rather than evicting into it.
-        The turn's own cache is not in the map, and a fork slot this turn
-        copied from has already been copied, so neither needs protecting.
+        doubling that must never happen. `protect` is what this turn must
+        keep — the forks it already published, or the turn slot it is about
+        to copy: a copy is never made room for by evicting what it copies or
+        sits beside, and when the budget cannot hold both the answer is False
+        and the caller skips the copy rather than evicting into it. The
+        turn's own cache is not in the map and needs no protecting.
         A copy that cannot fit beside what `protect` alone holds is refused
         up front, before any eviction runs — otherwise a copy that can never
         fit would empty the map of everything evictable for nothing.
 
         `require`, when given, must still be in the map, else False before any
-        eviction: LRU is daemon-wide and the caller released the lock after
-        choosing it, so another owner's publish may have dropped the slot
-        meanwhile — and a copy of a slot nobody can take again is not worth
-        making room for.
+        eviction: the lock was released after the take, and the gateway can
+        retire the owner meanwhile (`reset(owner)` for a generation it
+        abandoned as stalled), emptying its slots. That turn's publish will
+        be refused, and a copy for it is not worth making room for.
 
         Takes the lock itself.
         """
         with self._lock:
-            if require is not None and not any(s is require for s in self._slots):
+            if require is not None and not self._holds(require):
                 return False
             protected_bytes = sum(s.nbytes for s in protect)
             if protected_bytes + nbytes > self.max_bytes:
@@ -684,7 +697,7 @@ class PrefixCache:
         room for exactly one slot that one survives — and a cold turn's second
         fork never evicts its first.
 
-        The lineage drop runs under the same lock, before the caps, so the
+        The ancestor drop runs under the same lock, before the caps, so the
         caps see the map the conversation actually needs.
         """
         keep = (slot, *protect)
@@ -692,29 +705,42 @@ class PrefixCache:
             if epoch != self._epoch or slot.owner in self._retired:
                 return False
             self._slots.append(slot)
-            self._drop_grandparent(slot)
+            if slot.kind == "turn":
+                self._retire_ancestors(slot, keep_longest=True)
             self._evict_caps(protect=keep)
         self._evict_pressure(protect=keep)
         return True
 
-    def _drop_grandparent(self, slot: Slot) -> None:
-        """Keep a linear conversation at its current and previous lengths.
-        Every retained take leaves the predecessor in place, so without this
-        a ten-turn subagent would hold ten copies of itself: when `slot`
-        extends a retained turn slot that itself extended one, that
-        grandparent goes, charged to `evictions` — neither the budget nor
-        pressure asked for it. A branch (a progress-summary call descends
-        from the same parent as the real conversation's next turn) is not on
-        this chain and stays until LRU takes it. Forks are shared and never
-        dropped by lineage. Lock held by the caller."""
-        parent = slot.parent() if slot.parent is not None else None
-        if parent is None or parent.parent is None:
-            return
-        grand = parent.parent()
-        if grand is None or grand.kind != "turn" or not any(s is grand for s in self._slots):
-            return
-        self._slots = [s for s in self._slots if s is not grand]
-        self._stats_for(grand.owner).evictions += 1
+    def _ancestors(self, slot: Slot) -> list[Slot]:
+        """This owner's turn slots whose ids `slot`'s strictly extend: the
+        same conversation at shorter lengths. Read off the map at every use
+        rather than recorded at the take, so a chain broken by a cold retry
+        or a moved slot needs no repair. A fork is a prefix of every turn
+        slot of its session and never counts; a branch (a progress-summary
+        call takes the same prefix down a different last turn) extends
+        nothing the real conversation's next turn publishes, and vice versa,
+        so neither is the other's ancestor. Lock held by the caller."""
+        return [
+            s
+            for s in self._slots
+            if s.kind == "turn" and s.owner is slot.owner and reuse_length(s.held, slot.held)
+        ]
+
+    def _retire_ancestors(self, slot: Slot, *, keep_longest: bool) -> None:
+        """Drop `slot`'s ancestors, charged to `evictions` (neither the budget
+        nor pressure asked for it), keeping the longest when asked. Every
+        retained take leaves the predecessor in place, so without this a
+        ten-turn subagent would hold ten copies of itself: a turn retires
+        the lengths below the slot it takes as it takes it — their bytes
+        fund its copy, rather than another conversation's slot — and its
+        publish keeps the slot it took beside the one it adds, so a linear
+        conversation holds at most its current and previous lengths. Lock
+        held by the caller."""
+        ancestors = self._ancestors(slot)
+        longest = max(ancestors, key=lambda s: len(s.held)) if keep_longest and ancestors else None
+        for s in ancestors:
+            if s is not longest:
+                self._drop(s)
 
     def _evict_pressure(self, protect: Sequence[Slot]) -> None:
         """Shrink the map when the machine says so, never touching a slot in
@@ -818,6 +844,30 @@ class PrefixCache:
                 "resident_bytes": sum(s.nbytes for s in mine),
             }
 
+    def _copy_of(
+        self, stats: PromptCacheStats, cache: list, what: str, fallback: str
+    ) -> list | None:
+        """A fresh cache holding what `cache` holds, or None when the copy
+        failed — `what` names the copy and `fallback` what the caller does
+        without it, for the warning. An optimization must never fail a turn,
+        the rule the warm-retry and probe paths follow too; a half-built copy
+        dies here, before the caller allocates anything in its place. Prefill
+        time, like the fork copies in `_run`: the copy is part of building
+        the cache the turn runs on."""
+        hooks = self._hooks
+        started = _clock()
+        try:
+            copy = hooks.new_cache()
+            fork_copy(cache, copy, hooks.copy_array)
+        except Exception as e:
+            warnings.warn(
+                f"sous prompt cache: {what} ({type(e).__name__}); {fallback}", stacklevel=3
+            )
+            return None
+        finally:
+            stats.prefill_seconds += _clock() - started
+        return copy
+
     def generate(
         self,
         stable_ids: list[int],
@@ -889,6 +939,12 @@ class PrefixCache:
                 if slot is None or slot.kind == "fork"
                 else []
             )
+            if slot is not None and slot.kind == "turn":
+                # The lengths below the taken slot are what this turn's
+                # publish would retire anyway (it keeps the slot it took
+                # beside the one it adds): gone now, their bytes fund the
+                # copy below instead of another conversation's slot.
+                self._retire_ancestors(slot, keep_longest=False)
             # Whatever is still in the map is not going to serve this turn,
             # and this turn's own cache is about to be prefilled to full size
             # beside it. Bring the map under its caps here rather than only at
@@ -906,7 +962,7 @@ class PrefixCache:
             if slot is None or slot.kind == "fork":
                 self._evict_caps(protect=(slot,) if slot is not None else ())
         warm: list | None = None
-        parent: weakref.ref[Slot] | None = None
+        kind = ""
         if slot is not None and slot.kind == "fork":
             # The slot stays for the next conversation; this turn works on its
             # own copy. Taking that copy is part of the warm optimization, so
@@ -916,64 +972,55 @@ class PrefixCache:
             # mid-generation failure there is no replay to weigh. The slot
             # itself is untouched (a fork is never removed by `_take`), so the
             # next conversation still finds it.
-            try:
-                warm = hooks.new_cache()
-                fork_copy(slot.cache, warm, hooks.copy_array)
-            except Exception as e:
-                warnings.warn(
-                    f"sous prompt cache: fork clone failed ({type(e).__name__}); prefilling cold",
-                    stacklevel=2,
-                )
-                # Drop the half-built copy before the cold cache is allocated,
-                # and take the miss branch below: this is not a hit, and
+            warm = self._copy_of(stats, slot.cache, "fork clone failed", "prefilling cold")
+            if warm is None:
+                # Take the miss branch below: this is not a hit, and
                 # `cold_retries` is not the counter for it either — that one
                 # means a warm run that failed after it had started.
-                warm = None
                 slot = None
             else:
                 stats.fork_hits += 1
+                kind = "fork"
         elif slot is not None:
             # A turn slot is copied and left in place when the budget can hold
-            # a second slot of its size beside it — the forecast for this
-            # turn's own publish, evicting least-recently-used slots now to
-            # make that room — so a branch of the conversation (Claude Code's
-            # progress-summary call takes the same prefix down a different
-            # last turn) does not consume the slot the real conversation
-            # extends next. When it cannot — always at a budget of 0, where
-            # the feasibility rule refuses a copy that would not fit even on
-            # an empty map — or when another owner's eviction has already
-            # taken the slot out (LRU is daemon-wide), the slot is moved:
-            # removed from the map and its arrays adopted, the pre-retention
-            # behaviour byte for byte. A copy failure is an optimization
-            # failure and falls back to the move; the turn still runs warm on
-            # the original arrays.
-            if self._make_room(slot.nbytes, protect=(slot,), require=slot):
-                try:
-                    warm = hooks.new_cache()
-                    fork_copy(slot.cache, warm, hooks.copy_array)
-                except Exception as e:
-                    warnings.warn(
-                        f"sous prompt cache: turn-slot copy failed ({type(e).__name__}); "
-                        "extending the slot in place",
-                        stacklevel=2,
-                    )
-                    warm = None
-                else:
-                    stats.retained += 1
-                    parent = weakref.ref(slot)
+            # it beside the slot this turn will publish — the copy grown by
+            # this turn's tokens, forecast from the taken slot's bytes per
+            # token: the parent's own size would pass a budget the publish
+            # then cannot honour, copy and all — evicting least-recently-used
+            # slots now to make that room. So a branch of the conversation
+            # (Claude Code's progress-summary call takes the same prefix down
+            # a different last turn) does not consume the slot the real
+            # conversation extends next. When it cannot — always at a budget
+            # of 0, where the feasibility rule refuses a copy that would not
+            # fit even on an empty map — or when the owner was retired
+            # meanwhile, the slot is moved: removed from the map and its
+            # arrays adopted, the pre-retention behaviour byte for byte. A
+            # copy failure is an optimization failure and falls back to the
+            # move; the turn still runs warm on the original arrays.
+            projected = -(-slot.nbytes * len(stable_ids) // len(slot.held))
+            if self._make_room(projected, protect=(slot,), require=slot):
+                warm = self._copy_of(
+                    stats, slot.cache, "turn-slot copy failed", "extending the slot in place"
+                )
             retained = warm is not None
             with self._lock:
                 if not retained:
-                    # By identity: another thread's eviction may already have
-                    # taken it out, and a dataclass `remove` would compare
-                    # two ~50K-token id lists per candidate.
-                    self._slots = [s for s in self._slots if s is not slot]
-                self._evict_caps(protect=(slot,) if retained else ())
-            if not retained:
+                    self._remove(slot)
+                # The cap pass for a turn take runs here, after the decision,
+                # so bytes about to leave the map are never charged against
+                # slots that stay; a retained slot must survive it, and
+                # protecting one that just left is a no-op.
+                self._evict_caps(protect=(slot,))
+            if retained:
+                stats.retained += 1
+                kind = "turn"
+            else:
                 stats.moved += 1
+                kind = "turn-moved"
         if slot is not None:
             reuse = len(slot.held)
             stats.took_len = reuse  # the slot this turn took; stays 0 on a miss
+            stats.took_kind = kind
             if warm is None:
                 warm = slot.cache
             stats.hits += 1
@@ -990,9 +1037,8 @@ class PrefixCache:
         # Drop this frame's reference to the slot before anything else is
         # allocated: on a moved slot this is what keeps one conversation from
         # ever holding two copies of itself, and on a retained one the map's
-        # reference is the only one that should outlive this point (a weak
-        # `parent` link does not pin it). (A fork slot is referenced by the
-        # map by design.)
+        # reference is the only one that should outlive this point. (A fork
+        # slot is referenced by the map by design.)
         slot = None
 
         # A warm attempt that already streamed text cannot be retried: the
@@ -1054,7 +1100,6 @@ class PrefixCache:
                 stacklevel=2,
             )
             warm = hooks.new_cache()
-            parent = None  # a slot rebuilt cold extended nothing
             text = self._run(
                 stats, warm, stable_ids, full_ids, 0, max_tokens, relay, fork_at, owner, epoch
             )
@@ -1066,9 +1111,7 @@ class PrefixCache:
         # what the next turn's pre-turn cap pass would do anyway. Protecting
         # it here would only leave the map over budget across a turn
         # boundary instead of at one.
-        self._publish(
-            Slot(warm, list(stable_ids), owner, "turn", slot_bytes(warm), parent=parent), epoch
-        )
+        self._publish(Slot(warm, list(stable_ids), owner, "turn", slot_bytes(warm)), epoch)
         return text
 
     def _run(

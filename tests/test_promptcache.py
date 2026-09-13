@@ -903,6 +903,7 @@ def test_stats_as_dict_reports_every_counter():
         "moved": 1,
         "prefilled_tokens": 0,
         "took_len": 0,
+        "took_kind": "",
         "bound_lo": 0,
         "bound_hi": 0,
         "probe_seconds": 0.0,
@@ -1195,80 +1196,85 @@ def test_a_take_that_ends_in_a_move_does_not_charge_the_moved_bytes_against_othe
     assert pc.stats()["moved"] == 1
 
 
-def test_a_slot_another_owner_evicted_after_the_take_is_not_copied():
-    """LRU is daemon-wide and the lock is released between the take and the
-    copy decision, so another owner's publish can drop the taken slot in
-    that window. The decision re-checks residency under its own lock and
-    refuses the copy: a full copy of a slot nobody can take again, made
-    under the very pressure that evicted it, is the wrong answer."""
+def test_a_slot_reset_out_of_the_map_after_the_take_is_not_copied():
+    """The lock is released between the take and the copy decision, and the
+    gateway can retire the owner in that window (`reset(owner)` for a
+    generation it abandoned as stalled), emptying its slots. The decision
+    re-checks residency under its own lock and refuses the copy: a full copy
+    for a publish that will be refused is the wrong answer."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
     pc.generate(A1, A1_FULL, 16)
     (slot,) = pc.slots()
     with pc._lock:
-        pc._slots = []  # what another owner's eviction does to the map
+        pc._slots = []  # what reset(owner) does to the map
     assert pc._make_room(slot.nbytes, protect=(slot,), require=slot) is False
     assert pc._make_room(slot.nbytes, protect=(slot,)) is True  # only the residency rule refused
 
 
-def test_a_retained_take_publishes_a_slot_whose_parent_is_its_predecessor():
-    """`parent` names the slot this one was copied from and extended, and only
-    a retained take has one: the two slots are the same conversation at two
-    lengths, and a reader of the map has no other way to tell that apart from
-    two unrelated conversations that happen to share a prefix."""
+def test_a_take_retires_the_lengths_below_the_slot_it_takes():
+    """The lengths below the taken slot are this turn's grandparents: its
+    publish would retire them anyway, so they go at the take, and their bytes
+    fund the copy — not another conversation's slot, which is what LRU would
+    otherwise reach for."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
+    a3 = [*A2, 7]
     pc.generate(A1, A1_FULL, 16)
-    (first,) = pc.slots()
-    pc.generate(A2, A2_FULL, 16)
-    (child,) = [s for s in pc.slots() if s.held == A2]
-    assert child.parent is not None
-    assert child.parent() is first  # the slot object itself, not an equal one
-    assert first.parent is None  # the conversation's first turn extended nothing
+    pc.generate(B1, B1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)  # retains A1's slot, now the LRU is B1's
+    a1, b1, a2 = (next(s for s in pc.slots() if s.held == held) for held in (A1, B1, A2))
+    # Room for B1's, A2's and a3's slots — but not with A1's still resident.
+    pc.max_bytes = b1.nbytes + a2.nbytes + a2.nbytes * len(a3) // len(A2)
+    pc.generate(a3, [*a3, 90, 91], 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([B1, A2, a3])
+    s = pc.stats()
+    assert (s["retained"], s["evictions"]) == (2, 1)  # A1's slot, at a3's take
+    assert a1.nbytes > 0  # the object this test holds; the map let go of it
 
 
-def test_a_miss_publishes_a_slot_with_no_parent():
-    """A turn that took no slot extended none — including one that missed with
-    another conversation's slot resident beside it."""
+def test_a_miss_beside_another_conversation_drops_nothing():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
     pc.generate(A1, A1_FULL, 16)
     pc.generate(B1, B1_FULL, 16)  # a miss, with A1's slot in the map
-    assert [s.parent for s in pc.slots()] == [None, None]
+    assert sorted(s.held for s in pc.slots()) == sorted([A1, B1])
+    assert pc.stats()["evictions"] == 0
 
 
-def test_a_moved_take_publishes_a_slot_with_no_parent():
-    """A moved slot is gone from the map, and the turn that adopted its arrays
-    is the same cache under a longer key — there is no predecessor left to
-    point at."""
+def test_a_copy_the_publish_could_not_keep_beside_the_original_is_not_taken():
+    """The slot this turn publishes is the copy plus this turn's tokens, so
+    the room the copy needs is forecast at that size: a budget of exactly
+    twice the original would fund the copy and then evict the original at
+    publish — a full copy paid for nothing. Refused, the turn moves the
+    slot, as it would at a budget of 0."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
     pc.generate(A1, A1_FULL, 16)
     (slot,) = pc.slots()
-    pc.max_bytes = slot.nbytes  # room for the original, not for a copy beside it
+    pc.max_bytes = 2 * slot.nbytes
     pc.generate(A2, A2_FULL, 16)
-    (child,) = pc.slots()
-    assert (child.held, child.parent) == (A2, None)
-
-
-def test_a_failed_turn_slot_copy_publishes_a_slot_with_no_parent():
-    """The copy that failed is what a parent link would name: the turn fell
-    back to extending the original arrays, so the published slot is the moved
-    case and carries no parent."""
+    assert [s.held for s in pc.slots()] == [A2]
+    s = pc.stats()
+    assert (s["retained"], s["moved"], s["evictions"]) == (0, 1, 0)
+    assert len(h.caches) == 1  # no copy: the arrays were adopted
+    # The original beside the slot this turn publishes: that is the copy's price.
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
     pc.generate(A1, A1_FULL, 16)
-    _fail_next_copy(h)
-    with pytest.warns(UserWarning, match="turn-slot copy failed"):
-        pc.generate(A2, A2_FULL, 16)
-    (child,) = pc.slots()
-    assert (child.held, child.parent) == (A2, None)
+    (slot,) = pc.slots()
+    pc.max_bytes = slot.nbytes + slot.nbytes * len(A2) // len(A1)
+    pc.generate(A2, A2_FULL, 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([A1, A2])
+    s = pc.stats()
+    assert (s["retained"], s["moved"], s["evictions"]) == (1, 0, 0)
 
 
-def test_a_cold_retry_publishes_a_slot_with_no_parent():
-    """The warm attempt that took the slot was abandoned: the cache published
-    at the end was built from nothing, so the parent the take had set must be
-    cleared before the retry's slot carries it."""
+def test_a_cold_retry_keeps_the_conversation_at_two_lengths():
+    """The warm attempt that took the slot was abandoned and the published
+    cache built from nothing — but it is still the next length of the slot
+    it took, which is what the two-length rule is about: the original stays
+    for a branch, and the next turn retires it like any predecessor."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
     pc.generate(A1, A1_FULL, 16)
@@ -1277,36 +1283,19 @@ def test_a_cold_retry_publishes_a_slot_with_no_parent():
         pc.generate(A2, A2_FULL, 16)
     assert pc.stats()["cold_retries"] == 1
     assert h.decoded[-1] == A2_FULL  # the retry fed the whole prompt
-    (child,) = [s for s in pc.slots() if s.held == A2]
-    assert child.parent is None
-
-
-def test_the_parent_link_does_not_pin_a_predecessor_that_left_the_map():
-    """Weak by design: a conversation publishes a slot per turn, so a strong
-    chain would keep every cache it ever held alive for as long as its newest
-    one — the eviction that dropped the predecessor would free nothing."""
-    h = FakeHooks(trimmable=True)
-    pc = PrefixCache(h, max_bytes=ROOMY)
-    pc.generate(A1, A1_FULL, 16)
-    pc.generate(A2, A2_FULL, 16)
-    (child,) = [s for s in pc.slots() if s.held == A2]
-    assert child.parent is not None and child.parent() is not None
-    h.pressure_value = KERNEL_PRESSURE_WARN  # one unprotected drop per publish
+    assert sorted(s.held for s in pc.slots()) == sorted([A1, A2])
     a3 = [*A2, 7]
+    a4 = [*a3, 8]
     pc.generate(a3, [*a3, 90, 91], 16)
-    # A1's slot goes to the lineage bound (a3's publish drops its grandparent)
-    # and A2's — `child`, which this test still holds — to the valve, as the
-    # LRU of what was left.
-    assert [s.held for s in pc.slots()] == [a3]
-    gc.collect()
-    assert child.parent() is None
+    pc.generate(a4, [*a4, 90, 91], 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([a3, a4])
 
 
 def test_a_linear_conversation_keeps_only_its_current_and_previous_lengths():
     """Each retained take leaves the predecessor in place; without a bound a
-    ten-turn subagent would hold ten copies of itself. Publishing a turn slot
-    drops its grandparent, charged to evictions (the budget did not ask for
-    it, and neither did pressure)."""
+    ten-turn subagent would hold ten copies of itself. Taking a turn slot
+    retires the lengths below it, charged to evictions (the budget did not
+    ask for it, and neither did pressure)."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
     a3 = [*A2, 7]
@@ -1320,11 +1309,11 @@ def test_a_linear_conversation_keeps_only_its_current_and_previous_lengths():
     assert s["resident_bytes"] == sum(x.nbytes for x in pc.slots())
 
 
-def test_extending_a_slot_whose_parent_already_left_the_map_is_a_no_op():
-    """a3's own publish drops A1 by lineage and then A2 by the valve, so by
-    the time a4 extends a3, a3's parent link resolves to nothing: the
-    grandparent lookup must treat that as nothing to drop rather than
-    raising or charging a second eviction for a slot that is already gone."""
+def test_extending_a_slot_whose_predecessor_already_left_the_map_drops_nothing():
+    """a3's take retires A1 and its publish loses A2 to the valve, so by the
+    time a4 extends a3 there is nothing below a3 in the map: the ancestor
+    lookup must find nothing to drop rather than raising or charging a
+    second eviction for a slot that is already gone."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
     a3 = [*A2, 7]
@@ -1333,23 +1322,23 @@ def test_extending_a_slot_whose_parent_already_left_the_map_is_a_no_op():
     pc.generate(A2, A2_FULL, 16)
     h.pressure_value = KERNEL_PRESSURE_WARN  # one unprotected drop per publish
     pc.generate(a3, [*a3, 90, 91], 16)
-    # A1 goes to the lineage bound (a3's publish drops its grandparent) and
-    # A2 to the valve, as the only slot left once A1 is gone: nothing keeps
-    # A2's Slot alive after this call.
+    # A1 goes at a3's take (the length below the slot it took) and A2 to the
+    # valve, as the only slot left once A1 is gone: nothing keeps A2's Slot
+    # alive after this call.
     assert [s.held for s in pc.slots()] == [a3]
     gc.collect()
     h.pressure_value = 1  # normal again: a4 must not trigger another drop
     pc.generate(a4, [*a4, 90, 91], 16)
     assert sorted(s.held for s in pc.slots()) == sorted([a3, a4])
     s = pc.stats()
-    # `evictions` counts every drop regardless of cause (A1 by lineage, A2 by
-    # the valve); `pressure_evictions` is the subset the valve took. Both are
-    # charged once, at a3's publish, and a4 must not add to either: that is
-    # what "no double charge" for the already-gone A2 means here.
+    # `evictions` counts every drop regardless of cause (A1 as a retired
+    # length, A2 by the valve); `pressure_evictions` is the subset the valve
+    # took. Both are charged once, during a3, and a4 must not add to either:
+    # that is what "no double charge" for the already-gone A2 means here.
     assert (s["evictions"], s["pressure_evictions"]) == (2, 1)
 
 
-def test_a_dropped_grandparent_is_freed_not_pinned_by_lineage():
+def test_a_retired_length_is_freed_not_pinned():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
     a3 = [*A2, 7]
@@ -1363,7 +1352,7 @@ def test_a_dropped_grandparent_is_freed_not_pinned_by_lineage():
     assert gone() is None
 
 
-def test_lineage_never_drops_a_fork():
+def test_retiring_a_conversations_lengths_never_drops_a_fork():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
     pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
@@ -1375,8 +1364,9 @@ def test_lineage_never_drops_a_fork():
 
 
 def test_a_branch_keeps_its_own_slot_until_lru_takes_it():
-    """Lineage is by reference: the summary call's slot descends from A1's,
-    not from the real conversation's next turn, so nothing drops it but LRU."""
+    """The summary call's slot and the real conversation's next turn both
+    extend A1's; neither extends the other, so nothing drops the branch but
+    LRU."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
     summary = [*A1, 500]
@@ -1384,13 +1374,14 @@ def test_a_branch_keeps_its_own_slot_until_lru_takes_it():
     pc.generate(A1, A1_FULL, 16)
     pc.generate(summary, [*summary, 90, 91], 16)
     pc.generate(A2, A2_FULL, 16)
-    pc.generate(a3, [*a3, 90, 91], 16)  # drops A1's slot, the grandparent
+    pc.generate(a3, [*a3, 90, 91], 16)  # its take retires A1's slot, the length below A2's
     assert sorted(s.held for s in pc.slots()) == sorted([summary, A2, a3])
 
 
-def test_a_moved_slot_carries_no_lineage():
-    """At a budget of 0 nothing is retained, so there is never a grandparent
-    to drop and the evictions counter stays what the cap pass makes it."""
+def test_at_a_budget_of_zero_there_is_never_a_length_to_retire():
+    """At a budget of 0 nothing is retained, so a take never finds a length
+    below its slot and the evictions counter stays what the cap pass makes
+    it."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h)
     a3 = [*A2, 7]
@@ -1664,9 +1655,10 @@ def test_a_cold_retry_still_forks():
 
 
 def _fail_next_copy(h: FakeHooks) -> None:
-    """Make the very next array copy raise, once. A fork's copy is the first
-    one any turn takes — snapshot's, on the non-trimmable path, comes after
-    the whole fork block."""
+    """Make the very next array copy raise, once. The first copy any turn
+    takes is the one a test aims at — a taken slot's on a warm turn, a
+    fork's on a cold one; snapshot's, on the non-trimmable path, comes after
+    both."""
 
     def impl(hooks, a):
         hooks.copy_impl = None
@@ -2501,7 +2493,7 @@ def test_a_cold_retry_reports_only_the_attempt_that_produced_the_text(clock):
         pc.generate(STABLE_2, FULL_2, 16)
     s = pc.stats()
     assert s["cold_retries"] == 1
-    assert (s["took_len"], s["prefilled_tokens"]) == (0, len(STABLE_2))
+    assert (s["took_len"], s["took_kind"], s["prefilled_tokens"]) == (0, "", len(STABLE_2))
     assert s["prefill_seconds"] == pytest.approx(2.0)  # the cold attempt's one prefill
     assert s["decode_seconds"] == pytest.approx(5.0)
 
@@ -2509,10 +2501,13 @@ def test_a_cold_retry_reports_only_the_attempt_that_produced_the_text(clock):
 def test_begin_turn_resets_exactly_the_turn_gauges():
     from sous.engine.promptcache import TURN_GAUGES, without_turn_gauges
 
-    stats = PromptCacheStats(**dict.fromkeys(TURN_GAUGES, 7), hits=3, miss_lcp=9)
+    stats = PromptCacheStats(hits=3, miss_lcp=9)
+    for name in TURN_GAUGES:  # every gauge off its default, whatever its type
+        setattr(stats, name, "x" if isinstance(getattr(stats, name), str) else 7)
     stats.begin_turn()
     after = stats.as_dict()
-    assert all(after[name] == 0 for name in TURN_GAUGES)
+    fresh = PromptCacheStats().as_dict()
+    assert all(after[name] == fresh[name] for name in TURN_GAUGES)
     assert (after["hits"], after["miss_lcp"]) == (3, 9)
     assert TURN_GAUGES.isdisjoint(without_turn_gauges({**after, "slots": 1}))
     assert without_turn_gauges({**after, "slots": 1})["slots"] == 1
@@ -2580,6 +2575,54 @@ def test_fork_copies_and_the_snapshot_count_as_prefill(clock):
     s = pc.stats()
     assert s["prefill_seconds"] > 4.0  # two prefills (2 s each) plus copies
     assert s["decode_seconds"] == pytest.approx(5.0, abs=0.5)  # decode plus restore copies
+
+
+def test_the_copies_a_warm_turn_takes_count_as_prefill(clock):
+    """A retained turn slot's copy and a fork's clone are the one allocation
+    a warm turn makes before it prefills: without them on the prefill side
+    the turn line's phases would leave the copy unaccounted for."""
+    h = TimedHooks(clock, trimmable=True)
+
+    def slow_copy(hooks, a):
+        clock.advance(0.1)
+        return copy_array(a)
+
+    h.copy_impl = slow_copy
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(STABLE_1, FULL_1, 16)
+    assert pc.stats()["prefill_seconds"] == 0.0  # trimmable: one fused pass, all decode
+    pc.generate(STABLE_2, FULL_2, 16)
+    s = pc.stats()
+    assert s["took_kind"] == "turn"
+    assert s["prefill_seconds"] == pytest.approx(0.1 * h.layers)  # the copy, one array per layer
+    assert s["decode_seconds"] == pytest.approx(5.0)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
+    pc.generate(C2, C2_FULL, 16, fork_at=[FORK])
+    s = pc.stats()
+    assert s["took_kind"] == "fork"
+    assert s["prefill_seconds"] == pytest.approx(0.1 * h.layers)
+
+
+def test_took_kind_names_the_slot_the_turn_took():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(A1, A1_FULL, 16)
+    assert pc.stats()["took_kind"] == ""
+    pc.generate(A2, A2_FULL, 16)
+    assert pc.stats()["took_kind"] == "turn"
+    (slot,) = [s for s in pc.slots() if s.held == A2]
+    pc.max_bytes = slot.nbytes  # room for the original, not for a copy beside it
+    a3 = [*A2, 7]
+    pc.generate(a3, [*a3, 90, 91], 16)
+    assert pc.stats()["took_kind"] == "turn-moved"
+    b2 = [*B1, 11]
+    pc.max_bytes = ROOMY
+    pc.generate(B1, B1_FULL, 16)
+    assert pc.stats()["took_kind"] == ""  # a miss beside another conversation
+    h.fail_once = True
+    with pytest.warns(UserWarning, match="retrying cold"):
+        pc.generate(b2, [*b2, 90, 91], 16)
+    assert pc.stats()["took_kind"] == ""  # the retry took no slot in the end
 
 
 def test_gauges_fold_by_max_like_the_existing_ones():
