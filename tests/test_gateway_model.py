@@ -233,5 +233,5 @@ def test_an_attachment_keeps_the_conversation_warm_and_bit_exact(
         assert branch_cold.json()["content"] == branch_warm.json()["content"]
     finally:
         gateway.close()
-        assert gateway._runner._session is None
-    engines.get().unload()
+        engines.get().unload()
+    assert gateway._runner._session is None
