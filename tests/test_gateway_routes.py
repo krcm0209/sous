@@ -909,6 +909,94 @@ def test_the_log_carries_lcp_only_on_a_miss(tmp_path: Path, capsys):
     assert "cache=hit" in lines[1] and "lcp=" not in lines[1]
 
 
+class _PrefixReuseEngine(FakeEngine):
+    """Reports a hit exactly when the render it receives strictly extends the
+    previous one, with `reused_tokens` the previous render's length — the
+    prompt cache's own rule, on a token-per-character stand-in."""
+
+    def __init__(self, script: list[str]):
+        super().__init__(script)
+        self._held: list[int] = []
+        self.lengths: list[int] = []  # each render's length, in the order served
+        self.stats = {"hits": 0, "misses": 0, "fork_hits": 0, "reused_tokens": 0}
+
+    def generate(self, messages, tools, max_tokens, on_delta=None):
+        from sous.engine.promptcache import reuse_length
+
+        ids = list(b"".join(json.dumps(m, sort_keys=True).encode() + b"\n" for m in messages))
+        reused = reuse_length(self._held, ids)
+        self.stats = {**self.stats, "reused_tokens": self.stats["reused_tokens"] + reused}
+        self.stats["hits" if reused else "misses"] += 1
+        self._held = ids
+        self.lengths.append(len(ids))
+        return super().generate(messages, tools, max_tokens, on_delta)
+
+
+def test_an_attachment_and_a_summary_call_leave_the_conversation_warm(tmp_path: Path, capsys):
+    """T1 the brief, T3 the same conversation plus a tool exchange and a
+    role:system attachment after the tool result, T5 one more exchange: each
+    render strictly extends the one before, so the second and third turns
+    are hits that reuse the whole previous render. Hoisting the attachment
+    into the system turn made T3 a miss at the header."""
+    inner = _PrefixReuseEngine(["one", "two", "three"])
+    app = _app(tmp_path, inner)
+    system = [{"type": "text", "text": "You are Claude Code."}]
+    t1 = [{"role": "user", "content": "Summarise the repo."}]
+    t3 = [
+        *t1,
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "a", "name": "Read", "input": {"file_path": "x"}}
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "contents of x"},
+                {"type": "text", "text": "<total_tokens>900 tokens left</total_tokens>\n"},
+            ],
+        },
+        {"role": "system", "content": "Available agent types for the Agent tool:\n- Explore"},
+    ]
+    t5 = [
+        *t3,
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "b", "name": "Read", "input": {"file_path": "y"}}
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "b", "content": "contents of y"},
+                {"type": "text", "text": "<total_tokens>800 tokens left</total_tokens>\n"},
+            ],
+        },
+    ]
+    for messages in (t1, t3, t5):
+        r = _post(app, _body(system=system, tools=[READ_TOOL], messages=messages))
+        assert r.status_code == 200
+    lines = [_fields(line) for line in _turn_lines(capsys.readouterr().err)]
+    assert [f["cache"] for f in lines] == ["miss", "hit", "hit"]
+    # Each hit reused exactly the previous render — the whole of it.
+    assert [f["reused_tokens"] for f in lines] == [
+        "0",
+        str(inner.lengths[0]),
+        str(inner.lengths[1]),
+    ]
+    assert lines[1]["system"] == lines[0]["system"] == lines[2]["system"]
+    # The attachment rendered as a user turn after the tool turn, not into the system block.
+    assert inner.calls[1][-1] == {
+        "role": "user",
+        "content": "<system-reminder>\nAvailable agent types for the Agent tool:\n- Explore\n"
+        "</system-reminder>",
+    }
+    assert inner.calls[1][: len(inner.calls[0])] == inner.calls[0]
+    assert inner.calls[2][: len(inner.calls[1])] == inner.calls[1]
+
+
 def _gateway_records(caplog) -> list[logging.LogRecord]:
     return [r for r in caplog.records if r.name == "sous.gateway"]
 
