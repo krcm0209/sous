@@ -543,8 +543,9 @@ def test_non_streaming_turn_matches_the_streamed_content(tmp_path: Path):
 
 
 def test_prompt_conversion_reaches_the_engine(tmp_path: Path):
-    """Inline system, billing header and the volatile marker: the engine sees
-    one stable system message, so the prefix cache can hold across turns."""
+    """Billing header and the volatile marker stripped, the inline system
+    message rendered into the user turn: the engine sees one stable system
+    message, so the prefix cache can hold across turns."""
     inner = FakeEngine(["ok"])
     app = _app(tmp_path, inner)
     body = _body(
@@ -560,8 +561,8 @@ def test_prompt_conversion_reaches_the_engine(tmp_path: Path):
     )
     assert _post(app, body).status_code == 200
     assert inner.calls[0] == [
-        {"role": "system", "content": "Canonical.\n\nInline."},
-        {"role": "user", "content": "task"},
+        {"role": "system", "content": "Canonical."},
+        {"role": "user", "content": "task\n<system-reminder>\nInline.\n</system-reminder>"},
     ]
     assert [t["function"]["name"] for t in inner.tools_seen[0]] == ["Read"]
 

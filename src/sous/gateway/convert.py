@@ -4,7 +4,8 @@ Pure: no engine, no mlx, no I/O. Everything Claude Code sends that the local
 model cannot use is dropped here, deliberately and visibly (the spec's
 accommodation checklist): tools that carry no schema, thinking blocks, images,
 and the per-request volatile markers that would otherwise defeat the prefix
-cache.
+cache; and a mid-conversation system message is rendered into the user turn
+before it rather than hoisted into the system block.
 """
 
 from __future__ import annotations
@@ -128,15 +129,74 @@ def _text_parts(content: object, *, drop_billing: bool) -> list[str]:
     return parts
 
 
-def _system_text(system: object, messages: list[dict]) -> str:
-    """One system prompt from the canonical field plus every inline system
-    message, canonical first. Qwen's template accepts a system message only
-    at index 0 (it raises otherwise), so this is the only place they can go."""
-    parts = _text_parts(system, drop_billing=True) if system is not None else []
+_REMINDER_OPEN = "<system-reminder>"
+
+
+def _reminder(text: str) -> str:
+    """System text delivered inside a user message, in the shape Claude Code
+    itself uses for models without mid-conversation system support. Text it
+    already wrapped (it does so for one model id) is left alone."""
+    if text.startswith(_REMINDER_OPEN):
+        return text
+    return f"{_REMINDER_OPEN}\n{text}\n</system-reminder>"
+
+
+def _with_block(msg: dict, block: dict) -> dict:
+    """A copy of user message `msg` with `block` appended to its content. A
+    string content becomes one text block first (an empty string, none)."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        blocks = [{"type": "text", "text": content}] if content else []
+    elif isinstance(content, list):
+        blocks = list(content)
+    else:
+        raise _invalid("content must be a string or a list of content blocks")
+    return {**msg, "content": [*blocks, block]}
+
+
+def _place_inline_system(messages: list[dict]) -> tuple[list[str], list[dict]]:
+    """Consume every `role: "system"` message by position. Qwen's template
+    accepts a system turn at index 0 only, and hoisting a later one there
+    moves the whole system block: every cached prefix behind it dies on the
+    turn the attachment arrives. So: before any user or assistant message it
+    joins the system prompt; after a user message it becomes a text block on
+    that message (rendered after that message's tool results, as a user
+    turn); after an assistant message it becomes a user message of its own.
+    Consecutive ones land in the same place, in order; one that strips to
+    nothing lands nowhere, so the render equals the request's without it.
+    Returns the leading texts and the rewritten list; `messages` is not
+    mutated."""
+    leading: list[str] = []
+    placed: list[dict] = []
+    # Index in `placed` of the user message the next system message appends
+    # to; None while nothing precedes it or an assistant message was last.
+    target: int | None = None
     for msg in messages:
-        if msg.get("role") == "system":
-            parts.extend(_text_parts(msg.get("content"), drop_billing=True))
-    return strip_volatile("\n\n".join(parts))
+        role = msg.get("role")
+        if role != "system":
+            placed.append(msg)
+            target = len(placed) - 1 if role == "user" else None
+            continue
+        text = strip_volatile("\n\n".join(_text_parts(msg.get("content"), drop_billing=True)))
+        if not text:
+            continue
+        if not placed:
+            leading.append(text)
+            continue
+        block = {"type": "text", "text": _reminder(text)}
+        if target is None:
+            placed.append({"role": "user", "content": [block]})
+            target = len(placed) - 1
+        else:
+            placed[target] = _with_block(placed[target], block)
+    return leading, placed
+
+
+def _system_text(system: object, leading: list[str]) -> str:
+    """One system prompt from the canonical field plus the inline system
+    messages that precede every user and assistant message, canonical first."""
+    parts = _text_parts(system, drop_billing=True) if system is not None else []
+    return strip_volatile("\n\n".join([*parts, *leading]))
 
 
 def _tool_result_text(content: object) -> str:
@@ -171,13 +231,14 @@ def _user_turns(content: object) -> list[dict]:
 
     def flush() -> None:
         # Claude Code appends the <total_tokens> marker as its own text block
-        # after every tool-result batch. Once stripped there is nothing left,
-        # and an empty user turn right after the tool responses would read to
-        # the model as "the user said nothing".
-        text = strip_volatile("\n".join(texts))
+        # after every tool-result batch. Stripped block by block, a marker-only
+        # block contributes nothing — not even the join's newline in front of
+        # a block that follows it — and an empty user turn right after the
+        # tool responses would read to the model as "the user said nothing".
+        stripped = [t for t in (strip_volatile(t) for t in texts) if t]
         texts.clear()
-        if text:
-            out.append({"role": "user", "content": text})
+        if stripped:
+            out.append({"role": "user", "content": "\n".join(stripped)})
 
     for block in content:
         if not isinstance(block, dict):
@@ -247,14 +308,13 @@ def _assistant_turn(content: object) -> dict:
 
 def chat_messages(system: object, messages: list[dict]) -> list[dict]:
     """The chat-template message list for a request. Raises RequestError."""
+    leading, placed = _place_inline_system(messages)
     out: list[dict] = []
-    prompt = _system_text(system, messages)
+    prompt = _system_text(system, leading)
     if prompt:
         out.append({"role": "system", "content": prompt})
-    for msg in messages:
+    for msg in placed:
         role = msg.get("role")
-        if role == "system":
-            continue  # folded into the system prompt above
         if role == "user":
             out.extend(_user_turns(msg.get("content")))
         elif role == "assistant":
