@@ -246,14 +246,19 @@ turn gives up, stated plainly:
 - **One turn at a time; keyed prompt-cache slots.** Local turns are serialized
   behind the same lock as delegated tasks. The prompt cache keeps one slot per
   resident conversation (bounded by `[model].prompt_cache_gb`), so a subagent's
-  consecutive turns reuse their own slot, two subagents interleaving reuse
-  theirs, and a delegated task running in between no longer wipes the
-  gateway's slots the way a shared single slot did. Reuse stays owner-scoped
-  — a slot is used only by the thread that built it, so a delegated task can
-  never adopt a gateway slot or vice versa — but the budget and
-  memory-pressure eviction below apply across the daemon, so a delegated
-  task's own slot can displace a least-recently-used gateway one (and at
-  `prompt_cache_gb = 0`, where only one slot fits, it will).
+  consecutive turns reuse their own slot — copied and left in place when the
+  budget can hold the copy, so a conversation that Claude Code branches (its
+  progress-summary calls for a background agent take the same prefix down a
+  different last turn) still finds it, and moved into the extending turn when
+  it cannot, which is every turn at `prompt_cache_gb = 0`; a linear
+  conversation holds at most its current and previous lengths — two subagents
+  interleaving reuse theirs, and a delegated task running in between no longer
+  wipes the gateway's slots the way a shared single slot did. Reuse stays
+  owner-scoped — a slot is used only by the thread that built it, so a
+  delegated task can never adopt a gateway slot or vice versa — but the
+  budget and memory-pressure eviction below apply across the daemon, so a
+  delegated task's own slot can displace a least-recently-used gateway one
+  (and at `prompt_cache_gb = 0`, where only one slot fits, it will).
   A new subagent starts from a *fork* when it can: a copy of an earlier
   conversation's cache taken at a boundary its own prompt shares. Two
   boundaries are kept, each when it is long enough to clear the 4096-token
@@ -281,6 +286,16 @@ turn gives up, stated plainly:
   which is where the SDKs read the input-side fields from when present. No
   `cache_creation_input_tokens`: every prompt stays resident, so it would only
   double-count the uncached tokens.
+- **Mid-conversation system messages become `<system-reminder>` blocks.**
+  Claude Code delivers attachments that arrive after the first turn (agent
+  listings, MCP instructions, deferred tools) as a `role: "system"` message
+  after the preceding user message. The chat template takes one system turn,
+  at index 0, so the gateway renders such a message the way Claude Code's own
+  fallback for models without the feature does — a `<system-reminder>` block
+  in the user turn before it (after that turn's tool results). The model sees
+  the same text in the same place a frontier model without the feature would;
+  nothing is lost, and the conversation stays a strict extension of the
+  previous turn's, which is what keeps it warm.
 - **A client that disconnects does not stop the model.** A local turn runs to
   completion (so the next request never waits on a wedged lock); aborting
   mid-generation comes with batching, later. A forwarded stream, by contrast,
@@ -301,12 +316,16 @@ example (wrapped here):
 line joins to Claude Code's transcript). `cache` is `hit` (this
 conversation's own slot), `fork` (a copy of a shared boundary — ~45–56K
 reused tokens is a tools fork, ~57K a header fork) or `miss`; `took` names
-the slot and its length — `none` on a miss, and on a hit whose warm attempt
-failed and was rebuilt cold (a `WARNING py.warnings: … retrying cold` line
-comes first), where `prefilled_tokens` and the phases below describe that
-cold attempt. `prefilled_tokens` is what the turn had to prefill;
+the slot and its length — `turn@N` for this conversation's own slot copied
+and left in place, `turn-moved@N` for one the budget could not hold a copy
+of (removed and extended in place — every hit at `prompt_cache_gb = 0`),
+`fork@N` for a shared boundary, `none` on a miss, and on a hit whose warm
+attempt failed and was rebuilt cold (a `WARNING py.warnings: … retrying cold`
+line comes first), where `prefilled_tokens` and the phases below describe
+that cold attempt. `prefilled_tokens` is what the turn had to prefill;
 `forks`/`evicted`/`pressure` are what it published and what was dropped under
-it — `evicted` counts every drop, budget or pressure, and `pressure` is the
+it — `evicted` counts every drop — budget, pressure, or a retained
+predecessor two turns back that lineage retires — and `pressure` is the
 subset of those `evicted` the pressure valve forced (not a second, disjoint
 count). `load_s` (a model load, ≈0 when resident — including one this turn
 only waited out, started by another request), `queue_s` (the wait for the
@@ -501,11 +520,17 @@ session touches them). `"auto"` is what Metal's recommended working set has
 left once the weights, one full context window of KV (the larger of
 `[model]`'s and `[gateway]`'s) and 2 GiB of slack are paid for — about
 27 GiB on a 64 GB machine with the default model and gateway window, room
-for those forks and several conversations; a 48 GB machine should set it to
-`0` (forks off, one slot), or to at least one fork copy plus one
-conversation slot — about 8 GiB with the default model at ~57K tokens. A
-value between the two makes every cold turn take a fork copy that its own
-turn slot then evicts, so it pays the copy and never reuses it. Slots are
+for those forks and several conversations; each live conversation under the
+auto budget also keeps its previous length resident (the slot a branch of it
+starts from), so count ~4 GiB per conversation at 63K tokens beyond the
+forks; a 48 GB machine should set it to `0` (forks off, one slot), or to at
+least one fork copy plus one conversation slot — about 8 GiB with the
+default model at ~57K tokens, which keeps a conversation warm but moves its
+slot each turn, so a branch of it (a progress-summary call) starts from the
+fork; retaining the previous length as well needs one fork copy plus two
+conversation slots, about 12 GiB. A value between the two makes every cold
+turn take a fork copy that its own turn slot then evicts, so it pays the
+copy and never reuses it. Slots are
 evicted least-recently-used first when the budget, a count of 16, or memory
 pressure says so. Pressure is two readings: Metal's own headroom (room for one
 more window of KV), and the kernel's memory-pressure level — at *warn* each
@@ -523,7 +548,8 @@ degrades to that on its own. Forks live as long as the weights do:
 the model, so "every new session" means every new session inside that
 window.
 `server_status` reports `prompt_cache` — slots, resident bytes, hits, fork
-hits, evictions and the subset the pressure valve took — counts only.
+hits, retained and moved turn-slot takes, evictions and the subset the
+pressure valve took — counts only.
 
 `[model].int8_prefill` (default `false`) runs the prefill matmuls as INT8 activations
 against the checkpoint's packed 4-bit weights on the M5 GPU's neural accelerators

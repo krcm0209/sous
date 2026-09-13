@@ -58,7 +58,17 @@ Claude Code use stretches further — evaluate features against that goal.
   (`promptcache.probe_boundaries`), never from rendering the system turn
   alone, which Qwen3.8's template refuses. Warm turns resolve the probe too:
   a turn that starts at another session's tools fork must still publish its
-  own header fork. A `turn` slot is *moved* into the turn that extends it.
+  own header fork. A `turn` slot is *copied* and left in place by the turn
+  that extends it when `_make_room` can hold the copy (Claude Code branches
+  a background subagent's conversation every 30 s with a progress-summary
+  call, and a consumed slot left the real conversation only the header
+  fork), and *moved* — removed, its arrays adopted — when it cannot, always
+  at `prompt_cache_gb = 0`; `Slot.parent` lineage drops the grandparent at
+  publish. Inline `role:"system"` messages after the first user message
+  render as `<system-reminder>` blocks in the preceding user turn
+  (`gateway/convert._place_inline_system`), never hoisted into the system
+  block: the hoist moved the header boundary and killed every prefix behind
+  it on the turn an attachment arrived.
   Never rewind a cache to make a slot — a hybrid model's recurrent layers
   cannot.
   `base.measure_cache_budget`/`live_headroom` deliberately do not call
