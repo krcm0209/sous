@@ -1714,6 +1714,7 @@ _ALL_GAUGES = {
     "decode_seconds": 0.0,
     "retained": 0,
     "moved": 0,
+    "took_kind": "",
 }
 
 
@@ -1731,6 +1732,7 @@ def test_the_turn_line_attributes_a_hit(tmp_path: Path, capsys):
                 "reused_tokens": 40,
                 "prefilled_tokens": 6,
                 "took_len": 40,
+                "took_kind": "turn",
                 "bound_lo": 10,
                 "bound_hi": 30,
                 "forks": 1,
@@ -1820,6 +1822,7 @@ def test_a_fork_hit_prints_took_fork(tmp_path: Path, capsys):
                 "fork_hits": 1,
                 "reused_tokens": 4000,
                 "took_len": 4000,
+                "took_kind": "fork",
             }
         return out
 
@@ -1867,6 +1870,7 @@ def test_a_moved_turn_slot_prints_took_turn_moved(tmp_path: Path, capsys):
                 **_ALL_GAUGES,
                 "hits": 1,
                 "moved": 1,
+                "took_kind": "turn-moved",
                 "reused_tokens": 40,
                 "took_len": 40,
             }

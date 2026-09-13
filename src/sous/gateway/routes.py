@@ -776,9 +776,9 @@ class Gateway:
         self, chat: ChatRequest, result: TurnResult, assembler: TurnAssembler, *, stream: bool
     ) -> None:
         cache = "fork" if result.forked else "hit" if result.cache_hit else "miss"
-        kind = "fork" if cache == "fork" else "turn-moved" if result.moved else "turn"
-        # A hit retried cold took no slot in the end: its took_len is 0.
-        took = "none" if cache == "miss" or not result.took_len else f"{kind}@{result.took_len}"
+        # A hit retried cold took no slot in the end: the cache zeroes its
+        # per-turn gauges with the retry, so took_kind is "" there too.
+        took = f"{result.took_kind}@{result.took_len}" if result.took_kind else "none"
         lo, hi = result.bounds
         # A hit already says how much was reused; a miss says how far the
         # render agreed with the closest slot and in which region — the

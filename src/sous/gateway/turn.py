@@ -67,9 +67,11 @@ class TurnResult:
     reused_tokens: int
     seconds: float
     forked: bool = False  # the hit was served by copying a fork slot
-    # The hit moved its turn slot (removed and adopted, because the budget
-    # could not hold a copy beside the live cache) rather than copying it.
-    moved: bool = False
+    # Which kind of slot the hit took, as the cache names it: "turn" (copied
+    # and left in place), "turn-moved" (removed and adopted, because the
+    # budget could not hold a copy beside the live cache) or "fork"; "" when
+    # none served the text — a miss, or a hit rebuilt cold.
+    took_kind: str = ""
     # On a miss: how many leading tokens the render shared with the closest
     # slot the session held (0 when it held none). Where two Claude Code
     # renders diverged — inside the tool block or after it — without a token
@@ -211,19 +213,18 @@ class TurnRunner:
                         engine.reset_prompt_cache(owner=stalled)
                     raise
                 after = engine.prompt_cache_stats(owner=session.thread)
-                cache_hit = after.get("hits", 0) > before.get("hits", 0)
 
                 def delta_of(key: str) -> int:
                     return max(0, after.get(key, 0) - before.get(key, 0))
 
+                cache_hit = delta_of("hits") > 0
                 return TurnResult(
                     text=text,
                     input_tokens=input_tokens,
                     output_tokens=final.output_tokens if final else 0,
                     finish_reason=final.finish_reason if final else "stop",
                     cache_hit=cache_hit,
-                    forked=after.get("fork_hits", 0) > before.get("fork_hits", 0),
-                    moved=delta_of("moved") > 0,
+                    forked=delta_of("fork_hits") > 0,
                     reused_tokens=delta_of("reused_tokens"),
                     # miss_lcp is a gauge the engine assigns per miss, so
                     # `after` holds this turn's value exactly when this turn
@@ -233,6 +234,7 @@ class TurnRunner:
                     # Gauges: assigned per turn by the cache, read directly like miss_lcp.
                     prefilled_tokens=after.get("prefilled_tokens", 0),
                     took_len=after.get("took_len", 0),
+                    took_kind=after.get("took_kind", ""),
                     forks=delta_of("forks"),
                     evictions=delta_of("evictions"),
                     pressure_evictions=delta_of("pressure_evictions"),
