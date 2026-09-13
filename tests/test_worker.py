@@ -807,6 +807,8 @@ def test_report_carries_the_prompt_cache_block(env):
         "reused_tokens": 900,
         "snapshot_bytes": 0,
         "cold_retries": 0,
+        "prefill_seconds": 0.83,
+        "prefilled_tokens": 212,
     }
     engine = SessionCapturingEngine(inner)
     run_task(task, store, engine, cfg)
@@ -817,6 +819,9 @@ def test_report_carries_the_prompt_cache_block(env):
     block = got.report["prompt_cache"]
     assert block["hits"] == 4
     assert block["elisions"] == 0
+    # Per-turn gauges would be the task's last generate() beside task-long
+    # counters, in a report Claude pays tokens to read.
+    assert "prefill_seconds" not in block and "prefilled_tokens" not in block
     # The report is this task's own counters, not the whole daemon's: a
     # gateway turn's hits must never be attributed to a delegated task.
     assert inner.stats_owners and all(o is engine.sessions[0].thread for o in inner.stats_owners)
@@ -833,10 +838,12 @@ def test_failure_extra_carries_the_prompt_cache_block(env):
         "reused_tokens": 10,
         "snapshot_bytes": 0,
         "cold_retries": 0,
+        "decode_seconds": 2.9,
     }
     engine = SessionCapturingEngine(inner)
     run_task(task, store, engine, cfg)
-    assert store.get(task.id).report["prompt_cache"]["hits"] == 1
+    block = store.get(task.id).report["prompt_cache"]
+    assert block["hits"] == 1 and "decode_seconds" not in block
     assert inner.stats_owners and all(o is engine.sessions[0].thread for o in inner.stats_owners)
     _join_sessions(engine)
 

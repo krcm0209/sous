@@ -218,10 +218,11 @@ def test_pings_keep_flowing_while_the_model_is_silent(tmp_path: Path, monkeypatc
     assert text == "slowreply"
 
 
-def test_client_disconnect_drains_the_turn_and_never_wedges_the_next(tmp_path: Path):
+def test_client_disconnect_drains_the_turn_and_never_wedges_the_next(tmp_path: Path, capsys):
     """An undrained producer holding the engine lock
     would block every later generation. The thread finishes the turn after the
-    client is gone, and the next request runs on the same session."""
+    client is gone, and the next request runs on the same session — and the
+    drained turn still logs its line, or the lock it held is unexplained."""
     inner = ChunkedFakeEngine(["a|b|c|d|e", "second"], delay=0.3)
     with (
         _serve(_app(tmp_path, inner)) as (base, _server, _thread),
@@ -238,6 +239,10 @@ def test_client_disconnect_drains_the_turn_and_never_wedges_the_next(tmp_path: P
         assert second.json()["content"] == [{"type": "text", "text": "second"}]
         assert time.monotonic() - t0 < 5
     assert inner.generate_threads[0] is inner.generate_threads[1]
+    err = capsys.readouterr().err
+    drained = [line for line in err.splitlines() if "model=sous-local stream=1" in line]
+    assert len(drained) == 1, err
+    assert "status=200" in drained[0] and "output_tokens=5" in drained[0]
 
 
 def test_non_streaming_over_a_real_socket(tmp_path: Path):
@@ -277,6 +282,34 @@ def test_a_request_abandoned_while_queued_never_generates(tmp_path: Path):
         assert len(inner.calls) == 1
         third = client.post(f"{base}/v1/messages", json=_body(stream=False))
         assert third.json()["content"] == [{"type": "text", "text": "third"}]
+
+
+def test_a_request_abandoned_while_queued_logs_status_and_error(tmp_path: Path, capsys):
+    """This was the only member of the /v1/messages family with no `status=`
+    and no `error=` — free prose among key=value tokens. It must read like
+    every other refusal on the endpoint."""
+    inner = ChunkedFakeEngine(["a|b|c|d|e|f", "third"], delay=0.4)
+    with (
+        _serve(_app(tmp_path, inner)) as (base, _server, _thread),
+        httpx.Client(timeout=30) as client,
+    ):
+
+        def first_turn() -> None:
+            with contextlib.suppress(Exception):
+                client.post(f"{base}/v1/messages", json=_body(stream=False))
+
+        first = threading.Thread(target=first_turn, daemon=True)
+        first.start()
+        _wait_for_generation(inner)  # the first turn holds the gateway lock
+        with client.stream("POST", f"{base}/v1/messages", json=_body()) as r:
+            assert r.status_code == 200  # headers and the first ping arrive while queued
+        # Leaving the block closed the second request while it was still queued.
+        first.join(10)
+        time.sleep(1.0)  # every chance for the abandoned turn's line to be written
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "model=sous-local stream=1" in line]
+    assert len(lines) == 1, err
+    assert "status=499 error=abandoned" in lines[0]
 
 
 def test_shutdown_is_bounded_while_a_non_streaming_turn_runs(tmp_path: Path):

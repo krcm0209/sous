@@ -9,7 +9,13 @@ from typing import cast
 import pytest
 
 from sous.engine.lm import LMEngine
-from sous.engine.promptcache import FORK_MIN_TOKENS, CacheHooks, PrefixCache, PromptMemo
+from sous.engine.promptcache import (
+    FORK_MIN_TOKENS,
+    CacheHooks,
+    PrefixCache,
+    PromptCacheStats,
+    PromptMemo,
+)
 from sous.engine.vlm import VLMEngine
 
 # The fake's tool block, whenever a conversation has tools: long enough to be
@@ -141,7 +147,7 @@ class Recording:
     def generate(self, stable_ids, full_ids, max_tokens, on_delta=None, fork_at=()):
         if callable(fork_at):
             fork_at = self._resolver._fork_boundaries(
-                threading.current_thread(), list(stable_ids), fork_at, 0
+                PromptCacheStats(), threading.current_thread(), list(stable_ids), fork_at, 0
             )
         self.fork_ats.append(list(fork_at))
         return "text"

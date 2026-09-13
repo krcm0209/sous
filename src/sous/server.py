@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import logging
 import os
 import pwd
 import re
@@ -26,6 +27,7 @@ from sous.config import SousConfig, current_allowlist, load_config, persist_allo
 from sous.engine.base import EngineManager, release_mlx_thread_state
 from sous.gateway.routes import Gateway, mount_gateway
 from sous.gateway.upstream import Upstream
+from sous.logs import configure_daemon_logging, enable_warning_capture, format_line
 from sous.tasks import FINISHED_STATES, Task, TaskState, TaskStore
 from sous.toolexec import (
     _is_within,
@@ -34,6 +36,8 @@ from sous.toolexec import (
     terminate_active_commands,
 )
 from sous.worker import run_worker_loop
+
+_logger = logging.getLogger("sous.server")
 
 
 def _mlx_memory_gb() -> float | None:
@@ -327,6 +331,12 @@ def create_server(
 
     mcp = MCPServer("sous", instructions=_INSTRUCTIONS, lifespan=_lifespan)
 
+    # MCPServer.__init__ just ran the SDK's configure_logging("INFO"), which
+    # basicConfig's a RichHandler onto the root logger — every record wrapped
+    # at 80 columns. Replace it with the daemon's one-line shape now, before
+    # the first line anyone cares about is written.
+    configure_daemon_logging()
+
     # The MCP-facing name deliberately differs from SousService.delegate_task:
     # on surfaces that defer tool schemas, the name is the only signal the
     # model has at decision time, so it must carry its own trigger (mechanical
@@ -483,7 +493,10 @@ def _install_shutdown_handler(stop: threading.Event) -> None:
         stop.set()
         killed = terminate_active_commands()
         if killed:
-            print(f"sous: killed {killed} running command group(s)", file=sys.stderr)
+            print(
+                format_line("WARNING", "sous.server", f"killed {killed} running command group(s)"),
+                file=sys.stderr,
+            )
         sys.stderr.flush()
         os._exit(0)
 
@@ -519,6 +532,11 @@ def uvicorn_config(app, host: str, port: int, log_level: str = "info") -> uvicor
         # gateway writes its own bounded metadata line per forwarded request,
         # and the MCP transport never had a query string worth logging.
         access_log=False,
+        # uvicorn's default dictConfig gives `uvicorn` and `uvicorn.error`
+        # their own stderr handlers and stops propagation, so its lines would
+        # keep the `INFO:     Started server process` shape beside the
+        # daemon's timestamped ones. None leaves logging to sous.logs.
+        log_config=None,
         timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
     )
 
@@ -532,6 +550,16 @@ def serve(mcp: MCPServer, host: str, port: int) -> None:
 
 
 def main() -> None:
+    # The line shape from the first line on — load_config() below is about to
+    # warn on whatever is wrong with the user's config file, and that must
+    # already come out shaped and leveled, not as a raw UserWarning on stderr.
+    # Install the handler (create_server re-runs the idempotent installer
+    # after MCPServer.__init__ puts the SDK's RichHandler back) and route
+    # warnings.warn through logging (pytest owns showwarning in tests) before
+    # anything else runs. Neither depends on the config or the singleton lock
+    # below, so there is no reason for either to wait.
+    configure_daemon_logging()
+    enable_warning_capture()
     config = load_config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
     # Adopt the login shell's PATH before the worker exists: scrubbed_env()
@@ -545,10 +573,21 @@ def main() -> None:
     # model. The port bind at the end of this function is far too late to be
     # the guard. `_lock` is unused by design — it must stay open to hold it.
     _lock = _acquire_singleton_lock(config.data_dir)
+    # Only the daemon entry point silences huggingface_hub's tqdm bars —
+    # terminal animation that lands in a log file as garbage (`Fetching 13
+    # files: 100%|██████████|`).
+    from huggingface_hub.utils import disable_progress_bars
+
+    # launchd's stderr is a pipe with nobody to animate a bar for; a `sous
+    # serve` run by hand for a first multi-GB model download has a real
+    # terminal, and the download's own progress should still show there.
+    # stderr is None when fd 2 was closed at exec (`sous serve 2>&-`).
+    if sys.stderr is None or not sys.stderr.isatty():
+        disable_progress_bars()
     store = TaskStore(config.data_dir / "tasks.db")
     interrupted = store.recover_interrupted(config.data_dir)
     if interrupted:
-        print(f"sous: marked {interrupted} interrupted task(s) as failed")
+        _logger.warning(f"marked {interrupted} interrupted task(s) as failed")
     engines = EngineManager(config)
     stop = threading.Event()
     _install_shutdown_handler(stop)
@@ -560,8 +599,8 @@ def main() -> None:
     worker.start()
     mcp = create_server(store, engines, config)
     if config.gateway_enabled:
-        print(
-            f"sous: gateway (experimental) serving {', '.join(config.gateway_local_models)} "
+        _logger.info(
+            f"gateway (experimental) serving {', '.join(config.gateway_local_models)} "
             f"at http://127.0.0.1:{config.server_port}/v1/messages; "
             f"everything else is forwarded to {config.gateway_upstream_url}"
         )

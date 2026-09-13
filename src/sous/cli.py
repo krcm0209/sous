@@ -267,8 +267,13 @@ def launchd_plist(sous_executable: str, log_dir: Path) -> str:
             "ProgramArguments": [sous_executable, "serve"],
             "RunAtLoad": True,
             "KeepAlive": True,
+            # Both streams to one file, in write order. The stderr file was
+            # named daemon.err.log and held everything the daemon said — Python
+            # logging, the gateway's lines, warnings, the SDK's handler all
+            # write to stderr — while daemon.log held the banner. One file,
+            # and the level on every line (sous.logs) says what is an error.
             "StandardOutPath": f"{log_dir}/daemon.log",
-            "StandardErrorPath": f"{log_dir}/daemon.err.log",
+            "StandardErrorPath": f"{log_dir}/daemon.log",
         },
         sort_keys=False,
     ).decode()
@@ -352,6 +357,30 @@ def _await_port_closed(port: int, seconds: float) -> bool:
             return True
         time.sleep(0.2)
     return not _port_open(port)
+
+
+# How long install-launchd waits for the daemon it just unloaded to let go of
+# the lock. Past the port closing, that daemon still runs uvicorn's graceful
+# bound (server.GRACEFUL_SHUTDOWN_SECONDS), the gateway runner's close and the
+# teardown of a resident model — well past _UNLOAD_GRACE_SECONDS.
+_DAEMON_EXIT_SECONDS = 30.0
+
+
+def _await_lock_free(data_dir: Path, seconds: float) -> bool:
+    """Wait up to `seconds` for the daemon lock to be free.
+
+    The port closes as soon as launchd's listener stops accepting, but a
+    daemon unloading a resident model is still running lifespan shutdown —
+    and still holding the flock — for seconds after that. Poll the lock
+    itself rather than the port, since the lock is what the caller actually
+    needs free.
+    """
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not _lock_is_held(data_dir):
+            return True
+        time.sleep(0.2)
+    return not _lock_is_held(data_dir)
 
 
 def _launchd_loaded(label: str) -> bool:
@@ -508,21 +537,127 @@ def _cmd_uninstall_launchd() -> None:
         print("the running daemon is now unmanaged; stop it with: sous stop")
 
 
+def _fold_legacy_stderr_log(data_dir: Path) -> bool:
+    """Append a pre-one-file `daemon.err.log` onto `daemon.log` and remove it.
+
+    The history is worth keeping; the name is not — it was launchd's stderr
+    path, not an error log, and it will never be written again. Byte for
+    byte, so nothing in it is reformatted. Only ever called with no daemon
+    holding the lock: an open descriptor would keep writing into the unlinked
+    inode and those lines would be lost."""
+    legacy = data_dir / "daemon.err.log"
+    if not legacy.exists():
+        return False
+    target = data_dir / "daemon.log"
+    if target.exists() and os.path.samefile(legacy, target):
+        # One file under both names, linked by hand: appending it to itself
+        # would read back its own writes until the disk filled. Drop the old
+        # name only where that cannot take the data with it — not when
+        # daemon.log is the link and daemon.err.log the only real copy.
+        if target.is_symlink() or not (legacy.is_symlink() or legacy.stat().st_nlink > 1):
+            print(f"{legacy.name} and {target.name} are already one file; left as they are")
+            return False
+        try:
+            legacy.unlink()
+        except OSError as exc:
+            print(f"sous: could not remove {legacy.name}, a link to {target.name} ({exc})")
+            raise SystemExit(1) from None
+        print(f"removed {legacy.name}, a link to {target.name}")
+        return True
+    try:
+        with legacy.open("rb") as src, target.open("ab") as dst:
+            shutil.copyfileobj(src, dst)
+            # The appended bytes are only in the page cache at this point,
+            # while the unlink below is journaled metadata; without forcing
+            # them out first, a panic between the two loses the folded
+            # history even though the source is already gone.
+            dst.flush()
+            os.fsync(dst.fileno())
+    except OSError as exc:
+        # No rollback attempt: a partial append may already be in target, so a
+        # retry after the underlying problem (full disk, an unwritable target)
+        # is fixed will duplicate that prefix — an accepted cost of not losing
+        # anything, since the legacy file is left in place either way.
+        print(
+            f"sous: could not fold {legacy.name} into {target.name} ({exc}); "
+            f"{legacy.name} left in place"
+        )
+        raise SystemExit(1) from None
+    try:
+        legacy.unlink()
+    except OSError as exc:
+        # The append above already landed and was fsynced, so — same stance
+        # as the copy failure — there is nothing to roll back. Unlike that
+        # case, the fold itself succeeded here; say so, and name what a
+        # human needs to do before the next run appends this file's bytes
+        # a second time, rather than let the exception escape as a traceback.
+        print(
+            f"sous: folded {legacy.name} into {target.name}, but could not remove "
+            f"{legacy.name} ({exc}); delete it by hand before re-running or its "
+            f"contents will be appended twice"
+        )
+        raise SystemExit(1) from None
+    print(f"folded {legacy.name} into {target.name}")
+    return True
+
+
 def _cmd_install_launchd() -> None:
     config = load_config()
     exe = shutil.which("sous") or sys.argv[0]
     plist_path = _plist_path()
-    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    # Out first, unconditionally: `bootstrap` fails on a label that is already
+    # loaded, so a re-run (a new plist — this release moved both log streams
+    # to daemon.log — or a moved executable) never applied. Same rule and
+    # same helper as uninstall: anything but "unloaded" or "was not loaded"
+    # leaves a live KeepAlive job, and writing a plist over it would report
+    # success for a daemon still running the old one.
+    code = _bootout(LABEL)
+    # launchctl answers a job it cannot find with codes other than
+    # _BOOTOUT_NOT_LOADED too — a domain error over SSH with no GUI login,
+    # for one — so only a job launchd still lists makes a failure fatal.
+    if code not in (0, _BOOTOUT_NOT_LOADED) and _launchd_loaded(LABEL):
+        print(f"sous: launchctl bootout failed (exit {code}); not touching {plist_path}")
+        raise SystemExit(1)
+    # Nothing below reloads the job a successful bootout just unloaded, so
+    # every failure from here on has to say so: otherwise the daemon, and
+    # every `sous claude` session's upstream with it, is simply gone.
+    unloaded = "; the launchd job is unloaded until install-launchd succeeds" if code == 0 else ""
+    if code == 0 and not _await_lock_free(config.data_dir, _DAEMON_EXIT_SECONDS):
+        print(
+            f"sous: the unloaded daemon still holds the lock after {_DAEMON_EXIT_SECONDS:.0f}s"
+            f"{unloaded}; retry once it exits"
+        )
+        raise SystemExit(1)
+    if _lock_is_held(config.data_dir):
+        # A daemon started by hand (`sous serve`): folding a log out from
+        # under it would lose lines.
+        print(f"sous: a daemon still holds the lock{unloaded}; stop it first: sous stop")
+        raise SystemExit(1)
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    plist_path.write_text(launchd_plist(exe, config.data_dir))
+    try:
+        _fold_legacy_stderr_log(config.data_dir)
+    except SystemExit:
+        if unloaded:
+            print(unloaded.removeprefix("; "))
+        raise
+    try:
+        plist_path.parent.mkdir(parents=True, exist_ok=True)
+        plist_path.write_text(launchd_plist(exe, config.data_dir))
+    except OSError as exc:
+        print(f"sous: could not write {plist_path} ({exc}){unloaded}")
+        raise SystemExit(1) from None
     print(f"wrote {plist_path}")
     cmd = ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)]
     try:
         subprocess.run(cmd, check=True)
         print("daemon loaded; it will start at login and stay alive")
     except subprocess.CalledProcessError, FileNotFoundError:
+        # Bootout above is unconditional now, so a failed load here is worse
+        # than the pre-existing state: exiting 0 would report success with no
+        # daemon running at all, not the previously-loaded job left in place.
         print("could not load automatically; run manually:")
         print("  " + " ".join(cmd))
+        raise SystemExit(1) from None
 
 
 def _arg_interval(text: str) -> float:

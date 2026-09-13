@@ -650,7 +650,132 @@ def test_count_tokens(tmp_path: Path):
     assert fake.requests[0]["path"] == "/v1/messages/count_tokens"
 
 
+def _turn_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if "sous.gateway: POST /v1/messages" in line]
+
+
+def test_every_failure_line_ends_with_seconds(tmp_path: Path, capsys):
+    """A refusal's wall time matters as much as a success's: a 529 that took
+    ten seconds to be refused is a different problem from one that took none."""
+    app = _app(tmp_path, FakeEngine([]))
+    assert _post(app, _body(max_tokens=0)).status_code == 400
+    assert (
+        _post(
+            app, {"model": "sous-local", "max_tokens": 4}, path="/v1/messages/count_tokens"
+        ).status_code
+        == 400
+    )
+    lines = _turn_lines(capsys.readouterr().err)
+    assert len(lines) == 2
+    assert all(" seconds=" in line for line in lines), lines
+
+
+def test_a_served_count_logs_one_line_with_load_count_and_client_seconds(tmp_path: Path, capsys):
+    app = _app(tmp_path, FakeEngine([]))
+    body = {"model": "sous-local", "messages": [{"role": "user", "content": "hi"}]}
+    assert _post(app, body, path="/v1/messages/count_tokens").status_code == 200
+    (line,) = _turn_lines(capsys.readouterr().err)
+    assert "POST /v1/messages/count_tokens model=sous-local input_tokens=" in line
+    # load_s (the model load), count_s (the runner's own work) and seconds
+    # (client-visible, from request receipt) are all distinct keys.
+    assert " load_s=" in line and " count_s=" in line and " seconds=" in line
+    assert "hi" not in line.split("input_tokens=")[0]  # body text never reaches the log
+
+
+class _SlowThenFastCountEngine(FakeEngine):
+    """The first `hold` calls to count_tokens signal `entered` and then block
+    on `release`; calls after that return immediately. Lets a test confirm
+    both `_counts` workers are occupied before submitting a third, queued
+    call, whose own tokenizing work is negligible next to its wait for a
+    free worker."""
+
+    def __init__(self, hold: int = 2):
+        super().__init__([])
+        self.hold = hold
+        self.entered = threading.Semaphore(0)
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+        self._calls = 0
+
+    def count_tokens(self, messages, tools):
+        with self._lock:
+            self._calls += 1
+            mine = self._calls
+        if mine <= self.hold:
+            self.entered.release()
+            self.release.wait(5)
+        return super().count_tokens(messages, tools)
+
+
+def test_count_tokens_seconds_includes_the_queue_wait_like_the_failure_lines(
+    tmp_path: Path, capsys
+):
+    """_counts is a 2-worker pool; MAX_PENDING_COUNTS admits up to 8, so a
+    third concurrent count queues behind the two already running. Every
+    other line on this endpoint (the two 400s, the 529 — all `_elapsed
+    (received)`) already counts that wait as `seconds`; the success line must
+    too, with the runner-internal figure kept visible as its own `count_s`."""
+    inner = _SlowThenFastCountEngine(hold=2)
+    app = _app(tmp_path, inner)
+    body = {"model": "sous-local", "messages": [{"role": "user", "content": "hi"}]}
+    results: list[httpx.Response] = []
+    lock = threading.Lock()
+
+    def fire() -> None:
+        r = _post(app, body, path="/v1/messages/count_tokens")
+        with lock:
+            results.append(r)
+
+    holders = [threading.Thread(target=fire) for _ in range(2)]
+    for t in holders:
+        t.start()
+    assert inner.entered.acquire(timeout=5)
+    assert inner.entered.acquire(timeout=5)  # both _counts workers now occupied
+
+    queued = threading.Thread(target=fire)
+    queued.start()
+    time.sleep(0.3)  # the queued call sits behind both workers for at least this long
+    inner.release.set()
+    for t in [*holders, queued]:
+        t.join(5)
+
+    assert len(results) == 3 and all(r.status_code == 200 for r in results)
+    lines = [
+        line
+        for line in _turn_lines(capsys.readouterr().err)
+        if "/v1/messages/count_tokens model=" in line and "input_tokens=" in line
+    ]
+    assert len(lines) == 3
+
+    def parse(line: str) -> tuple[float, float]:
+        count_s = float(line.split("count_s=")[1].split()[0])
+        seconds = float(line.split(" seconds=")[1].split()[0])
+        return count_s, seconds
+
+    parsed = [parse(line) for line in lines]
+    # Exactly one of the three calls did negligible runner-internal work
+    # (the queued one, picked up only once a worker freed) — the other two
+    # spent their whole runner-internal time blocked on `release`.
+    queued_only = [(c, s) for c, s in parsed if c < 0.15]
+    assert len(queued_only) == 1, parsed
+    count_s, seconds = queued_only[0]
+    assert seconds >= 0.25, parsed  # the client waited for a free worker
+    assert count_s < 0.15, parsed  # but the runner's own work was instant
+
+
 # --- turn admission (MAX_PENDING_TURNS) --------------------------------------------
+
+
+def test_turns_pool_has_exactly_max_pending_turns_workers(tmp_path: Path):
+    """queue_s on the turn line is only a complete accounting of the wait
+    when every admitted turn can start on its own worker at once — tie the
+    pool's size to MAX_PENDING_TURNS explicitly rather than leaving it to
+    ThreadPoolExecutor's own default (min(32, os.cpu_count() + 4)), which
+    would make queue_s's completeness depend on the host's core count."""
+    import sous.gateway.routes as routes
+
+    gateway, _app = _gateway_app(tmp_path, FakeEngine([]))
+    assert gateway._turns._max_workers == routes.MAX_PENDING_TURNS
 
 
 def test_a_full_queue_answers_529_with_an_anthropic_shaped_body(tmp_path: Path, monkeypatch):
@@ -729,7 +854,7 @@ def test_log_lines_carry_metadata_only(tmp_path: Path, capsys):
     )
     assert r.status_code == 200
     err = capsys.readouterr().err
-    assert "sous gateway: POST /v1/messages" in err
+    assert "sous.gateway: POST /v1/messages" in err
     assert "model=sous-local" in err and "stream=1" in err and "input_tokens=" in err
     assert secret_text not in err
     assert secret_token not in err and "oauth-2025-04-20" not in err
@@ -783,6 +908,161 @@ def test_the_log_carries_lcp_only_on_a_miss(tmp_path: Path, capsys):
     assert "cache=hit" in lines[1] and "lcp=" not in lines[1]
 
 
+def _gateway_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == "sous.gateway"]
+
+
+def test_a_served_turn_logs_at_info(tmp_path: Path, caplog):
+    app = _app(tmp_path, FakeEngine(["ok"]))
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        assert _post(app, _body()).status_code == 200
+    turn = [r for r in _gateway_records(caplog) if "POST /v1/messages" in r.getMessage()]
+    assert turn and turn[-1].levelno == logging.INFO
+
+
+def test_a_refused_request_logs_at_warning(tmp_path: Path, caplog):
+    """4xx and 529 are refusals sous chose — a client's malformed body, or
+    back-pressure the SDKs retry — not failures."""
+    app = _app(tmp_path, FakeEngine([]))
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        assert _post(app, _body(max_tokens=0)).status_code == 400
+    assert [r.levelno for r in _gateway_records(caplog)] == [logging.WARNING]
+
+
+def test_a_failure_sous_produced_logs_at_error(tmp_path: Path, caplog):
+    class Boom(FakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            raise RuntimeError("engine exploded")
+
+    app = _app(tmp_path, Boom([]))
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        assert _post(app, _body()).status_code == 500
+    assert logging.ERROR in [r.levelno for r in _gateway_records(caplog)]
+
+
+def test_a_streamed_failure_logs_the_id_its_client_already_has(tmp_path: Path, caplog):
+    """message_start carried the id before the engine failed; without it on
+    the failure line, the one turn most worth finding in the transcript is
+    the one the log cannot be joined to."""
+
+    class Boom(FakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            raise RuntimeError("engine exploded")
+
+    app = _app(tmp_path, Boom([]))
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        r = _post(app, _body(stream=True))
+    (started,) = [data for event, data in _events(r.text) if event == "message_start"]
+    (record,) = [rec for rec in _gateway_records(caplog) if "error=" in rec.getMessage()]
+    assert f"id={started['message']['id']} " in record.getMessage()
+    assert record.levelno == logging.ERROR  # status=200 on the line, a failure all the same
+
+
+@pytest.mark.parametrize("outcome", ["done", "error"])
+def test_a_turn_whose_client_left_mid_stream_still_logs_its_outcome(
+    tmp_path: Path, caplog, outcome
+):
+    """A disconnect cancels the SSE consumer at queue.get(), but a started turn
+    drains to completion regardless; its line must not go down with the
+    consumer that used to be the only thing writing it."""
+    from sous.engine.base import Delta
+    from sous.gateway.convert import parse_messages_request
+    from sous.gateway.response import TurnAssembler, new_message_id
+    from sous.gateway.turn import TurnResult
+    from sous.protocol import ToolSet
+
+    gateway, _ = _gateway_app(tmp_path, FakeEngine([]))
+    chat = parse_messages_request(_body(stream=True))
+    assembler = TurnAssembler(new_message_id(), chat.model, ToolSet.from_tools([], strict=False))
+
+    async def scenario() -> threading.Event:
+        queue: asyncio.Queue = asyncio.Queue()
+        abandoned = threading.Event()
+        stream = gateway._stream(chat, assembler, queue, abandoned, time.monotonic())
+        await anext(stream)  # the opening ping
+        queue.put_nowait(("started", 5))
+        await anext(stream)  # message_start
+        reader = asyncio.ensure_future(anext(stream))
+        await asyncio.sleep(0)  # parked at queue.get(), as a live stream is between deltas
+        reader.cancel()  # the client disconnects
+        with contextlib.suppress(asyncio.CancelledError):
+            await reader
+        queue.put_nowait(("delta", Delta("a", 1, None)))
+        if outcome == "done":
+            result = TurnResult("ab", 5, 2, "stop", cache_hit=False, reused_tokens=0, seconds=0.1)
+            queue.put_nowait(("done", result))
+        else:
+            queue.put_nowait(("error", RuntimeError("engine exploded")))
+        for _ in range(50):
+            if not gateway._drains:
+                break
+            await asyncio.sleep(0.01)
+        return abandoned
+
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        assert asyncio.run(scenario()).is_set()
+    (record,) = _gateway_records(caplog)
+    line = record.getMessage()
+    assert f"id={assembler.message_id} " in line and "stream=1 status=200" in line
+    if outcome == "done":
+        assert record.levelno == logging.INFO and "output_tokens=2" in line
+    else:
+        assert record.levelno == logging.ERROR and "error=api_error" in line
+
+
+def test_a_full_queue_logs_at_warning_not_error(tmp_path: Path, monkeypatch, caplog):
+    """529 is the one 5xx that is back-pressure, not a fault."""
+    import sous.gateway.routes as routes
+
+    monkeypatch.setattr(routes, "MAX_PENDING_TURNS", 0)
+    app = _app(tmp_path, FakeEngine([]))
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        assert _post(app, _body()).status_code == 529
+    assert [r.levelno for r in _gateway_records(caplog)] == [logging.WARNING]
+
+
+def test_status_level_splits_refusals_from_failures():
+    from sous.gateway.routes import _status_level
+
+    assert _status_level(400) == _status_level(413) == _status_level(529) == logging.WARNING
+    assert _status_level(500) == _status_level(502) == _status_level(504) == logging.ERROR
+
+
+def test_an_unreachable_upstream_logs_at_error_but_a_forwarded_status_at_info(
+    tmp_path: Path, caplog
+):
+    """502/504 the forwarder synthesizes are sous's failures; a 5xx the real
+    upstream answered is the upstream's verdict and stays INFO — the same
+    number, told apart by the marker `_error` sets, never by status."""
+    from sous.gateway.upstream import Upstream
+
+    unreachable = Upstream("https://127.0.0.1:9")  # the discard port: refused at once
+    app = _app(tmp_path, FakeEngine([]), upstream=unreachable)
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        r = _post(app, _body(model="claude-opus-5"))
+    assert r.status_code == 502
+    upstream_lines = [r for r in _gateway_records(caplog) if "upstream POST" in r.getMessage()]
+    assert [r.levelno for r in upstream_lines] == [logging.ERROR]
+
+    caplog.clear()
+    app = _app(tmp_path, FakeEngine([]))  # FakeUpstream answers 200
+    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+        assert _post(app, _body(model="claude-opus-5")).status_code == 200
+    upstream_lines = [r for r in _gateway_records(caplog) if "upstream POST" in r.getMessage()]
+    assert [r.levelno for r in upstream_lines] == [logging.INFO]
+
+
+def test_mounting_pins_the_noisy_library_loggers(tmp_path: Path, monkeypatch):
+    """The handler swap (sous.logs) replaces the root handler, never a library
+    logger's level — the no-bodies rule rests on these three pins."""
+    for name in ("sse_starlette", "httpx", "httpcore"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.DEBUG)
+    _app(tmp_path, FakeEngine([]))  # create_server → configure_daemon_logging → mount_gateway
+    assert logging.getLogger("sse_starlette").level == logging.INFO
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
+
+
 def test_mounting_pins_the_sse_logger_above_debug(tmp_path: Path, monkeypatch):
     """sse-starlette logs every frame it sends at DEBUG — the model's reply,
     verbatim. Mounting the gateway pins that logger, so the no-bodies rule does
@@ -822,7 +1102,7 @@ def test_a_dropped_tool_type_cannot_forge_a_log_line(tmp_path: Path, capsys):
     write whatever line the client chose into the daemon log. Short enough here
     to survive the length cap, so the escaping is what has to stop it."""
     app = _app(tmp_path, FakeEngine(["ok"]))
-    forged = "x\nsous gateway: POST /v1/messages status=200"
+    forged = "x\nsous.gateway: POST /v1/messages status=200"
     body = _body(tools=[{"type": forged, "name": "web_search"}])
     assert _post(app, body).status_code == 200
     err = capsys.readouterr().err
@@ -1274,16 +1554,15 @@ def test_forwarding_logs_one_bounded_metadata_line_and_never_a_body_header_or_qu
         _post(app, json.dumps(_body(model="m" * 65)).encode())
         _post(app, b"not json")
     err = capsys.readouterr().err
-    lines = [line for line in err.splitlines() if line.startswith("sous gateway: upstream")]
-    assert lines[0].startswith(
-        "sous gateway: upstream POST /v1/messages model=claude-opus-5 status=200 seconds="
+    lines = [line for line in err.splitlines() if "sous.gateway: upstream" in line]
+    assert (
+        "sous.gateway: upstream POST /v1/messages model=claude-opus-5 status=200 seconds="
+        in lines[0]
     )
-    assert lines[1].startswith(
-        "sous gateway: upstream GET /api/oauth/usage model=- status=200 seconds="
-    )
-    assert lines[2].startswith("sous gateway: upstream POST /v1/messages model=- status=200")
-    assert lines[3].startswith("sous gateway: upstream POST /v1/messages model=- status=200")
-    assert lines[4].startswith("sous gateway: upstream POST /v1/messages model=- status=200")
+    assert "sous.gateway: upstream GET /api/oauth/usage model=- status=200 seconds=" in lines[1]
+    assert "sous.gateway: upstream POST /v1/messages model=- status=200" in lines[2]
+    assert "sous.gateway: upstream POST /v1/messages model=- status=200" in lines[3]
+    assert "sous.gateway: upstream POST /v1/messages model=- status=200" in lines[4]
     assert len(lines) == 5
     for canary in ("BODY-CANARY", "HEADER-CANARY", "QUERY-CANARY", "x y", "m" * 65):
         assert canary not in err, canary
@@ -1303,7 +1582,7 @@ def test_a_claimed_model_id_cannot_forge_or_bloat_a_log_line(tmp_path: Path, cap
     reach a log line unbounded, the way a forwarded id already can't."""
     fake = FakeUpstream()
     app = _app(tmp_path, FakeEngine(["ok", "ok"]), upstream=fake.upstream())
-    forged = "sous-local[\nsous gateway: FORGED status=200]"
+    forged = "sous-local[\nsous.gateway: FORGED status=200]"
     oversized = "sous-local[" + "A" * 100 + "]"
     for raw_id in (forged, oversized):
         r = _post(app, _body(model=raw_id))
@@ -1313,9 +1592,170 @@ def test_a_claimed_model_id_cannot_forge_or_bloat_a_log_line(tmp_path: Path, cap
     assert fake.requests == []
     err = capsys.readouterr().err
     assert "FORGED" not in err
-    lines = [line for line in err.splitlines() if line.startswith("sous gateway:")]
+    lines = [line for line in err.splitlines() if "sous.gateway:" in line]
     assert lines, "expected at least one log line"
     for line in lines:
-        assert len(line) < 200, line
+        # The attributed turn line is ~410 chars with its prefix; the cap is
+        # here to catch an unbounded client string, not to pin a length.
+        assert len(line) < 500, line
+        assert "A" * 20 not in line, line  # the oversized id never reaches it
         if "model=" in line:
             assert "model=-" in line, line
+
+
+def _fields(line: str) -> dict[str, str]:
+    """`key=value` tokens of a turn line; `bounds=[a,b]` stays one token."""
+    return dict(tok.split("=", 1) for tok in line.split(" ") if "=" in tok)
+
+
+_ALL_GAUGES = {
+    "hits": 0,
+    "fork_hits": 0,
+    "reused_tokens": 0,
+    "miss_lcp": 0,
+    "forks": 0,
+    "evictions": 0,
+    "pressure_evictions": 0,
+    "prefilled_tokens": 0,
+    "took_len": 0,
+    "bound_lo": 0,
+    "bound_hi": 0,
+    "probe_seconds": 0.0,
+    "prefill_seconds": 0.0,
+    "decode_seconds": 0.0,
+}
+
+
+def test_the_turn_line_attributes_a_hit(tmp_path: Path, capsys):
+    inner = FakeEngine(["first", "second reply here"])
+    inner.stats = dict(_ALL_GAUGES)
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 2:
+            inner.stats = {
+                **_ALL_GAUGES,
+                "hits": 1,
+                "reused_tokens": 40,
+                "prefilled_tokens": 6,
+                "took_len": 40,
+                "bound_lo": 10,
+                "bound_hi": 30,
+                "forks": 1,
+                "evictions": 2,
+                "pressure_evictions": 1,
+                "prefill_seconds": 2.0,
+                "decode_seconds": 4.0,
+            }
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    app = _app(tmp_path, inner)
+    assert _post(app, _body(system="Be terse.", tools=[READ_TOOL])).status_code == 200
+    r = _post(app, _body(system="Be terse.", tools=[READ_TOOL]))
+    assert r.status_code == 200
+    line = _turn_lines(capsys.readouterr().err)[1]
+    f = _fields(line)
+    assert f["id"] == r.json()["id"] and f["id"].startswith("msg_")
+    assert f["cache"] == "hit" and f["took"] == "turn@40"
+    assert f["reused_tokens"] == "40" and f["prefilled_tokens"] == "6"
+    assert (f["forks"], f["evicted"], f["pressure"]) == ("1", "2", "1")
+    assert f["prefill_s"] == "2.0" and f["decode_s"] == "4.0"
+    # 6 prefilled tokens / 2.0 s; "second reply here" is 3 words = 3 output tokens / 4.0 s
+    assert f["prefill_tps"] == "3.0" and f["decode_tps"] == "0.8"
+    for key in ("load_s", "queue_s", "engine_wait_s", "tokenize_s", "ttft_s", "seconds"):
+        assert key in f, key
+    assert len(f["tools"]) == 8 and len(f["system"]) == 8
+    assert "lcp" not in f and "bounds" not in f
+
+
+def test_the_turn_line_diagnoses_a_miss(tmp_path: Path, capsys):
+    inner = FakeEngine(["reply"])
+    inner.stats = {
+        **_ALL_GAUGES,
+        "miss_lcp": 25,
+        "bound_lo": 10,
+        "bound_hi": 30,
+        "prefilled_tokens": 50,
+    }
+    app = _app(tmp_path, inner)
+    assert _post(app, _body()).status_code == 200
+    f = _fields(_turn_lines(capsys.readouterr().err)[0])
+    assert f["cache"] == "miss" and f["took"] == "none"
+    assert (f["lcp"], f["lcp_region"], f["bounds"]) == ("25", "system", "[10,30]")
+    assert (f["tools"], f["system"]) == ("-", "-")  # no tools, no system text in _body()
+
+
+@pytest.mark.parametrize(
+    ("lcp", "lo", "hi", "region"),
+    [
+        (5, 10, 30, "tools"),
+        (15, 10, 30, "system"),
+        (35, 10, 30, "conversation"),
+        # One boundary: the tools one never cleared the fork floor (or the
+        # template renders the tools inside the system block), so below the
+        # header a tool change and a system change look the same.
+        (15, 0, 30, "tools-or-system"),
+        (35, 0, 30, "conversation"),
+        (15, 0, 0, "-"),
+        (0, 10, 30, "-"),  # nothing resident to compare with
+    ],
+)
+def test_lcp_region_places_the_divergence(lcp, lo, hi, region):
+    from sous.gateway.routes import _lcp_region
+
+    assert _lcp_region(lcp, lo, hi) == region
+
+
+def test_rates_and_optional_fields_print_a_dash_when_undefined():
+    from sous.gateway.routes import _opt, _rate
+
+    assert _rate(100, 0.0) == "-" and _rate(100, 4.0) == "25.0" and _rate(59, 4.0) == "14.8"
+    assert _opt(None) == "-" and _opt(1.234) == "1.2"
+
+
+def test_a_fork_hit_prints_took_fork(tmp_path: Path, capsys):
+    inner = FakeEngine(["a", "b"])
+    inner.stats = dict(_ALL_GAUGES)
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 2:
+            inner.stats = {
+                **_ALL_GAUGES,
+                "hits": 1,
+                "fork_hits": 1,
+                "reused_tokens": 4000,
+                "took_len": 4000,
+            }
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    app = _app(tmp_path, inner)
+    _post(app, _body())
+    _post(app, _body())
+    f = _fields(_turn_lines(capsys.readouterr().err)[1])
+    assert f["cache"] == "fork" and f["took"] == "fork@4000"
+
+
+def test_a_hit_retried_cold_prints_took_none(tmp_path: Path, capsys):
+    """The cache resets the per-turn gauges when a warm attempt fails and the
+    turn is rebuilt cold: no slot served the text, so none is named."""
+    inner = FakeEngine(["a", "b"])
+    inner.stats = dict(_ALL_GAUGES)
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 2:
+            inner.stats = {**_ALL_GAUGES, "hits": 1, "reused_tokens": 40, "prefilled_tokens": 46}
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    app = _app(tmp_path, inner)
+    _post(app, _body())
+    _post(app, _body())
+    f = _fields(_turn_lines(capsys.readouterr().err)[1])
+    assert f["cache"] == "hit" and f["took"] == "none"

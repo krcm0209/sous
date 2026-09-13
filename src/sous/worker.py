@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import sys
+import logging
 import threading
 import time
 from pathlib import Path
@@ -17,6 +17,7 @@ from sous.engine.base import (
     ManagedEngine,
     release_mlx_thread_state,
 )
+from sous.engine.promptcache import without_turn_gauges
 from sous.protocol import WORKER_TOOLS, ParseError, ToolCall, parse_tool_calls
 from sous.tasks import Task, TaskStore
 from sous.toolexec import PathViolation, ToolExecutor
@@ -167,7 +168,10 @@ def _failure_extra(
     return {
         "files_changed": [vars(c) for c in ex.changed_files()],
         "transcript_path": str(transcript.path),
-        "prompt_cache": {**engine.prompt_cache_stats(owner=owner), "elisions": elisions},
+        "prompt_cache": {
+            **without_turn_gauges(engine.prompt_cache_stats(owner=owner)),
+            "elisions": elisions,
+        },
     }
 
 
@@ -404,7 +408,7 @@ def run_task(
                 "context_reason": context.reason,
             },
             "prompt_cache": {
-                **engine.prompt_cache_stats(owner=session.thread),
+                **without_turn_gauges(engine.prompt_cache_stats(owner=session.thread)),
                 "elisions": elisions,
             },
             "transcript_path": str(transcript.path),
@@ -471,5 +475,5 @@ def _worker_loop(
             # the MCP main thread keeps serving, so a dead worker thread would
             # wedge the queue forever with no launchd self-heal. Log, back
             # off one poll interval, keep looping.
-            print(f"sous: worker loop error (continuing): {e}", file=sys.stderr)
+            logging.getLogger("sous.worker").error(f"worker loop error (continuing): {e}")
             stop.wait(poll_interval)

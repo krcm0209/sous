@@ -16,7 +16,6 @@ import json
 import logging
 import math
 import re
-import sys
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -43,7 +42,7 @@ from sous.gateway.turn import (
     TurnResult,
     TurnRunner,
 )
-from sous.gateway.upstream import Upstream
+from sous.gateway.upstream import SynthesizedError, Upstream
 from sous.protocol import ToolSet
 
 # Anthropic's own request cap. The MCP transport's 4 MiB limit wraps only the
@@ -120,14 +119,66 @@ _LOG_PATH_CHARS = 80
 _MCP_PATH = "/mcp"
 
 
-def _log(message: str) -> None:
-    print(f"sous gateway: {message}", file=sys.stderr, flush=True)
+_logger = logging.getLogger("sous.gateway")
+
+
+def _log(message: str, level: int = logging.INFO) -> None:
+    """One metadata line per event, at a level that means something: INFO for
+    a request served or forwarded, WARNING for one sous refused (a 4xx, a
+    529, a client gone while queued, tools it had to drop), ERROR for a
+    failure sous produced (a 5xx from an exception, an unreachable upstream).
+    The root handler (sous.logs) adds the timestamp and the name."""
+    _logger.log(level, message)
+
+
+def _status_level(status: int) -> int:
+    # 529 is back-pressure both official SDKs retry with backoff, not a fault.
+    return logging.ERROR if status >= 500 and status != 529 else logging.WARNING
+
+
+def _lcp_region(lcp: int, lo: int, hi: int) -> str:
+    """Which part of the render a miss diverged in, given the two fork
+    boundaries the probe verified: below the tools boundary the tool array
+    changed, below the header the system text did, else the conversation.
+    With one boundary known (a tool block under the fork floor, or a template
+    that renders the tools inside the system block) nothing below it tells the
+    two apart. `-` when the probe never ran (no fork budget) or there was no
+    slot to compare with (an lcp of 0)."""
+    if not hi or not lcp:
+        return "-"
+    if lo and lcp < lo:
+        return "tools"
+    if lcp < hi:
+        return "system" if lo else "tools-or-system"
+    return "conversation"
+
+
+def _rate(count: int, seconds: float) -> str:
+    return "-" if seconds <= 0 else f"{count / seconds:.1f}"
+
+
+def _opt(value: float | None) -> str:
+    return "-" if value is None else f"{value:.1f}"
+
+
+def _elapsed(since: float) -> str:
+    return f" seconds={time.monotonic() - since:.1f}"
 
 
 def _error_response(status: int, error_type: str, message: str) -> JSONResponse:
     return JSONResponse(
         {"type": "error", "error": {"type": error_type, "message": message}}, status_code=status
     )
+
+
+def _log_refused(path: str, e: RequestError, received: float) -> JSONResponse:
+    """The shape shared by every RequestError caught before a chat request is
+    parsed (no `model=` yet): one metadata line, one Anthropic-shaped body."""
+    _log(
+        f"POST {path} status={e.status} error={e.error_type}{_elapsed(received)}",
+        level=_status_level(e.status),
+    )
+    return JSONResponse(e.body(), status_code=e.status)
 
 
 def _log_token(value: object, limit: int) -> str:
@@ -325,7 +376,16 @@ class Gateway:
         # in server.py) — but off the main thread, which is how the real-server
         # test drives it, it is: the pool is what lets that test observe the
         # graceful bound instead of the drain.
-        self._turns = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="sous-gateway-turn")
+        # Tied to MAX_PENDING_TURNS rather than left at the default worker
+        # count: the turn line's queue_s is only a complete accounting of the
+        # wait when every admitted turn can start on its own worker at once —
+        # otherwise a burst would queue inside the pool too, off the clock,
+        # on whatever core count the host happens to have. max() guards a
+        # test driving admission to zero (BoundedSemaphore(0) refuses every
+        # turn outright): the pool itself still needs at least one thread.
+        self._turns = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, MAX_PENDING_TURNS), thread_name_prefix="sous-gateway-turn"
+        )
         # count_tokens never takes TurnRunner._lock, so it must never queue
         # behind a turn parked waiting on that lock inside a saturated _turns
         # pool. A dedicated pool also keeps it off asyncio's default executor
@@ -338,6 +398,9 @@ class Gateway:
         self._pending = threading.BoundedSemaphore(MAX_PENDING_TURNS)
         self._pending_counts = threading.BoundedSemaphore(MAX_PENDING_COUNTS)
         self._upstream = upstream or Upstream(config.gateway_upstream_url)
+        # The event loop holds its tasks weakly; these log a turn whose client
+        # left mid-stream (_stream), and must outlive the request that made them.
+        self._drains: set[asyncio.Task] = set()
 
     def close(self, timeout: float = 2.0) -> None:
         """Best-effort shutdown, called from the app's lifespan hook. Never
@@ -404,16 +467,20 @@ class Gateway:
         _log(
             f"upstream {request.method} {_log_token(request.url.path, _LOG_PATH_CHARS)} "
             f"model={model} status={response.status_code} "
-            f"seconds={time.monotonic() - started:.1f}"
+            f"seconds={time.monotonic() - started:.1f}",
+            level=_status_level(response.status_code)
+            if isinstance(response, SynthesizedError)
+            else logging.INFO,
         )
         return response
 
     async def count_tokens(self, request: Request) -> Response:
+        received = time.monotonic()
         try:
             _check_loopback(request)
             raw = await _read_body(request)
         except RequestError as e:
-            return JSONResponse(e.body(), status_code=e.status)
+            return _log_refused("/v1/messages/count_tokens", e, received)
         body, model = self._route(raw)
         if body is None:
             return await self._forward(request, raw, model)
@@ -421,7 +488,7 @@ class Gateway:
             _check_depth(body)
             chat = parse_count_tokens_request(body)
         except RequestError as e:
-            return JSONResponse(e.body(), status_code=e.status)
+            return _log_refused("/v1/messages/count_tokens", e, received)
         # Same bounded-admission reasoning as messages()'s self._pending: a
         # queued count still holds its parsed body while the 2 _counts
         # workers serialize on the tokenizer, so bound it before any bytes
@@ -429,11 +496,12 @@ class Gateway:
         if not self._pending_counts.acquire(blocking=False):
             _log(
                 f"POST /v1/messages/count_tokens model={_model_label(chat)} "
-                "status=529 error=overloaded_error"
+                f"status=529 error=overloaded_error{_elapsed(received)}",
+                level=logging.WARNING,
             )
             return _error_response(529, "overloaded_error", "too many token counts queued")
         try:
-            count = await self._submit(
+            result = await self._submit(
                 self._counts,
                 self._pending_counts,
                 self._runner.count_tokens,
@@ -441,16 +509,27 @@ class Gateway:
                 chat.tools,
             )
         except Exception as e:  # noqa: BLE001 — every failure becomes an Anthropic error body
-            return _error_response(*_classify(e))
-        return JSONResponse({"input_tokens": count})
+            status, error_type, message = _classify(e)
+            _log(
+                f"POST /v1/messages/count_tokens model={_model_label(chat)} status={status} "
+                f"error={error_type}{_elapsed(received)}",
+                level=_status_level(status),
+            )
+            return _error_response(status, error_type, message)
+        _log(
+            f"POST /v1/messages/count_tokens model={_model_label(chat)} "
+            f"input_tokens={result.count} load_s={result.load_seconds:.1f} "
+            f"count_s={result.seconds:.1f}{_elapsed(received)}"
+        )
+        return JSONResponse({"input_tokens": result.count})
 
     async def messages(self, request: Request) -> Response:
+        received = time.monotonic()
         try:
             _check_loopback(request)
             raw = await _read_body(request)
         except RequestError as e:
-            _log(f"POST /v1/messages status={e.status} error={e.error_type}")
-            return JSONResponse(e.body(), status_code=e.status)
+            return _log_refused("/v1/messages", e, received)
         body, model = self._route(raw)
         if body is None:
             return await self._forward(request, raw, model)
@@ -458,8 +537,7 @@ class Gateway:
             _check_depth(body)
             chat = parse_messages_request(body)
         except RequestError as e:
-            _log(f"POST /v1/messages status={e.status} error={e.error_type}")
-            return JSONResponse(e.body(), status_code=e.status)
+            return _log_refused("/v1/messages", e, received)
         if chat.dropped_tool_types:
             # Anthropic's type identifiers are a bounded, useful set, but a
             # client can put any string there, so cap the line: repr escapes a
@@ -470,7 +548,8 @@ class Gateway:
                 shown.append(f"… (+{hidden} more)")
             _log(
                 f"dropped {len(chat.dropped_tool_types)} tool(s) with no client-supplied "
-                f"schema (Anthropic server-side or built-in): {', '.join(shown)}"
+                f"schema (Anthropic server-side or built-in): {', '.join(shown)}",
+                level=logging.WARNING,
             )
         assembler = TurnAssembler(
             new_message_id(), chat.model, ToolSet.from_tools(chat.tools, strict=False)
@@ -480,8 +559,9 @@ class Gateway:
         # what does is guarded below, so a failure there still releases.
         if not self._pending.acquire(blocking=False):
             _log(
-                f"POST /v1/messages model={_model_label(chat)} stream={int(chat.stream)} "
-                "status=529 error=overloaded_error"
+                f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
+                f"stream={int(chat.stream)} status=529 error=overloaded_error{_elapsed(received)}",
+                level=logging.WARNING,
             )
             return _error_response(529, "overloaded_error", "too many turns queued")
         if chat.stream:
@@ -515,15 +595,18 @@ class Gateway:
                     )
                 except TurnAbandoned:
                     _log(
-                        f"POST /v1/messages model={_model_label(chat)} stream=1 "
-                        "abandoned while queued"
+                        f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
+                        f"stream=1 status=499 error=abandoned{_elapsed(received)}",
+                        level=logging.WARNING,
                     )
+                    # Ends the drain _stream left waiting for this turn's outcome.
+                    sink.put(("abandoned", None))
                 except Exception as e:  # noqa: BLE001 — relayed as an in-band error event
                     sink.put(("error", e))
 
             self._submit(self._turns, self._pending, turn)
             return EventSourceResponse(
-                self._stream(chat, assembler, queue, abandoned),
+                self._stream(chat, assembler, queue, abandoned, received),
                 ping=PING_INTERVAL_SECONDS,
                 ping_message_factory=lambda: _PING,
                 sep=_SEP,
@@ -542,8 +625,9 @@ class Gateway:
         except Exception as e:  # noqa: BLE001 — every failure becomes an Anthropic error body
             status, error_type, message = _classify(e)
             _log(
-                f"POST /v1/messages model={_model_label(chat)} stream=0 "
-                f"status={status} error={error_type}"
+                f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
+                f"stream=0 status={status} error={error_type}{_elapsed(received)}",
+                level=_status_level(status),
             )
             return _error_response(status, error_type, message)
         assembler.start(result.input_tokens)
@@ -605,10 +689,12 @@ class Gateway:
         assembler: TurnAssembler,
         queue: asyncio.Queue,
         abandoned: threading.Event,
+        received: float,
     ) -> AsyncIterator[ServerSentEvent]:
         # Pure consumer: the turn was already submitted (and the pending slot
         # already tied to its future) by messages() before this generator was
         # even constructed — see the comment at that submission site.
+        outcome_seen = False
         try:
             yield _PING
             while True:
@@ -620,18 +706,20 @@ class Gateway:
                     for event in assembler.feed(value):
                         yield _frame(event)
                 elif kind == "done":
-                    for event in assembler.finish(
+                    outcome_seen = True
+                    events = assembler.finish(
                         value.text, value.output_tokens, value.finish_reason, value.reused_tokens
-                    ):
-                        yield _frame(event)
+                    )
+                    # Before the last frames, so a client that hangs up on
+                    # them still leaves its turn on record.
                     self._log_turn(chat, value, assembler, stream=True)
+                    for event in events:
+                        yield _frame(event)
                     return
                 else:
+                    outcome_seen = True
                     status, error_type, message = _classify(value)
-                    _log(
-                        f"POST /v1/messages model={_model_label(chat)} stream=1 status=200 "
-                        f"error={error_type}"
-                    )
+                    self._log_stream_failure(chat, assembler, value, received)
                     yield _frame(
                         {"type": "error", "error": {"type": error_type, "message": message}}
                     )
@@ -641,20 +729,84 @@ class Gateway:
             # CancelledError lands at queue.get) and on generator close: a turn
             # still waiting for the lock sees this and never starts.
             abandoned.set()
+            # A turn that already started drains to completion with nobody
+            # reading its queue; without a reader its outcome never reaches
+            # the log, and the next turn's queue_s waits on something unnamed.
+            # (No running loop means the daemon is going down: nobody to log.)
+            if not outcome_seen:
+                with contextlib.suppress(RuntimeError):
+                    drain = asyncio.get_running_loop().create_task(
+                        self._log_when_drained(chat, assembler, queue, received)
+                    )
+                    self._drains.add(drain)
+                    drain.add_done_callback(self._drains.discard)
+
+    async def _log_when_drained(
+        self, chat: ChatRequest, assembler: TurnAssembler, queue: asyncio.Queue, received: float
+    ) -> None:
+        """The line `_stream` would have written, for a client that left while
+        its turn ran: the rest of the queue, consumed without a reader."""
+        while True:
+            kind, value = await queue.get()
+            if kind == "done":
+                assembler.finish(
+                    value.text, value.output_tokens, value.finish_reason, value.reused_tokens
+                )
+                self._log_turn(chat, value, assembler, stream=True)
+                return
+            if kind == "error":
+                self._log_stream_failure(chat, assembler, value, received)
+                return
+            if kind == "abandoned":
+                return  # still queued when the client left: turn() logged its 499
+
+    def _log_stream_failure(
+        self, chat: ChatRequest, assembler: TurnAssembler, exc: Exception, received: float
+    ) -> None:
+        status, error_type, _ = _classify(exc)
+        # status=200 because the SSE headers already went out; the level
+        # follows the failure itself.
+        _log(
+            f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} stream=1 "
+            f"status=200 error={error_type}{_elapsed(received)}",
+            level=_status_level(status),
+        )
 
     def _log_turn(
         self, chat: ChatRequest, result: TurnResult, assembler: TurnAssembler, *, stream: bool
     ) -> None:
         cache = "fork" if result.forked else "hit" if result.cache_hit else "miss"
+        # A hit retried cold took no slot in the end: its took_len is 0.
+        took = (
+            "none"
+            if cache == "miss" or not result.took_len
+            else f"{'fork' if cache == 'fork' else 'turn'}@{result.took_len}"
+        )
+        lo, hi = result.bounds
         # A hit already says how much was reused; a miss says how far the
-        # render agreed with the closest slot, which is the number that tells
-        # a changed tool array from a changed system text.
-        lcp = f" lcp={result.lcp}" if cache == "miss" else ""
+        # render agreed with the closest slot and in which region — the
+        # number that tells a changed tool array from a changed system text.
+        diag = ""
+        if cache == "miss":
+            bounds = ",".join(str(b) for b in (lo, hi) if b)
+            diag = (
+                f" lcp={result.lcp} lcp_region={_lcp_region(result.lcp, lo, hi)} bounds=[{bounds}]"
+            )
         _log(
-            f"POST /v1/messages model={_model_label(chat)} stream={int(stream)} status=200 "
+            f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
+            f"stream={int(stream)} status=200 "
             f"input_tokens={result.input_tokens} output_tokens={result.output_tokens} "
-            f"stop={assembler.stop_reason} cache={cache} "
-            f"reused_tokens={result.reused_tokens}{lcp} seconds={result.seconds:.1f}"
+            f"stop={assembler.stop_reason} cache={cache} took={took} "
+            f"reused_tokens={result.reused_tokens} prefilled_tokens={result.prefilled_tokens} "
+            f"forks={result.forks} evicted={result.evictions} pressure={result.pressure_evictions} "
+            f"load_s={result.load_seconds:.1f} queue_s={result.queue_seconds:.1f} "
+            f"engine_wait_s={result.engine_wait_seconds:.1f} "
+            f"tokenize_s={result.tokenize_seconds:.1f} ttft_s={_opt(result.ttft_seconds)} "
+            f"prefill_s={result.prefill_seconds:.1f} decode_s={result.decode_seconds:.1f} "
+            f"prefill_tps={_rate(result.prefilled_tokens, result.prefill_seconds)} "
+            f"decode_tps={_rate(result.output_tokens, result.decode_seconds)} "
+            f"seconds={result.seconds:.1f}{diag} "
+            f"tools={chat.tools_hash or '-'} system={chat.system_hash or '-'}"
         )
 
 
