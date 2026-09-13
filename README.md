@@ -250,7 +250,7 @@ turn gives up, stated plainly:
   budget can hold the copy, so a conversation that Claude Code branches (its
   progress-summary calls for a background agent take the same prefix down a
   different last turn) still finds it, and moved into the extending turn when
-  it cannot, which is every turn at `prompt_cache_gb = 0`; a linear
+  it cannot, which is every hit at `prompt_cache_gb = 0`; a linear
   conversation holds at most its current and previous lengths — two subagents
   interleaving reuse theirs, and a delegated task running in between no longer
   wipes the gateway's slots the way a shared single slot did. Reuse stays
@@ -318,11 +318,12 @@ conversation's own slot), `fork` (a copy of a shared boundary — ~45–56K
 reused tokens is a tools fork, ~57K a header fork) or `miss`; `took` names
 the slot and its length — `turn@N` for this conversation's own slot copied
 and left in place, `turn-moved@N` for one the budget could not hold a copy
-of (removed and extended in place — every hit at `prompt_cache_gb = 0`),
-`fork@N` for a shared boundary, `none` on a miss, and on a hit whose warm
-attempt failed and was rebuilt cold (a `WARNING py.warnings: … retrying cold`
-line comes first), where `prefilled_tokens` and the phases below describe
-that cold attempt. `prefilled_tokens` is what the turn had to prefill;
+of, or whose copy failed (removed and extended in place — every hit at
+`prompt_cache_gb = 0`), `fork@N` for a shared boundary, `none` on a miss, and
+on a hit whose warm attempt failed and was rebuilt cold (a
+`WARNING py.warnings: … retrying cold` line comes first), where
+`prefilled_tokens` and the phases below describe that cold attempt.
+`prefilled_tokens` is what the turn had to prefill;
 `forks`/`evicted`/`pressure` are what it published and what was dropped under
 it — `evicted` counts every drop — budget, pressure, or a retained
 predecessor two turns back that lineage retires — and `pressure` is the
@@ -524,13 +525,15 @@ for those forks and several conversations; each live conversation under the
 auto budget also keeps its previous length resident (the slot a branch of it
 starts from), so count ~4 GiB per conversation at 63K tokens beyond the
 forks; a 48 GB machine should set it to `0` (forks off, one slot), or to at
-least one fork copy plus one conversation slot — about 8 GiB with the
-default model at ~57K tokens, which keeps a conversation warm but moves its
-slot each turn, so a branch of it (a progress-summary call) starts from the
-fork; retaining the previous length as well needs one fork copy plus two
-conversation slots, about 12 GiB. A value between the two makes every cold
-turn take a fork copy that its own turn slot then evicts, so it pays the
-copy and never reuses it. Slots are
+least twice one conversation slot — about 8 GiB with the default model at
+~57K tokens — because the copy that keeps a conversation's previous length
+resident is taken only when twice the slot fits; below that every hit moves
+its slot, and a branch of the conversation (a progress-summary call) starts
+from the fork instead. The copy's room comes from least-recently-used slots,
+forks included, so keeping a fork resident beside a retaining conversation
+wants about four slots' worth, ~14 GiB. A value between the two makes every
+cold turn take a fork copy that its own turn slot then evicts, so it pays
+the copy and never reuses it. Slots are
 evicted least-recently-used first when the budget, a count of 16, or memory
 pressure says so. Pressure is two readings: Metal's own headroom (room for one
 more window of KV), and the kernel's memory-pressure level — at *warn* each

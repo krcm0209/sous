@@ -65,7 +65,8 @@ Claude Code use stretches further — evaluate features against that goal.
   fork), and *moved* — removed, its arrays adopted — when it cannot, always
   at `prompt_cache_gb = 0`; `Slot.parent` lineage drops the grandparent at
   publish. Inline `role:"system"` messages after the first user message
-  render as `<system-reminder>` blocks in the preceding user turn
+  render as `<system-reminder>` blocks in the preceding user turn (after its
+  tool results), or as a user turn of their own after an assistant turn
   (`gateway/convert._place_inline_system`), never hoisted into the system
   block: the hoist moved the header boundary and killed every prefix behind
   it on the turn an attachment arrived.
