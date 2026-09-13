@@ -1,4 +1,6 @@
 import asyncio
+import io
+import logging
 import os
 import socket
 import subprocess
@@ -12,6 +14,15 @@ from sous.engine.base import EngineManager
 from sous.server import SousService
 from sous.tasks import TaskStore
 from tests.fake_engine import FakeEngine
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_warning_capture():
+    """server.main() turns logging.captureWarnings on for the process. Left on,
+    a later captureWarnings(True) anywhere in the suite is a no-op once pytest
+    has restored showwarning — and that test passes or fails by file order."""
+    yield
+    logging.captureWarnings(False)
 
 
 @pytest.fixture()
@@ -534,6 +545,53 @@ def test_main_installs_the_shutdown_handler_before_serving(tmp_path: Path, monke
     assert installed, "main() served without installing the shutdown handler"
 
 
+def test_main_routes_config_load_warnings_through_the_daemon_shape(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """load_config() runs inside main(), which must already have installed the
+    warnings-to-logging redirect by the time it does — otherwise a config typo
+    reaches stderr as a raw `UserWarning`, unshaped and unleveled, while every
+    other line the daemon writes carries a timestamp and a level.
+    """
+    import dataclasses
+    import logging
+
+    import sous.server as server
+    from sous.config import load_config as real_load_config
+
+    data = tmp_path / "data"
+    data.mkdir()
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[nonsense]\n")  # unknown section: load_config warns
+
+    with socket.socket() as occupied:  # make mcp.run() fail fast instead of serving
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+
+        def fake_load_config():
+            # The real parser, so the warning is genuine — only the paths
+            # (never the real ~/.sous) and port are stood in for.
+            cfg = real_load_config(config_path)
+            return dataclasses.replace(cfg, data_dir=data, server_port=occupied.getsockname()[1])
+
+        monkeypatch.setattr(server, "load_config", fake_load_config)
+        # logging.captureWarnings(True) only rebinds warnings.showwarning the
+        # first time it is called in a process — a no-op on every later call
+        # while it thinks capture is already on. An earlier test in this same
+        # file already left it "on" from a stale rebinding, so reset it here
+        # (and restore that reset afterward) rather than depend on suite order.
+        logging.captureWarnings(False)
+        try:
+            with caplog.at_level("WARNING"), pytest.raises(SystemExit):
+                server.main()
+        finally:
+            logging.captureWarnings(False)
+
+    warning_records = [r for r in caplog.records if r.name == "py.warnings"]
+    assert warning_records, "config warning never reached logging as py.warnings"
+    assert "unknown section" in warning_records[0].getMessage()
+
+
 # --- login-shell PATH resolution ------------------------------------------------
 
 
@@ -584,6 +642,61 @@ def test_main_adopts_the_login_shell_path_before_serving(tmp_path: Path, monkeyp
         with pytest.raises(SystemExit):
             server.main()
     assert os.environ["PATH"] == "/resolved/bin:/usr/bin"
+
+
+class _FakeStderr(io.StringIO):
+    """A stream main() can log through (write/flush both work) whose isatty()
+    is controlled by the test, unlike a real TextIOWrapper's."""
+
+    def __init__(self, tty: bool):
+        super().__init__()
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+def _run_main_against_an_occupied_port(tmp_path: Path, monkeypatch, *, subdir: str) -> None:
+    """make serve() fail fast instead of actually serving, so main() runs its
+    startup steps and exits via the bind failure."""
+    import sous.server as server
+
+    data = tmp_path / subdir
+    data.mkdir()
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+        cfg = SousConfig(
+            data_dir=data,
+            config_path=tmp_path / f"{subdir}.toml",
+            server_port=occupied.getsockname()[1],
+        )
+        cfg.config_path.write_text("")
+        monkeypatch.setattr(server, "load_config", lambda: cfg)
+        with pytest.raises(SystemExit):
+            server.main()
+
+
+def test_main_disables_progress_bars_only_when_stderr_is_not_a_tty(tmp_path: Path, monkeypatch):
+    """Under launchd stderr is a pipe with nobody to animate a bar for; a
+    `sous serve` run by hand for a first multi-GB model download has a real
+    terminal, and the download's own progress should still show there."""
+    calls: list[bool] = []
+    monkeypatch.setattr("huggingface_hub.utils.disable_progress_bars", lambda: calls.append(True))
+
+    monkeypatch.setattr(sys, "stderr", _FakeStderr(tty=True))
+    _run_main_against_an_occupied_port(tmp_path, monkeypatch, subdir="tty")
+    assert calls == []  # interactive: progress bars stay on
+
+    monkeypatch.setattr(sys, "stderr", _FakeStderr(tty=False))
+    _run_main_against_an_occupied_port(tmp_path, monkeypatch, subdir="no-tty")
+    assert calls == [True]  # non-interactive: progress bars are silenced
+
+    # fd 2 closed at exec (`sous serve 2>&-`): Python sets sys.stderr to None,
+    # and the daemon must still start rather than die silently on isatty().
+    monkeypatch.setattr(sys, "stderr", None)
+    _run_main_against_an_occupied_port(tmp_path, monkeypatch, subdir="no-stderr")
+    assert calls == [True, True]
 
 
 def test_server_status_reports_context_policy(svc):
@@ -638,4 +751,39 @@ def test_uvicorn_config_bounds_graceful_shutdown():
     assert cfg.host == "127.0.0.1"
     # uvicorn's access log prints the raw request target, query string
     # included, at INFO — the daemon's own level.
+    assert cfg.access_log is False
+
+
+def test_create_server_installs_the_daemon_log_handler_and_drops_the_rich_one(svc):
+    import logging
+
+    from sous.logs import SOUS_HANDLER_NAME
+    from sous.server import create_server
+
+    class RichHandler(logging.Handler):  # the SDK's, matched by class name
+        def emit(self, record: logging.LogRecord) -> None:
+            pass
+
+    service, store, _ = svc
+    root = logging.getLogger()
+    root.addHandler(RichHandler())
+    try:
+        create_server(store, service.engines, service.config)
+        names = [h.get_name() for h in root.handlers]
+        assert names.count(SOUS_HANDLER_NAME) == 1
+        assert not [h for h in root.handlers if type(h).__name__ == "RichHandler"]
+    finally:
+        for h in list(root.handlers):
+            if h.get_name() == SOUS_HANDLER_NAME or type(h).__name__ == "RichHandler":
+                root.removeHandler(h)
+
+
+def test_uvicorn_config_leaves_logging_to_the_daemon():
+    """uvicorn's default dictConfig gives its loggers their own handlers and
+    stops propagation, so its lines would keep the `INFO:     …` shape
+    instead of the daemon's. log_config=None lets them reach the root."""
+    from sous.server import uvicorn_config
+
+    cfg = uvicorn_config(object(), "127.0.0.1", 0)
+    assert cfg.log_config is None
     assert cfg.access_log is False
