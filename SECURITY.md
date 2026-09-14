@@ -60,6 +60,13 @@ Anything that breaks a guarantee in the
   altered beyond `Host`, the hop-by-hop headers and a buffered body's
   recomputed `Content-Length`; a locally served turn
   executing a tool (the gateway returns `tool_use` blocks and never runs one).
+- **The `/sous/` routes** (`GET /sous/status`, `POST /sous/hold`) — the
+  daemon's own loopback routes, mounted whether or not the gateway is
+  enabled, behind the same `Host`/`Origin` refusal. `/sous/status` serves
+  the `server_status` document (model id, port, queue depth, allowlist);
+  `/sous/hold` pins the model in memory while a named process lives. In
+  scope: reachability from anything but a loopback client; a path under
+  `/sous` reaching the gateway's forwarder; a hold body reaching a log.
 
 ## What isn't
 
