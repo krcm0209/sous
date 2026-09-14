@@ -96,6 +96,20 @@ def release_mlx_thread_state() -> None:
         pass
 
 
+def _holder_alive(pid: int, create_time: float) -> bool:
+    """Whether the process that registered a hold is still the one wearing
+    `pid`: alive, and started within a second of the time it reported. A
+    reused pid fails the second test; a zombie, a vanished process or one
+    this user cannot read (never ours — the daemon and its holders share a
+    user) all count as gone rather than pin the model forever."""
+    import psutil
+
+    try:
+        return abs(psutil.Process(pid).create_time() - create_time) <= 1.0
+    except psutil.Error:
+        return False
+
+
 def measure_cache_budget(reserve_bytes: int) -> int:
     """The automatic resident-slot budget, read once the weights are loaded so
     `active` is the weights (drafter included). Deliberately no
@@ -467,7 +481,14 @@ class GenerationSession:
 
 
 class EngineManager:
-    def __init__(self, config: SousConfig, engine_factory: Callable[[str], Engine] | None = None):
+    def __init__(
+        self,
+        config: SousConfig,
+        engine_factory: Callable[[str], Engine] | None = None,
+        *,
+        holder_alive: Callable[[int, float], bool] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self._config = config
         self._factory = engine_factory or (
             lambda model_id: _default_factory(
@@ -503,13 +524,21 @@ class EngineManager:
         self._unloading = False
         self._last_used: float | None = None
         self._leases = 0
+        # Processes that pin the model: pid -> the start time it reported.
+        # `sous claude` registers itself and then execs Claude Code, which
+        # keeps the pid, so the holder IS that session; the sweep drops a
+        # holder whose process is gone.
+        self._holders: dict[int, float] = {}
+        self._holder_alive: Callable[[int, float], bool] = holder_alive or _holder_alive
+        self._preload: threading.Thread | None = None
+        self._clock = clock
 
     def get(self) -> ManagedEngine:
         with self._changed:
             while self._loading or self._unloading:
                 self._changed.wait()
             if self._engine is not None:
-                self._last_used = time.monotonic()
+                self._last_used = self._clock()
                 return self._engine
             self._loading = True
         loading = time.monotonic()
@@ -523,7 +552,7 @@ class EngineManager:
         with self._changed:
             self._engine = engine
             self._loading = False
-            self._last_used = time.monotonic()
+            self._last_used = self._clock()
             self._changed.notify_all()
         # The one line that brackets a cold start in the daemon log —
         # before it, only huggingface_hub's own chatter said a load
@@ -533,7 +562,7 @@ class EngineManager:
 
     def touch(self) -> None:
         with self._lock:
-            self._last_used = time.monotonic()
+            self._last_used = self._clock()
 
     @contextlib.contextmanager
     def lease(self):
@@ -554,8 +583,63 @@ class EngineManager:
             with self._lock:
                 self._leases -= 1
 
+    def hold(self, pid: int, create_time: float) -> dict:
+        """Pin the model for as long as process `pid` (started at
+        `create_time`) lives, loading it now if nothing is loaded and no load
+        is under way. Never waits for the load and never raises because of
+        it: a hold is an optimization, and the first turn's own get() reports
+        a real failure."""
+        with self._lock:
+            self._holders[pid] = create_time
+            holders = len(self._holders)
+            loaded = self._engine is not None
+            preloading = not loaded and not self._loading and self._preload is None
+            if preloading:
+                self._preload = threading.Thread(
+                    target=self._run_preload, name="sous-preload", daemon=True
+                )
+                self._preload.start()
+            loading = self._loading or self._preload is not None
+        _logger.info(f"hold pid={pid} (holders={holders})")
+        if preloading:
+            _logger.info(f"preloading {self._config.model_id}")
+        return {"loaded": loaded, "loading": loading, "holders": holders}
+
+    def _run_preload(self) -> None:
+        try:
+            self.get()
+        except Exception as exc:  # noqa: BLE001 — the load's own error surfaces on the first turn
+            # The type only: a loader's message can name a path.
+            _logger.warning(f"preload failed ({type(exc).__name__})")
+        finally:
+            # This thread loaded the model, so it touched mlx: the weights are
+            # arrays every later thread can use, the streams are this one's
+            # own (the gateway's turn thread releases the same way after a
+            # get() that loaded). Released before the registry forgets the
+            # thread, so `_preload is None` means it is done with everything.
+            release_mlx_thread_state()
+            with self._lock:
+                self._preload = None
+
+    def _prune_holders(self) -> bool:
+        """Drop every holder whose process is gone; True when that emptied
+        the registry. Lock held by the caller — the psutil check is
+        sub-millisecond, once per poll, and the registry it reads must not
+        change under it."""
+        gone = [
+            pid for pid, started in self._holders.items() if not self._holder_alive(pid, started)
+        ]
+        for pid in gone:
+            del self._holders[pid]
+            _logger.info(f"hold released pid={pid} (holders={len(self._holders)})")
+        return bool(gone) and not self._holders
+
     def unload_if_idle(self) -> bool:
         with self._changed:
+            if self._prune_holders() and self._last_used is not None:
+                # The last session just left: its idle time starts now, so a
+                # relaunch inside idle_unload_minutes never pays a reload.
+                self._last_used = self._clock()
             # _engine is None while a load or an unload is in progress too,
             # so both are refused here without a second check.
             if self._engine is None or self._last_used is None:
@@ -565,7 +649,9 @@ class EngineManager:
                 # abandoned-as-stalled) generation, nor under a caller that is
                 # holding this engine across calls that take no _gen_lock.
                 return False
-            idle = time.monotonic() - self._last_used
+            if self._holders:
+                return False
+            idle = self._clock() - self._last_used
             if idle <= self._config.idle_unload_minutes * 60:
                 return False
             engine, self._engine = self._engine, None
@@ -580,12 +666,13 @@ class EngineManager:
 
     def status(self) -> dict:
         with self._lock:
-            idle = (time.monotonic() - self._last_used) if self._last_used else None
+            idle = (self._clock() - self._last_used) if self._last_used else None
             out = {
                 "loaded": self._engine is not None,
-                "loading": self._loading,
+                "loading": self._loading or self._preload is not None,
                 "model_id": self._config.model_id,
                 "idle_seconds": idle,
+                "holders": len(self._holders),
             }
             if self._engine is not None:
                 # promptcache imports this module, so the import cannot be global.
