@@ -296,6 +296,16 @@ def rail_row(turn: dict) -> dict[str, str]:
     }
 
 
+def turn_tallies(recent: list[dict]) -> tuple[int, int, int]:
+    """How the book's turns ended, in the pass's own words: ORDER UP,
+    DROPPED IT, WALKED OUT — never SERVED, BURNT or 86'D, which the legend
+    reserves for delegated tasks, a different population."""
+    up = sum(1 for t in recent if not t.get("error"))
+    dropped = sum(1 for t in recent if t.get("error") and t.get("error") != "abandoned")
+    walked = sum(1 for t in recent if t.get("error") == "abandoned")
+    return up, dropped, walked
+
+
 def hi_score(recent: list[dict], live: list[float]) -> tuple[float, float | None]:
     """The best decode rate on record — the completed turns' and the live
     samples' — and the time of the turn that set it."""
@@ -854,13 +864,12 @@ class Card(Vertical):
             if best:
                 set_at = f", set {local_time(when)}" if when else ""
                 lines.append(f" HI-SCORE {best:.1f} tok/s  best plate rate today{set_at}")
-            served = sum(1 for t in recent if not t.get("error"))
+            up, dropped, walked = turn_tallies(recent)
             scratch = sum(1 for t in recent if t.get("cache") == "miss")
-            burnt = sum(1 for t in recent if t.get("error") and t.get("error") != "abandoned")
-            walked = sum(1 for t in recent if t.get("error") == "abandoned")
             lines += [
                 "",
-                f" {served} SERVED · {scratch} SCRATCH miss · {burnt} BURNT · {walked} WALKED OUT",
+                f" {DONE_WORD} {up} · {FAILED_WORD} {dropped} · {ABANDONED_WORD} {walked}"
+                f" · SCRATCH {scratch} miss",
             ]
             oldest = min(t.get("ts") or now for t in recent)
             self.border_subtitle = f"since {local_time(oldest)[:5]} · {span_text(now - oldest)}"
@@ -953,9 +962,7 @@ class LinePanel(Vertical):
         holders = engine.get("holders") or 0
         c = engine.get("prompt_cache") or {}
         resident = (c.get("resident_bytes") or 0) / (1 << 30)
-        served = sum(1 for t in recent if not t.get("error"))
-        burnt = sum(1 for t in recent if t.get("error") and t.get("error") != "abandoned")
-        cancelled = sum(1 for t in recent if t.get("error") == "abandoned")
+        up, dropped, walked = turn_tallies(recent)
         word = engine_word(engine)
         literal = (
             "loaded" if engine.get("loaded") else "loading" if engine.get("loading") else "unloaded"
@@ -986,13 +993,15 @@ class LinePanel(Vertical):
             ]
             # `size` is the content box: the sprite's three rows come off it.
             # The tickets block needs three more rows than the wide layout
-            # leaves once the rate panel has taken its five.
+            # leaves once the rate panel has taken its five. Tasks and turns
+            # are two different populations, so each keeps its own row and
+            # its own vocabulary rather than sharing one heading.
             if self.size.height - 3 >= len(lines) + 3:
                 lines += [
-                    "",
-                    f" TICKETS  ON RAIL {queue.get('queued', 0)}"
+                    f" {'TASKS':<8}ON RAIL {queue.get('queued', 0)}"
                     f" · COOKING {queue.get('running', 0)}",
-                    f" SERVED {served} · BURNT {burnt} · 86'D {cancelled}",
+                    f" {'ORDERS':<8}{DONE_WORD} {up} · {FAILED_WORD} {dropped}",
+                    f" {'':<8}{ABANDONED_WORD} {walked}",
                 ]
             self.query_one("#line-body", Static).update("\n".join(lines))
         idle = engine.get("idle_seconds")
@@ -1038,7 +1047,9 @@ class Rail(DataTable):
 
     def set_columns(self, columns: tuple[str, ...], screen_width: int) -> None:
         """The columns for a screen width; `why` takes what the others leave
-        (the table's own padding costs two cells per column)."""
+        (the table's own padding costs two cells per column). A resize
+        rebuilds the rows on the spot: a pause holds back new data, it
+        never blanks what is already on screen."""
         widths = {name: RAIL_WIDTHS[name] for name in columns}
         used = sum(w + 2 for name, w in widths.items() if name != "why")
         widths["why"] = max(RAIL_WIDTHS["why"], screen_width - 2 - used - 2)
@@ -1049,12 +1060,17 @@ class Rail(DataTable):
         for name in columns:
             self.add_column(Text(name, style=SLATE), width=widths[name], key=name)
         self._shown = []
+        self._rebuild(self._pending if self._pending is not None else self.turns)
 
     def show(self, turns: list[dict]) -> list[str]:
         """Rebuild when the set of ids changed; returns the ids that are new."""
         if self.paused:
             self._pending = turns
             return []
+        return self._rebuild(turns)
+
+    def _rebuild(self, turns: list[dict]) -> list[str]:
+        """Redraw every row from `turns`; returns the ids that are new."""
         ids = [t.get("id") or "" for t in turns]
         if ids == self._shown:
             return []
@@ -1178,6 +1194,17 @@ def ticket_text(turn: dict) -> str:
     return "\n".join(f" {k:<26} {v}" for k, v in rows)
 
 
+def _slip_phase_css() -> str:
+    """One `#slip.phase-<phase>` rule per phase, in that phase's own accent
+    from `PHASE_COLOURS` — built outside the class's CSS f-string so the
+    literal braces there stay readable."""
+    return "\n    ".join(
+        f"#slip.phase-{phase} {{ border: dashed {colour}; border-title-color: {colour}; "
+        f"border-subtitle-color: {colour}; }}"
+        for phase, colour in PHASE_COLOURS.items()
+    )
+
+
 class Top(App[int]):
     """`sous top`."""
 
@@ -1189,6 +1216,7 @@ class Top(App[int]):
     #slip {{ height: 1fr; border: dashed {PURPLE}; border-title-color: {PURPLE};
              border-title-style: bold; border-subtitle-color: {PURPLE};
              border-subtitle-align: center; }}
+    {_slip_phase_css()}
     #slip.stalled {{ border: dashed {SLATE}; border-title-color: {SLATE};
                      border-subtitle-color: {SLATE}; }}
     #slip.settling {{ border: dashed {SLATE}; }}

@@ -319,6 +319,19 @@ def _plain(app, selector: str) -> str:
     return app.query_one(selector).render().plain
 
 
+async def _until(pilot, predicate, *, ceiling: float = 1.5, step: float = 0.01) -> None:
+    """Poll `predicate` every `step` seconds until it is true or `ceiling`
+    passes, so a test that samples a tween, a highlight or a flash is not
+    pinned to one exact instant. The caller repeats the same check in its
+    own assertion right after this returns, so a tween, highlight or flash
+    that never happens still fails the test — this only stops a slow run
+    from missing a real one."""
+    elapsed = 0.0
+    while not predicate() and elapsed < ceiling:
+        await pilot.pause(step)
+        elapsed += step
+
+
 def test_the_slip_shows_the_turn_from_the_document():
     async def test(app, pilot, feed, clock):
         behind = _turn(
@@ -331,6 +344,10 @@ def test_the_slip_shows_the_turn_from_the_document():
         slip = app.query_one(tui.Slip)
         assert slip.display and slip.border_title == "ORDER № msg_f4cfe7"
         assert slip.has_class("phase-decode") and slip.border_subtitle == "tear here"
+        # The first document also looks like a phase change (there was no
+        # prior phase), so the settling step's slate can still be showing.
+        await _until(pilot, lambda: not slip.has_class("settling"))
+        assert slip.styles.border_top[1].hex.upper() == tui.PHASE_COLOURS["decode"]
         headline = _plain(app, "#headline")
         assert headline.startswith(" PLATING  decode 412 tok") and "00:41.3" in headline
         assert headline.rstrip().endswith("ETA 01:02")
@@ -345,6 +362,10 @@ def test_the_slip_shows_the_turn_from_the_document():
         line = _plain(app, "#line-engine")
         assert line.startswith("  LINE IS OPEN  loaded") and "hold 1" in line
         assert "REHEAT  41 hit    DRAWER 18 fork" in _plain(app, "#line-body")
+        body = _plain(app, "#line-body")
+        assert " TASKS   ON RAIL 2 · COOKING 1" in body
+        assert " ORDERS  ORDER UP 3 · DROPPED IT 1" in body
+        assert "         WALKED OUT 1" in body
         assert app.query_one("#line-chef", tui.Chef).mood == "decode"
         assert "HI-SCORE 10.5 tok/s" in app.query_one(tui.Strip).render().plain
         assert app.query_one(tui.Rail).row_count == 5
@@ -415,7 +436,7 @@ def test_a_quiet_kitchen_shows_the_card_and_stops_the_ticker():
         assert "KITCHEN QUIET  no orders on the rail for 4m 12s" in body
         assert "LIGHTS OUT in 25m 48s   idle unload at 30m" in body
         assert "HI-SCORE 10.5 tok/s  best plate rate today, set" in body
-        assert "3 SERVED · 1 SCRATCH miss · 1 BURNT · 1 WALKED OUT" in body
+        assert "ORDER UP 3 · DROPPED IT 1 · WALKED OUT 1 · SCRATCH 1 miss" in body
         assert "s o u s" not in body and "▒▒▒▒▒" in _plain(app, "#card-art")
         assert app.query_one("#card-chef", tui.Chef).mood in ("done", "quiet")
         assert "KITCHEN QUIET 4m 12s" in app.query_one(tui.Strip).render().plain
@@ -513,6 +534,15 @@ def test_keys_pause_the_rail_open_the_overlays_and_quit():
         await pilot.press("p")
         await pilot.pause()
         assert rail.paused and "paused" in app.query_one("#gingham").render().plain
+        # A resize while paused reflows the columns but must not blank the
+        # book: the pause holds back new data, it never blanks what is
+        # already on screen.
+        before_rows, first_ticket = rail.row_count, rail.get_row_at(0)[1]
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause(0.15)
+        assert rail.row_count == before_rows and rail.get_row_at(0)[1] == first_ticket
+        await pilot.resize_terminal(100, 30)
+        await pilot.pause(0.15)
         await _deliver(feed, pilot, _doc(_turn(), recent=RECENT))
         assert rail.row_count == 2
         await pilot.press("p")
@@ -541,6 +571,9 @@ def test_keys_pause_the_rail_open_the_overlays_and_quit():
         await pilot.pause()
         assert isinstance(app.screen, tui.Overlay)
         assert app.screen.query_one("#overlay").border_title == "ORDER № msg_000000"
+        # The DataTable's own enter binding and the App's must not both open
+        # a ticket: exactly one Overlay reaches the stack, not two stacked.
+        assert sum(isinstance(s, tui.Overlay) for s in app.screen_stack) == 1
         await pilot.press("escape")
         await pilot.pause()
         await pilot.press("m")
@@ -596,9 +629,10 @@ def test_the_plate_gauge_tweens_to_the_fed_value_and_snaps_without_motion():
         await pilot.wait_for_animation()
         assert plate.fraction == pytest.approx(100 / 1024)
         await feed.queue.put(_doc(_turn(generated_tokens=900)))
-        await pilot.pause(0.03)
+        start, target = 100 / 1024, 900 / 1024
+        await _until(pilot, lambda: start < plate.fraction < target)
         mid = plate.fraction
-        assert 100 / 1024 < mid < 900 / 1024, "the bar is between the two values mid-tween"
+        assert start < mid < target, "the bar is between the two values mid-tween"
         await pilot.wait_for_animation()
         assert plate.fraction == pytest.approx(900 / 1024)
         app.motion = False
@@ -614,12 +648,17 @@ def test_a_phase_change_ramps_through_the_settling_step():
         prefill = _turn(phase="prefill", generated_tokens=0, decode_tps=None, eta_seconds=3.0)
         await _deliver(feed, pilot, _doc(prefill))
         slip = app.query_one(tui.Slip)
+        # The very first document also looks like a phase change (there was
+        # no prior phase), so it ramps through the same settling step.
+        await _until(pilot, lambda: not slip.has_class("settling"))
         assert slip.has_class("phase-prefill") and not slip.has_class("settling")
         await feed.queue.put(_doc(_turn()))
-        await pilot.pause(0.03)
+        await _until(pilot, lambda: slip.has_class("phase-decode") and slip.has_class("settling"))
         assert slip.has_class("phase-decode") and slip.has_class("settling")
-        await pilot.pause(0.2)
+        assert slip.styles.border_top[1].hex.upper() == tui.SLATE
+        await _until(pilot, lambda: not slip.has_class("settling"))
         assert not slip.has_class("settling")
+        assert slip.styles.border_top[1].hex.upper() == tui.PHASE_COLOURS["decode"]
         await _deliver(feed, pilot, _doc(_turn(generated_tokens=500)))
         assert not slip.has_class("settling")
         app.motion = False
@@ -635,14 +674,20 @@ def test_a_new_ticket_on_the_rail_is_highlighted_then_settles():
         await _deliver(feed, pilot, _doc(_turn(), recent=RECENT[1:]))
         rail = app.query_one(tui.Rail)
         assert not isinstance(rail.get_row(RECENT[1]["id"])[0], Text)
+
+        def cell_style() -> str | None:
+            if RECENT[0]["id"] not in rail._shown:
+                return None
+            cell = rail.get_row(RECENT[0]["id"])[0]
+            return str(cell.style) if isinstance(cell, Text) else None
+
         await feed.queue.put(_doc(_turn(), recent=RECENT))
-        await pilot.pause(0.03)
-        cell = rail.get_row(RECENT[0]["id"])[0]
-        assert isinstance(cell, Text) and str(cell.style) == "reverse"
+        await _until(pilot, lambda: cell_style() == "reverse")
+        assert cell_style() == "reverse"
         assert not isinstance(rail.get_row(RECENT[1]["id"])[0], Text)
-        await pilot.pause(0.12)
-        assert str(rail.get_row(RECENT[0]["id"])[0].style) == "bold"
-        await pilot.pause(0.15)
+        await _until(pilot, lambda: cell_style() == "bold")
+        assert cell_style() == "bold"
+        await _until(pilot, lambda: cell_style() is None)
         assert not isinstance(rail.get_row(RECENT[0]["id"])[0], Text)
         assert str(rail.get_row(RECENT[0]["id"])[2].style) == tui.TEAL
         app.motion = False
@@ -660,9 +705,9 @@ def test_a_miss_or_a_pressure_eviction_flashes_the_line_once():
         bumped = _doc(_turn())
         bumped["engine"]["prompt_cache"]["misses"] += 1
         await feed.queue.put(bumped)
-        await pilot.pause(0.03)
+        await _until(pilot, lambda: line.has_class("flash"))
         assert line.has_class("flash") and line.styles.border_top[1].hex.upper() == tui.PINK
-        await pilot.pause(0.35)
+        await _until(pilot, lambda: not line.has_class("flash"))
         assert not line.has_class("flash") and line.styles.border_top[1].hex.upper() == tui.TEAL
         app.motion = False
         quiet = _doc(_turn())
