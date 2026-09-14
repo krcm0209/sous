@@ -159,6 +159,7 @@ def test_routes_are_absent_when_the_gateway_is_disabled(tmp_path: Path):
     app = _app(tmp_path, FakeEngine([]), gateway_enabled=False)
     assert _request(app, "HEAD", "/api/hello").status_code == 404
     assert _post(app, _body()).status_code == 404
+    assert _request(app, "GET", "/sous/status").status_code == 200  # the daemon's own routes stay
 
 
 def test_a_non_local_model_is_forwarded_byte_for_byte(tmp_path: Path):
@@ -196,8 +197,6 @@ def test_configured_local_models_are_all_served(tmp_path: Path):
 def test_host_header_must_be_loopback(tmp_path: Path):
     """Custom routes skip the /mcp transport's Host check; a page whose hostname
     re-resolves to 127.0.0.1 must not get to drive the local model."""
-    import sous.gateway.routes as routes
-
     app = _app(tmp_path, FakeEngine([]))
     for host in ("evil.example:8383", "evil.example"):
         r = _post(app, _body(), headers={"host": host})
@@ -205,7 +204,6 @@ def test_host_header_must_be_loopback(tmp_path: Path):
         assert _request(app, "HEAD", "/api/hello", headers={"host": host}).status_code == 403
     for host in ("127.0.0.1:8383", "localhost", "[::1]:8383", "[::1]", "LOCALHOST:8383"):
         assert _request(app, "HEAD", "/api/hello", headers={"host": host}).status_code == 200
-    assert set(routes._ALLOWED_HOSTS) == {"127.0.0.1", "localhost", "[::1]"}
 
 
 def test_a_foreign_origin_is_rejected_before_the_model_is_touched(tmp_path: Path):

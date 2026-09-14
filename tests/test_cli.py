@@ -1,4 +1,5 @@
 import errno
+import json
 import os
 import plistlib
 import socket
@@ -829,10 +830,16 @@ _DEFAULT_STATUS = object()
 
 
 def _status(**gateway) -> dict:
-    """What the running daemon reports about itself — the shape of
-    SousService.server_status()["config"]["gateway"], which is what the
-    launcher reads instead of trusting the config file."""
+    """The shape of `GET /sous/status` — `SousService.server_status()` — of
+    which the launcher reads `config.gateway` for its checks and
+    `model.model_id` for its one line."""
     return {
+        "model": {
+            "model_id": "mlx-community/Qwen3.8-27B-4bit",
+            "loaded": True,
+            "loading": False,
+            "holders": 0,
+        },
         "config": {
             "gateway": {
                 "enabled": True,
@@ -841,7 +848,7 @@ def _status(**gateway) -> dict:
                 "upstream_url": "https://api.anthropic.com",
                 **gateway,
             }
-        }
+        },
     }
 
 
@@ -870,7 +877,13 @@ def _claude_setup(tmp_path, monkeypatch, *, status=_DEFAULT_STATUS, **overrides)
         cli.shutil, "which", lambda name: "/opt/bin/claude" if name == "claude" else None
     )
     answer = _status() if status is _DEFAULT_STATUS else status
-    monkeypatch.setattr(cli, "_daemon_status", lambda port: answer)
+    monkeypatch.setattr(cli, "_daemon_status", lambda port, data_dir: answer)
+    holds: list[int] = []
+    monkeypatch.setattr(
+        cli,
+        "_hold",
+        lambda port: (holds.append(port), {"loaded": True, "loading": False, "holders": 1})[1],
+    )
     for var in (
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_API_KEY",
@@ -880,7 +893,7 @@ def _claude_setup(tmp_path, monkeypatch, *, status=_DEFAULT_STATUS, **overrides)
         monkeypatch.delenv(var, raising=False)
     calls: list[tuple] = []
     monkeypatch.setattr(os, "execve", lambda exe, argv, env: calls.append((exe, argv, env)))
-    return cfg, calls
+    return cfg, calls, holds
 
 
 def test_claude_argv_appends_the_lsp_opt_out_unless_the_user_chose_their_own():
@@ -945,7 +958,7 @@ def test_claude_env_sets_the_gateway_variables_and_nothing_credential_shaped():
 def test_claude_execs_claude_with_the_gateway_environment(tmp_path, capsys, monkeypatch):
     from sous import cli
 
-    cfg, calls = _claude_setup(tmp_path, monkeypatch)
+    cfg, calls, _ = _claude_setup(tmp_path, monkeypatch)
     cli.main(["claude", "-p", "hi"])
     [(exe, argv, env)] = calls
     assert exe == "/opt/bin/claude"
@@ -968,7 +981,7 @@ def test_claude_passes_every_argument_through_including_help(tmp_path, monkeypat
     help, and a leading option is not sous's to reject."""
     from sous import cli
 
-    _, calls = _claude_setup(tmp_path, monkeypatch)
+    _, calls, _ = _claude_setup(tmp_path, monkeypatch)
     cli.main(["claude", "--help"])
     cli.main(["claude", "--model", "opus", "--verbose"])
     assert calls[0][1] == ["/opt/bin/claude", "--help", "--disallowedTools", "LSP"]
@@ -987,7 +1000,7 @@ def test_claude_warns_about_a_credential_variable_but_still_launches(tmp_path, c
     subscription to API-credit billing, and that is the user's call to make."""
     from sous import cli
 
-    _, calls = _claude_setup(tmp_path, monkeypatch)
+    _, calls, _ = _claude_setup(tmp_path, monkeypatch)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-canary")
     cli.main(["claude"])
     assert len(calls) == 1
@@ -1006,7 +1019,7 @@ def test_claude_warns_about_an_inherited_tier_variable_but_still_launches(
     secret) and say what it costs — then launch."""
     from sous import cli
 
-    _, calls = _claude_setup(tmp_path, monkeypatch)
+    _, calls, _ = _claude_setup(tmp_path, monkeypatch)
     monkeypatch.setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "sous-local")
     cli.main(["claude"])
     assert len(calls) == 1
@@ -1024,7 +1037,7 @@ def test_claude_refuses_when_the_running_daemon_has_the_gateway_off(tmp_path, ca
     until it restarts."""
     from sous import cli
 
-    _, calls = _claude_setup(tmp_path, monkeypatch, status=_status(enabled=False))
+    _, calls, _ = _claude_setup(tmp_path, monkeypatch, status=_status(enabled=False))
     with pytest.raises(SystemExit) as exc:
         cli.main(["claude"])
     assert exc.value.code == 1 and calls == []
@@ -1035,26 +1048,13 @@ def test_claude_refuses_when_the_running_daemon_has_the_gateway_off(tmp_path, ca
 def test_claude_refuses_when_no_daemon_answers(tmp_path, capsys, monkeypatch):
     from sous import cli
 
-    _, calls = _claude_setup(tmp_path, monkeypatch, status=None)
+    _, calls, _ = _claude_setup(tmp_path, monkeypatch, status=None)
+    monkeypatch.setattr(cli, "_port_open", lambda port: False)
     with pytest.raises(SystemExit) as exc:
         cli.main(["claude"])
     assert exc.value.code == 1 and calls == []
-    assert "sous serve" in capsys.readouterr().err
-
-
-def test_claude_refuses_a_pre_routing_daemon(tmp_path, capsys, monkeypatch):
-    """A Phase 1 daemon reports its gateway without an upstream_url: it serves
-    the local model and 404s everything else, so the main loop of the session
-    about to be launched could not run at all."""
-    from sous import cli
-
-    status = _status()
-    del status["config"]["gateway"]["upstream_url"]
-    _, calls = _claude_setup(tmp_path, monkeypatch, status=status)
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["claude"])
-    assert exc.value.code == 1 and calls == []
-    assert "reinstall" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "no daemon" in err and "sous serve" in err
 
 
 def test_claude_uses_the_daemons_values_and_says_so_when_the_file_disagrees(
@@ -1065,7 +1065,7 @@ def test_claude_uses_the_daemons_values_and_says_so_when_the_file_disagrees(
     drift from the file is reported rather than silently applied."""
     from sous import cli
 
-    _, calls = _claude_setup(
+    _, calls, _ = _claude_setup(
         tmp_path,
         monkeypatch,
         status=_status(local_models=["sous-fast"], max_context_tokens=131072),
@@ -1084,7 +1084,7 @@ def test_claude_uses_the_daemons_values_and_says_so_when_the_file_disagrees(
 def test_claude_refuses_without_the_claude_binary(tmp_path, capsys, monkeypatch):
     from sous import cli
 
-    _, calls = _claude_setup(tmp_path, monkeypatch)
+    _, calls, _ = _claude_setup(tmp_path, monkeypatch)
     monkeypatch.setattr(cli.shutil, "which", lambda name: None)
     with pytest.raises(SystemExit) as exc:
         cli.main(["claude"])
@@ -1092,10 +1092,315 @@ def test_claude_refuses_without_the_claude_binary(tmp_path, capsys, monkeypatch)
     assert "PATH" in capsys.readouterr().err
 
 
+class _FakeSousHTTP:
+    """A daemon that speaks only the two /sous/ routes, over a real socket:
+    the launcher's HTTP client is under test, so no transport is faked."""
+
+    def __init__(
+        self,
+        status: dict | None,
+        status_code: int = 200,
+        hold_code: int = 200,
+        raw: bytes | None = None,
+    ):
+        """`raw`, when given, is sent verbatim (with the status code) for both
+        routes: what a wrong daemon on the port might answer."""
+        import http.server
+
+        self.holds: list[dict] = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:  # quiet
+                pass
+
+            def _send(self, code: int, payload: bytes) -> None:
+                self.send_response(code)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def _reply(self, code: int, body: dict) -> None:
+                self._send(code, raw if raw is not None else json.dumps(body).encode())
+
+            def do_GET(self) -> None:
+                if self.path == "/sous/status" and status_code == 200:
+                    self._reply(200, status or {})
+                else:
+                    error = {"type": "error", "error": {"type": "not_found_error", "message": ""}}
+                    self._reply(status_code, error)
+
+            def do_POST(self) -> None:
+                if self.path != "/sous/hold":
+                    error = {"type": "error", "error": {"type": "not_found_error", "message": ""}}
+                    self._reply(404, error)
+                    return
+                length = int(self.headers.get("content-length", "0"))
+                outer.holds.append(json.loads(self.rfile.read(length)))
+                self._reply(hold_code, {"loaded": False, "loading": True, "holders": 1})
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        # serve_forever notices shutdown() once per poll; the default half
+        # second would be most of each test's time.
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def test_daemon_status_reads_sous_status_over_http(tmp_path):
+    from sous import cli
+
+    fake = _FakeSousHTTP(_status())
+    try:
+        assert cli._daemon_status(fake.port, tmp_path) == _status()
+    finally:
+        fake.close()
+
+
+def test_loopback_calls_ignore_a_configured_proxy(tmp_path, monkeypatch):
+    """The daemon is loopback; a stray HTTP_PROXY/ALL_PROXY (no matching
+    no_proxy) must never route _daemon_status or _hold through it, or see
+    the hold body — same rule as gateway/upstream.py's trust_env=False."""
+    from sous import cli
+
+    monkeypatch.setenv("HTTP_PROXY", "http://10.255.255.1:9")
+    monkeypatch.setenv("HTTPS_PROXY", "http://10.255.255.1:9")
+    monkeypatch.setenv("ALL_PROXY", "http://10.255.255.1:9")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+
+    fake = _FakeSousHTTP(_status())
+    try:
+        assert cli._daemon_status(fake.port, tmp_path) == _status()
+        assert cli._hold(fake.port) == {"loaded": False, "loading": True, "holders": 1}
+    finally:
+        fake.close()
+
+
+def _held_daemon_lock(data_dir: Path):
+    """The flock a live daemon holds, taken in-process: flock is per open
+    file description, so _lock_is_held's own open of the same file sees it."""
+    import fcntl
+
+    handle = (data_dir / "daemon.lock").open("wb")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return handle
+
+
+def test_daemon_status_treats_a_404_from_the_lock_holder_as_a_daemon_that_predates_this_cli(
+    tmp_path, capsys
+):
+    """An older daemon has no /sous/status: with the gateway on it forwards
+    the path upstream and relays the API's 404, with it off Starlette 404s.
+    Either way the answer is restart, not a fallback to MCP — and it is a
+    daemon that answered, because one holds the lock."""
+    from sous import cli
+
+    fake = _FakeSousHTTP(None, status_code=404)
+    lock = _held_daemon_lock(tmp_path)
+    try:
+        with pytest.raises(SystemExit) as exc:
+            cli._daemon_status(fake.port, tmp_path)
+    finally:
+        lock.close()
+        fake.close()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "predates this CLI" in err and "sous stop" in err and "sous serve" in err
+
+
+def test_daemon_status_names_a_404_from_something_that_is_not_sous(tmp_path, capsys):
+    """Any HTTP server 404s an unknown path. With no daemon holding the lock,
+    'restart the daemon' would send the user to stop a daemon that is not
+    there; the port is what has to change."""
+    from sous import cli
+
+    fake = _FakeSousHTTP(None, status_code=404)
+    try:
+        with pytest.raises(SystemExit) as exc:
+            cli._daemon_status(fake.port, tmp_path)
+    finally:
+        fake.close()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "not a sous daemon" in err and "[server].port" in err
+    assert "predates" not in err
+
+
+def test_daemon_status_reports_a_listener_that_does_not_answer(tmp_path, capsys):
+    from sous import cli
+
+    fake = _FakeSousHTTP(None, status_code=500)
+    try:
+        assert cli._daemon_status(fake.port, tmp_path) is None
+    finally:
+        fake.close()
+    err = capsys.readouterr().err
+    assert "did not answer /sous/status" in err and "500" in err
+
+
+def test_daemon_status_is_none_when_nothing_listens(tmp_path):
+    from sous import cli
+
+    assert cli._daemon_status(1, tmp_path) is None  # port 1: never up
+
+
+def test_a_status_that_is_not_json_is_a_daemon_that_does_not_answer(tmp_path, capsys):
+    """Something else on the port — a 200 that is not the document."""
+    from sous import cli
+
+    fake = _FakeSousHTTP(None, raw=b"<html>nope</html>")
+    try:
+        assert cli._daemon_status(fake.port, tmp_path) is None
+    finally:
+        fake.close()
+    assert "did not answer /sous/status" in capsys.readouterr().err
+
+
+def test_a_reply_past_the_size_cap_is_a_daemon_that_does_not_answer(tmp_path, capsys):
+    """httpx would buffer whatever the listener sends; the launcher reads
+    under a cap, since what holds the port need not be the daemon."""
+    from sous import cli
+
+    fake = _FakeSousHTTP(None, raw=b"[" + b"1," * cli._REPLY_LIMIT + b"1]")
+    try:
+        assert cli._daemon_status(fake.port, tmp_path) is None
+        assert cli._hold(fake.port) is None
+    finally:
+        fake.close()
+    err = capsys.readouterr().err
+    assert "did not answer /sous/status (ReadError)" in err
+    assert "could not hold the model (ReadError)" in err
+
+
+def test_a_hold_that_cannot_read_its_own_process_warns_and_returns_none(monkeypatch, capsys):
+    """Everything a hold needs is inside its warning path, psutil included:
+    the session works without the hold, so nothing here may stop the launch."""
+    import psutil
+
+    from sous import cli
+
+    def denied(pid=None):
+        raise psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(psutil, "Process", denied)
+    assert cli._hold(1) is None
+    assert "could not hold the model (AccessDenied); launching anyway" in capsys.readouterr().err
+
+
+def test_hold_posts_this_process_and_returns_the_daemons_answer():
+    import psutil
+
+    from sous import cli
+
+    fake = _FakeSousHTTP(_status())
+    try:
+        assert cli._hold(fake.port) == {"loaded": False, "loading": True, "holders": 1}
+    finally:
+        fake.close()
+    [body] = fake.holds
+    assert body["pid"] == os.getpid()
+    assert abs(body["create_time"] - psutil.Process().create_time()) < 1.0
+    assert set(body) == {"pid", "create_time"}
+
+
+def test_a_refused_hold_warns_and_returns_none(capsys):
+    from sous import cli
+
+    fake = _FakeSousHTTP(_status(), hold_code=500)
+    try:
+        assert cli._hold(fake.port) is None
+    finally:
+        fake.close()
+    err = capsys.readouterr().err
+    assert "warning" in err and "hold" in err and "launching anyway" in err
+
+
+def test_a_hold_answered_with_something_that_is_not_an_object_warns(capsys):
+    from sous import cli
+
+    fake = _FakeSousHTTP(_status(), raw=b"[1, 2]")
+    try:
+        assert cli._hold(fake.port) is None
+    finally:
+        fake.close()
+    assert "unexpected answer" in capsys.readouterr().err
+
+
+def test_claude_holds_the_model_after_the_checks_and_says_so(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    _, calls, holds = _claude_setup(tmp_path, monkeypatch)
+    cli.main(["claude"])
+    assert holds == [8383] and len(calls) == 1
+    err = capsys.readouterr().err
+    assert (
+        "sous claude: mlx-community/Qwen3.8-27B-4bit already loaded; held while this session runs"
+        in err
+    )
+
+
+def test_claude_reports_a_preload(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    _, calls, _ = _claude_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "_hold", lambda port: {"loaded": False, "loading": True, "holders": 1})
+    cli.main(["claude"])
+    assert len(calls) == 1
+    assert (
+        "sous claude: preloading mlx-community/Qwen3.8-27B-4bit; held while this session runs"
+        in (capsys.readouterr().err)
+    )
+
+
+def test_claude_launches_even_when_the_hold_is_refused(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    _, calls, _ = _claude_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "_hold", lambda port: None)
+    cli.main(["claude", "-p", "hi"])
+    [(exe, argv, env)] = calls
+    assert argv == ["/opt/bin/claude", "-p", "hi", "--disallowedTools", "LSP"]
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8383"
+    assert "held while this session runs" not in capsys.readouterr().err
+
+
+def test_claude_does_not_hold_when_a_check_fails(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    _, calls, holds = _claude_setup(tmp_path, monkeypatch, status=_status(enabled=False))
+    with pytest.raises(SystemExit):
+        cli.main(["claude"])
+    assert holds == [] and calls == []
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h", "--version", "-v"])
+def test_claude_does_not_hold_for_an_invocation_that_exits_at_once(
+    tmp_path, capsys, monkeypatch, flag
+):
+    """A hold for `claude --version` would start a multi-minute load nobody
+    waits for and, once the process is gone, restart the idle clock under
+    weights nobody is using. The preflight still runs; only the hold is skipped."""
+    from sous import cli
+
+    _, calls, holds = _claude_setup(tmp_path, monkeypatch)
+    cli.main(["claude", flag])
+    assert holds == [] and len(calls) == 1
+    assert calls[0][1] == ["/opt/bin/claude", flag, "--disallowedTools", "LSP"]
+    assert "held while this session runs" not in capsys.readouterr().err
+
+
 @pytest.mark.slow
 def test_daemon_status_reads_the_real_daemons_gateway_config(tmp_path):
-    """The launcher's one source of truth, against the real server: an MCP
-    call to server_status over streamable HTTP, and None when nothing is
+    """The launcher's one source of truth, against the real server: a plain
+    GET /sous/status on the daemon's port, and None when nothing is
     listening."""
     import contextlib
     from collections.abc import Iterator
@@ -1131,7 +1436,7 @@ def test_daemon_status_reads_the_real_daemons_gateway_config(tmp_path):
     app = create_server(TaskStore(tmp_path / "tasks.db"), engines, cfg).streamable_http_app()
     port = _free_cli_port()
     with serve(app, port):
-        status = _daemon_status(port)
+        status = _daemon_status(port, tmp_path)
     assert status is not None
     assert status["config"]["gateway"] == {
         "enabled": True,
@@ -1140,4 +1445,66 @@ def test_daemon_status_reads_the_real_daemons_gateway_config(tmp_path):
         "upstream_url": "https://api.anthropic.com",
     }
     # Nothing listening on that port any more.
-    assert _daemon_status(port) is None
+    assert _daemon_status(port, tmp_path) is None
+
+
+def test_claude_skips_the_hold_for_an_exit_at_once_flag_anywhere_before_a_double_dash(
+    tmp_path, capsys, monkeypatch
+):
+    """Claude Code honours --version and --help after other options too, so
+    `--model opus --version` exits at once; after a `--` the same string is
+    prompt text, and that session is held like any other."""
+    from sous import cli
+
+    _, calls, holds = _claude_setup(tmp_path, monkeypatch)
+    cli.main(["claude", "--model", "opus", "--version"])
+    assert holds == [] and len(calls) == 1
+    cli.main(["claude", "-p", "--", "--help"])
+    assert holds == [8383] and len(calls) == 2
+
+
+def test_claude_refuses_a_status_document_without_the_gateway_values(tmp_path, capsys, monkeypatch):
+    """A 200 that is an object but not the document: a KeyError traceback
+    would name nothing the user can act on."""
+    from sous import cli
+
+    status = _status()
+    del status["config"]["gateway"]["local_models"]
+    _, calls, holds = _claude_setup(tmp_path, monkeypatch, status=status)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["claude"])
+    assert exc.value.code == 1 and calls == [] and holds == []
+    err = capsys.readouterr().err
+    assert "unexpected document" in err and "sous serve" in err
+
+
+def test_claude_tells_a_listener_that_did_not_answer_from_no_daemon(tmp_path, capsys, monkeypatch):
+    """`sous serve` against a bound port fails on the daemon lock, so the
+    advice for a listener that did not answer is a restart, not a start."""
+    from sous import cli
+
+    _, calls, _ = _claude_setup(tmp_path, monkeypatch, status=None)
+    monkeypatch.setattr(cli, "_port_open", lambda port: True)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["claude"])
+    assert exc.value.code == 1 and calls == []
+    err = capsys.readouterr().err
+    assert "did not answer as a sous daemon" in err and "sous stop" in err
+    assert "no daemon" not in err
+
+
+def test_claude_reports_a_hold_that_is_neither_loaded_nor_loading(tmp_path, capsys, monkeypatch):
+    """The daemon could not start its preload thread: the hold stands, the
+    first turn loads, and the line says so rather than claiming a load."""
+    from sous import cli
+
+    _, calls, _ = _claude_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        cli, "_hold", lambda port: {"loaded": False, "loading": False, "holders": 1}
+    )
+    cli.main(["claude"])
+    assert len(calls) == 1
+    assert (
+        "sous claude: mlx-community/Qwen3.8-27B-4bit not loaded yet; held while this session runs"
+        in capsys.readouterr().err
+    )

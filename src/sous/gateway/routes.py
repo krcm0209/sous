@@ -19,7 +19,6 @@ import re
 import threading
 import time
 from collections.abc import AsyncIterator
-from urllib.parse import urlsplit
 
 from mcp.server import MCPServer
 from sse_starlette import EventSourceResponse, ServerSentEvent
@@ -43,6 +42,7 @@ from sous.gateway.turn import (
     TurnRunner,
 )
 from sous.gateway.upstream import SynthesizedError, Upstream
+from sous.loopback import check_loopback
 from sous.protocol import ToolSet
 
 # Anthropic's own request cap. The MCP transport's 4 MiB limit wraps only the
@@ -81,19 +81,6 @@ MAX_PENDING_COUNTS = 8
 # says "\n" so the whole stream is one canonical shape.
 _SEP = "\n"
 _PING = ServerSentEvent(event="ping", data='{"type": "ping"}', sep=_SEP)
-
-# Custom routes get none of the Host validation the /mcp transport applies to
-# loopback binds; without it a web page whose hostname re-resolves to
-# 127.0.0.1 could drive the local model. Same allow-list as the SDK's.
-_ALLOWED_HOSTS = ("127.0.0.1", "localhost", "[::1]")
-# The SDK checks Origin as well, and Host alone does not cover what it covers:
-# a cross-origin fetch with Content-Type: text/plain is a CORS simple request,
-# so it skips the preflight and arrives with a perfectly legitimate loopback
-# Host. The page cannot read the reply, but the turn it starts holds the
-# gateway lock, the engine lock and a prompt-cache slot for a whole generation
-# timeout — a drive-by DoS of the daemon. urlsplit unwraps the IPv6 brackets a
-# netloc carries, so these are bare addresses.
-_ALLOWED_ORIGIN_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 # How much of the dropped-tool set the log names. Anthropic's identifiers are
 # short and few, so these bounds only ever bite on a client sending junk.
@@ -294,32 +281,6 @@ def _check_depth(body: object) -> None:
         )
 
 
-def _check_loopback(request: Request) -> None:
-    """Host and Origin, the pair the /mcp transport checks on a loopback bind."""
-    host = request.headers.get("host", "").lower()
-    # Strip the port; an IPv6 literal keeps its brackets.
-    if host.startswith("[") and "]" in host:
-        host = host[: host.index("]") + 1]
-    else:
-        host = host.split(":", 1)[0]
-    if host not in _ALLOWED_HOSTS:
-        raise RequestError(403, "permission_error", "the gateway serves loopback hosts only")
-    # Only a browser sends Origin, and only a browser can be someone else's
-    # page: absent (Claude Code, httpx, curl) passes untouched. `null` — a
-    # sandboxed frame or a file:// page — has no hostname and is refused.
-    origin = request.headers.get("origin")
-    if origin is None:
-        return
-    try:
-        # An unbalanced IPv6 bracket makes urlsplit raise instead of
-        # returning; a malformed Origin is refused like any foreign one.
-        hostname = (urlsplit(origin).hostname or "").lower()
-    except ValueError:
-        hostname = ""
-    if hostname not in _ALLOWED_ORIGIN_HOSTS:
-        raise RequestError(403, "permission_error", "the gateway serves loopback origins only")
-
-
 def _frame(event: dict) -> ServerSentEvent:
     return ServerSentEvent(
         event=event["type"], data=json.dumps(event, separators=(",", ":")), sep=_SEP
@@ -426,7 +387,7 @@ class Gateway:
         /api/oauth/usage, event logging, whatever Claude Code adds next —
         streams through to the upstream untouched."""
         try:
-            _check_loopback(request)
+            check_loopback(request)
         except RequestError as e:
             return JSONResponse(e.body(), status_code=e.status)
         # /mcp/ is the MCP transport's path, not the upstream's: forwarding it
@@ -477,7 +438,7 @@ class Gateway:
     async def count_tokens(self, request: Request) -> Response:
         received = time.monotonic()
         try:
-            _check_loopback(request)
+            check_loopback(request)
             raw = await _read_body(request)
         except RequestError as e:
             return _log_refused("/v1/messages/count_tokens", e, received)
@@ -526,7 +487,7 @@ class Gateway:
     async def messages(self, request: Request) -> Response:
         received = time.monotonic()
         try:
-            _check_loopback(request)
+            check_loopback(request)
             raw = await _read_body(request)
         except RequestError as e:
             return _log_refused("/v1/messages", e, received)

@@ -200,6 +200,34 @@ and pinning it to the local window would make the frontier main loop compact
 far too early; the subagent's window is bounded by
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` instead.
 
+Before it execs, `sous claude` asks the daemon to keep the model loaded for
+the session: it `POST`s `/sous/hold` with its own process id and start time,
+and since `exec` keeps the process id, the holder *is* the Claude Code
+process. If nothing is loaded the daemon starts loading right away, on its
+own thread — the launcher prints `sous claude: preloading <model>; held
+while this session runs` (or `already loaded`) and does not wait, so the
+first subagent turn finds the weights resident or the load already under
+way instead of paying it. The daemon's idle sweep checks its holders on
+every poll between delegated tasks: when the `claude` process exits, the
+hold goes with it at the next sweep — within a second on an idle daemon; a
+delegated task in flight defers the sweep until it finishes — and the idle
+clock restarts from that moment, so quitting and relaunching inside
+`[model].idle_unload_minutes` never reloads either. A hold the daemon
+refuses is a warning, not a stop. Two caveats: a daemon restart forgets its
+holders (the model then unloads after `idle_unload_minutes` and the next
+subagent turn reloads it); and `sous claude --help`, `-h`, `--version` and
+`-v` skip the hold, while any other invocation that exits at once (`sous
+claude mcp list`, say) holds like a session — the load it may start is one
+nobody waits for, and the weights then stay resident for a fresh
+`idle_unload_minutes`.
+
+The preflight itself is plain HTTP: `GET /sous/status` on the daemon's port
+returns the same document the MCP `server_status` tool does. A `404` means
+the running daemon predates this CLI (the route did not exist); `sous
+claude` says so and exits 1 — restart the daemon from the same install
+(`sous stop`, then `sous serve` or `sous install-launchd`). There is no
+compatibility mode: the CLI and the daemon ship as one package.
+
 Forwarding is a plain HTTP/1.1 pass-through to `[gateway].upstream_url`
 (default `https://api.anthropic.com`): the request body goes up byte for
 byte; `Authorization`, `anthropic-beta`, `anthropic-version` and every header
@@ -296,6 +324,34 @@ turn gives up, stated plainly:
   the same text in the same place a frontier model without the feature would;
   nothing the model needs is lost, and the conversation stays a strict extension of the
   previous turn's, which is what keeps it warm.
+- **A shorter window, and Claude Code compacts inside it.** A frontier
+  subagent has a 200K-token window; a local one has
+  `[gateway].max_context_tokens` (131072 by default), which `sous claude`
+  passes as `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. Claude Code auto-compacts a
+  conversation when *its own* token count reaches the window minus its
+  output reserve (20K) minus a 13K buffer — 98K at the default window — and
+  its "precompute" variant fires earlier still, at a fraction of that it
+  takes from remote configuration. In practice a general-purpose subagent
+  compacts after four or five tool turns at 131072: one call to write the
+  summary (a warm hit, but a ~3.4K-token generation at the model's decode
+  speed — about 3.5 minutes on the default model) and one to continue from
+  it (the summary plus every re-attached file, ~30K tokens of prefill from
+  the tools fork), and the agent then reports from a summary of itself.
+  Nothing on the sous side changes this — both calls are served as cheaply
+  as their content allows — and none of Claude Code's compaction switches
+  (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `DISABLE_AUTO_COMPACT`,
+  `autoCompactEnabled`) is per-model: each would also change the frontier
+  main loop, so `sous claude` sets none of them. The lever is the window:
+  the default model's native context is 262144, and `max_context_tokens =
+  262144` moves the classic threshold to ~229K at the cost of one more
+  window of KV reserved out of the auto prompt-cache budget (8 GiB on the
+  default model — the ~27 GiB auto budget described under `prompt_cache_gb`
+  below becomes ~19 GiB on a 64 GB machine, still room for a tools fork
+  beside a retaining conversation). Where the
+  earlier precompute trigger lands at that window is not known until
+  measured: its fraction comes from Claude Code's remote configuration,
+  keyed by window size. Restart the daemon after the edit; `sous claude`
+  passes the running daemon's value.
 - **A client that disconnects does not stop the model.** A local turn runs to
   completion (so the next request never waits on a wedged lock); aborting
   mid-generation comes with batching, later. A forwarded stream, by contrast,
@@ -401,7 +457,8 @@ port = 8383
 
 [model]
 id = "mlx-community/Qwen3.8-27B-4bit"
-idle_unload_minutes = 30
+idle_unload_minutes = 30   # a live `sous claude` session pins the model; the clock
+                           # restarts when its last one exits
 max_context_tokens = 32768
 prompt_cache = true
 # Cache slots kept resident beyond the running turn: "auto" sizes them
@@ -467,6 +524,10 @@ max_context_tokens = 131072     # server-side limit on prompt + reply tokens for
                                 # running daemon's value of this (restart it after an edit);
                                 # without the launcher, set it yourself or a long subagent
                                 # conversation grows past it and fails with "prompt is too long".
+                                # Claude Code auto-compacts a local subagent once its own
+                                # count nears this minus ~33K (sooner with its precompute
+                                # trigger); 262144 — the default model's native length —
+                                # pushes that out at the cost of 8 GiB of prompt-cache budget.
 generation_timeout_minutes = 30
 ```
 
@@ -553,9 +614,11 @@ degrades to that on its own. Forks live as long as the weights do:
 `idle_unload_minutes` drops them with
 the model, so "every new session" means every new session inside that
 window.
-`server_status` reports `prompt_cache` — slots, resident bytes, hits, fork
-hits, retained and moved turn-slot takes, evictions and the subset the
-pressure valve took — counts only.
+`server_status` (and `GET /sous/status`, the same document over HTTP)
+reports `holders` (live `sous claude` sessions pinning the model), `loading`
+(a load in progress, a preload included) and `prompt_cache` — slots,
+resident bytes, hits, fork hits, retained and moved turn-slot takes,
+evictions and the subset the pressure valve took — counts only.
 
 `[model].int8_prefill` (default `false`) runs the prefill matmuls as INT8 activations
 against the checkpoint's packed 4-bit weights on the M5 GPU's neural accelerators

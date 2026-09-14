@@ -105,6 +105,524 @@ def test_get_logs_the_load_once_with_its_duration(caplog):
     assert lines[0].startswith("model_load seconds=") and lines[0].endswith(" model=fake/model")
 
 
+class _GatedFactory:
+    """A model factory that blocks until released, so a test can look at the
+    manager mid-load. `started` is set once the factory has been entered."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.created: list[FakeEngine] = []
+
+    def __call__(self, model_id: str) -> FakeEngine:
+        self.started.set()
+        assert self.release.wait(10)
+        engine = FakeEngine([])
+        self.created.append(engine)
+        return engine
+
+
+def _gated_manager(idle_minutes: int = 30) -> tuple[EngineManager, _GatedFactory]:
+    """Holders here are made-up pids that only the load tests use, so every
+    one counts as alive: the real psutil check would prune them on the next
+    hold() or status()."""
+    factory = _GatedFactory()
+    return EngineManager(
+        SousConfig(idle_unload_minutes=idle_minutes),
+        engine_factory=factory,
+        holder_alive=lambda pid, create_time: True,
+    ), factory
+
+
+def test_status_answers_while_the_model_loads():
+    """The worker's get() used to hold the manager lock for the whole load —
+    minutes for a 27B — so status() (and everything else on the lock) waited
+    it out. A load in progress must be reportable, not a blocking call."""
+    mgr, factory = _gated_manager()
+    loader = threading.Thread(target=mgr.get, daemon=True)
+    loader.start()
+    try:
+        assert factory.started.wait(5)
+        t0 = time.monotonic()
+        s = mgr.status()
+        assert time.monotonic() - t0 < 1.0
+        assert s["loaded"] is False and s["loading"] is True
+    finally:
+        factory.release.set()
+    loader.join(5)
+    assert not loader.is_alive()
+    s = mgr.status()
+    assert s["loaded"] is True and s["loading"] is False
+
+
+def test_concurrent_gets_share_one_load():
+    mgr, factory = _gated_manager()
+    engines: list = []
+    threads = [
+        threading.Thread(target=lambda: engines.append(mgr.get()), daemon=True) for _ in range(3)
+    ]
+    for t in threads:
+        t.start()
+    try:
+        assert factory.started.wait(5)
+    finally:
+        factory.release.set()
+    for t in threads:
+        t.join(5)
+        assert not t.is_alive()
+    assert len(factory.created) == 1
+    assert all(e is engines[0] for e in engines)
+
+
+def test_a_failed_load_leaves_the_manager_empty_and_loadable():
+    calls: list[str] = []
+
+    def factory(model_id: str):
+        calls.append(model_id)
+        if len(calls) == 1:
+            raise RuntimeError("weights missing")
+        return FakeEngine([])
+
+    mgr = EngineManager(SousConfig(), engine_factory=factory)
+    with pytest.raises(RuntimeError):
+        mgr.get()
+    s = mgr.status()
+    assert s["loaded"] is False and s["loading"] is False
+    assert mgr.get() is mgr.get() and len(calls) == 2
+
+
+def test_a_failed_load_releases_the_threads_waiting_on_it():
+    """A waiter parks until the load in progress ends; a load that ends by
+    raising must wake it too, or the daemon is wedged behind one bad load.
+    Each waiter then finds nothing loaded and loads on its own."""
+    entered = threading.Event()
+    proceed = threading.Event()
+    calls: list[str] = []
+
+    def factory(model_id: str):
+        calls.append(model_id)
+        if len(calls) == 1:
+            entered.set()
+            assert proceed.wait(10)
+            raise RuntimeError("weights missing")
+        return FakeEngine([])
+
+    mgr = EngineManager(SousConfig(), engine_factory=factory)
+    failed = threading.Event()
+
+    def load_and_fail():
+        try:
+            mgr.get()
+        except RuntimeError:
+            failed.set()
+
+    loader = threading.Thread(target=load_and_fail, daemon=True)
+    loader.start()
+    assert entered.wait(5)
+    got: list = []
+    waiter = threading.Thread(target=lambda: got.append(mgr.get()), daemon=True)
+    waiter.start()
+    proceed.set()
+    loader.join(5)
+    assert failed.is_set()
+    waiter.join(5)
+    assert not waiter.is_alive(), "a failed load left its waiter parked"
+    assert len(calls) == 2 and got[0] is mgr.get()
+
+
+def test_unload_if_idle_is_refused_at_once_during_a_load():
+    """Refused, and refused without waiting: the sweep runs on the worker's
+    thread every poll, and parking it behind a load for minutes is the
+    stall the lock change removes."""
+    mgr, factory = _gated_manager(idle_minutes=0)
+    loader = threading.Thread(target=mgr.get, daemon=True)
+    loader.start()
+    try:
+        assert factory.started.wait(5)
+        t0 = time.monotonic()
+        assert mgr.unload_if_idle() is False
+        assert time.monotonic() - t0 < 1.0
+    finally:
+        factory.release.set()
+    loader.join(5)
+    assert not loader.is_alive()
+
+
+class _SlowUnloadEngine(FakeEngine):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.unloading = threading.Event()
+        self.release = threading.Event()
+
+    def unload(self) -> None:
+        self.unloading.set()
+        assert self.release.wait(10)
+        super().unload()
+
+
+def test_get_during_an_unload_waits_for_it_and_loads_fresh():
+    """Freeing a 27B takes seconds and get() must never hand out an engine
+    that is being torn down, nor load a second copy beside it: it waits, then
+    loads. status() meanwhile reports neither loaded nor loading."""
+    slow = _SlowUnloadEngine()
+    second_started = threading.Event()
+    made: list[FakeEngine] = []
+
+    def factory(model_id: str):
+        if made:
+            second_started.set()
+        made.append(slow if not made else FakeEngine([]))
+        return made[-1]
+
+    mgr = EngineManager(SousConfig(idle_unload_minutes=0), engine_factory=factory)
+    mgr.get()
+    time.sleep(0.01)
+    sweeper = threading.Thread(target=mgr.unload_if_idle, daemon=True)
+    sweeper.start()
+    assert slow.unloading.wait(5)
+    got: list = []
+    getter = threading.Thread(target=lambda: got.append(mgr.get()), daemon=True)
+    getter.start()
+    # Parked behind the unload, not loading a second copy beside it.
+    assert not second_started.wait(0.2)
+    assert got == []
+    s = mgr.status()
+    assert s["loading"] is False and s["loaded"] is False
+    slow.release.set()
+    sweeper.join(5)
+    getter.join(5)
+    assert not getter.is_alive()
+    assert len(made) == 2 and got[0] is not slow and slow.unloaded is True
+
+
+def test_a_failed_unload_does_not_park_the_next_load():
+    """unload() runs outside the lock behind the _unloading flag; if it
+    raises, the flag must still clear, or every later get() waits forever
+    with nothing in the log but the worker's "continuing" line."""
+    made: list[FakeEngine] = []
+
+    class _RaisingUnload(FakeEngine):
+        def unload(self) -> None:
+            raise RuntimeError("teardown failed")
+
+    def factory(model_id: str):
+        made.append(_RaisingUnload([]) if not made else FakeEngine([]))
+        return made[-1]
+
+    mgr = EngineManager(SousConfig(idle_unload_minutes=0), engine_factory=factory)
+    mgr.get()
+    time.sleep(0.01)
+    with pytest.raises(RuntimeError):
+        mgr.unload_if_idle()
+    s = mgr.status()
+    assert s["loaded"] is False and s["loading"] is False
+    got: list = []
+    getter = threading.Thread(target=lambda: got.append(mgr.get()), daemon=True)
+    getter.start()
+    getter.join(5)
+    assert not getter.is_alive(), "a failed unload left the next load parked"
+    # `made` records raw engines and a load wraps its engine once, so the
+    # identity check goes through the wrapper the second load made.
+    assert len(made) == 2 and got[0]._inner is made[1]
+
+
+class _Liveness:
+    """A stand-in for the psutil check: which (pid, create_time) pairs are
+    live processes right now."""
+
+    def __init__(self) -> None:
+        self.live: set[tuple[int, float]] = set()
+
+    def __call__(self, pid: int, create_time: float) -> bool:
+        return (pid, create_time) in self.live
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _held_manager(idle_minutes: int = 30, factory=None):
+    created: list[FakeEngine] = []
+
+    def default_factory(model_id: str):
+        e = FakeEngine([])
+        created.append(e)
+        return e
+
+    live, clock = _Liveness(), _Clock()
+    mgr = EngineManager(
+        SousConfig(idle_unload_minutes=idle_minutes),
+        engine_factory=factory or default_factory,
+        holder_alive=live,
+        clock=clock,
+    )
+    return mgr, created, live, clock
+
+
+def _join_preload(mgr: EngineManager) -> None:
+    """Wait for a preload the test just triggered. The manager forgets the
+    thread as its last act, so a missing thread means a finished preload —
+    which the status must then agree with."""
+    thread = mgr._preload
+    if thread is None:
+        assert mgr.status()["loading"] is False
+        return
+    thread.join(5)
+    assert not thread.is_alive()
+
+
+def test_hold_starts_exactly_one_preload_which_releases_its_mlx_state(monkeypatch):
+    """The release is monkeypatched, so this pins that it happens on the
+    preload thread and once, not what the real call does to a loaded model;
+    the gateway's turn-pool thread already releases after a get() that may
+    have loaded the weights, and the real-daemon run is what exercises it."""
+    from sous.engine import base
+
+    released_in: list[int] = []
+    monkeypatch.setattr(
+        base, "release_mlx_thread_state", lambda: released_in.append(threading.get_ident())
+    )
+    mgr, factory = _gated_manager()
+    first = mgr.hold(101, 5.0)
+    assert first == {"loaded": False, "loading": True, "holders": 1}
+    assert factory.started.wait(5)
+    preload = mgr._preload
+    assert preload is not None and preload.daemon and preload.name == "sous-preload"
+    second = mgr.hold(102, 6.0)
+    assert second == {"loaded": False, "loading": True, "holders": 2}
+    assert mgr._preload is preload  # no second thread while the first loads
+    s = mgr.status()
+    assert s["loaded"] is False and s["loading"] is True and s["holders"] == 2
+    factory.release.set()
+    preload.join(5)
+    assert not preload.is_alive()
+    assert len(factory.created) == 1
+    assert released_in == [preload.ident]
+    s = mgr.status()
+    assert s["loaded"] is True and s["loading"] is False and s["holders"] == 2
+    assert mgr.hold(103, 7.0) == {"loaded": True, "loading": False, "holders": 3}
+
+
+def test_a_hold_during_another_threads_load_starts_no_preload():
+    """The worker or a gateway turn may already be loading; a hold then only
+    registers itself and reports the load in progress."""
+    mgr, factory = _gated_manager()
+    loader = threading.Thread(target=mgr.get, daemon=True)
+    loader.start()
+    try:
+        assert factory.started.wait(5)
+        assert mgr.hold(51, 1.0) == {"loaded": False, "loading": True, "holders": 1}
+        assert mgr._preload is None
+        assert mgr.status()["loading"] is True
+    finally:
+        factory.release.set()
+    loader.join(5)
+    assert not loader.is_alive()
+    assert len(factory.created) == 1  # one load, not two
+
+
+def test_a_hold_on_an_unloaded_model_reports_the_load_it_starts():
+    """The launcher prints one of two lines from these flags; a hold on an
+    unloaded model starts or joins a load, so short of the OS refusing a
+    thread there is no third state."""
+    mgr, created, live, _ = _held_manager()
+    answer = mgr.hold(81, 1.0)
+    _join_preload(mgr)
+    assert answer == {"loaded": False, "loading": True, "holders": 1}
+
+
+def test_a_hold_whose_preload_thread_cannot_start_reports_neither_and_never_raises(
+    monkeypatch, caplog
+):
+    """The one third state: the OS refused a thread. hold() keeps its
+    contract (a warning, never a raise), forgets the thread it could not
+    start so the next hold tries again, and status() does not report a load
+    that is not happening."""
+    import logging
+
+    mgr, created, live, _ = _held_manager()
+    live.live.update({(91, 1.0), (92, 2.0)})
+    refusals = 0
+
+    def refuse(self):
+        nonlocal refusals
+        refusals += 1
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    with caplog.at_level(logging.WARNING, logger="sous.engine"):
+        answer = mgr.hold(91, 1.0)
+    assert answer == {"loaded": False, "loading": False, "holders": 1}
+    assert mgr._preload is None and mgr.status()["loading"] is False
+    assert "preload thread could not start (RuntimeError)" in [
+        r.getMessage() for r in caplog.records
+    ]
+    monkeypatch.undo()
+    assert mgr.hold(92, 2.0) == {"loaded": False, "loading": True, "holders": 2}
+    _join_preload(mgr)
+    assert refusals == 1 and len(created) == 1 and mgr.status()["loaded"] is True
+
+
+def test_loading_never_reads_true_beside_a_loaded_model():
+    """The preload thread forgets itself only after releasing its mlx state,
+    which is after get() has published the engine: in that window the thread
+    alone must not say a load is in progress."""
+    mgr, created, live, _ = _held_manager()
+    mgr.get()
+    mgr._preload = threading.current_thread()  # the window, held open
+    try:
+        assert mgr.status()["loading"] is False
+        assert mgr.hold(93, 1.0)["loading"] is False
+    finally:
+        mgr._preload = None
+
+
+def test_a_failed_preload_is_logged_and_never_raised(caplog):
+    import logging
+
+    def factory(model_id: str):
+        raise RuntimeError("weights missing")
+
+    mgr, _, live, _ = _held_manager(factory=factory)
+    live.live.add((7, 1.0))
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        assert mgr.hold(7, 1.0)["loading"] is True
+        _join_preload(mgr)
+    messages = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert "hold pid=7 (holders=1)" in messages
+    assert f"preloading {mgr._config.model_id}" in messages
+    assert "preload failed (RuntimeError)" in messages
+    assert "weights missing" not in "".join(messages)
+    assert mgr.status()["loading"] is False and mgr.status()["holders"] == 1
+
+
+def test_the_sweep_keeps_the_model_while_any_holder_lives(caplog):
+    import logging
+
+    mgr, created, live, clock = _held_manager(idle_minutes=30)
+    live.live.update({(11, 1.0), (12, 2.0)})
+    mgr.hold(11, 1.0)
+    mgr.hold(12, 2.0)
+    _join_preload(mgr)
+    clock.now += 3600  # an hour idle: past the threshold, but held
+    assert mgr.unload_if_idle() is False
+    live.live.discard((11, 1.0))  # one holder exits
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        assert mgr.unload_if_idle() is False
+    assert "hold released pid=11 (holders=1)" in [r.getMessage() for r in caplog.records]
+    assert mgr.status()["holders"] == 1 and created[0].unloaded is False
+
+
+def test_a_reused_pid_is_a_different_holder():
+    """PID reuse: the same number with a different start time is not the
+    process that asked for the hold."""
+    mgr, created, live, clock = _held_manager(idle_minutes=0)
+    live.live.add((21, 100.0))
+    mgr.hold(21, 100.0)
+    _join_preload(mgr)
+    clock.now += 1
+    assert mgr.unload_if_idle() is False  # held
+    live.live = {(21, 100.0 + 5.0)}  # a new process wearing the old pid
+    assert mgr.unload_if_idle() is False  # pruned: the idle clock restarts on this sweep
+    assert mgr.status()["holders"] == 0
+    clock.now += 1
+    assert mgr.unload_if_idle() is True
+    assert created[0].unloaded is True
+
+
+def test_the_idle_clock_restarts_when_the_last_holder_leaves():
+    mgr, created, live, clock = _held_manager(idle_minutes=30)
+    live.live.add((31, 1.0))
+    mgr.hold(31, 1.0)
+    _join_preload(mgr)
+    clock.now += 7200  # two hours held
+    live.live.clear()
+    assert mgr.unload_if_idle() is False  # released now: idle clock restarts here
+    assert mgr.status()["holders"] == 0
+    clock.now += 30 * 60  # exactly the threshold
+    assert mgr.unload_if_idle() is False
+    clock.now += 1
+    assert mgr.unload_if_idle() is True
+    assert created[0].unloaded is True
+
+
+def test_a_hold_during_an_unload_reloads_after_it():
+    slow = _SlowUnloadEngine()
+    made: list[FakeEngine] = []
+
+    def factory(model_id: str):
+        made.append(slow if not made else FakeEngine([]))
+        return made[-1]
+
+    live, clock = _Liveness(), _Clock()
+    mgr = EngineManager(
+        SousConfig(idle_unload_minutes=0), engine_factory=factory, holder_alive=live, clock=clock
+    )
+    mgr.get()
+    clock.now += 1
+    sweeper = threading.Thread(target=mgr.unload_if_idle, daemon=True)
+    sweeper.start()
+    assert slow.unloading.wait(5)
+    live.live.add((41, 1.0))
+    assert mgr.hold(41, 1.0) == {"loaded": False, "loading": True, "holders": 1}
+    slow.release.set()
+    sweeper.join(5)
+    _join_preload(mgr)
+    assert len(made) == 2 and mgr.status()["loaded"] is True
+
+
+def test_holder_alive_is_this_process_under_its_real_start_time_only():
+    import os
+
+    import psutil
+
+    from sous.engine.base import _holder_alive
+
+    start = psutil.Process().create_time()
+    assert _holder_alive(os.getpid(), start) is True
+    assert _holder_alive(os.getpid(), start - 3600.0) is False
+    assert _holder_alive(2**30, start) is False  # beyond every platform's pid range
+    assert _holder_alive(-1, start) is False  # psutil.Process(-1) raises ValueError
+    assert _holder_alive("abc", start) is False  # ty: ignore[invalid-argument-type]
+
+
+def test_a_holder_we_cannot_read_counts_as_gone(monkeypatch):
+    """psutil raises AccessDenied for another user's process; the daemon and
+    its holders share a user, so that is never ours and must not pin the
+    model. Any other psutil error is the same answer."""
+    import psutil
+
+    from sous.engine.base import _holder_alive
+
+    def denied(pid):
+        raise psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(psutil, "Process", denied)
+    assert _holder_alive(1234, 1.0) is False
+
+
+def test_holders_are_pruned_even_with_nothing_loaded():
+    """A load that failed leaves no engine; the registry must still forget a
+    holder whose process is gone, or /sous/status reports sessions that
+    ended hours ago."""
+
+    def factory(model_id: str):
+        raise RuntimeError("weights missing")
+
+    mgr, _, live, _ = _held_manager(factory=factory)
+    live.live.add((71, 1.0))
+    mgr.hold(71, 1.0)
+    _join_preload(mgr)
+    assert mgr.status()["holders"] == 1
+    live.live.clear()
+    assert mgr.unload_if_idle() is False  # nothing loaded, but the sweep still prunes
+    assert mgr.status()["holders"] == 0
+
+
 class _BlockingEngine(FakeEngine):
     def __init__(self):
         super().__init__([])
@@ -845,3 +1363,58 @@ def test_kernel_memory_pressure_reads_the_kernels_level_or_none():
     assert level in (None, 1, 2, 4)
     if sys.platform == "darwin":
         assert isinstance(level, int)
+
+
+def test_a_zombie_holder_counts_as_gone():
+    """A holder that exited but has not been reaped still has a start time
+    psutil can read; only its status says it is gone. Without the status
+    check the model stayed pinned until the parent got round to reaping."""
+    import subprocess
+    import sys
+
+    import psutil
+
+    from sous.engine.base import _holder_alive
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        start = psutil.Process(proc.pid).create_time()
+        deadline = time.monotonic() + 10
+        while psutil.Process(proc.pid).status() != psutil.STATUS_ZOMBIE:
+            assert time.monotonic() < deadline, "the child never exited"
+            time.sleep(0.01)
+        assert _holder_alive(proc.pid, start) is False
+    finally:
+        proc.wait()
+    assert _holder_alive(proc.pid, start) is False
+
+
+def test_status_and_hold_never_report_a_session_that_has_ended():
+    """Only the idle sweep pruned, and the worker sweeps only between tasks:
+    for a whole delegated task /sous/status counted sessions that had ended,
+    and a new hold's reply counted them too."""
+    mgr, created, live, clock = _held_manager()
+    live.live.add((11, 1.0))
+    mgr.hold(11, 1.0)
+    _join_preload(mgr)
+    live.live.clear()  # the session exits; no sweep runs
+    assert mgr.status()["holders"] == 0
+    live.live.add((12, 2.0))
+    assert mgr.hold(12, 2.0)["holders"] == 1
+
+
+def test_the_idle_clock_restarts_whichever_caller_sees_the_last_holder_leave():
+    """A /sous/status poll can be the first to notice a departure; the sweep
+    after it must still find the idle clock restarted, or the model unloads
+    the moment a long session ends."""
+    mgr, created, live, clock = _held_manager(idle_minutes=30)
+    live.live.add((31, 1.0))
+    mgr.hold(31, 1.0)
+    _join_preload(mgr)
+    clock.now += 7200
+    live.live.clear()
+    assert mgr.status()["holders"] == 0  # status() pruned first
+    assert mgr.unload_if_idle() is False  # and the sweep sees a fresh clock
+    clock.now += 30 * 60 + 1
+    assert mgr.unload_if_idle() is True
+    assert created[0].unloaded is True

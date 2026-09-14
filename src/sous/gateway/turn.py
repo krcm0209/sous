@@ -155,10 +155,16 @@ class TurnRunner:
                     # cannot be interrupted and the lock discipline depends on it.)
                     raise TurnAbandoned
                 engine = self._engines.get()
-                # From `started`, not from here: entering the lease waits out
-                # a load or unload another thread is in the middle of, which
-                # costs this turn exactly what loading the model itself would.
+                # From `started`, not from here: get() waits out a load or
+                # unload another thread is in the middle of, which costs this
+                # turn exactly what loading the model itself would.
                 load_seconds = time.monotonic() - started
+                if abandoned is not None and abandoned.is_set():
+                    # That wait is minutes when a hold started the load, and
+                    # the client may have left during it: the check above ran
+                    # before it, and the lease no longer parks a turn behind
+                    # the load the way the manager lock once did.
+                    raise TurnAbandoned
                 session = self._session_for(engine)
                 counting = time.monotonic()
                 input_tokens = engine.count_tokens(messages, tools)
@@ -270,7 +276,7 @@ class TurnRunner:
             # Same race as run(): this whole call happens outside _gen_lock.
             with self._engines.lease():
                 engine = self._engines.get()
-                load_seconds = time.monotonic() - started  # the lease wait too, as in run()
+                load_seconds = time.monotonic() - started  # the get() wait too, as in run()
                 count = engine.count_tokens(messages, tools)
             self._engines.touch()
             return CountResult(count, load_seconds, time.monotonic() - started)
