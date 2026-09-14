@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import json
 import math
 import os
 import plistlib
@@ -39,11 +38,19 @@ _TIER_VARS = (
 )
 _DISALLOWED_FLAGS = ("--disallowedTools", "--disallowed-tools")
 _LSP_OFF = ["--disallowedTools", "LSP"]
+# Invocations that exit at once: holding the model for them would start a
+# load nobody waits for and, once the process is gone, restart the idle
+# clock under weights nobody is using. Only these four are knowable here.
+_NO_HOLD_FLAGS = ("--help", "-h", "--version", "-v")
 # Model load plus a long prefill: minutes, not the SDK's default.
 _API_TIMEOUT_MS = "3000000"
-# Nothing about server_status is slow: it reads the queue counts and the
-# config snapshot, and never touches the model.
+# Nothing about /sous/status or /sous/hold is slow: one reads the queue
+# counts and the config snapshot, the other registers a pid; neither waits
+# for the model.
 _STATUS_TIMEOUT_SECONDS = 15.0
+_PREDATES_MESSAGE = (
+    "sous claude: the running daemon predates this CLI; restart it (sous stop; sous serve)"
+)
 
 
 def claude_argv(user_args: list[str]) -> list[str]:
@@ -97,72 +104,80 @@ def claude_env(
     return env
 
 
-def _failure_names(exc: BaseException) -> list[str]:
-    """The class names of what actually failed, flattened out of the
-    ExceptionGroup an anyio task group raises. Names only: an exception's
-    message can carry the URL it was building."""
-    if isinstance(exc, BaseExceptionGroup):
-        return [name for sub in exc.exceptions for name in _failure_names(sub)]
-    return [type(exc).__name__]
-
-
-async def _server_status(port: int) -> dict:
-    # Imports are function-local so only `sous claude` pays for them: an async
-    # MCP client is a lot of module to load for `sous status`.
-    import anyio
-    import mcp
-    from mcp.client.streamable_http import streamable_http_client
-
-    with anyio.fail_after(_STATUS_TIMEOUT_SECONDS):
-        async with (
-            streamable_http_client(f"http://127.0.0.1:{port}/mcp") as (read, write),
-            mcp.ClientSession(read, write) as session,
-        ):
-            await session.initialize()
-            result = await session.call_tool("server_status", {})
-    structured = getattr(result, "structured_content", None)
-    if isinstance(structured, dict):
-        return structured
-    # mcp 2.1 leaves structured_content unset for this tool, so the dict the
-    # tool returned arrives JSON-encoded in the first text content block.
-    for block in getattr(result, "content", ()):
-        if isinstance(text := getattr(block, "text", None), str):
-            return json.loads(text)
-    raise ValueError("server_status answered with no text content")
-
-
 def _daemon_status(port: int) -> dict | None:
-    """What the daemon on `port` reports about itself, or None if it does not
-    answer.
+    """What the daemon on `port` reports about itself (GET /sous/status), or
+    None if nothing there answers. Exits 1 on a 404: that is a daemon from
+    before the route existed, and the fix is a restart — the CLI and the
+    daemon ship in one package, so there is no older dialect to fall back to.
 
     The config FILE is not the truth: the daemon loads it once at startup and
     holds that snapshot for its whole life, so an edit since then — a changed
     `local_models`, a wider `max_context_tokens`, `enabled` flipped — is a
-    setting the running gateway does not have. `server_status` is the one
-    place the daemon reports the gateway config it is actually serving, so
-    ask it rather than re-reading the file behind its back.
+    setting the running gateway does not have. /sous/status is where the
+    daemon reports the gateway config it is actually serving.
     """
-    import anyio
+    import httpx
 
     if not _port_open(port):
         return None
     try:
-        return anyio.run(_server_status, port)
-    except Exception as exc:
-        # Deliberately wide, and deliberately not silent. The failure surfaces
-        # from inside an anyio task group, so it arrives as an ExceptionGroup
-        # whose leaves belong to whatever HTTP client the installed mcp uses
-        # (2.1 swapped httpx for httpx2) — a type list here would rot into a
-        # traceback out of `sous claude`. A Ctrl-C is not an Exception and
-        # still propagates. Reached only when something IS listening, so the
-        # names are worth printing: the caller's "no daemon" alone would be
-        # the wrong diagnosis.
+        reply = httpx.get(f"http://127.0.0.1:{port}/sous/status", timeout=_STATUS_TIMEOUT_SECONDS)
+    except httpx.HTTPError as exc:
+        # The type only: an httpx message can carry the URL it was building.
         print(
-            f"sous claude: 127.0.0.1:{port} did not answer server_status "
-            f"({', '.join(_failure_names(exc))})",
+            f"sous claude: 127.0.0.1:{port} did not answer /sous/status ({type(exc).__name__})",
             file=sys.stderr,
         )
         return None
+    if reply.status_code == 404:
+        print(_PREDATES_MESSAGE, file=sys.stderr)
+        raise SystemExit(1)
+    body: object = None
+    if reply.status_code == 200:
+        try:
+            body = reply.json()
+        except ValueError:
+            body = None
+    if not isinstance(body, dict):
+        print(
+            f"sous claude: 127.0.0.1:{port} did not answer /sous/status "
+            f"(status {reply.status_code})",
+            file=sys.stderr,
+        )
+        return None
+    return body
+
+
+def _hold(port: int) -> dict | None:
+    """Ask the daemon to keep the model loaded while this process lives.
+    execve keeps the pid, so the process that leaves is the Claude Code
+    session, and its start time tells the daemon a reused pid from a new
+    one. Any failure is a warning: the session works without the hold, it
+    just pays a reload after an idle unload."""
+    import httpx
+    import psutil
+
+    body = {"pid": os.getpid(), "create_time": psutil.Process().create_time()}
+    try:
+        reply = httpx.post(
+            f"http://127.0.0.1:{port}/sous/hold", json=body, timeout=_STATUS_TIMEOUT_SECONDS
+        )
+        reply.raise_for_status()
+        answer = reply.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        print(
+            f"sous claude: warning: could not hold the model ({type(exc).__name__}); "
+            "launching anyway",
+            file=sys.stderr,
+        )
+        return None
+    if not isinstance(answer, dict):
+        print(
+            "sous claude: warning: could not hold the model (unexpected answer); launching anyway",
+            file=sys.stderr,
+        )
+        return None
+    return answer
 
 
 def _cmd_claude(user_args: list[str]) -> None:
@@ -187,16 +202,6 @@ def _cmd_claude(user_args: list[str]) -> None:
         )
         raise SystemExit(1)
     gateway = status.get("config", {}).get("gateway", {})
-    # A Phase 1 daemon reports a gateway but no upstream_url: it serves the
-    # local model and 404s everything else, so the frontier main loop of the
-    # session about to be launched could not run at all.
-    if "upstream_url" not in gateway:
-        print(
-            "sous claude: the running daemon is a pre-routing build that would 404 every "
-            "frontier-model request; reinstall sous and restart the daemon",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
     if not gateway.get("enabled"):
         print(
             f"sous claude: the running daemon has the gateway off (config edited without a "
@@ -240,6 +245,17 @@ def _cmd_claude(user_args: list[str]) -> None:
                 file=sys.stderr,
             )
     env = claude_env(config.server_port, local_models, max_context_tokens, os.environ)
+    held = None if user_args and user_args[0] in _NO_HOLD_FLAGS else _hold(config.server_port)
+    if held is not None:
+        model_id = status.get("model", {}).get("model_id", "the model")
+        if held.get("loaded"):
+            line = f"sous claude: {model_id} already loaded; held while this session runs"
+        elif held.get("loading"):
+            line = f"sous claude: preloading {model_id}; held while this session runs"
+        else:
+            # Not a state hold() produces, but this is another process's JSON.
+            line = f"sous claude: {model_id} held while this session runs"
+        print(line, file=sys.stderr)
     print(
         f"sous claude: ANTHROPIC_BASE_URL={env['ANTHROPIC_BASE_URL']} "
         f"CLAUDE_CODE_SUBAGENT_MODEL={env['CLAUDE_CODE_SUBAGENT_MODEL']} "
