@@ -283,7 +283,9 @@ def rail_row(turn: dict) -> dict[str, str]:
     return {
         "time": local_time(turn.get("ts") or 0.0),
         "ticket": (turn.get("id") or "")[:10],
-        "cache": FAILED_WORD
+        "cache": ABANDONED_WORD
+        if turn.get("error") == "abandoned"
+        else FAILED_WORD
         if failed
         else f"{RAIL_CACHE_WORDS.get(cache, '—')} {kilo_text(turn.get('reused_tokens') or 0)}",
         "took": "none" if failed else turn.get("took") or "none",
@@ -445,7 +447,6 @@ PROP_COLOURS = {
 }  # fmt: skip
 STEAM = ("    ∿ ∿    ", "   ∿   ∿   ")
 POT = ("  ╭─────╮  ", " ═┫▒▒▒▒▒┣═ ", "  ╰─────╯  ")
-CARD_CHEF_MOODS = {"quiet": "quiet", "firing": "loading", "vhs": "vhs", "closed": "closed"}
 
 
 def sprite_frame(mood: str, now: float, *, motion: bool = True) -> tuple[str, str, str]:
@@ -835,7 +836,9 @@ class Card(Vertical):
 
     def __init__(self) -> None:
         super().__init__(id="card")
-        self._mood = "closed"
+        self._attempt = 0
+        self._why = ""
+        self._wait_text = ""
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="card-top"):
@@ -911,6 +914,7 @@ class Card(Vertical):
         self, attempt: int, wait: float, why: str, as_of: str, now: float, motion: bool
     ) -> None:
         self._state("vhs", SLATE)
+        self._attempt, self._why, self._wait_text = attempt, why, f"{wait:.0f}"
         self.border_title = "VHS TRACKING"
         self.border_subtitle = f"as of {as_of}" if as_of else ""
         self.query_one("#card-chef", Chef).show("vhs", now, motion=motion)
@@ -922,6 +926,7 @@ class Card(Vertical):
 
     def show_closed(self, port: int, attempt: int, wait: float, now: float) -> None:
         self._state("closed", CHILLI)
+        self._attempt, self._wait_text = attempt, f"{wait:.0f}"
         self.border_title = CLOSED_WORD
         self.border_subtitle = f"attempt {attempt} · next try in {wait:.0f}s" if attempt else ""
         self.query_one("#card-chef", Chef).show("closed", now, motion=False)
@@ -936,7 +941,6 @@ class Card(Vertical):
     def _state(self, state: str, colour: str) -> None:
         for s in ("quiet", "firing", "vhs", "closed"):
             self.set_class(s == state, f"card-{s}")
-        self._mood = CARD_CHEF_MOODS[state]
         firing = self.query_one("#firing", LoadingIndicator)
         firing.display = state == "firing"
         # Its own mount starts a 16 Hz refresh; off the firing state that would
@@ -944,14 +948,29 @@ class Card(Vertical):
         firing.auto_refresh = 1 / 16 if state == "firing" else None
         self.query_one("#card-art").display = state == "quiet"
 
-    def tick(self, now: float, *, motion: bool) -> None:
-        """The idle tick's own work: the chef's motion and, in a quiet
-        kitchen, the pot's steam — never a rebuild of the card's text, which
-        only a real document or retry changes."""
-        self.query_one("#card-chef", Chef).show(self._mood, now, motion=motion)
+    def tick(self, now: float, *, motion: bool, wait: float | None = None) -> None:
+        """The idle tick's own work: the chef's motion, in a quiet kitchen
+        the pot's steam, and — disconnected — the one number a real
+        document or retry doesn't otherwise touch between events, the
+        redial/closed countdown. Never a rebuild of the rest of the card's
+        text."""
+        chef = self.query_one("#card-chef", Chef)
+        chef.show(chef.mood, now, motion=motion)
         if self.has_class("card-quiet"):
             steam = STEAM[int(now * 2) % 2 if motion else 0]
             self.query_one("#card-art", Static).update("\n".join([steam, *POT]))
+        if wait is None:
+            return
+        text = f"{wait:.0f}"
+        if text == self._wait_text:
+            return
+        self._wait_text = text
+        if self.has_class("card-vhs"):
+            self.query_one("#card-lead", Static).update(
+                f"\n  redialing the daemon · try {self._attempt} · next in {text}s\n  ({self._why})"
+            )
+        elif self.has_class("card-closed") and self._attempt:
+            self.border_subtitle = f"attempt {self._attempt} · next try in {text}s"
 
 
 class LinePanel(Vertical):
@@ -1655,11 +1674,13 @@ class Top(App[int]):
             self.query_one("#line-chef", Chef).show(mood, now, motion=self.motion)
             card = self.query_one(Card)
             if card.display:
-                # Only the chef's motion and the pot's steam, never the
+                # Only the chef's motion, the pot's steam, and — disconnected
+                # — the redial/closed countdown, never the rest of the
                 # card's text: that only a real document or retry changes,
                 # and rebuilding it twice a second is the idle tick's whole
                 # CPU budget gone on a picture that hasn't moved.
-                card.tick(now, motion=self.motion)
+                wait = max(0.0, (self._retry_at or now) - now) if not self._connected else None
+                card.tick(now, motion=self.motion, wait=wait)
         except NoMatches:
             return
 

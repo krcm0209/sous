@@ -24,13 +24,22 @@ class Clock:
         return self.now
 
 
-def _doc(turn=None, *, loaded=True, loading=False, recent=None, tasks=None, behind=()):
+def _doc(
+    turn=None,
+    *,
+    loaded=True,
+    loading=False,
+    recent=None,
+    tasks=None,
+    behind=(),
+    idle_seconds=252.0,
+):
     return {
         "engine": {
             "loaded": loaded,
             "loading": loading,
             "model_id": "mlx-community/Qwen3.8-27B-4bit",
-            "idle_seconds": 252.0,
+            "idle_seconds": idle_seconds,
             "holders": 1,
             "memory_gb": 31.4,
             "prompt_cache": {
@@ -163,6 +172,8 @@ def test_every_kitchen_word_is_glued_to_its_literal_or_its_number():
     failed = tui.rail_row(_summary(1, error="api_error", status=500))
     assert failed["cache"] == "DROPPED IT" and failed["in"] == "—" and failed["took"] == "none"
     assert failed["why"] == "DROPPED IT · 500 api_error"
+    abandoned = tui.rail_row(_summary(1, error="abandoned", status=499))
+    assert abandoned["cache"] == "WALKED OUT" and abandoned["in"] == "—"
     assert tui.stop_word(_summary(1, error="abandoned", status=499)) == "WALKED OUT"
     assert tui.stop_word(_summary(1, stop_reason="max_tokens")) == "PLATE FULL"
     assert tui.stop_word(_summary(1, stop_reason="tool_use")) == "ORDER UP"
@@ -240,6 +251,24 @@ def test_the_chef_has_a_face_for_every_state_and_holds_still_without_motion():
     # The toque and the face are the terminal's own ink, bold; the apron teal.
     spans = [(quiet.plain[s.start : s.end], str(s.style)) for s in quiet.spans]
     assert ("▟███▙", "bold") in spans and ("▐███▌", tui.TEAL) in spans
+
+
+def test_chef_show_skips_the_repaint_when_the_picture_has_not_moved(monkeypatch):
+    """The idle tick calls Chef.show() up to twice a second forever; only a
+    genuine change of mood or frame may cost a repaint."""
+    calls = []
+    monkeypatch.setattr(tui.Chef, "refresh", lambda self, *a, **k: calls.append(1))
+    chef = tui.Chef(id="chef")
+    chef.show("decode", 10.0, motion=True)
+    assert len(calls) == 1 and chef.mood == "decode"
+    chef.show("decode", 10.0, motion=True)  # the same (mood, frame): no repaint
+    assert len(calls) == 1
+    chef.show("decode", 10.25, motion=True)  # decode is fps 4: a new frame at +0.25s
+    assert len(calls) == 2
+    chef.show("closed", 10.25, motion=False)  # a mood change always repaints
+    assert len(calls) == 3
+    chef.show("closed", 99.0, motion=False)  # closed is fps 0: never repaints again
+    assert len(calls) == 3
 
 
 def test_the_ticket_card_carries_every_field_of_the_turn():
@@ -469,6 +498,26 @@ def test_a_quiet_kitchen_shows_the_card_and_stops_the_ticker():
     _run(test)
 
 
+def test_a_quiet_kitchens_idle_tick_only_moves_the_steam():
+    async def test(app, pilot, feed, clock):
+        await _deliver(feed, pilot, _doc(_turn()))
+        await _deliver(feed, pilot, _doc(None, recent=RECENT))
+        body = _plain(app, "#card-body")
+        steam_0 = _plain(app, "#card-art")
+        clock.now = BASE + 0.5
+        await pilot.pause(0.6)
+        steam_1 = _plain(app, "#card-art")
+        assert steam_1 != steam_0
+        assert _plain(app, "#card-body") == body
+        clock.now = BASE + 1.0
+        await pilot.pause(0.6)
+        steam_2 = _plain(app, "#card-art")
+        assert steam_2 == steam_0 and steam_2 != steam_1
+        assert _plain(app, "#card-body") == body
+
+    _run(test)
+
+
 def test_a_dropped_feed_redials_and_a_daemon_that_never_answered_exits_one():
     async def test(app, pilot, feed, clock):
         card = app.query_one(tui.Card)
@@ -477,6 +526,19 @@ def test_a_dropped_feed_redials_and_a_daemon_that_never_answered_exits_one():
         await feed.queue.put(None)
         await pilot.pause(0.15)
         assert card.border_subtitle.startswith("attempt 1 · next try in")
+        # The idle tick redraws only this one number as the wait passes —
+        # retry_at is fixed, so rewinding the pinned clock gives the
+        # countdown room to fall from, then moving it forward lets it fall
+        # toward zero, the way it would over the real backoff.
+        clock.now = BASE - 4.5
+        await pilot.pause(0.6)
+        before = int(card.border_subtitle.rsplit(" ", 1)[-1].rstrip("s"))
+        assert before > 0
+        clock.now = BASE + 10.0
+        await pilot.pause(0.6)
+        after = int(card.border_subtitle.rsplit(" ", 1)[-1].rstrip("s"))
+        assert after < before
+        clock.now = BASE
         await pilot.pause(0.6)  # the first retry: 0.5 s
         assert feed.connections == 2
         await _deliver(feed, pilot, _doc(_turn()))
@@ -737,14 +799,82 @@ def test_a_miss_or_a_pressure_eviction_flashes_the_line_once():
 SNAPSHOT = Path(__file__).parent / "snapshots" / "sous-top-100x30.svg"
 
 
-def test_the_pass_renders_as_committed(monkeypatch):
-    """The 100×30 screen mid-decode, cell for cell (an SVG of the screen).
-    A deliberate change to the look — or a Textual upgrade that renders
-    differently — is a rerun with SOUS_UPDATE_SNAPSHOTS=1 and a commit of
-    the new file; the diff is the review."""
+def test_the_pass_renders_as_committed(monkeypatch, request):
+    """The 100×30 screen mid-decode, cell for cell (an SVG of the screen) —
+    also the picture the README shows. A deliberate change to the look —
+    or a Textual upgrade that renders differently — is a rerun with
+    SOUS_UPDATE_SNAPSHOTS=1 and a commit of the new file; the diff is the
+    review."""
+
+    # monkeypatch restores the TZ env var on teardown but never calls
+    # tzset() again to match, which would leave the process's C-level zone
+    # pinned at UTC for every test that runs after this one. Calling
+    # monkeypatch.undo() ourselves, from our own finalizer, both reverts
+    # the env var and lets tzset() re-read it in the same breath —
+    # deterministic regardless of finalizer order, and safe to call again:
+    # monkeypatch's own automatic undo() at fixture teardown is documented
+    # as a no-op once its own undo stack is already empty.
+    def resync_tz() -> None:
+        monkeypatch.undo()
+        time.tzset()
+
+    request.addfinalizer(resync_tz)
     monkeypatch.setenv("TZ", "UTC")
     time.tzset()
     clock = Clock(BASE - 8)
+    # Nine distinct tickets — REHEAT, DRAWER and SCRATCH outcomes, one
+    # DROPPED IT and one WALKED OUT — so the book reads like a real pass
+    # rather than the five-row fixture other assertions share. Every rate
+    # stays at or below 11.4 so the live feed loop below still sets
+    # HI-SCORE, not one of these.
+    snapshot_recent = [
+        _summary(1, id="msg_1a2b3c4d5e6f7089a1b2c3d4", reused_tokens=57840, decode_tps=8.6),
+        _summary(2, id="msg_2b3c4d5e6f70819a2b3c4d5e", reused_tokens=60512, decode_tps=9.4),
+        _summary(
+            3,
+            "fork",
+            id="msg_3c4d5e6f708192a3b4c5d6e7",
+            took="fork@53296",
+            reused_tokens=53296,
+            evicted=2,
+            pressure=2,
+            decode_tps=10.1,
+        ),
+        _summary(4, id="msg_4d5e6f708192a3b4c5d6e7f8", reused_tokens=61904, decode_tps=11.4),
+        _summary(
+            5,
+            "miss",
+            id="msg_5e6f708192a3b4c5d6e7f809",
+            lcp=0,
+            lcp_region="tools",
+            bounds=[1, 2],
+            load_s=12.8,
+            decode_tps=7.2,
+        ),
+        _summary(
+            6,
+            "fork",
+            id="msg_6f708192a3b4c5d6e7f8091a",
+            took="fork@45210",
+            reused_tokens=45210,
+            decode_tps=9.8,
+        ),
+        _summary(7, id="msg_708192a3b4c5d6e7f8091a2b", reused_tokens=59120, decode_tps=10.6),
+        _summary(
+            8,
+            id="msg_8192a3b4c5d6e7f8091a2b3c",
+            error="overloaded_error",
+            status=529,
+            decode_tps=6.5,
+        ),
+        _summary(
+            9,
+            id="msg_92a3b4c5d6e7f8091a2b3c4d",
+            error="abandoned",
+            status=499,
+            decode_tps=5.0,
+        ),
+    ]
 
     async def test(app, pilot, feed, clock):
         for n in range(1, 9):
@@ -758,7 +888,17 @@ def test_the_pass_renders_as_committed(monkeypatch):
             started_at=BASE - 7,
             input_tokens=8912,
         )
-        await _deliver(feed, pilot, _doc(_turn(), recent=RECENT, tasks=TASKS, behind=[behind]))
+        await _deliver(
+            feed,
+            pilot,
+            _doc(
+                _turn(),
+                recent=snapshot_recent,
+                tasks=TASKS,
+                behind=[behind],
+                idle_seconds=6.0,
+            ),
+        )
         await pilot.wait_for_scheduled_animations()
         await pilot.pause(0.35)
         rendered = app.export_screenshot()
