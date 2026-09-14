@@ -414,3 +414,39 @@ def test_events_document_is_built_off_the_event_loop(tmp_path: Path, monkeypatch
     app, _ = _app(tmp_path)
     _collect_events(app, want=1)
     assert threads and "MainThread" not in threads
+
+
+def test_a_failing_status_build_ends_the_events_stream_not_a_traceback(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """The same failure discipline as /sous/status: a broken document build
+    ends the stream and logs its type, never an uncaught traceback through
+    uvicorn and never a message that could name a path."""
+    import logging
+
+    from sous.server import SousService
+
+    def failing_status(self, *, recent):
+        raise RuntimeError("tasks.db is locked")
+
+    monkeypatch.setattr(SousService, "status_document", failing_status)
+    app, _ = _app(tmp_path)
+    with caplog.at_level(logging.ERROR, logger="sous.monitor"):
+        status, frames = _collect_events(app, want=0)
+    assert status == [200]
+    assert [f for f in frames if f[0] == "status"] == []
+    messages = [r.getMessage() for r in caplog.records if r.name == "sous.monitor"]
+    assert messages == ["GET /sous/events failed (RuntimeError)"]
+    assert "locked" not in messages[0] and "tasks.db" not in messages[0]
+
+
+def test_mounting_the_monitor_pins_sse_starlette_above_debug(tmp_path: Path, monkeypatch):
+    """/sous/events is mounted whether or not the gateway is, and sse-starlette
+    logs every frame it sends at DEBUG — the pin must not depend on the
+    gateway's own copy of it, which only runs when the gateway is mounted."""
+    import logging
+
+    logger = logging.getLogger("sse_starlette")
+    monkeypatch.setattr(logger, "level", logging.NOTSET)
+    _app(tmp_path, gateway_enabled=False)
+    assert logger.level == logging.INFO

@@ -51,14 +51,21 @@ async def _status_events(
     last one went out — checked every tick — and at least once a heartbeat
     regardless. Built on a worker thread each time. Nothing is buffered for
     a client that is gone: the response cancels this generator on
-    disconnect, and the tick's sleep is where that lands."""
+    disconnect, and the tick's sleep is where that lands. A failure building
+    the document ends the stream rather than raising through uvicorn: the
+    client sees the connection close and redials, the same as any other
+    daemon failure logs its type and never its message."""
     seen: int | None = None
     sent = float("-inf")
     while True:
         version = inflight.version
         now = time.monotonic()
         if version != seen or now - sent >= EVENT_HEARTBEAT_SECONDS:
-            document = await run_sync(status)
+            try:
+                document = await run_sync(status)
+            except Exception as e:  # noqa: BLE001 — logged and the stream ends, never raised
+                _logger.error(f"GET /sous/events failed ({type(e).__name__})")
+                return
             yield ServerSentEvent(
                 event="status", data=json.dumps(document, separators=(",", ":")), sep=_SEP
             )
@@ -129,6 +136,11 @@ def mount_monitor(
     whose version the event stream watches. Every handler hands its work to
     a thread: status() reads the task store and hold() takes the engine
     manager's lock, and neither belongs on the event loop."""
+    # sse-starlette logs every frame it sends at DEBUG — the status document,
+    # verbatim, up to ten times a second — and the gateway's own pin of this
+    # logger only runs when the gateway is mounted. /sous/events is mounted
+    # unconditionally, so the no-bodies-in-logs rule cannot depend on that.
+    logging.getLogger("sse_starlette").setLevel(logging.INFO)
 
     async def sous_status(request: Request) -> Response:
         try:
