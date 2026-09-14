@@ -93,6 +93,30 @@ Claude Code use stretches further — evaluate features against that goal.
   `EngineManager.status`) goes through `without_turn_gauges`, because there a
   gauge is a task's last `generate()` beside task-long counters, or a max
   over every owner ever seen — tokens the frontier model pays to read nothing.
+- `EngineManager` never holds its lock across a model load or unload
+  (`_loading`/`_unloading` on a `Condition`): `status()`, `hold()` and the
+  idle sweep must answer during either, and `/sous/status` reports
+  `loading`. A `hold(pid, create_time)` pins the model while that process
+  lives — the sweep prunes holders with psutil (pid gone, or start time
+  off by more than a second = reused pid) and restarts the idle clock when
+  the last leaves; the preload thread it may start calls `get()` and then
+  `release_mlx_thread_state()` like every mlx-touching thread. The `/sous/`
+  routes (`sous/monitor.py`) are mounted in `create_server` *before* the
+  gateway and whether or not it is enabled, behind the loopback guard in
+  `sous/loopback.py` that the gateway shares; a `/sous/` path never reaches
+  the upstream. `sous claude` has no MCP client: `/sous/status` or a 404 =
+  "restart the daemon", no compatibility fallback.
+- Claude Code auto-compacts a `sous-local` subagent when *its own* token
+  count nears `CLAUDE_CODE_MAX_CONTEXT_TOKENS − 33K` (sooner with its
+  precompute trigger) — two extra local calls, ~6 minutes at 131072 for a
+  four-turn agent, and the agent then answers from a summary. Every
+  compaction switch is global to the session (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`
+  is a *minimum* with the model window; `DISABLE_AUTO_COMPACT`,
+  `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`), so `sous claude` sets none; the
+  per-local-model lever is `[gateway].max_context_tokens` (the default
+  model's native length is 262144, at +8 GiB of KV reserve) — the classic
+  threshold scales with it, the precompute fraction is remote-configured
+  per window size and unmeasured at 262144.
 - The gateway forwards every request it does not serve (`gateway/upstream.py`)
   as a transparent proxy: never re-serialize a forwarded body, never add or
   alter an end-to-end header (only `Host`, the hop-by-hop set and a buffered
