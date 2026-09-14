@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import math
@@ -57,6 +58,10 @@ _REPLY_LIMIT = 1 << 20
 _PREDATES_MESSAGE = (
     "sous claude: the running daemon predates this CLI; restart it (sous stop; sous serve)"
 )
+# Claude Code runs the status-line command about once a second and shows
+# whatever it prints; a slow answer is a frozen line, so the whole call is
+# bounded well inside that second.
+_STATUSLINE_TIMEOUT_SECONDS = 0.5
 
 
 def claude_argv(user_args: list[str]) -> list[str]:
@@ -377,6 +382,76 @@ def _cmd_status() -> None:
     store = TaskStore(config.data_dir / "tasks.db")
     for t in store.list_recent(limit=10):
         print(f"  {t.id}  {t.state:<18} {t.title}")
+
+
+def _clock(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def statusline_text(document: dict, now: float) -> str:
+    """One line for Claude Code's status bar from the status document: the
+    turn in flight if there is one, else the engine. Every number is the
+    daemon's; `now` is only for the elapsed time of a turn."""
+    engine = document.get("engine") or {}
+    inflight = document.get("inflight") or []
+    if not inflight:
+        if not engine.get("loaded"):
+            return "sous: loading" if engine.get("loading") else "sous: idle · model unloaded"
+        parts = ["sous: idle"]
+        slots = (engine.get("prompt_cache") or {}).get("slots")
+        if slots is not None:
+            parts.append(f"{slots} slots")
+        if engine.get("holders"):
+            parts.append("held")
+        return " · ".join(parts)
+    turn = inflight[0]
+    phase = turn.get("phase", "queued")
+    head = f"sous: {phase}"
+    parts: list[str] = []
+    if phase == "decode":
+        head = f"{head} {turn.get('generated_tokens', 0):,} tok"
+        if turn.get("decode_tps"):
+            parts.append(f"{turn['decode_tps']:.1f} tok/s")
+    elif phase == "prefill" and turn.get("to_prefill"):
+        head = f"{head} {turn['to_prefill']:,} tok"
+    eta = turn.get("eta_seconds")
+    if eta is not None and (phase == "decode" or (phase == "prefill" and turn.get("to_prefill"))):
+        parts.append(f"eta {int(eta)}s")
+    elif turn.get("started_at") is not None:
+        parts.append(_clock(now - turn["started_at"]))
+    if len(inflight) > 1:
+        parts.append(f"+{len(inflight) - 1} queued")
+    return " · ".join([head, *parts])
+
+
+def _cmd_statusline() -> None:
+    import urllib.request
+
+    config = load_config()
+    # Claude Code writes its own JSON (model, cwd, cost) to stdin; none of
+    # it is needed here, but a pipe nobody reads can block the writer. A
+    # stdin that cannot be read (a closed handle, pytest's capture) is as
+    # harmless as an empty one.
+    with contextlib.suppress(OSError):
+        if not sys.stdin.isatty():
+            sys.stdin.read()
+    # No proxy, whatever the environment says: 127.0.0.1 is loopback, the
+    # same rule as the launcher's httpx client and the gateway's forwarder.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    url = f"http://127.0.0.1:{config.server_port}/sous/status"
+    try:
+        with opener.open(url, timeout=_STATUSLINE_TIMEOUT_SECONDS) as reply:
+            document = json.loads(reply.read(_REPLY_LIMIT))
+    except OSError, ValueError:
+        # urllib's URLError and HTTPError are OSErrors; a body that is not
+        # JSON, or is JSON but not an object, is not the daemon's.
+        print("sous: daemon down")
+        return
+    if not isinstance(document, dict):
+        print("sous: daemon down")
+        return
+    print(statusline_text(document, time.time()))
 
 
 def _cmd_wait(task_id: str, timeout: float | None, interval: float) -> None:
@@ -776,6 +851,10 @@ def main(argv: list[str] | None = None) -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="run the daemon (MCP over HTTP on 127.0.0.1)")
     sub.add_parser("status", help="check the daemon and recent tasks")
+    sub.add_parser(
+        "statusline",
+        help="one line for Claude Code's statusLine setting (reads and ignores its stdin JSON)",
+    )
     wait = sub.add_parser("wait", help="block until a task finishes or requests a command approval")
     wait.add_argument("task_id")
     wait.add_argument(
@@ -809,6 +888,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(sous.proxy.run())
     elif args.command == "status":
         _cmd_status()
+    elif args.command == "statusline":
+        _cmd_statusline()
     elif args.command == "wait":
         _cmd_wait(args.task_id, args.timeout, args.interval)
     elif args.command == "stop":

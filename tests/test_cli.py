@@ -1508,3 +1508,164 @@ def test_claude_reports_a_hold_that_is_neither_loaded_nor_loading(tmp_path, caps
         "sous claude: mlx-community/Qwen3.8-27B-4bit not loaded yet; held while this session runs"
         in capsys.readouterr().err
     )
+
+
+# --- sous statusline --------------------------------------------------------------
+
+
+def _document(**overrides) -> dict:
+    doc = {
+        "engine": {"loaded": True, "loading": False, "holders": 0, "prompt_cache": {"slots": 5}},
+        "inflight": [],
+        "queue": {"queued": 0, "running": 0},
+        "config": {},
+        "recent_turns": [],
+        "recent_tasks": [],
+    }
+    doc.update(overrides)
+    return doc
+
+
+def _turn(**overrides) -> dict:
+    turn = {
+        "id": "msg_1",
+        "phase": "decode",
+        "started_at": 1_000.0,
+        "phase_since": 1_010.0,
+        "generated_tokens": 612,
+        "to_prefill": None,
+        "decode_tps": 14.7,
+        "eta_seconds": 18.4,
+    }
+    turn.update(overrides)
+    return turn
+
+
+def test_statusline_text_for_each_state():
+    from sous.cli import statusline_text
+
+    now = 1_042.0
+    assert statusline_text(_document(inflight=[_turn()]), now) == (
+        "sous: decode 612 tok · 14.7 tok/s · eta 18s"
+    )
+    assert statusline_text(_document(inflight=[_turn(decode_tps=None, eta_seconds=None)]), now) == (
+        "sous: decode 612 tok · 00:42"
+    )
+    assert (
+        statusline_text(
+            _document(inflight=[_turn(phase="prefill", to_prefill=3120, eta_seconds=4.0)]), now
+        )
+        == "sous: prefill 3,120 tok · eta 4s"
+    )
+    assert statusline_text(_document(inflight=[_turn(phase="prefill")]), now) == (
+        "sous: prefill · 00:42"
+    )
+    assert statusline_text(_document(inflight=[_turn(phase="loading")]), now) == (
+        "sous: loading · 00:42"
+    )
+    queued = _document(inflight=[_turn(), _turn(id="msg_2", phase="queued")])
+    assert statusline_text(queued, now) == (
+        "sous: decode 612 tok · 14.7 tok/s · eta 18s · +1 queued"
+    )
+    assert statusline_text(_document(), now) == "sous: idle · 5 slots"
+    assert statusline_text(_document(engine={"loaded": True, "holders": 2}), now) == (
+        "sous: idle · held"
+    )
+    assert statusline_text(_document(engine={"loaded": False, "loading": True}), now) == (
+        "sous: loading"
+    )
+    assert statusline_text(_document(engine={"loaded": False, "loading": False}), now) == (
+        "sous: idle · model unloaded"
+    )
+    assert statusline_text({}, now) == "sous: idle · model unloaded"
+
+
+def _statusline_config(tmp_path, monkeypatch, port: int):
+    from sous import cli
+    from sous.config import SousConfig
+
+    cfg = SousConfig(server_port=port, data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+
+
+def test_statusline_reads_the_daemon_and_prints_one_line(tmp_path, capsys, monkeypatch):
+    import io
+
+    from sous import cli
+
+    fake = _FakeSousHTTP(_document(inflight=[_turn()]))
+    try:
+        _statusline_config(tmp_path, monkeypatch, fake.port)
+        # Claude Code pipes its own JSON in; it is read and ignored.
+        monkeypatch.setattr(sys, "stdin", io.StringIO('{"model": {"id": "claude-opus-5"}}'))
+        cli.main(["statusline"])
+    finally:
+        fake.close()
+    out = capsys.readouterr().out
+    assert out == "sous: decode 612 tok · 14.7 tok/s · eta 18s\n"
+
+
+def test_statusline_says_daemon_down_and_exits_zero(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    _statusline_config(tmp_path, monkeypatch, _free_cli_port())
+    cli.main(["statusline"])
+    assert capsys.readouterr().out == "sous: daemon down\n"
+
+
+def test_statusline_treats_a_wrong_answer_as_daemon_down(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    fake = _FakeSousHTTP(None, raw=b"<html>not sous</html>")
+    try:
+        _statusline_config(tmp_path, monkeypatch, fake.port)
+        cli.main(["statusline"])
+    finally:
+        fake.close()
+    assert capsys.readouterr().out == "sous: daemon down\n"
+
+
+def test_statusline_ignores_a_configured_proxy(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    fake = _FakeSousHTTP(_document())
+    try:
+        _statusline_config(tmp_path, monkeypatch, fake.port)
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+        monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+        cli.main(["statusline"])
+    finally:
+        fake.close()
+    assert capsys.readouterr().out == "sous: idle · 5 slots\n"
+
+
+def test_statusline_imports_nothing_heavy(tmp_path):
+    """It runs once a second under Claude Code: the stdlib only. Checked in
+    a fresh interpreter, since this test process has long since imported
+    httpx for the launcher's tests."""
+    fake = _FakeSousHTTP(_document())
+    try:
+        probe = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from sous import cli\n"
+            "from sous.config import SousConfig\n"
+            f"cfg = SousConfig(server_port={fake.port}, data_dir=Path(sys.argv[1]), "
+            "config_path=Path(sys.argv[1]) / 'c.toml')\n"
+            "cli.load_config = lambda: cfg\n"
+            "cli.main(['statusline'])\n"
+            "print(sorted(m for m in ('textual', 'httpx', 'mlx', 'psutil') if m in sys.modules))\n"
+        )
+        done = subprocess.run(
+            [sys.executable, "-c", probe, str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+    finally:
+        fake.close()
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "sous: idle · 5 slots\n[]\n"
