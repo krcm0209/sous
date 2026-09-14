@@ -97,15 +97,20 @@ Claude Code use stretches further — evaluate features against that goal.
   (`_loading`/`_unloading` on a `Condition`): `status()`, `hold()` and the
   idle sweep must answer during either, and `/sous/status` reports
   `loading`. A `hold(pid, create_time)` pins the model while that process
-  lives — the sweep prunes holders with psutil (pid gone, or start time
-  off by more than a second = reused pid) and restarts the idle clock when
-  the last leaves; the preload thread it may start calls `get()` and then
-  `release_mlx_thread_state()` like every mlx-touching thread. The `/sous/`
+  lives — the sweep, `status()` and `hold()` all prune holders with psutil
+  (pid gone, a zombie, or start time off by more than a second = reused
+  pid), and whichever prunes the last one restarts the idle clock; the
+  preload thread `hold()` may start calls `get()` and then
+  `release_mlx_thread_state()` like every mlx-touching thread. A gateway
+  turn re-checks `abandoned` after `engines.get()`: that is where it now
+  waits out another thread's load (the lease no longer does). The `/sous/`
   routes (`sous/monitor.py`) are mounted in `create_server` *before* the
   gateway and whether or not it is enabled, behind the loopback guard in
   `sous/loopback.py` that the gateway shares; a `/sous/` path never reaches
-  the upstream. `sous claude` has no MCP client: `/sous/status` or a 404 =
-  "restart the daemon", no compatibility fallback.
+  the upstream, and a failure inside a route is a JSON 500, never
+  Starlette's text one. `sous claude` has no MCP client: `/sous/status`, or
+  a 404 from whatever holds `daemon.lock` = "restart the daemon" (from
+  anything else = "not sous on this port"), no compatibility fallback.
 - Claude Code auto-compacts a `sous-local` subagent when *its own* token
   count nears `CLAUDE_CODE_MAX_CONTEXT_TOKENS − 33K` (sooner with its
   precompute trigger) — two extra local calls, ~6 minutes at 131072 for a

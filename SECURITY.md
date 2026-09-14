@@ -66,7 +66,9 @@ Anything that breaks a guarantee in the
   the `server_status` document (model id, port, queue depth, allowlist);
   `/sous/hold` pins the model in memory while a named process lives. In
   scope: reachability from anything but a loopback client; a path under
-  `/sous` reaching the gateway's forwarder; a hold body reaching a log.
+  `/sous` reaching the gateway's forwarder; anything of a hold body beyond
+  its pid reaching a log (the pid is logged, deliberately, to attribute the
+  hold and its release; the start time and the raw body never are).
 
 ## What isn't
 
