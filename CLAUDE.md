@@ -131,8 +131,9 @@ Claude Code use stretches further — evaluate features against that goal.
   never wake it from a writer. The routes record a summary for *every*
   `POST /v1/messages id=…` line — refused, abandoned and failed included —
   and the served line is printed from that summary (`_turn_line`), so a
-  row and a line cannot disagree; PR 3 persists the dict as it is. Textual
-  is imported only inside the `sous top` command function: `sous serve`,
+  row and a line cannot disagree; the dict is in memory only and does not
+  survive a restart. Textual is imported only inside the `sous top`
+  command function: `sous serve`,
   `sous claude` and `sous statusline` (stdlib only, half-second budget)
   never load it. The terminal runs with `ansi_color=True` and the
   `ansi-dark` theme pinned explicitly — foreground and background are the
