@@ -339,9 +339,48 @@ def test_server_status(svc):
     service.delegate_task("t", "x", str(root))
     s = service.server_status()
     assert s["queue"]["queued"] == 1
-    assert s["model"]["loaded"] is False
+    assert s["engine"]["loaded"] is False and s["engine"]["loading"] is False
+    assert s["engine"]["holders"] == 0 and "memory_gb" in s["engine"]
+    assert s["inflight"] == []
     assert s["config"]["model_id"]
     assert ["pytest"] in s["config"]["allowlist"]
+    # The MCP tool's answer is the document without the two recent lists:
+    # a frontier model pays to read every key.
+    assert set(s) == {"engine", "inflight", "queue", "config"}
+
+
+def test_status_document_with_recents_lists_turns_and_tasks(svc):
+    from sous.inflight import Inflight
+
+    service, store, root = svc
+    assert isinstance(service.inflight, Inflight)
+    tid = service.delegate_task("scaffold the fixtures", "x", str(root))["task_id"]
+    store.claim_next()
+    service.inflight.begin("msg_1", model="sous-local", stream=True, max_tokens=64)
+    service.inflight.finished({"ts": 1.0, "id": "msg_0", "status": 200})
+    doc = service.status_document(recent=True)
+    assert set(doc) == {"engine", "inflight", "queue", "config", "recent_turns", "recent_tasks"}
+    assert [t["id"] for t in doc["inflight"]] == ["msg_1"]
+    assert doc["recent_turns"] == [{"ts": 1.0, "id": "msg_0", "status": 200}]
+    (task,) = doc["recent_tasks"]
+    assert task["id"] == tid and task["state"] == "running"
+    assert task["title"] == "scaffold the fixtures" and task["seconds"] >= 0
+    assert set(task) == {"id", "state", "title", "seconds"}
+    assert doc["queue"] == {"queued": 0, "running": 1}
+
+
+def test_recent_tasks_are_capped_at_ten_newest_first(svc):
+    service, store, root = svc
+    for n in range(12):
+        store.enqueue(
+            title=f"t{n}",
+            instructions="x",
+            project_root=str(root),
+            context_files=[],
+            verify_commands=[],
+        )
+    titles = [t["title"] for t in service.status_document(recent=True)["recent_tasks"]]
+    assert titles == [f"t{n}" for n in range(11, 1, -1)]
 
 
 def test_server_status_counts_past_200_tasks(svc):

@@ -314,7 +314,7 @@ def _cmd_claude(user_args: list[str]) -> None:
     exits_at_once = any(arg in _NO_HOLD_FLAGS for arg in user_args[:end])
     held = None if exits_at_once else _hold(config.server_port)
     if held is not None:
-        model_id = status.get("model", {}).get("model_id", "the model")
+        model_id = status.get("engine", {}).get("model_id", "the model")
         if held.get("loaded"):
             what = f"{model_id} already loaded"
         elif held.get("loading"):

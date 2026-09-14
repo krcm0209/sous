@@ -1,30 +1,69 @@
-"""The daemon's own loopback routes under /sous/: what `sous claude` speaks
-to the daemon. Mounted before the gateway's routes and whatever the gateway
-flag says, so a path under /sous — the bare /sous included — is answered
-here or 404s here for every method the routes register (a verb none of them
-lists gets Starlette's own 405 first), and is never forwarded to the
-upstream."""
+"""The daemon's own loopback routes under /sous/: what `sous claude`, `sous
+top` and `sous statusline` speak to the daemon. Mounted before the gateway's
+routes and whatever the gateway flag says, so a path under /sous — the bare
+/sous included — is answered here or 404s here for every method the routes
+register (a verb none of them lists gets Starlette's own 405 first), and is
+never forwarded to the upstream."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
-from collections.abc import Callable
+import time
+from collections.abc import AsyncIterator, Callable
 
 from anyio.to_thread import run_sync
 from mcp.server import MCPServer
+from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 
 from sous.engine.base import EngineManager
 from sous.gateway.convert import RequestError, _invalid
+from sous.inflight import Inflight
 from sous.loopback import ALL_METHODS, check_loopback
 
 _logger = logging.getLogger("sous.monitor")
 
 # A hold body is two numbers; anything larger is not one.
 HOLD_BODY_LIMIT = 1024
+# The event stream polls the registry's version this often: a burst of
+# changes inside one tick is one event, and a change is on the wire within
+# a tick. Ten a second is what a terminal can show and what a token-per-
+# delta feed produces at the default model's decode speed.
+EVENT_TICK_SECONDS = 0.1
+# Engine state (a load starting, a holder leaving, the idle clock) is not
+# in the registry, so the document also goes out this often unchanged.
+EVENT_HEARTBEAT_SECONDS = 1.0
+# sse-starlette's keepalive, for a client behind something that closes a
+# silent connection; the daemon's own /v1 stream uses the same interval.
+EVENT_PING_SECONDS = 10
+_SEP = "\n"
+_PING = ServerSentEvent(event="ping", data='{"type": "ping"}', sep=_SEP)
+
+
+async def _status_events(
+    status: Callable[[], dict], inflight: Inflight
+) -> AsyncIterator[ServerSentEvent]:
+    """The document now, then again whenever the registry changed since the
+    last one went out — checked every tick — and at least once a heartbeat
+    regardless. Built on a worker thread each time. Nothing is buffered for
+    a client that is gone: the response cancels this generator on
+    disconnect, and the tick's sleep is where that lands."""
+    seen: int | None = None
+    sent = float("-inf")
+    while True:
+        version = inflight.version
+        now = time.monotonic()
+        if version != seen or now - sent >= EVENT_HEARTBEAT_SECONDS:
+            document = await run_sync(status)
+            yield ServerSentEvent(
+                event="status", data=json.dumps(document, separators=(",", ":")), sep=_SEP
+            )
+            seen, sent = version, now
+        await asyncio.sleep(EVENT_TICK_SECONDS)
 
 
 def _refused(e: RequestError) -> Response:
@@ -81,12 +120,15 @@ async def _served(route: str, fn: Callable[..., dict], *args: object) -> Respons
         return _refused(RequestError(500, "api_error", type(e).__name__))
 
 
-def mount_monitor(mcp: MCPServer, engines: EngineManager, status: Callable[[], dict]) -> None:
-    """Register GET /sous/status, POST /sous/hold and a 404 for every other
-    /sous/ path. `status` is the daemon's server_status document. Both real
-    handlers hand their work to a thread: status() reads the task store and
-    hold() takes the engine manager's lock, and neither belongs on the event
-    loop."""
+def mount_monitor(
+    mcp: MCPServer, engines: EngineManager, status: Callable[[], dict], inflight: Inflight
+) -> None:
+    """Register GET /sous/status, GET /sous/events, POST /sous/hold and a
+    404 for every other /sous/ path. `status` builds the full status
+    document (recent turns and tasks included); `inflight` is the registry
+    whose version the event stream watches. Every handler hands its work to
+    a thread: status() reads the task store and hold() takes the engine
+    manager's lock, and neither belongs on the event loop."""
 
     async def sous_status(request: Request) -> Response:
         try:
@@ -94,6 +136,18 @@ def mount_monitor(mcp: MCPServer, engines: EngineManager, status: Callable[[], d
         except RequestError as e:
             return _refused(e)
         return await _served("GET /sous/status", status)
+
+    async def sous_events(request: Request) -> Response:
+        try:
+            check_loopback(request)
+        except RequestError as e:
+            return _refused(e)
+        return EventSourceResponse(
+            _status_events(status, inflight),
+            ping=EVENT_PING_SECONDS,
+            ping_message_factory=lambda: _PING,
+            sep=_SEP,
+        )
 
     async def sous_hold(request: Request) -> Response:
         try:
@@ -111,8 +165,9 @@ def mount_monitor(mcp: MCPServer, engines: EngineManager, status: Callable[[], d
         return _refused(RequestError(404, "not_found_error", "no such route"))
 
     mcp.custom_route("/sous/status", methods=["GET"])(sous_status)
+    mcp.custom_route("/sous/events", methods=["GET"])(sous_events)
     mcp.custom_route("/sous/hold", methods=["POST"])(sous_hold)
-    # Registered after the two real routes and before the gateway mounts its
+    # Registered after the real routes and before the gateway mounts its
     # catch-all (the SDK keeps registration order), so no path under /sous
     # can reach the upstream with the gateway on. The bare /sous needs its
     # own entry: `/sous/{path:path}` does not match it, and the gateway's

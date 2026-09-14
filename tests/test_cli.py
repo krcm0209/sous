@@ -832,9 +832,9 @@ _DEFAULT_STATUS = object()
 def _status(**gateway) -> dict:
     """The shape of `GET /sous/status` — `SousService.server_status()` — of
     which the launcher reads `config.gateway` for its checks and
-    `model.model_id` for its one line."""
+    `engine.model_id` for its one line."""
     return {
-        "model": {
+        "engine": {
             "model_id": "mlx-community/Qwen3.8-27B-4bit",
             "loaded": True,
             "loading": False,
@@ -854,8 +854,8 @@ def _status(**gateway) -> dict:
 
 def _claude_setup(tmp_path, monkeypatch, *, status=_DEFAULT_STATUS, **overrides):
     """A gateway-enabled config file, a `claude` on PATH, a daemon that answers
-    server_status, and an execve that records instead of replacing the
-    process. `status=None` is a daemon that does not answer at all."""
+    `GET /sous/status`, and an execve that records instead of replacing the
+    process."""
     import os
 
     from sous import cli

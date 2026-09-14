@@ -27,6 +27,7 @@ from sous.config import SousConfig, current_allowlist, load_config, persist_allo
 from sous.engine.base import EngineManager, release_mlx_thread_state
 from sous.gateway.routes import Gateway, mount_gateway
 from sous.gateway.upstream import Upstream
+from sous.inflight import Inflight
 from sous.logs import configure_daemon_logging, enable_warning_capture, format_line
 from sous.monitor import mount_monitor
 from sous.tasks import FINISHED_STATES, Task, TaskState, TaskStore
@@ -56,10 +57,19 @@ def _mlx_memory_gb() -> float | None:
 
 
 class SousService:
-    def __init__(self, store: TaskStore, engines: EngineManager, config: SousConfig):
+    def __init__(
+        self,
+        store: TaskStore,
+        engines: EngineManager,
+        config: SousConfig,
+        inflight: Inflight | None = None,
+    ):
         self.store = store
         self.engines = engines
         self.config = config
+        # The gateway's turns report here; create_server hands the same
+        # registry to both, so the status document sees what the gateway does.
+        self.inflight = inflight or Inflight()
 
     def delegate_task(
         self,
@@ -222,11 +232,29 @@ class SousService:
             )
         return {"ok": ok}
 
-    def server_status(self) -> dict:
-        counts = self.store.count_by_state()
+    def _task_summary(self, t: Task) -> dict:
+        end = t.finished_at or time.time()
         return {
-            "model": self.engines.status(),
-            "memory_gb": _mlx_memory_gb(),
+            "id": t.id,
+            "state": t.state,
+            "title": t.title,
+            "seconds": round(end - t.started_at) if t.started_at else 0,
+        }
+
+    def status_document(self, *, recent: bool) -> dict:
+        """The one document every status surface serves. `recent` adds the
+        last fifty turns and the last ten tasks — for the HTTP routes and
+        the terminal, not for the MCP tool, where a frontier model pays for
+        every key it reads. Runs on a worker thread: the task store is
+        SQLite, the engine's status takes its lock, and the registry's
+        snapshot may call into the prompt cache."""
+        counts = self.store.count_by_state()
+        engine = self.engines.status()
+        engine["memory_gb"] = _mlx_memory_gb()
+        live = self.inflight.snapshot()
+        document = {
+            "engine": engine,
+            "inflight": live["inflight"],
             "queue": {
                 "queued": counts.get(TaskState.QUEUED, 0),
                 "running": counts.get(TaskState.RUNNING, 0)
@@ -254,6 +282,15 @@ class SousService:
                 },
             },
         }
+        if recent:
+            document["recent_turns"] = live["recent_turns"]
+            document["recent_tasks"] = [
+                self._task_summary(t) for t in self.store.list_recent(limit=10)
+            ]
+        return document
+
+    def server_status(self) -> dict:
+        return self.status_document(recent=False)
 
 
 # Clients surface server instructions to the model unconditionally, even on
@@ -306,8 +343,13 @@ def create_server(
     config: SousConfig,
     *,
     upstream: Upstream | None = None,
+    inflight: Inflight | None = None,
 ) -> MCPServer:
-    svc = SousService(store, engines, config)
+    # One registry: the gateway's turns write it, the status routes and the
+    # MCP tool read it. A caller may pass its own (a test that writes to it
+    # while driving the app).
+    inflight = inflight or Inflight()
+    svc = SousService(store, engines, config, inflight)
     # mount_gateway (below) runs after MCPServer(...) is constructed, so the
     # lifespan closure below needs a late-bound holder for whatever it
     # mounts — empty when the gateway is disabled, since there is then
@@ -408,9 +450,11 @@ def create_server(
     # with a catch-all that forwards upstream, and a /sous/ path must never
     # get there. Mounted whatever the gateway flag says — `sous claude`
     # asks /sous/status whether the gateway is on.
-    mount_monitor(mcp, engines, svc.server_status)
+    mount_monitor(mcp, engines, lambda: svc.status_document(recent=True), inflight)
     if config.gateway_enabled:
-        mounted_gateway.append(mount_gateway(mcp, engines, config, upstream=upstream))
+        mounted_gateway.append(
+            mount_gateway(mcp, engines, config, upstream=upstream, inflight=inflight)
+        )
 
     return mcp
 
