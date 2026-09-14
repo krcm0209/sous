@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from sous.config import SousConfig
-from sous.engine.base import Delta, EngineManager, GenerationStalled, ReplaySafe
+from sous.engine.base import Delta, EngineManager, GenerationStalled, ManagedEngine, ReplaySafe
 from sous.gateway.turn import (
     CountResult,
     GatewayBusy,
@@ -16,6 +16,7 @@ from sous.gateway.turn import (
     TurnResult,
     TurnRunner,
 )
+from sous.inflight import Inflight
 from tests.fake_engine import ChunkedFakeEngine, FakeEngine
 
 
@@ -722,3 +723,141 @@ def test_a_turn_abandoned_while_waiting_out_another_threads_load_never_generates
     t.join(10)
     loader.join(10)
     assert outcome == ["abandoned"] and inner.calls == []
+
+
+class _Recording(Inflight):
+    """Every registry call in order, so a turn's walk through the phases
+    can be pinned without racing the turn thread."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple] = []
+
+    def begin(self, turn_id, *, model, stream, max_tokens):
+        self.calls.append(("begin", turn_id, model, stream, max_tokens))
+        super().begin(turn_id, model=model, stream=stream, max_tokens=max_tokens)
+
+    def phase(self, turn_id, phase, *, probe=None):
+        self.calls.append(("phase", turn_id, phase, probe is not None))
+        super().phase(turn_id, phase, probe=probe)
+
+    def sized(self, turn_id, input_tokens):
+        self.calls.append(("sized", turn_id, input_tokens))
+        super().sized(turn_id, input_tokens)
+
+    def progress(self, turn_id, generated_tokens):
+        self.calls.append(("progress", turn_id, generated_tokens))
+        super().progress(turn_id, generated_tokens)
+
+    def end(self, turn_id):
+        self.calls.append(("end", turn_id))
+        super().end(turn_id)
+
+
+def test_a_turn_walks_the_registry_and_leaves_it(tmp_path: Path):
+    inner = ChunkedFakeEngine(["Hel|lo"])
+    live = _Recording()
+    engines = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    runner = TurnRunner(engines, _cfg(tmp_path), live)
+    runner.run(MSGS, [], 4096, RecordingSink(), turn_id="msg_1", model="sous-local", stream=True)
+    tokens = inner.count_tokens(MSGS, [])
+    assert live.calls == [
+        ("begin", "msg_1", "sous-local", True, 4096),
+        ("phase", "msg_1", "loading", False),
+        ("phase", "msg_1", "tokenizing", False),
+        ("sized", "msg_1", tokens),
+        ("phase", "msg_1", "prefill", True),
+        ("progress", "msg_1", 1),
+        ("progress", "msg_1", 2),
+        ("end", "msg_1"),
+    ]
+    assert live.snapshot()["inflight"] == []
+
+
+def test_the_registry_sees_the_turn_while_it_generates(tmp_path: Path):
+    """What a status reader on another thread finds mid-turn: the entry in
+    its prefill phase, and — through the probe — the sizes the cache has
+    already decided, read off the owner's own counters."""
+    inner = FakeEngine(["ok"])
+    live = Inflight()
+    engines = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    runner = TurnRunner(engines, _cfg(tmp_path), live)
+    seen: list[dict] = []
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        # Before the cache decides: the probe has nothing to say.
+        seen.append(live.snapshot()["inflight"][0])
+        inner.stats = {"reused_tokens": 55175, "prefilled_tokens": 3120}
+        seen.append(live.snapshot()["inflight"][0])
+        return original(messages, tools, max_tokens, on_delta)
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    runner.run(MSGS, [], 4096, RecordingSink(), turn_id="msg_1", model="sous-local")
+    undecided, decided = seen
+    assert undecided["phase"] == "prefill"
+    assert undecided["reused_tokens"] is None and undecided["to_prefill"] is None
+    assert decided["reused_tokens"] == 55175 and decided["to_prefill"] == 3120
+    assert decided["input_tokens"] == inner.count_tokens(MSGS, [])
+
+
+def test_a_failed_turn_leaves_the_registry_too(tmp_path: Path):
+    class Boom(FakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            raise RuntimeError("no")
+
+    live = Inflight()
+    engines = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: Boom([]))
+    runner = TurnRunner(engines, _cfg(tmp_path), live)
+    with pytest.raises(RuntimeError):
+        runner.run(MSGS, [], 4096, RecordingSink(), turn_id="msg_1")
+    assert live.snapshot()["inflight"] == []
+
+
+def test_a_turn_refused_at_the_lock_leaves_the_registry(tmp_path: Path):
+    live = Inflight()
+    engines = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: FakeEngine([]))
+    runner = TurnRunner(engines, _cfg(tmp_path, gateway_generation_timeout_minutes=1), live)
+    runner._timeout = 0.05
+    with runner._lock, pytest.raises(GatewayBusy):
+        runner.run(MSGS, [], 4096, RecordingSink(), turn_id="msg_1")
+    assert live.snapshot()["inflight"] == []
+
+
+def test_an_abandoned_turn_leaves_the_registry(tmp_path: Path):
+    live = _Recording()
+    engines = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: FakeEngine(["never"]))
+    runner = TurnRunner(engines, _cfg(tmp_path), live)
+    gone = threading.Event()
+    gone.set()
+    with pytest.raises(TurnAbandoned):
+        runner.run(MSGS, [], 4096, RecordingSink(), gone, turn_id="msg_1")
+    assert live.calls == [
+        ("begin", "msg_1", "-", False, 4096),
+        ("phase", "msg_1", "loading", False),
+        ("end", "msg_1"),
+    ]
+    assert live.snapshot()["inflight"] == []
+
+
+def test_a_turn_without_an_id_never_touches_the_registry(tmp_path: Path):
+    live = _Recording()
+    engines = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: FakeEngine(["ok"]))
+    runner = TurnRunner(engines, _cfg(tmp_path), live)
+    runner.run(MSGS, [], 4096, RecordingSink())
+    assert live.calls == []
+
+
+def test_the_prefill_probe_reads_the_owners_counters_against_the_turns_baseline():
+    from sous.gateway.turn import _prefill_plan
+
+    inner = FakeEngine([])
+    engine = ManagedEngine(inner)
+    owner = threading.current_thread()
+    inner.stats = {"reused_tokens": 40, "prefilled_tokens": 0}
+    assert _prefill_plan(engine, owner, {"reused_tokens": 40}) is None
+    inner.stats = {"reused_tokens": 90, "prefilled_tokens": 12}
+    assert _prefill_plan(engine, owner, {"reused_tokens": 40}) == (50, 12)
+    inner.stats = {"reused_tokens": 40, "prefilled_tokens": 12}
+    assert _prefill_plan(engine, owner, {"reused_tokens": 40}) == (0, 12)
+    assert inner.stats_owners[-1] is owner

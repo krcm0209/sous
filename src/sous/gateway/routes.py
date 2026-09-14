@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import functools
 import json
 import logging
 import math
@@ -42,7 +43,8 @@ from sous.gateway.turn import (
     TurnRunner,
 )
 from sous.gateway.upstream import SynthesizedError, Upstream
-from sous.loopback import check_loopback
+from sous.inflight import Inflight
+from sous.loopback import ALL_METHODS, check_loopback
 from sous.protocol import ToolSet
 
 # Anthropic's own request cap. The MCP transport's 4 MiB limit wraps only the
@@ -140,8 +142,8 @@ def _lcp_region(lcp: int, lo: int, hi: int) -> str:
     return "conversation"
 
 
-def _rate(count: int, seconds: float) -> str:
-    return "-" if seconds <= 0 else f"{count / seconds:.1f}"
+def _per_second(count: int, seconds: float) -> float | None:
+    return None if seconds <= 0 else count / seconds
 
 
 def _opt(value: float | None) -> str:
@@ -197,6 +199,93 @@ def _classify(exc: Exception) -> tuple[int, str, str]:
     if isinstance(exc, GenerationStalled):
         return 500, "api_error", str(exc)
     return 500, "api_error", f"generation failed: {exc}"
+
+
+def _turn_summary(
+    chat: ChatRequest, result: TurnResult, assembler: TurnAssembler, *, stream: bool
+) -> dict:
+    """The turn line's fields as one JSON-ready dict: what the registry keeps
+    for the live view and what the line is printed from, so the two can
+    never disagree. Counts, durations, hashes and identifiers only."""
+    cache = "fork" if result.forked else "hit" if result.cache_hit else "miss"
+    lo, hi = result.bounds
+    miss = cache == "miss"
+    return {
+        "ts": time.time(),
+        "id": assembler.message_id,
+        "model": _model_label(chat),
+        "stream": int(stream),
+        "status": 200,
+        "error": None,
+        "stop_reason": assembler.stop_reason,
+        "cache": cache,
+        # A hit retried cold took no slot in the end: the cache zeroes its
+        # per-turn gauges with the retry, so took_kind is "" there too.
+        "took": f"{result.took_kind}@{result.took_len}" if result.took_kind else "none",
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "reused_tokens": result.reused_tokens,
+        "prefilled_tokens": result.prefilled_tokens,
+        # A hit already says how much was reused; a miss says how far the
+        # render agreed with the closest slot and in which region — the
+        # number that tells a changed tool array from a changed system text.
+        "lcp": result.lcp if miss else None,
+        "lcp_region": _lcp_region(result.lcp, lo, hi) if miss else None,
+        "bounds": [b for b in (lo, hi) if b] if miss else None,
+        "forks": result.forks,
+        "evicted": result.evictions,
+        "pressure": result.pressure_evictions,
+        "load_s": result.load_seconds,
+        "queue_s": result.queue_seconds,
+        "engine_wait_s": result.engine_wait_seconds,
+        "tokenize_s": result.tokenize_seconds,
+        "ttft_s": result.ttft_seconds,
+        "prefill_s": result.prefill_seconds,
+        "decode_s": result.decode_seconds,
+        "prefill_tps": _per_second(result.prefilled_tokens, result.prefill_seconds),
+        "decode_tps": _per_second(result.output_tokens, result.decode_seconds),
+        "seconds": result.seconds,
+        "tools_hash": chat.tools_hash or None,
+        "system_hash": chat.system_hash or None,
+    }
+
+
+def _turn_line(s: dict) -> str:
+    diag = ""
+    if s["cache"] == "miss":
+        bounds = ",".join(str(b) for b in s["bounds"])
+        diag = f" lcp={s['lcp']} lcp_region={s['lcp_region']} bounds=[{bounds}]"
+    return (
+        f"POST /v1/messages id={s['id']} model={s['model']} "
+        f"stream={s['stream']} status=200 "
+        f"input_tokens={s['input_tokens']} output_tokens={s['output_tokens']} "
+        f"stop={s['stop_reason']} cache={s['cache']} took={s['took']} "
+        f"reused_tokens={s['reused_tokens']} prefilled_tokens={s['prefilled_tokens']} "
+        f"forks={s['forks']} evicted={s['evicted']} pressure={s['pressure']} "
+        f"load_s={s['load_s']:.1f} queue_s={s['queue_s']:.1f} "
+        f"engine_wait_s={s['engine_wait_s']:.1f} "
+        f"tokenize_s={s['tokenize_s']:.1f} ttft_s={_opt(s['ttft_s'])} "
+        f"prefill_s={s['prefill_s']:.1f} decode_s={s['decode_s']:.1f} "
+        f"prefill_tps={_opt(s['prefill_tps'])} decode_tps={_opt(s['decode_tps'])} "
+        f"seconds={s['seconds']:.1f}{diag} "
+        f"tools={s['tools_hash'] or '-'} system={s['system_hash'] or '-'}"
+    )
+
+
+def _failure_summary(
+    turn_id: str, model: str, stream: bool, status: int, error: str, received: float
+) -> dict:
+    """What the ring keeps for a turn that produced no result: the same head
+    as a success plus the error type and the client's wait."""
+    return {
+        "ts": time.time(),
+        "id": turn_id,
+        "model": model,
+        "stream": int(stream),
+        "status": status,
+        "error": error,
+        "seconds": time.monotonic() - received,
+    }
 
 
 def _reject_constant(name: str) -> None:
@@ -322,10 +411,18 @@ class _NullSink:
 
 class Gateway:
     def __init__(
-        self, engines: EngineManager, config: SousConfig, upstream: Upstream | None = None
+        self,
+        engines: EngineManager,
+        config: SousConfig,
+        upstream: Upstream | None = None,
+        inflight: Inflight | None = None,
     ):
         self._config = config
-        self._runner = TurnRunner(engines, config)
+        # The daemon's registry when create_server hands one in (the status
+        # routes read it); a private one otherwise, so the runner always has
+        # somewhere to report.
+        self._inflight = inflight or Inflight()
+        self._runner = TurnRunner(engines, config, self._inflight)
         # Turns get their own pool, never asyncio's default executor. A turn
         # drains to completion after its client is gone, so a shared pool would
         # mean one generation-long thread starving every asyncio.to_thread user
@@ -524,6 +621,16 @@ class Gateway:
                 f"stream={int(chat.stream)} status=529 error=overloaded_error{_elapsed(received)}",
                 level=logging.WARNING,
             )
+            self._inflight.finished(
+                _failure_summary(
+                    assembler.message_id,
+                    _model_label(chat),
+                    chat.stream,
+                    529,
+                    "overloaded_error",
+                    received,
+                )
+            )
             return _error_response(529, "overloaded_error", "too many turns queued")
         if chat.stream:
             loop = asyncio.get_running_loop()
@@ -550,7 +657,14 @@ class Gateway:
                         (
                             "done",
                             self._runner.run(
-                                chat.messages, chat.tools, chat.max_tokens, sink, abandoned
+                                chat.messages,
+                                chat.tools,
+                                chat.max_tokens,
+                                sink,
+                                abandoned,
+                                turn_id=assembler.message_id,
+                                model=_model_label(chat),
+                                stream=True,
                             ),
                         )
                     )
@@ -559,6 +673,16 @@ class Gateway:
                         f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
                         f"stream=1 status=499 error=abandoned{_elapsed(received)}",
                         level=logging.WARNING,
+                    )
+                    self._inflight.finished(
+                        _failure_summary(
+                            assembler.message_id,
+                            _model_label(chat),
+                            True,
+                            499,
+                            "abandoned",
+                            received,
+                        )
                     )
                     # Ends the drain _stream left waiting for this turn's outcome.
                     sink.put(("abandoned", None))
@@ -575,11 +699,16 @@ class Gateway:
         future = self._submit(
             self._turns,
             self._pending,
-            self._runner.run,
-            chat.messages,
-            chat.tools,
-            chat.max_tokens,
-            _NullSink(),
+            functools.partial(
+                self._runner.run,
+                chat.messages,
+                chat.tools,
+                chat.max_tokens,
+                _NullSink(),
+                turn_id=assembler.message_id,
+                model=_model_label(chat),
+                stream=False,
+            ),
         )
         try:
             result = await future
@@ -589,6 +718,11 @@ class Gateway:
                 f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
                 f"stream=0 status={status} error={error_type}{_elapsed(received)}",
                 level=_status_level(status),
+            )
+            self._inflight.finished(
+                _failure_summary(
+                    assembler.message_id, _model_label(chat), False, status, error_type, received
+                )
             )
             return _error_response(status, error_type, message)
         assembler.start(result.input_tokens)
@@ -677,6 +811,14 @@ class Gateway:
                     for event in events:
                         yield _frame(event)
                     return
+                elif kind == "abandoned":
+                    # turn() already logged the 499 and recorded it in the
+                    # registry before putting this; a buffered client (never
+                    # cancelled, unlike a real disconnect) still reads this
+                    # consumer to the end, so it must not treat the same
+                    # outcome as a second, generic failure.
+                    outcome_seen = True
+                    return
                 else:
                     outcome_seen = True
                     status, error_type, message = _classify(value)
@@ -732,44 +874,30 @@ class Gateway:
             f"status=200 error={error_type}{_elapsed(received)}",
             level=_status_level(status),
         )
+        self._inflight.finished(
+            # The client saw 200: the SSE headers had gone out before the failure.
+            _failure_summary(
+                assembler.message_id, _model_label(chat), True, 200, error_type, received
+            )
+        )
 
     def _log_turn(
         self, chat: ChatRequest, result: TurnResult, assembler: TurnAssembler, *, stream: bool
     ) -> None:
-        cache = "fork" if result.forked else "hit" if result.cache_hit else "miss"
-        # A hit retried cold took no slot in the end: the cache zeroes its
-        # per-turn gauges with the retry, so took_kind is "" there too.
-        took = f"{result.took_kind}@{result.took_len}" if result.took_kind else "none"
-        lo, hi = result.bounds
-        # A hit already says how much was reused; a miss says how far the
-        # render agreed with the closest slot and in which region — the
-        # number that tells a changed tool array from a changed system text.
-        diag = ""
-        if cache == "miss":
-            bounds = ",".join(str(b) for b in (lo, hi) if b)
-            diag = (
-                f" lcp={result.lcp} lcp_region={_lcp_region(result.lcp, lo, hi)} bounds=[{bounds}]"
-            )
-        _log(
-            f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
-            f"stream={int(stream)} status=200 "
-            f"input_tokens={result.input_tokens} output_tokens={result.output_tokens} "
-            f"stop={assembler.stop_reason} cache={cache} took={took} "
-            f"reused_tokens={result.reused_tokens} prefilled_tokens={result.prefilled_tokens} "
-            f"forks={result.forks} evicted={result.evictions} pressure={result.pressure_evictions} "
-            f"load_s={result.load_seconds:.1f} queue_s={result.queue_seconds:.1f} "
-            f"engine_wait_s={result.engine_wait_seconds:.1f} "
-            f"tokenize_s={result.tokenize_seconds:.1f} ttft_s={_opt(result.ttft_seconds)} "
-            f"prefill_s={result.prefill_seconds:.1f} decode_s={result.decode_seconds:.1f} "
-            f"prefill_tps={_rate(result.prefilled_tokens, result.prefill_seconds)} "
-            f"decode_tps={_rate(result.output_tokens, result.decode_seconds)} "
-            f"seconds={result.seconds:.1f}{diag} "
-            f"tools={chat.tools_hash or '-'} system={chat.system_hash or '-'}"
-        )
+        # On the event loop: the record is a lock held for microseconds by
+        # threads that hold it for microseconds, and nothing else.
+        summary = _turn_summary(chat, result, assembler, stream=stream)
+        self._inflight.finished(summary)
+        _log(_turn_line(summary))
 
 
 def mount_gateway(
-    mcp: MCPServer, engines: EngineManager, config: SousConfig, *, upstream: Upstream | None = None
+    mcp: MCPServer,
+    engines: EngineManager,
+    config: SousConfig,
+    *,
+    upstream: Upstream | None = None,
+    inflight: Inflight | None = None,
 ) -> Gateway:
     """Register the Anthropic-compatible routes on the daemon's Starlette app.
     custom_route adds bare routes: no auth (loopback only, like /mcp), no
@@ -789,14 +917,12 @@ def mount_gateway(
     # the daemon log unless pinned above where they say those things.
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    gateway = Gateway(engines, config, upstream)
+    gateway = Gateway(engines, config, upstream, inflight)
     mcp.custom_route("/v1/messages", methods=["POST"])(gateway.messages)
     mcp.custom_route("/v1/messages/count_tokens", methods=["POST"])(gateway.count_tokens)
     # Registered last and matched last: the SDK appends custom routes after
     # its /mcp mount, so this can never shadow the MCP transport — and a
     # method the two routes above do not take (GET /v1/messages) falls
     # through to here and gets the upstream's own answer for it.
-    mcp.custom_route(
-        "/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-    )(gateway.passthrough)
+    mcp.custom_route("/{path:path}", methods=list(ALL_METHODS))(gateway.passthrough)
     return gateway

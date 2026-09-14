@@ -19,13 +19,12 @@ from starlette.responses import JSONResponse, Response
 
 from sous.engine.base import EngineManager
 from sous.gateway.convert import RequestError, _invalid
-from sous.loopback import check_loopback
+from sous.loopback import ALL_METHODS, check_loopback
 
 _logger = logging.getLogger("sous.monitor")
 
 # A hold body is two numbers; anything larger is not one.
 HOLD_BODY_LIMIT = 1024
-_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
 
 def _refused(e: RequestError) -> Response:
@@ -118,5 +117,5 @@ def mount_monitor(mcp: MCPServer, engines: EngineManager, status: Callable[[], d
     # can reach the upstream with the gateway on. The bare /sous needs its
     # own entry: `/sous/{path:path}` does not match it, and the gateway's
     # `/{path:path}` would.
-    mcp.custom_route("/sous", methods=_METHODS)(sous_unknown)
-    mcp.custom_route("/sous/{path:path}", methods=_METHODS)(sous_unknown)
+    mcp.custom_route("/sous", methods=list(ALL_METHODS))(sous_unknown)
+    mcp.custom_route("/sous/{path:path}", methods=list(ALL_METHODS))(sous_unknown)
