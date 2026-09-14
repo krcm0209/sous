@@ -290,6 +290,37 @@ def test_get_during_an_unload_waits_for_it_and_loads_fresh():
     assert len(made) == 2 and got[0] is not slow and slow.unloaded is True
 
 
+def test_a_failed_unload_does_not_park_the_next_load():
+    """unload() runs outside the lock behind the _unloading flag; if it
+    raises, the flag must still clear, or every later get() waits forever
+    with nothing in the log but the worker's "continuing" line."""
+    made: list[FakeEngine] = []
+
+    class _RaisingUnload(FakeEngine):
+        def unload(self) -> None:
+            raise RuntimeError("teardown failed")
+
+    def factory(model_id: str):
+        made.append(_RaisingUnload([]) if not made else FakeEngine([]))
+        return made[-1]
+
+    mgr = EngineManager(SousConfig(idle_unload_minutes=0), engine_factory=factory)
+    mgr.get()
+    time.sleep(0.01)
+    with pytest.raises(RuntimeError):
+        mgr.unload_if_idle()
+    s = mgr.status()
+    assert s["loaded"] is False and s["loading"] is False
+    got: list = []
+    getter = threading.Thread(target=lambda: got.append(mgr.get()), daemon=True)
+    getter.start()
+    getter.join(5)
+    assert not getter.is_alive(), "a failed unload left the next load parked"
+    # get() always returns a fresh ManagedEngine wrapper (see get()), so the
+    # identity check is on the raw engine it wraps, not the wrapper itself.
+    assert len(made) == 2 and got[0]._inner is made[1]
+
+
 class _Liveness:
     """A stand-in for the psutil check: which (pid, create_time) pairs are
     live processes right now."""
