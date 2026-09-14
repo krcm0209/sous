@@ -543,6 +543,47 @@ def test_a_quiet_kitchens_idle_tick_only_moves_the_steam():
     _run(test)
 
 
+def test_a_heartbeat_repaints_only_the_lines_whose_words_changed(monkeypatch):
+    """The feed sends a status document every second whether or not anything
+    on it moved. A quiet kitchen's heartbeat changes the idle clock and
+    nothing else, and only the lines that show that clock may cost a
+    repaint — a whole screen redrawn every second is 2–6% of a core."""
+    painted: list[str] = []
+    real_refresh = tui.Widget.refresh
+
+    def spy(self, *args, **kwargs):
+        painted.append(f"{type(self).__name__}#{self.id}")
+        return real_refresh(self, *args, **kwargs)
+
+    async def test(app, pilot, feed, clock):
+        # Motion off parks the idle tick against a live daemon, so every
+        # repaint counted below is the document's own: the chef holds still
+        # and the pot's steam does not move.
+        app.motion = False
+        await _deliver(feed, pilot, _doc(None, recent=RECENT))
+        await _deliver(feed, pilot, _doc(None, recent=RECENT))
+        assert app._idler is not None and not app._idler._active.is_set()
+        assert "no orders on the rail for 4m 12s" in _plain(app, "#card-body")
+        monkeypatch.setattr(tui.Widget, "refresh", spy)
+        await _deliver(feed, pilot, _doc(None, recent=RECENT))
+        assert painted == [], f"a document that changed nothing repainted {painted}"
+        for n in (1, 2, 3):
+            painted.clear()
+            await _deliver(feed, pilot, _doc(None, recent=RECENT, idle_seconds=252.0 + n))
+            assert len(painted) <= 3, painted
+            assert "Line#card-body" in painted, painted
+            assert f"no orders on the rail for 4m {12 + n}s" in _plain(app, "#card-body")
+        # The memo is at the widget, not over the document: a turn arriving
+        # still draws the slip.
+        painted.clear()
+        await _deliver(feed, pilot, _doc(_turn(), recent=RECENT))
+        assert "Line#headline" in painted and "Slip#slip" in painted, painted
+        assert app.query_one(tui.Slip).display
+        assert _plain(app, "#headline").startswith(" PLATING  decode 412 tok")
+
+    _run(test)
+
+
 def test_a_dropped_feed_redials_and_a_daemon_that_never_answered_exits_one(monkeypatch):
     async def test(app, pilot, feed, clock):
         card = app.query_one(tui.Card)

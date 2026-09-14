@@ -521,6 +521,40 @@ async def sse_feed(port: int) -> AsyncIterator[tuple[str, dict]]:
 
 
 # --- widgets ------------------------------------------------------------------------------
+# The feed sends a status document every second whether or not anything on it
+# moved, and a document is applied to every widget at once. Textual's
+# `Static.update` re-parses the text, drops the cached dimensions and lays the
+# region out again whatever it is handed, and the border-title setter refreshes
+# on every assignment: a heartbeat that changed only the idle clock cost
+# fifteen repaints. The compare therefore lives at the widget boundary — one
+# place, no caller to remember it, and no cached copy of the document, which
+# would have to be invalidated for the clock and the one or two lines that
+# genuinely tick.
+
+
+class Line(Static):
+    """A line (or block) of text that repaints only when the text changes."""
+
+    def __init__(self, text: str = "", *, id: str) -> None:
+        # markup=False throughout: the text carries the daemon's own model
+        # ids and error strings, never console markup.
+        super().__init__(text, id=id, markup=False)
+        self._shown = text
+
+    def show(self, text: str) -> None:
+        if text != self._shown:
+            self._shown = text
+            self.update(text)
+
+
+def _retitle(widget: Widget, *, title: str | None = None, subtitle: str | None = None) -> None:
+    """Set a border title or subtitle only when it differs from the one drawn.
+    The getter returns the markup the setter stored, so equal markup is the
+    same picture."""
+    if title is not None and widget.border_title != title:
+        widget.border_title = title
+    if subtitle is not None and widget.border_subtitle != subtitle:
+        widget.border_subtitle = subtitle
 
 
 class Strip(Widget):
@@ -536,6 +570,8 @@ class Strip(Widget):
         self._headline_colour = TEAL
 
     def show(self, headline: str, colour: str) -> None:
+        if (headline, colour) == (self._headline, self._headline_colour):
+            return
         self._headline, self._headline_colour = headline, colour
         self.refresh()
 
@@ -691,7 +727,7 @@ class Slip(Vertical):
         self._stats = ""
 
     def compose(self) -> ComposeResult:
-        yield Static("", id="headline", markup=False)
+        yield Line(id="headline")
         yield Static("", id="spacer1")
         yield Gauge("SEAR", MUSTARD, id="sear")
         yield Gauge("PLATE", PURPLE, id="plate")
@@ -699,10 +735,10 @@ class Slip(Vertical):
         with Horizontal(id="tps-row"):
             yield Static(" tok/s ", id="tps-label", markup=False)
             yield Sparkline([0.0], id="spark")
-            yield Static("", id="tps", markup=False)
-        yield Static("", id="shelf", markup=False)
+            yield Line(id="tps")
+        yield Line(id="shelf")
         yield Static("", id="spacer3")
-        yield Static("", id="order", markup=False)
+        yield Line(id="order")
 
     def _motion(self) -> bool:
         return getattr(self.app, "motion", True)
@@ -717,7 +753,7 @@ class Slip(Vertical):
             # of a second, then the phase colour.
             self.add_class("settling")
             self.set_timer(0.1, lambda: self.remove_class("settling"))
-        self.border_title = f"ORDER № {view.id[:10]}"
+        _retitle(self, title=f"ORDER № {view.id[:10]}")
         sep = " · " if not self.has_class("compact") else " "
         sear = f"prefill {view.to_prefill:,} tok" if view.to_prefill else "prefill sizing…"
         if view.phase == "prefill" and view.eta is not None:
@@ -739,21 +775,21 @@ class Slip(Vertical):
         padded = [0.0] * max(0, SPARK_SAMPLES - len(spark)) + spark[-SPARK_SAMPLES:]
         self.query_one("#spark", Sparkline).data = padded
         self._stats = f" {view.tps:.1f} now" if view.tps is not None else " — now"
-        self.query_one("#tps", Static).update(self._stats)
+        self.query_one("#tps", Line).show(self._stats)
         if view.reused is None:
             shelf = "the walk-in is deciding"
         elif view.reused:
             shelf = f"REHEAT hit · reused {view.reused:,} tok · {view.to_prefill or 0:,} fresh"
         else:
             shelf = f"SCRATCH miss · nothing reused · {view.to_prefill or 0:,} fresh"
-        self.query_one("#shelf", Static).update(f" {shelf}")
+        self.query_one("#shelf", Line).show(f" {shelf}")
         order = (
             f" in {view.input_tokens:,} tok   max {view.max_tokens:,}   "
             f"started {local_time(view.started_at)}"
         )
         if behind:
             order += f"   1st of {behind + 1}"
-        self.query_one("#order", Static).update(order)
+        self.query_one("#order", Line).show(order)
         self.tick(view, stalled=False, silence=0.0)
 
     def tick(self, view: TurnView, *, stalled: bool, silence: float) -> None:
@@ -766,16 +802,16 @@ class Slip(Vertical):
         literal = view.phase
         if stalled:
             head = f"{STALLED_WORD}  stalled {clock_text(silence)}"
-            self.border_subtitle = f"{STALLED_WORD} · no event {silence:.0f}s"
+            _retitle(self, subtitle=f"{STALLED_WORD} · no event {silence:.0f}s")
         else:
             head = f"{view.word}  {literal}"
             if view.phase == "decode":
                 head += f" {view.generated:,} tok"
-            self.border_subtitle = "tear here"
+            _retitle(self, subtitle="tear here")
         eta = f"ETA {clock_text(view.eta)}" if view.eta is not None and not stalled else "ETA —"
         width = max(20, self.size.width - 2)
         gap = max(2, width - 1 - len(head) - len(clock) - len(eta) - 8)
-        self.query_one("#headline", Static).update(
+        self.query_one("#headline", Line).show(
             f" {head}{' ' * (gap // 2)}{clock}{' ' * (gap - gap // 2 + 8)}{eta}"[:width]
         )
         sear = self.query_one("#sear", Gauge)
@@ -802,24 +838,36 @@ class Stub(Widget):
         self._turn: dict | None = None
         self._more = 0
         self._now = 0.0
+        self._shown: tuple[str, bool] | None = None
 
     def show(self, turn: dict | None, more: int, now: float) -> None:
         self._turn, self._more, self._now = turn, more, now
         self.display = turn is not None
         if turn is not None:
-            self.border_title = f"ORDER № {turn.get('id', '')[:10]}"
-            self.border_subtitle = "tear here"
-        self.refresh()
+            _retitle(self, title=f"ORDER № {turn.get('id', '')[:10]}", subtitle="tear here")
+        # The words and the frame: a stack that crossed the compact
+        # breakpoint draws the same line differently. An empty pass repaints
+        # the empty stub once and then not again, whatever the clock says.
+        shown = (self._line(), self.has_class("compact"))
+        if shown != self._shown:
+            self._shown = shown
+            self.refresh()
 
-    def render(self) -> Text:
+    def _line(self) -> str:
         if self._turn is None:
-            return Text("")
+            return ""
         t = self._turn
         waited = clock_text(self._now - (t.get("started_at") or self._now))
         tokens = t.get("input_tokens") or 0
         line = f"{PHASE_WORDS['queued']}  queued {waited}   next up · {tokens:,} tok in"
         if self._more:
             line += f" · +{self._more} more"
+        return line
+
+    def render(self) -> Text:
+        line = self._line()
+        if not line:
+            return Text("")
         if self.has_class("compact"):
             pair = "┄┄"
             return Text.assemble((f" {pair} ", SLATE), (line, ""), (f" {pair}", SLATE))
@@ -843,22 +891,22 @@ class Card(Vertical):
     def compose(self) -> ComposeResult:
         with Horizontal(id="card-top"):
             yield Chef(id="card-chef")
-            yield Static("", id="card-art", markup=False)
-            yield Static("", id="card-lead", markup=False)
+            yield Line(id="card-art")
+            yield Line(id="card-lead")
         yield LoadingIndicator(id="firing")
-        yield Static("", id="card-body", markup=False)
+        yield Line(id="card-body")
 
     def show_quiet(
         self, engine: dict, config: dict, recent: list[dict], now: float, motion: bool
     ) -> None:
         self._state("quiet", TEAL)
-        self.border_title = "THE PASS IS CLEAR"
+        _retitle(self, title="THE PASS IS CLEAR")
         idle = engine.get("idle_seconds") or 0.0
         minutes = config.get("idle_unload_minutes")
         self.query_one("#card-chef", Chef).show("quiet", now, motion=motion)
         steam = STEAM[int(now * 2) % 2 if motion else 0]
-        self.query_one("#card-art", Static).update("\n".join([steam, *POT]))
-        self.query_one("#card-lead", Static).update("\n\n  stock on, nobody ordering")
+        self.query_one("#card-art", Line).show("\n".join([steam, *POT]))
+        self.query_one("#card-lead", Line).show("\n\n  stock on, nobody ordering")
         lines = ["", f" {QUIET_WORD}  no orders on the rail for {span_text(idle)}"]
         if minutes and minutes * 60 > idle:
             lines.append(
@@ -886,10 +934,10 @@ class Card(Vertical):
                 f" · SCRATCH {scratch} miss",
             ]
             oldest = min(t.get("ts") or now for t in recent)
-            self.border_subtitle = f"since {local_time(oldest)[:5]} · {span_text(now - oldest)}"
+            _retitle(self, subtitle=f"since {local_time(oldest)[:5]} · {span_text(now - oldest)}")
         else:
-            self.border_subtitle = ""
-        self.query_one("#card-body", Static).update("\n".join(lines))
+            _retitle(self, subtitle="")
+        self.query_one("#card-body", Line).show("\n".join(lines))
 
     def show_firing(
         self,
@@ -900,41 +948,42 @@ class Card(Vertical):
         motion: bool,
     ) -> None:
         self._state("firing", MUSTARD)
-        self.border_title = ENGINE_WORDS["loading"]
-        self.border_subtitle = f"{elapsed:.0f}s loading"
+        _retitle(self, title=ENGINE_WORDS["loading"], subtitle=f"{elapsed:.0f}s loading")
         self.query_one("#card-chef", Chef).show("loading", now, motion=motion)
-        self.query_one("#card-art", Static).update("")
+        self.query_one("#card-art", Line).show("")
         memory_text = f" · {memory:.1f} GB to read" if memory else ""
-        self.query_one("#card-lead", Static).update(
+        self.query_one("#card-lead", Line).show(
             f"\n  loading {model_id.rsplit('/', 1)[-1]}{memory_text}"
         )
-        self.query_one("#card-body", Static).update("")
+        self.query_one("#card-body", Line).show("")
 
     def show_redial(
         self, attempt: int, wait: float, why: str, as_of: str, now: float, motion: bool
     ) -> None:
         self._state("vhs", SLATE)
         self._attempt, self._why, self._wait_text = attempt, why, f"{wait:.0f}"
-        self.border_title = "VHS TRACKING"
-        self.border_subtitle = f"as of {as_of}" if as_of else ""
+        _retitle(self, title="VHS TRACKING", subtitle=f"as of {as_of}" if as_of else "")
         self.query_one("#card-chef", Chef).show("vhs", now, motion=motion)
-        self.query_one("#card-art", Static).update("")
-        self.query_one("#card-lead", Static).update(
+        self.query_one("#card-art", Line).show("")
+        self.query_one("#card-lead", Line).show(
             f"\n  redialing the daemon · try {attempt} · next in {wait:.0f}s\n  ({why})"
         )
-        self.query_one("#card-body", Static).update("")
+        self.query_one("#card-body", Line).show("")
 
     def show_closed(self, port: int, attempt: int, wait: float, now: float) -> None:
         self._state("closed", CHILLI)
         self._attempt, self._wait_text = attempt, f"{wait:.0f}"
-        self.border_title = CLOSED_WORD
-        self.border_subtitle = f"attempt {attempt} · next try in {wait:.0f}s" if attempt else ""
+        _retitle(
+            self,
+            title=CLOSED_WORD,
+            subtitle=f"attempt {attempt} · next try in {wait:.0f}s" if attempt else "",
+        )
         self.query_one("#card-chef", Chef).show("closed", now, motion=False)
-        self.query_one("#card-art", Static).update("")
-        self.query_one("#card-lead", Static).update(
+        self.query_one("#card-art", Line).show("")
+        self.query_one("#card-lead", Line).show(
             f"\n  {CLOSED_WORD} — no daemon on 127.0.0.1:{port}\n  start it with:  sous serve"
         )
-        self.query_one("#card-body", Static).update(
+        self.query_one("#card-body", Line).show(
             "\n  (or: sous install-launchd)   q leaves; the screen keeps trying meanwhile"
         )
 
@@ -958,7 +1007,7 @@ class Card(Vertical):
         chef.show(chef.mood, now, motion=motion)
         if self.has_class("card-quiet"):
             steam = STEAM[int(now * 2) % 2 if motion else 0]
-            self.query_one("#card-art", Static).update("\n".join([steam, *POT]))
+            self.query_one("#card-art", Line).show("\n".join([steam, *POT]))
         if wait is None:
             return
         text = f"{wait:.0f}"
@@ -966,11 +1015,11 @@ class Card(Vertical):
             return
         self._wait_text = text
         if self.has_class("card-vhs"):
-            self.query_one("#card-lead", Static).update(
+            self.query_one("#card-lead", Line).show(
                 f"\n  redialing the daemon · try {self._attempt} · next in {text}s\n  ({self._why})"
             )
         elif self.has_class("card-closed") and self._attempt:
-            self.border_subtitle = f"attempt {self._attempt} · next try in {text}s"
+            _retitle(self, subtitle=f"attempt {self._attempt} · next try in {text}s")
 
 
 class LinePanel(Vertical):
@@ -983,8 +1032,8 @@ class LinePanel(Vertical):
     def compose(self) -> ComposeResult:
         with Horizontal(id="line-top"):
             yield Chef(id="line-chef")
-            yield Static("", id="line-engine", markup=False)
-        yield Static("", id="line-body", markup=False)
+            yield Line(id="line-engine")
+        yield Line(id="line-body")
 
     def show(
         self,
@@ -1011,16 +1060,16 @@ class LinePanel(Vertical):
         full = c.get("pressure_evictions", 0)
         compact = self.has_class("compact")
         if compact:
-            self.query_one("#line-engine", Static).update(
+            self.query_one("#line-engine", Line).show(
                 f"  {word}  {literal}   {model}   {gb}   hold {holders}\n"
                 f"  REHEAT {c.get('hits', 0)} hit   DRAWER {c.get('fork_hits', 0)} fork   "
                 f"SCRATCH {c.get('misses', 0)} miss\n"
                 f"  TOSSED {c.get('evictions', 0)} evict  WALK-IN FULL {full}"
                 f"   slots {c.get('slots', 0)} · {resident:.1f} GB"
             )
-            self.query_one("#line-body", Static).update("")
+            self.query_one("#line-body", Line).show("")
         else:
-            self.query_one("#line-engine", Static).update(
+            self.query_one("#line-engine", Line).show(
                 f"  {word}  {literal}\n  {model}\n  {gb} · hold {holders}"
             )
             lines = [
@@ -1043,12 +1092,12 @@ class LinePanel(Vertical):
                     f" {'ORDERS':<7}{DONE_WORD} {up} · {FAILED_WORD} {dropped}",
                     f" {'':<7}{ABANDONED_WORD} {walked}",
                 ]
-            self.query_one("#line-body", Static).update("\n".join(lines))
+            self.query_one("#line-body", Line).show("\n".join(lines))
         idle = engine.get("idle_seconds")
         tail = f"idle {span_text(idle)}" if idle is not None and engine.get("loaded") else literal
         if compact:
             tail = f"ON RAIL {queue.get('queued', 0)} · COOKING {queue.get('running', 0)} · {tail}"
-        self.border_subtitle = tail
+        _retitle(self, subtitle=tail)
 
 
 class RatePanel(Vertical):
@@ -1061,16 +1110,21 @@ class RatePanel(Vertical):
     def compose(self) -> ComposeResult:
         with Horizontal():
             yield Digits("", id="digits")
-            yield Static("", id="rate-text", markup=False)
+            yield Line(id="rate-text")
 
     def show(self, tps: float | None, floor: float | None, best: float, word: str) -> None:
-        self.query_one("#digits", Digits).update(f"{tps:.1f}" if tps is not None else "")
-        self.query_one("#rate-text", Static).update(
+        digits = self.query_one("#digits", Digits)
+        value = f"{tps:.1f}" if tps is not None else ""
+        # Digits.update refreshes whatever it is handed, and the panel is
+        # blank at every width below 120 columns.
+        if value != digits.value:
+            digits.update(value)
+        self.query_one("#rate-text", Line).show(
             f"tok/s now\nfloor {floor:.1f} · 60s\n{word}"
             if floor is not None
             else f"tok/s now\n\n{word}"
         )
-        self.border_subtitle = f"HI-SCORE {best:.1f} tok/s" if best else ""
+        _retitle(self, subtitle=f"HI-SCORE {best:.1f} tok/s" if best else "")
 
 
 class Rail(DataTable):
@@ -1393,9 +1447,9 @@ class Top(App[int]):
                 yield RatePanel()
         yield Rule("RECENT ORDERS", id="gingham")
         yield Rail()
-        yield Static("", id="tasks", markup=False)
-        yield Static(LEGEND_STRIP, id="legend", markup=False)
-        yield Static(KEYS, id="footer", markup=False)
+        yield Line(id="tasks")
+        yield Line(LEGEND_STRIP, id="legend")
+        yield Line(KEYS, id="footer")
 
     def on_mount(self) -> None:
         self._base_screen = self.screen
@@ -1429,7 +1483,7 @@ class Top(App[int]):
             widget.set_class(width < COMPACT_COLUMNS, "compact")
         for gauge in self.query(Gauge):
             gauge.detail_width = 30 if width >= COMPACT_COLUMNS else 26
-        self.query_one("#legend", Static).update(
+        self.query_one("#legend", Line).show(
             LEGEND_STRIP if width >= COMPACT_COLUMNS else LEGEND_STRIP_COMPACT
         )
         self.query_one(Rail).set_columns(
@@ -1481,8 +1535,9 @@ class Top(App[int]):
             self._idler.resume()  # the redial countdown and the tracking bands
         for selector in ("#right", "#rail", "#tasks"):
             self.query_one(selector).add_class("stale")
-        self.query_one(LinePanel).border_subtitle = (
-            f"as of {local_time(self._received_at)}" if self._ever_connected else ""
+        _retitle(
+            self.query_one(LinePanel),
+            subtitle=f"as of {local_time(self._received_at)}" if self._ever_connected else "",
         )
         self._show_left(None)
         self._refresh_footer()
@@ -1645,12 +1700,10 @@ class Top(App[int]):
                 f" TASK  {word} {task_time(seconds) if seconds else '—'}  "
                 f"{(t.get('title') or '')[:70]}"
             )
-        self.query_one("#tasks", Static).update(
-            "\n".join(rows) if rows else " TASK  none on the rail"
-        )
+        self.query_one("#tasks", Line).show("\n".join(rows) if rows else " TASK  none on the rail")
 
     def _refresh_footer(self) -> None:
-        footer = self.query_one("#footer", Static)
+        footer = self.query_one("#footer", Line)
         width = self._width
         now = self._clock()
         if width < NARROW_COLUMNS:
@@ -1658,14 +1711,14 @@ class Top(App[int]):
                 view = turn_view(self._turn, now, self._received_at)
                 gen = f"{view.generated:,}" + (f"/{view.expected:,}" if view.expected else "")
                 rate = f" {view.tps:.1f}t/s" if view.tps else ""
-                footer.update(f" {view.word} {gen}{rate} {clock_text(view.elapsed)}  q")
+                footer.show(f" {view.word} {gen}{rate} {clock_text(view.elapsed)}  q")
             elif self._connected:
                 engine = self._document.get("engine") or {}
-                footer.update(f" {QUIET_WORD} {span_text(engine.get('idle_seconds') or 0)}  q")
+                footer.show(f" {QUIET_WORD} {span_text(engine.get('idle_seconds') or 0)}  q")
             else:
-                footer.update(f" {CLOSED_WORD}  q")
+                footer.show(f" {CLOSED_WORD}  q")
             return
-        footer.update(KEYS if width >= COMPACT_COLUMNS else KEYS_COMPACT)
+        footer.show(KEYS if width >= COMPACT_COLUMNS else KEYS_COMPACT)
 
     # -- timers ---------------------------------------------------------------------
 
