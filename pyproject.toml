@@ -92,6 +92,9 @@ Issues = "https://github.com/krcm0209/sous/issues"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# An assertion inside a test's thread target is a warning by default, and a
+# join that follows it passes; make it the failure it is.
+filterwarnings = ["error::pytest.PytestUnhandledThreadExceptionWarning"]
 markers = [
     "model: needs a real MLX model downloaded (manual/local only)",
     "slow: takes several seconds of real wall-clock (process-group kill tests)",
