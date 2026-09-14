@@ -1,11 +1,14 @@
 """The daemon's own loopback routes under /sous/: what `sous claude` speaks
 to the daemon. Mounted before the gateway's routes and whatever the gateway
 flag says, so a path under /sous — the bare /sous included — is answered
-here or 404s here, and is never forwarded to the upstream."""
+here or 404s here for every method the routes register (a verb none of them
+lists gets Starlette's own 405 first), and is never forwarded to the
+upstream."""
 
 from __future__ import annotations
 
 import json
+import logging
 import math
 from collections.abc import Callable
 
@@ -15,8 +18,10 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 
 from sous.engine.base import EngineManager
-from sous.gateway.convert import RequestError
+from sous.gateway.convert import RequestError, _invalid
 from sous.loopback import check_loopback
+
+_logger = logging.getLogger("sous.monitor")
 
 # A hold body is two numbers; anything larger is not one.
 HOLD_BODY_LIMIT = 1024
@@ -25,10 +30,6 @@ _METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
 def _refused(e: RequestError) -> Response:
     return JSONResponse(e.body(), status_code=e.status)
-
-
-def _invalid(message: str) -> RequestError:
-    return RequestError(400, "invalid_request_error", message)
 
 
 async def _hold_body(request: Request) -> tuple[int, float]:
@@ -59,14 +60,26 @@ async def _hold_body(request: Request) -> tuple[int, float]:
     if isinstance(create_time, bool) or not isinstance(create_time, int | float):
         raise _invalid("create_time must be a finite number")
     try:
-        create_time = float(create_time)
+        if not math.isfinite(create_time):
+            raise _invalid("create_time must be a finite number")
     except OverflowError:
         # math.isfinite converts its argument to a C double; an int too
         # large for one raises OverflowError rather than answering False.
         raise _invalid("create_time must be a finite number") from None
-    if not math.isfinite(create_time):
-        raise _invalid("create_time must be a finite number")
-    return pid, create_time
+    # The same conversion isfinite just survived, so this one cannot raise.
+    return pid, float(create_time)
+
+
+async def _served(route: str, fn: Callable[..., dict], *args: object) -> Response:
+    """`fn` on a worker thread, its dict as the reply. A failure is a 500 in
+    the error vocabulary every other route speaks, not Starlette's bare
+    text one — which `sous claude` reads as no daemon at all."""
+    try:
+        return JSONResponse(await run_sync(fn, *args))
+    except Exception as e:  # noqa: BLE001 — every failure becomes an error body
+        # The type only: an error's message can name a path.
+        _logger.error(f"{route} failed ({type(e).__name__})")
+        return _refused(RequestError(500, "api_error", type(e).__name__))
 
 
 def mount_monitor(mcp: MCPServer, engines: EngineManager, status: Callable[[], dict]) -> None:
@@ -81,7 +94,7 @@ def mount_monitor(mcp: MCPServer, engines: EngineManager, status: Callable[[], d
             check_loopback(request)
         except RequestError as e:
             return _refused(e)
-        return JSONResponse(await run_sync(status))
+        return await _served("GET /sous/status", status)
 
     async def sous_hold(request: Request) -> Response:
         try:
@@ -89,7 +102,7 @@ def mount_monitor(mcp: MCPServer, engines: EngineManager, status: Callable[[], d
             pid, create_time = await _hold_body(request)
         except RequestError as e:
             return _refused(e)
-        return JSONResponse(await run_sync(engines.hold, pid, create_time))
+        return await _served("POST /sous/hold", engines.hold, pid, create_time)
 
     async def sous_unknown(request: Request) -> Response:
         try:

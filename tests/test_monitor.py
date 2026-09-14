@@ -199,3 +199,38 @@ def test_routes_are_up_with_the_gateway_off(tmp_path: Path):
     assert _request(app, "GET", "/sous/nope").status_code == 404
     assert _request(app, "GET", "/sous").status_code == 404
     assert _request(app, "GET", "/api/hello").status_code == 404  # no gateway, no forwarding
+
+
+def test_a_failing_status_or_hold_is_an_error_body_not_a_bare_500(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """Starlette's own 500 is a line of text the launcher reads as no daemon
+    at all; a failure inside the daemon answers in the vocabulary every other
+    route speaks, and names its type in the log."""
+    import logging
+
+    from sous.server import SousService
+
+    def failing_status(self):
+        raise RuntimeError("tasks.db is locked")
+
+    def failing_hold(self, pid, create_time):
+        raise RuntimeError("no thread")
+
+    monkeypatch.setattr(SousService, "server_status", failing_status)
+    monkeypatch.setattr(EngineManager, "hold", failing_hold)
+    app, _ = _app(tmp_path)
+    with caplog.at_level(logging.ERROR, logger="sous.monitor"):
+        r = _request(app, "GET", "/sous/status")
+        assert r.status_code == 500
+        assert r.json() == {
+            "type": "error",
+            "error": {"type": "api_error", "message": "RuntimeError"},
+        }
+        r = _request(app, "POST", "/sous/hold", _hold_body())
+        assert r.status_code == 500 and r.json()["error"]["type"] == "api_error"
+    messages = [r.getMessage() for r in caplog.records if r.name == "sous.monitor"]
+    assert messages == [
+        "GET /sous/status failed (RuntimeError)",
+        "POST /sous/hold failed (RuntimeError)",
+    ]
