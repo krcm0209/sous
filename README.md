@@ -108,6 +108,8 @@ First delegation downloads the model (~16.1 GB for the default) — one time.
 
 ```bash
 sous status             # is it up, and what has it been doing
+sous top                # watch it live (alias: sous status --watch); q quits
+sous statusline         # one line for Claude Code's status bar (below)
 sous wait <task-id>     # block until a task finishes or needs approval
 sous claude             # Claude Code with local subagents (gateway mode, below)
 sous stop               # stop it (see below)
@@ -152,7 +154,7 @@ to run by hand and exits nonzero rather than claiming success.
 | `task_result` | fetch report, changed files, verify output, diff |
 | `cancel_task` | stop a queued or running task |
 | `respond_to_command_request` | approve/deny a non-allowlisted command |
-| `server_status` | model + queue + config health |
+| `server_status` | engine, live turns, queue and config — the status document, minus the recent lists GET /sous/status adds |
 
 ## Gateway mode (experimental)
 
@@ -221,12 +223,68 @@ claude mcp list`, say) holds like a session — the load it may start is one
 nobody waits for, and the weights then stay resident for a fresh
 `idle_unload_minutes`.
 
-The preflight itself is plain HTTP: `GET /sous/status` on the daemon's port
-returns the same document the MCP `server_status` tool does. A `404` means
-the running daemon predates this CLI (the route did not exist); `sous
-claude` says so and exits 1 — restart the daemon from the same install
-(`sous stop`, then `sous serve` or `sous install-launchd`). There is no
-compatibility mode: the CLI and the daemon ship as one package.
+The preflight itself is plain HTTP. The daemon's own routes live under
+`/sous/` on the same port, loopback-only like the gateway's, whether or not
+the gateway is on:
+
+- `GET /sous/status` — one JSON document: `engine` (`loaded`, `loading`,
+  `model_id`, `idle_seconds`, `holders`, `memory_gb`, the `prompt_cache`
+  counters), `inflight` (the turn the model is serving right now — its
+  `msg_` id, phase, tokens so far, rate and ETA — usually empty or one
+  entry), `queue` (delegated task counts), `recent_turns` (the last 50,
+  every field of the turn line below), `recent_tasks` (the last 10) and
+  `config`. The MCP `server_status` tool returns the same document without
+  the two `recent_*` lists.
+- `GET /sous/events` — the same document as a Server-Sent Events stream:
+  once at connect, then whenever the turn in flight changes (at most ten
+  times a second) and at least once a second, with a `ping` every 10 s.
+- `POST /sous/hold` — what `sous claude` posts (above).
+
+A `404` from `/sous/status` means the running daemon predates this CLI (the
+route did not exist); `sous claude` says so and exits 1 — restart the daemon
+from the same install (`sous stop`, then `sous serve` or `sous
+install-launchd`). There is no compatibility mode: the CLI and the daemon
+ship as one package.
+
+**`sous top`** (or `sous status --watch`) is that stream in a terminal —
+open it beside a `sous claude` session and watch a subagent's order go from
+the rail to the plate — a perforated slip with a timer dial, a pixel chef
+whose face is the state, the walk-in's counters, and the recent orders:
+
+![sous top at 100×30: the order slip mid-decode with a second order queued, THE LINE with the chef, and the recent orders](tests/snapshots/sous-top-100x30.svg)
+
+*`sous top` at 100×30, mid-decode with a second order queued — the render the test suite pins, so the picture is always the current one.*
+
+`q`, `Esc` or `Ctrl-C` leave the screen exactly as it was; `enter` opens
+the order under the cursor with every field of its turn line, `l` the
+legend, `?` the About card, `m` turns the motion off. The vocabulary is
+glossed on the screen itself (`SEAR ▐███▌ prefill`, `REHEAT 41 hit`) and
+on its legend line; the numbers are the turn line's, in the terminal's own
+foreground, and nothing paints over the terminal's background. It reconnects
+with backoff if the daemon restarts and says so if none is running. It is
+the one command in sous that imports [Textual](https://textual.textualize.io);
+nothing else (the daemon included) loads it.
+
+**`sous statusline`** prints one line for Claude Code's `statusLine`
+setting — `sous: decode 612 tok · 14.7 tok/s · eta 18s` during a turn,
+`sous: idle · 5 slots · held` between turns, `sous: daemon down` when
+nothing answers — and reads (and ignores) the JSON Claude Code pipes to it.
+Add to `~/.claude/settings.json`:
+
+```json
+{"statusLine": {"type": "command", "command": "sous statusline", "refreshInterval": 1}}
+```
+
+`refreshInterval` matters: without it Claude Code re-runs the command only on
+message events, and the line would freeze for a whole subagent turn. The
+command imports nothing beyond the standard library and gives up inside
+half a second, so it costs the status bar nothing.
+
+To bracket a subagent from the outside as well, a `SubagentStart` /
+`SubagentStop` hook can append its own record — `{ts, agent_id,
+agent_type}` — to a file; it sees the subagent's start and end, not the
+progress-summary calls Claude Code makes in between, which only the turn
+line and `sous top` show.
 
 Forwarding is a plain HTTP/1.1 pass-through to `[gateway].upstream_url`
 (default `https://api.anthropic.com`): the request body goes up byte for
@@ -614,11 +672,13 @@ degrades to that on its own. Forks live as long as the weights do:
 `idle_unload_minutes` drops them with
 the model, so "every new session" means every new session inside that
 window.
-`server_status` (and `GET /sous/status`, the same document over HTTP)
-reports `holders` (live `sous claude` sessions pinning the model), `loading`
-(a load in progress, a preload included) and `prompt_cache` — slots,
-resident bytes, hits, fork hits, retained and moved turn-slot takes,
-evictions and the subset the pressure valve took — counts only.
+`server_status` (and `GET /sous/status`, the same document over HTTP, plus
+the recent turns and tasks) reports the engine — `holders` (live `sous
+claude` sessions pinning the model), `loading` (a load in progress, a
+preload included), `memory_gb` and `prompt_cache` — slots, resident bytes,
+hits, fork hits, retained and moved turn-slot takes, evictions and the
+subset the pressure valve took — counts only — and `inflight`, the turn
+being served right now with its phase, tokens and rate.
 
 `[model].int8_prefill` (default `false`) runs the prefill matmuls as INT8 activations
 against the checkpoint's packed 4-bit weights on the M5 GPU's neural accelerators

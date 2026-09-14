@@ -110,7 +110,37 @@ Claude Code use stretches further — evaluate features against that goal.
   the upstream, and a failure inside a route is a JSON 500, never
   Starlette's text one. `sous claude` has no MCP client: `/sous/status`, or
   a 404 from whatever holds `daemon.lock` = "restart the daemon" (from
-  anything else = "not sous on this port"), no compatibility fallback.
+  anything else = "not sous on this port"), no compatibility fallback. The
+  status document is one shape everywhere (`SousService.status_document`):
+  `engine`, `inflight`, `queue`, `config`, and over HTTP `recent_turns` and
+  `recent_tasks` — the MCP tool drops the two lists because a frontier
+  model pays for every key it reads.
+- `sous/inflight.py` is the in-flight turn registry: a gateway turn
+  registers under its `msg_` id in `TurnRunner.run` and is removed in its
+  `finally`; `progress()` runs on the engine's session thread from inside
+  the decode loop, so every registry method is a dict write under one lock
+  and never raises (an unknown id is ignored). The prefill's size is not
+  stamped by the runner — it is inside `session.generate()` for the whole
+  prefill — but read by a *probe* the registry calls from a status reader's
+  thread: the cache adds the reuse at the take and assigns `prefilled_tokens`
+  on entering `_run`, both before the first prefill call, and `stats(owner)`
+  is a locked dict copy no prefill holds the lock across. `/sous/events`
+  polls `Inflight.version` ten times a second and rebuilds the whole
+  document on a worker thread when it moved (and once a second regardless,
+  because a load, a hold and the idle clock are not registry changes);
+  never wake it from a writer. The routes record a summary for *every*
+  `POST /v1/messages id=…` line — refused, abandoned and failed included —
+  and the served line is printed from that summary (`_turn_line`), so a
+  row and a line cannot disagree; PR 3 persists the dict as it is. Textual
+  is imported only inside the `sous top` command function: `sous serve`,
+  `sous claude` and `sous statusline` (stdlib only, half-second budget)
+  never load it. The terminal runs with `ansi_color=True` and the
+  `ansi-dark` theme pinned explicitly — foreground and background are the
+  terminal's own — and paints hex accents on top of that ground, each
+  chosen to clear 3:1 on black and on white (a test asserts it); nothing in
+  `tui.py` sets a `background:` other than `ansi_default`. The chef's
+  frames, the dial and the steam are picked from the app's clock, never
+  tweened, so a pinned clock is a pinned picture.
 - Claude Code auto-compacts a `sous-local` subagent when *its own* token
   count nears `CLAUDE_CODE_MAX_CONTEXT_TOKENS − 33K` (sooner with its
   precompute trigger) — two extra local calls, ~6 minutes at 131072 for a
