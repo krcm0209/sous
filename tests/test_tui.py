@@ -3,6 +3,7 @@ frames, the feed reader, and the app under Textual's pilot against an
 in-memory feed."""
 
 import asyncio
+import os
 import time
 from pathlib import Path
 
@@ -731,3 +732,47 @@ def test_a_miss_or_a_pressure_eviction_flashes_the_line_once():
         assert not line.has_class("flash")
 
     _run(test)
+
+
+SNAPSHOT = Path(__file__).parent / "snapshots" / "sous-top-100x30.svg"
+
+
+def test_the_pass_renders_as_committed(monkeypatch):
+    """The 100×30 screen mid-decode, cell for cell (an SVG of the screen).
+    A deliberate change to the look — or a Textual upgrade that renders
+    differently — is a rerun with SOUS_UPDATE_SNAPSHOTS=1 and a commit of
+    the new file; the diff is the review."""
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    clock = Clock(BASE - 8)
+
+    async def test(app, pilot, feed, clock):
+        for n in range(1, 9):
+            clock.now = BASE - 8 + n
+            await feed.queue.put(_doc(_turn(generated_tokens=400 + n, decode_tps=9.0 + n * 0.3)))
+            await pilot.pause(0.05)
+        clock.now = BASE
+        behind = _turn(
+            id="msg_64f2b36f3e4a528198cee4ea",
+            phase="queued",
+            started_at=BASE - 7,
+            input_tokens=8912,
+        )
+        await _deliver(feed, pilot, _doc(_turn(), recent=RECENT, tasks=TASKS, behind=[behind]))
+        await pilot.wait_for_scheduled_animations()
+        await pilot.pause(0.35)
+        rendered = app.export_screenshot()
+        if os.environ.get("SOUS_UPDATE_SNAPSHOTS") == "1":
+            SNAPSHOT.parent.mkdir(exist_ok=True)
+            SNAPSHOT.write_text(rendered)
+        assert SNAPSHOT.exists(), "run once with SOUS_UPDATE_SNAPSHOTS=1 to write the snapshot"
+        expected = SNAPSHOT.read_text()
+        if rendered != expected:
+            actual = SNAPSHOT.with_suffix(".actual.svg")
+            actual.write_text(rendered)
+            raise AssertionError(
+                f"the render differs from {SNAPSHOT.name}; the new render is at {actual.name} — "
+                "open both, and if the change is intended rerun with SOUS_UPDATE_SNAPSHOTS=1"
+            )
+
+    _run(test, clock=clock)

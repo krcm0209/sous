@@ -445,6 +445,7 @@ PROP_COLOURS = {
 }  # fmt: skip
 STEAM = ("    ∿ ∿    ", "   ∿   ∿   ")
 POT = ("  ╭─────╮  ", " ═┫▒▒▒▒▒┣═ ", "  ╰─────╯  ")
+CARD_CHEF_MOODS = {"quiet": "quiet", "firing": "loading", "vhs": "vhs", "closed": "closed"}
 
 
 def sprite_frame(mood: str, now: float, *, motion: bool = True) -> tuple[str, str, str]:
@@ -662,9 +663,18 @@ class Chef(Widget):
         self.mood = "closed"
         self.now = 0.0
         self.motion = True
+        self._shown = (self.mood, sprite_frame(self.mood, self.now, motion=self.motion))
 
     def show(self, mood: str, now: float, *, motion: bool) -> None:
+        # The rendered picture is (mood, frame) alone — a closed kitchen's
+        # frame never changes (fps 0) and a quiet one's only twice a second:
+        # skip the repaint when it would be the one already on screen, so an
+        # idle tick costs only what actually moved.
+        shown = (mood, sprite_frame(mood, now, motion=motion))
         self.mood, self.now, self.motion = mood, now, motion
+        if shown == self._shown:
+            return
+        self._shown = shown
         self.refresh()
 
     def render(self) -> Text:
@@ -825,6 +835,7 @@ class Card(Vertical):
 
     def __init__(self) -> None:
         super().__init__(id="card")
+        self._mood = "closed"
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="card-top"):
@@ -925,12 +936,22 @@ class Card(Vertical):
     def _state(self, state: str, colour: str) -> None:
         for s in ("quiet", "firing", "vhs", "closed"):
             self.set_class(s == state, f"card-{s}")
+        self._mood = CARD_CHEF_MOODS[state]
         firing = self.query_one("#firing", LoadingIndicator)
         firing.display = state == "firing"
         # Its own mount starts a 16 Hz refresh; off the firing state that would
         # be the only timer running in a quiet kitchen.
         firing.auto_refresh = 1 / 16 if state == "firing" else None
         self.query_one("#card-art").display = state == "quiet"
+
+    def tick(self, now: float, *, motion: bool) -> None:
+        """The idle tick's own work: the chef's motion and, in a quiet
+        kitchen, the pot's steam — never a rebuild of the card's text, which
+        only a real document or retry changes."""
+        self.query_one("#card-chef", Chef).show(self._mood, now, motion=motion)
+        if self.has_class("card-quiet"):
+            steam = STEAM[int(now * 2) % 2 if motion else 0]
+            self.query_one("#card-art", Static).update("\n".join([steam, *POT]))
 
 
 class LinePanel(Vertical):
@@ -1633,16 +1654,12 @@ class Top(App[int]):
             mood = self._mood(engine, now)
             self.query_one("#line-chef", Chef).show(mood, now, motion=self.motion)
             card = self.query_one(Card)
-            if card.display and self._connected and not engine.get("loading"):
-                card.show_quiet(
-                    engine,
-                    self._document.get("config") or {},
-                    self._document.get("recent_turns") or [],
-                    now,
-                    self.motion,
-                )
-            elif card.display and not self._connected:
-                self._show_left(None)
+            if card.display:
+                # Only the chef's motion and the pot's steam, never the
+                # card's text: that only a real document or retry changes,
+                # and rebuilding it twice a second is the idle tick's whole
+                # CPU budget gone on a picture that hasn't moved.
+                card.tick(now, motion=self.motion)
         except NoMatches:
             return
 
