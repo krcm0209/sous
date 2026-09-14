@@ -28,6 +28,7 @@ from sous.engine.base import EngineManager, release_mlx_thread_state
 from sous.gateway.routes import Gateway, mount_gateway
 from sous.gateway.upstream import Upstream
 from sous.logs import configure_daemon_logging, enable_warning_capture, format_line
+from sous.monitor import mount_monitor
 from sous.tasks import FINISHED_STATES, Task, TaskState, TaskStore
 from sous.toolexec import (
     _is_within,
@@ -403,6 +404,11 @@ def create_server(
         """Daemon health: model load state, memory, queue depth, active config."""
         return svc.server_status()
 
+    # The daemon's own routes go on before the gateway's: the gateway ends
+    # with a catch-all that forwards upstream, and a /sous/ path must never
+    # get there. Mounted whatever the gateway flag says — `sous claude`
+    # asks /sous/status whether the gateway is on.
+    mount_monitor(mcp, engines, svc.server_status)
     if config.gateway_enabled:
         mounted_gateway.append(mount_gateway(mcp, engines, config, upstream=upstream))
 
