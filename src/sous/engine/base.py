@@ -99,14 +99,15 @@ def release_mlx_thread_state() -> None:
 def _holder_alive(pid: int, create_time: float) -> bool:
     """Whether the process that registered a hold is still the one wearing
     `pid`: alive, and started within a second of the time it reported. A
-    reused pid fails the second test; a zombie, a vanished process or one
-    this user cannot read (never ours — the daemon and its holders share a
-    user) all count as gone rather than pin the model forever."""
+    reused pid fails the second test; a zombie, a vanished process, one this
+    user cannot read (never ours — the daemon and its holders share a user)
+    or a pid the kernel could never have issued all count as gone rather
+    than pin the model forever."""
     import psutil
 
     try:
         return abs(psutil.Process(pid).create_time() - create_time) <= 1.0
-    except psutil.Error:
+    except psutil.Error, ValueError, TypeError:
         return False
 
 

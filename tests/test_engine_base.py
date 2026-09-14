@@ -506,6 +506,8 @@ def test_holder_alive_is_this_process_under_its_real_start_time_only():
     assert _holder_alive(os.getpid(), start) is True
     assert _holder_alive(os.getpid(), start - 3600.0) is False
     assert _holder_alive(2**30, start) is False  # beyond every platform's pid range
+    assert _holder_alive(-1, start) is False  # psutil.Process(-1) raises ValueError
+    assert _holder_alive("abc", start) is False  # ty: ignore[invalid-argument-type]
 
 
 def test_a_holder_we_cannot_read_counts_as_gone(monkeypatch):
