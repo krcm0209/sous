@@ -998,10 +998,10 @@ class LinePanel(Vertical):
             # its own vocabulary rather than sharing one heading.
             if self.size.height - 3 >= len(lines) + 3:
                 lines += [
-                    f" {'TASKS':<8}ON RAIL {queue.get('queued', 0)}"
+                    f" {'TASKS':<7}ON RAIL {queue.get('queued', 0)}"
                     f" · COOKING {queue.get('running', 0)}",
-                    f" {'ORDERS':<8}{DONE_WORD} {up} · {FAILED_WORD} {dropped}",
-                    f" {'':<8}{ABANDONED_WORD} {walked}",
+                    f" {'ORDERS':<7}{DONE_WORD} {up} · {FAILED_WORD} {dropped}",
+                    f" {'':<7}{ABANDONED_WORD} {walked}",
                 ]
             self.query_one("#line-body", Static).update("\n".join(lines))
         idle = engine.get("idle_seconds")

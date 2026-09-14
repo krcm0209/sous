@@ -363,9 +363,9 @@ def test_the_slip_shows_the_turn_from_the_document():
         assert line.startswith("  LINE IS OPEN  loaded") and "hold 1" in line
         assert "REHEAT  41 hit    DRAWER 18 fork" in _plain(app, "#line-body")
         body = _plain(app, "#line-body")
-        assert " TASKS   ON RAIL 2 · COOKING 1" in body
-        assert " ORDERS  ORDER UP 3 · DROPPED IT 1" in body
-        assert "         WALKED OUT 1" in body
+        assert " TASKS  ON RAIL 2 · COOKING 1" in body
+        assert " ORDERS ORDER UP 3 · DROPPED IT 1" in body
+        assert "        WALKED OUT 1" in body
         assert app.query_one("#line-chef", tui.Chef).mood == "decode"
         assert "HI-SCORE 10.5 tok/s" in app.query_one(tui.Strip).render().plain
         assert app.query_one(tui.Rail).row_count == 5
@@ -379,6 +379,17 @@ def test_the_slip_shows_the_turn_from_the_document():
         }
         await _deliver(feed, pilot, _doc(_turn(), tasks=[long_job]))
         assert _plain(app, "#tasks").startswith(" TASK  COOKING 13:14  the whole test suite")
+        # Two-digit tallies (a plausible count on the book's 50-turn ring)
+        # must still fit THE LINE's body at 100 columns without wrapping.
+        big_recent = (
+            [_summary(n) for n in range(10)]
+            + [_summary(n, error="overloaded_error", status=529) for n in range(10, 22)]
+            + [_summary(n, error="abandoned", status=499) for n in range(22, 24)]
+        )
+        await _deliver(feed, pilot, _doc(_turn(), recent=big_recent))
+        wide_body = _plain(app, "#line-body")
+        assert all(len(row) <= 35 for row in wide_body.splitlines())
+        assert "WALKED OUT 2" in wide_body
 
     _run(test)
 
@@ -637,7 +648,7 @@ def test_the_plate_gauge_tweens_to_the_fed_value_and_snaps_without_motion():
         assert plate.fraction == pytest.approx(900 / 1024)
         app.motion = False
         await feed.queue.put(_doc(_turn(generated_tokens=200)))
-        await pilot.pause(0.03)
+        await _until(pilot, lambda: plate.fraction == 200 / 1024)
         assert plate.fraction == pytest.approx(200 / 1024)
 
     _run(test)
@@ -713,7 +724,10 @@ def test_a_miss_or_a_pressure_eviction_flashes_the_line_once():
         quiet = _doc(_turn())
         quiet["engine"]["prompt_cache"]["pressure_evictions"] += 2
         await feed.queue.put(quiet)
-        await pilot.pause(0.03)
+        # Wait for the document itself to land (motion off never flashes, so
+        # checking the class alone would pass even on a screen that never
+        # saw this document) before asserting the flash stayed off.
+        await _until(pilot, lambda: "WALK-IN FULL 3 pressure evict" in _plain(app, "#line-body"))
         assert not line.has_class("flash")
 
     _run(test)
