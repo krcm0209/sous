@@ -1625,6 +1625,21 @@ def test_statusline_treats_a_wrong_answer_as_daemon_down(tmp_path, capsys, monke
     assert capsys.readouterr().out == "sous: daemon down\n"
 
 
+def test_statusline_treats_someone_elses_json_as_daemon_down(tmp_path, capsys, monkeypatch):
+    """A JSON object from whatever else holds the port is not a status
+    document: without the engine block it would read as a loaded, idle
+    daemon and say so."""
+    from sous import cli
+
+    fake = _FakeSousHTTP({"ok": True})
+    try:
+        _statusline_config(tmp_path, monkeypatch, fake.port)
+        cli.main(["statusline"])
+    finally:
+        fake.close()
+    assert capsys.readouterr().out == "sous: daemon down\n"
+
+
 def test_statusline_ignores_a_configured_proxy(tmp_path, capsys, monkeypatch):
     from sous import cli
 

@@ -434,7 +434,7 @@ def _cmd_statusline() -> None:
     # it is needed here, but a pipe nobody reads can block the writer. A
     # stdin that cannot be read (a closed handle, pytest's capture) is as
     # harmless as an empty one.
-    with contextlib.suppress(OSError):
+    with contextlib.suppress(OSError, ValueError):
         if not sys.stdin.isatty():
             sys.stdin.read()
     # No proxy, whatever the environment says: 127.0.0.1 is loopback, the
@@ -449,7 +449,10 @@ def _cmd_statusline() -> None:
         # JSON, or is JSON but not an object, is not the daemon's.
         print("sous: daemon down")
         return
-    if not isinstance(document, dict):
+    if not isinstance(document, dict) or "engine" not in document:
+        # A JSON object without the engine block is some other service on the
+        # port, and reading it as a document would print a confident
+        # `sous: idle` about a daemon that isn't there.
         print("sous: daemon down")
         return
     print(statusline_text(document, time.time()))

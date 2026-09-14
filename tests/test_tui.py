@@ -271,11 +271,36 @@ def test_chef_show_skips_the_repaint_when_the_picture_has_not_moved(monkeypatch)
     assert len(calls) == 3
 
 
-def test_the_ticket_card_carries_every_field_of_the_turn():
+def test_the_ticket_card_carries_the_turns_numbers():
     text = tui.ticket_text(_summary(3, "miss", lcp=0, lcp_region="tools", load_s=12.8))
     assert "ticket" in text and _summary(3)["id"] in text
     assert "SCRATCH miss" in text and "0.0s / 12.8s" in text
     assert "ORDER UP · lcp 0 · new tools · PREHEATING 12.8s" in text
+
+
+def test_a_failure_summary_reads_on_every_surface_with_only_its_seven_keys():
+    """A refused turn is recorded with ts, id, model, stream, status, error
+    and seconds and nothing else — no cache, no tokens, no phase timings —
+    and every surface reads it without the keys it hasn't got."""
+    failed = {
+        "ts": BASE,
+        "id": "msg_a1b2c3d4e5f60718293a4b5c",
+        "model": "sous-local",
+        "stream": 1,
+        "status": 529,
+        "error": "overloaded_error",
+        "seconds": 0.3,
+    }
+    row = tui.rail_row(failed)
+    assert row["cache"] == "DROPPED IT" and row["in"] == "—" and row["took"] == "none"
+    assert row["total"] == "0.3s" and row["why"] == "DROPPED IT · 529 overloaded_error"
+    text = tui.ticket_text(failed)
+    assert f" {'stop':<26} DROPPED IT" in text
+    assert f" {'in / out':<26} 0 / 0 tok" in text
+    assert f" {'forks / tossed / pressure':<26} 0 / 0 / 0" in text
+    assert f" {'total':<26} 0.3s" in text
+    assert tui.turn_tallies([failed]) == (0, 1, 0)
+    assert tui.hi_score([failed], []) == (0.0, None)
 
 
 def test_the_palette_reads_on_a_black_and_a_white_ground():
@@ -518,7 +543,7 @@ def test_a_quiet_kitchens_idle_tick_only_moves_the_steam():
     _run(test)
 
 
-def test_a_dropped_feed_redials_and_a_daemon_that_never_answered_exits_one():
+def test_a_dropped_feed_redials_and_a_daemon_that_never_answered_exits_one(monkeypatch):
     async def test(app, pilot, feed, clock):
         card = app.query_one(tui.Card)
         assert card.border_title == "KITCHEN CLOSED" and card.has_class("card-closed")
@@ -539,12 +564,18 @@ def test_a_dropped_feed_redials_and_a_daemon_that_never_answered_exits_one():
         after = int(card.border_subtitle.rsplit(" ", 1)[-1].rstrip("s"))
         assert after < before
         clock.now = BASE
-        await pilot.pause(0.6)  # the first retry: 0.5 s
+        # The backoff runs on real time, not the pinned clock, so the retry
+        # already landed inside one of the 0.6 s pauses above.
+        await _until(pilot, lambda: feed.connections == 2)
         assert feed.connections == 2
+        # Out to 30 s of backoff from here — the pump re-reads it on every
+        # event — so nothing but the key below can reconnect this feed.
+        monkeypatch.setattr(tui, "RETRY_SECONDS", (30.0, 30.0))
         await _deliver(feed, pilot, _doc(_turn()))
         assert app.query_one(tui.Slip).display and not app.query_one("#right").has_class("stale")
         await feed.queue.put(None)
         await pilot.pause(0.15)
+        connections = feed.connections
         assert card.display and card.border_title == "VHS TRACKING"
         assert app.query_one("#right").has_class("stale")
         assert app.query_one(tui.LinePanel).border_subtitle == f"as of {tui.local_time(BASE)}"
@@ -553,9 +584,30 @@ def test_a_dropped_feed_redials_and_a_daemon_that_never_answered_exits_one():
         clock.now = BASE + 0.25  # two VHS frames on: the card keeps its clock
         await pilot.pause(0.6)
         assert _plain(app, "#card-chef") != bands
-        await pilot.press("r")  # retry now, ahead of the backoff
-        await pilot.pause(0.1)
-        assert feed.connections == 3
+
+        def next_in() -> int:
+            return int(_plain(app, "#card-lead").split("next in ")[1].split("s")[0])
+
+        # A resize with the feed down re-applies the document on screen —
+        # the stale one, with a turn still in it. Reading that turn back
+        # would put a finished order on the pass, restart the 10 fps ticker
+        # against a daemon that is gone, and stop the idle tick the redial
+        # countdown runs on.
+        waiting = next_in()
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause(0.15)
+        assert app._turn is None and card.display and card.border_title == "VHS TRACKING"
+        assert app._ticker is not None and not app._ticker._active.is_set()
+        assert app._idler is not None and app._idler._active.is_set()
+        clock.now = BASE + 12.0
+        await _until(pilot, lambda: next_in() < waiting)
+        assert next_in() < waiting, "the redial countdown keeps falling after a resize"
+        await pilot.resize_terminal(100, 30)
+        await pilot.pause(0.15)
+        await pilot.press("r")  # retry now, ahead of the 30 s backoff
+        await _until(pilot, lambda: feed.connections == connections + 1)
+        assert feed.connections == connections + 1
+        monkeypatch.undo()
         await pilot.press("q")
 
     app = _run(test)
@@ -575,6 +627,9 @@ def test_resize_reflows_to_every_breakpoint():
         await _deliver(feed, pilot, _doc(_turn(), recent=RECENT, tasks=TASKS, behind=[behind]))
         rail = app.query_one(tui.Rail)
         assert tuple(rail._widths) == tui.RAIL_COLUMNS and rail._widths["why"] == 29
+        # A why longer than its column is cut with an ellipsis: `529
+        # overloaded_e` would read as an error code of its own.
+        assert rail.get_row(RECENT[3]["id"])[7] == "DROPPED IT · 529 overloaded_…"
         await pilot.resize_terminal(80, 24)
         await pilot.pause(0.15)
         assert app.screen.has_class("compact")
@@ -771,6 +826,28 @@ def test_a_new_ticket_on_the_rail_is_highlighted_then_settles():
     _run(test)
 
 
+def test_a_resize_mid_highlight_leaves_the_screen_up():
+    """The highlight's last two steps are timers. A resize across a
+    breakpoint inside those 200 ms rebuilds the book with another set of
+    columns, and a step that still wrote to the old ones raised from inside
+    the timer callback — which ends the app and the terminal with it."""
+
+    async def test(app, pilot, feed, clock):
+        await _deliver(feed, pilot, _doc(_turn(), recent=RECENT[1:]))
+        rail = app.query_one(tui.Rail)
+        assert tuple(rail._widths) == tui.RAIL_COLUMNS_WIDE
+        await feed.queue.put(_doc(_turn(), recent=RECENT))
+        await _until(pilot, lambda: RECENT[0]["id"] in rail._shown)
+        assert RECENT[0]["id"] in rail._shown, "the new ticket landed and the highlight is running"
+        await pilot.resize_terminal(80, 30)  # took, in, out and sear all go
+        await pilot.pause(0.3)  # past the 100 ms and 200 ms steps
+        assert app.is_running
+        assert tuple(rail._widths) == tui.RAIL_COLUMNS_COMPACT
+        assert rail.row_count == 5 and rail.get_row_at(0)[1] == RECENT[0]["id"][:10]
+
+    _run(test, size=(120, 30))
+
+
 def test_a_miss_or_a_pressure_eviction_flashes_the_line_once():
     async def test(app, pilot, feed, clock):
         await _deliver(feed, pilot, _doc(_turn()))
@@ -818,6 +895,10 @@ def test_the_pass_renders_as_committed(monkeypatch, request):
         monkeypatch.undo()
         time.tzset()
 
+    repo = Path(__file__).parent.parent
+    assert str(SNAPSHOT.relative_to(repo)) in (repo / "README.md").read_text(), (
+        "the README shows this render: a snapshot that moved leaves it a broken image"
+    )
     request.addfinalizer(resync_tz)
     monkeypatch.setenv("TZ", "UTC")
     time.tzset()

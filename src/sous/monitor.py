@@ -52,9 +52,9 @@ async def _status_events(
     regardless. Built on a worker thread each time. Nothing is buffered for
     a client that is gone: the response cancels this generator on
     disconnect, and the tick's sleep is where that lands. A failure building
-    the document ends the stream rather than raising through uvicorn: the
-    client sees the connection close and redials, the same as any other
-    daemon failure logs its type and never its message."""
+    or encoding the document ends the stream rather than raising through
+    uvicorn: the client sees the connection close and redials, the same as
+    any other daemon failure logs its type and never its message."""
     seen: int | None = None
     sent = float("-inf")
     while True:
@@ -63,12 +63,13 @@ async def _status_events(
         if version != seen or now - sent >= EVENT_HEARTBEAT_SECONDS:
             try:
                 document = await run_sync(status)
+                # Encoded under the same guard: a value json cannot serialize
+                # would otherwise leave as a traceback through uvicorn.
+                data = json.dumps(document, separators=(",", ":"))
             except Exception as e:  # noqa: BLE001 — logged and the stream ends, never raised
                 _logger.error(f"GET /sous/events failed ({type(e).__name__})")
                 return
-            yield ServerSentEvent(
-                event="status", data=json.dumps(document, separators=(",", ":")), sep=_SEP
-            )
+            yield ServerSentEvent(event="status", data=data, sep=_SEP)
             seen, sent = version, now
         await asyncio.sleep(EVENT_TICK_SECONDS)
 

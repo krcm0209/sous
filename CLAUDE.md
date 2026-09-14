@@ -132,14 +132,13 @@ Claude Code use stretches further — evaluate features against that goal.
   `POST /v1/messages id=…` line — refused, abandoned and failed included —
   and the served line is printed from that summary (`_turn_line`), so a
   row and a line cannot disagree; the dict is in memory only and does not
-  survive a restart. Textual is imported only inside the `sous top`
-  command function: `sous serve`,
-  `sous claude` and `sous statusline` (stdlib only, half-second budget)
-  never load it. The terminal runs with `ansi_color=True` and the
-  `ansi-dark` theme pinned explicitly — foreground and background are the
-  terminal's own — and paints hex accents on top of that ground, each
-  chosen to clear 3:1 on black and on white (a test asserts it); nothing in
-  `tui.py` sets a `background:` other than `ansi_default`. The chef's
+  survive a restart. Textual is imported only inside the `sous top` command
+  function: `sous serve`, `sous claude` and `sous statusline` (stdlib only,
+  half-second budget) never load it. The terminal runs with `ansi_color=True`
+  and the `ansi-dark` theme pinned explicitly — foreground and background
+  are the terminal's own — and paints hex accents on top of that ground,
+  each chosen to clear 3:1 on black and on white (a test asserts it); nothing
+  in `tui.py` sets a `background:` other than `ansi_default`. The chef's
   frames, the dial and the steam are picked from the app's clock, never
   tweened, so a pinned clock is a pinned picture.
 - Claude Code auto-compacts a `sous-local` subagent when *its own* token

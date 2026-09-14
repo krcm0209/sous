@@ -143,8 +143,8 @@ class TurnRunner:
         # refuse to start rather than outlive a gateway that gave up on it.
         self._closing = False
         # Where a turn says what phase it is in and how far along. A runner
-        # built without one (tests, count_tokens) keeps a private registry
-        # nobody reads; the gateway hands in the daemon's.
+        # built without one (tests) keeps a private registry nobody reads;
+        # the gateway hands in the daemon's.
         self._inflight = inflight or Inflight()
 
     def run(

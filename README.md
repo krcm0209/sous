@@ -256,7 +256,7 @@ whose face is the state, the walk-in's counters, and the recent orders:
 *`sous top` at 100×30, mid-decode with a second order queued — the render the test suite pins, so the picture is always the current one.*
 
 `q`, `Esc` or `Ctrl-C` leave the screen exactly as it was; `enter` opens
-the order under the cursor with every field of its turn line, `l` the
+the order under the cursor — its ticket, with the turn's numbers; `l` the
 legend, `?` the About card, `m` turns the motion off. The vocabulary is
 glossed on the screen itself (`SEAR ▐███▌ prefill`, `REHEAT 41 hit`) and
 on its legend line; the numbers are the turn line's, in the terminal's own
@@ -276,7 +276,9 @@ Add to `~/.claude/settings.json`:
 ```
 
 `refreshInterval` matters: without it Claude Code re-runs the command only on
-message events, and the line would freeze for a whole subagent turn. The
+session events — a new assistant message, a compaction, a mode change — so the
+line goes quiet for a whole subagent turn; with it the command runs every
+second as well. The
 command imports nothing beyond the standard library and gives up inside
 half a second, so it costs the status bar nothing.
 

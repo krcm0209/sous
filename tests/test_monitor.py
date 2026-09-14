@@ -440,6 +440,27 @@ def test_a_failing_status_build_ends_the_events_stream_not_a_traceback(
     assert "locked" not in messages[0] and "tasks.db" not in messages[0]
 
 
+def test_a_document_json_cannot_encode_ends_the_stream_too(tmp_path: Path, monkeypatch, caplog):
+    """The encode is under the same guard as the build: a value json cannot
+    serialize ends the stream and logs its type, rather than raising through
+    uvicorn from inside the generator."""
+    import logging
+
+    from sous.server import SousService
+
+    monkeypatch.setattr(
+        SousService, "status_document", lambda self, *, recent: {"engine": object()}
+    )
+    app, _ = _app(tmp_path)
+    with caplog.at_level(logging.ERROR, logger="sous.monitor"):
+        status, frames = _collect_events(app, want=0)
+    assert status == [200]
+    assert [f for f in frames if f[0] == "status"] == []
+    assert [r.getMessage() for r in caplog.records if r.name == "sous.monitor"] == [
+        "GET /sous/events failed (TypeError)"
+    ]
+
+
 def test_mounting_the_monitor_pins_sse_starlette_above_debug(tmp_path: Path, monkeypatch):
     """/sous/events is mounted whether or not the gateway is, and sse-starlette
     logs every frame it sends at DEBUG — the pin must not depend on the

@@ -66,12 +66,13 @@ Anything that breaks a guarantee in the
   `/sous/status` and `/sous/events` serve the status document (engine
   state, the turn in flight, recent turns and tasks — counts, durations,
   hashes and identifiers; task titles are the user's own); `/sous/hold`
-  pins the model in memory while a named process lives. In scope:
-  reachability from anything but a loopback client; a path under `/sous`
-  reaching the gateway's forwarder; anything of a hold body beyond a pid and
-  a start time being acted on; any request body, prompt text, tool name or
-  file path reaching the document, the event stream, `sous top` or `sous
-  statusline`.
+  pins the model in memory while a named process lives — the pid is logged
+  to attribute the hold and its release; the start time and the raw body
+  never are. In scope: reachability from anything but a loopback client; a
+  path under `/sous` reaching the gateway's forwarder; anything of a hold
+  body beyond a pid and a start time being acted on; any request body,
+  prompt text, tool name or file path reaching the document, the event
+  stream, `sous top` or `sous statusline`.
 
 ## What isn't
 

@@ -250,8 +250,12 @@ class SousService:
         snapshot may call into the prompt cache."""
         counts = self.store.count_by_state()
         engine = self.engines.status()
-        engine["memory_gb"] = _mlx_memory_gb()
         live = self.inflight.snapshot()
+        # Last of all: the read releases this thread's mlx state, and the
+        # snapshot's probe reaches the prompt cache, which can free mlx
+        # arrays. Freeing after the release is what segfaults the thread on
+        # its way out (ml-explore/mlx#4327).
+        engine["memory_gb"] = _mlx_memory_gb()
         document = {
             "engine": engine,
             "inflight": live["inflight"],
@@ -444,7 +448,8 @@ def create_server(
 
     @mcp.tool()
     def server_status() -> dict:
-        """Daemon health: model load state, memory, queue depth, active config."""
+        """Daemon health: model load state, memory, the turn in flight, queue
+        depth, active config."""
         return svc.server_status()
 
     # The daemon's own routes go on before the gateway's: the gateway ends

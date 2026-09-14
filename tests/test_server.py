@@ -362,12 +362,35 @@ def test_status_document_with_recents_lists_turns_and_tasks(svc):
     doc = service.status_document(recent=True)
     assert set(doc) == {"engine", "inflight", "queue", "config", "recent_turns", "recent_tasks"}
     assert [t["id"] for t in doc["inflight"]] == ["msg_1"]
+    # The MCP tool drops the two recent lists, never the turn in flight.
+    assert [t["id"] for t in service.server_status()["inflight"]] == ["msg_1"]
     assert doc["recent_turns"] == [{"ts": 1.0, "id": "msg_0", "status": 200}]
     (task,) = doc["recent_tasks"]
     assert task["id"] == tid and task["state"] == "running"
     assert task["title"] == "scaffold the fixtures" and task["seconds"] >= 0
     assert set(task) == {"id", "state", "title", "seconds"}
     assert doc["queue"] == {"queued": 0, "running": 1}
+
+
+def test_the_memory_read_is_the_last_thing_the_document_does(svc, monkeypatch):
+    """Reading mlx's memory releases this thread's mlx state; the registry's
+    snapshot probes the prompt cache, which can free mlx arrays. Freeing
+    after the release is what segfaults the thread on its way out."""
+    from sous import server as server_module
+
+    service, _, _ = svc
+    order: list[str] = []
+    monkeypatch.setattr(server_module, "_mlx_memory_gb", lambda: order.append("memory") or 1.5)
+    snapshot = service.inflight.snapshot
+
+    def probing_snapshot() -> dict:
+        order.append("snapshot")
+        return snapshot()
+
+    monkeypatch.setattr(service.inflight, "snapshot", probing_snapshot)
+    doc = service.status_document(recent=True)
+    assert order == ["snapshot", "memory"]
+    assert doc["engine"]["memory_gb"] == 1.5
 
 
 def test_recent_tasks_are_capped_at_ten_newest_first(svc):

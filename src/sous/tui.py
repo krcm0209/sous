@@ -1084,6 +1084,7 @@ class Rail(DataTable):
         self.turns: list[dict] = []
         self.paused = False
         self._pending: list[dict] | None = None
+        self._fading: list[Timer] = []
 
     def set_columns(self, columns: tuple[str, ...], screen_width: int) -> None:
         """The columns for a screen width; `why` takes what the others leave
@@ -1096,6 +1097,12 @@ class Rail(DataTable):
         if columns == self._columns and widths == self._widths:
             return
         self._columns, self._widths = columns, widths
+        for timer in self._fading:
+            # The steps still pending were measured against the columns this
+            # rebuild is about to drop: stopping them keeps the old widths'
+            # text out of the new cells.
+            timer.stop()
+        self._fading = []
         self.clear(columns=True)
         for name in columns:
             self.add_column(Text(name, style=SLATE), width=widths[name], key=name)
@@ -1122,7 +1129,11 @@ class Rail(DataTable):
             cells = rail_row(turn)
             row = []
             for c in self._columns:
-                value = cells[c][: self._widths[c]]
+                value = cells[c]
+                if len(value) > self._widths[c]:
+                    # A cut with nothing to mark it reads as the whole value:
+                    # `529 overloaded_e` looks like an error code of its own.
+                    value = value[: self._widths[c] - 1] + "…"
                 if c == "cache" and not turn.get("error"):
                     row.append(Text(value, style=CACHE_COLOURS.get(turn.get("cache") or "", "")))
                 elif c == "cache":
@@ -1147,7 +1158,12 @@ class Rail(DataTable):
 
         def restyle(style: str | None) -> None:
             for (row_key, name), original in originals.items():
-                if row_key not in self._shown:
+                # A resize across a breakpoint inside the 200 ms window
+                # rebuilds the table with another set of columns, so a step
+                # still holding a row or a column that rebuild dropped would
+                # raise out of the timer callback — and an exception there
+                # takes the whole screen down.
+                if row_key not in self._shown or name not in self._columns:
                     continue
                 if style is None:
                     self.update_cell(row_key, name, original)
@@ -1156,8 +1172,10 @@ class Rail(DataTable):
                     self.update_cell(row_key, name, Text(plain, style=style))
 
         restyle("reverse")
-        self.set_timer(0.1, lambda: restyle("bold"))
-        self.set_timer(0.2, lambda: restyle(None))
+        self._fading = [
+            self.set_timer(0.1, lambda: restyle("bold")),
+            self.set_timer(0.2, lambda: restyle(None)),
+        ]
 
     def toggle_pause(self) -> bool:
         self.paused = not self.paused
@@ -1198,7 +1216,8 @@ class Overlay(ModalScreen[None]):
 
 
 def ticket_text(turn: dict) -> str:
-    """One completed ticket, every field of the turn line, for `enter`."""
+    """One completed ticket — how it ended, what it reheated, and where its
+    seconds went — for `enter`."""
     rows = [
         ("ticket", turn.get("id", "")),
         ("stop", stop_word(turn)),
@@ -1438,6 +1457,11 @@ class Top(App[int]):
                         delay = RETRY_SECONDS[0]
             except FeedDown as exc:
                 self._dropped(str(exc))
+            except Exception as exc:  # noqa: BLE001 — a redial, never the end of the screen
+                # Textual ends the app on a worker's uncaught exception, which
+                # on the alternate screen is a terminal left mid-frame. The
+                # type only: an exception's message can carry a URL.
+                self._dropped(type(exc).__name__)
             self._attempt += 1
             self._retry_at = self._clock() + delay
             self._show_left(None)
@@ -1481,7 +1505,12 @@ class Top(App[int]):
         recent = document.get("recent_turns") or []
         queue = document.get("queue") or {}
         previous = self._turn
-        self._turn = inflight[0] if inflight else None
+        # A resize re-applies the document that is already on screen, which
+        # while the feed is down is a stale one: reading its turn back would
+        # put a finished order on the pass and restart the 10 fps ticker
+        # against a daemon that is gone. A live document sets _connected
+        # above, so a turn in flight is unaffected.
+        self._turn = inflight[0] if inflight and self._connected else None
         self._behind = inflight[1:]
         if not resize and previous is not None and self._turn is None and self.motion:
             # The ticket just left the pass: the chef's flourish, for a beat.
@@ -1523,11 +1552,14 @@ class Top(App[int]):
                 self.query_one(LinePanel).add_class("flash")
                 self.set_timer(0.25, lambda: self.query_one(LinePanel).remove_class("flash"))
         self._refresh_footer()
-        busy = self._turn is not None or bool(engine.get("loading"))
+        busy = self._connected and (self._turn is not None or bool(engine.get("loading")))
         if self._ticker is not None:
             self._ticker.resume() if busy else self._ticker.pause()
         if self._idler is not None:
-            self._idler.resume() if (not busy and self.motion) else self._idler.pause()
+            # Disconnected, the idle tick is the only thing that moves the
+            # redial countdown, so it keeps running with the motion off.
+            idle = not busy and (self.motion or not self._connected)
+            self._idler.resume() if idle else self._idler.pause()
 
     def _mood(self, engine: dict, now: float) -> str:
         if not self._connected:
