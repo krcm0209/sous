@@ -98,15 +98,20 @@ def release_mlx_thread_state() -> None:
 
 def _holder_alive(pid: int, create_time: float) -> bool:
     """Whether the process that registered a hold is still the one wearing
-    `pid`: alive, and started within a second of the time it reported. A
-    reused pid fails the second test; a zombie, a vanished process, one this
-    user cannot read (never ours — the daemon and its holders share a user)
-    or a pid the kernel could never have issued all count as gone rather
-    than pin the model forever."""
+    `pid`: alive, not a zombie, and started within a second of the time it
+    reported. A reused pid fails the start-time test. A zombie — exited,
+    its parent yet to reap it — still has a start time psutil can read, so
+    it is refused by status; a vanished process, a pid the kernel could
+    never have issued or one psutil cannot read all raise, and count as gone
+    rather than pin the model forever. The second of slack is defensive
+    only: `sous claude` posts the same psutil reading the daemon takes."""
     import psutil
 
     try:
-        return abs(psutil.Process(pid).create_time() - create_time) <= 1.0
+        process = psutil.Process(pid)
+        if process.status() == psutil.STATUS_ZOMBIE:
+            return False
+        return abs(process.create_time() - create_time) <= 1.0
     except psutil.Error, ValueError, TypeError:
         return False
 
@@ -590,7 +595,9 @@ class EngineManager:
         is under way. Never waits for the load and never raises because of
         it: a hold is an optimization, and the first turn's own get() reports
         a real failure."""
+        refused = False
         with self._lock:
+            self._prune_holders()
             self._holders[pid] = create_time
             holders = len(self._holders)
             loaded = self._engine is not None
@@ -599,12 +606,26 @@ class EngineManager:
                 self._preload = threading.Thread(
                     target=self._run_preload, name="sous-preload", daemon=True
                 )
-                self._preload.start()
-            loading = self._loading or self._preload is not None
+                try:
+                    self._preload.start()
+                except RuntimeError:
+                    # The OS refused a thread. Forget it, or every later hold
+                    # would see a preload that never ran and start none.
+                    self._preload = None
+                    preloading, refused = False, True
+            loading = self._load_in_progress()
         _logger.info(f"hold pid={pid} (holders={holders})")
         if preloading:
             _logger.info(f"preloading {self._config.model_id}")
+        if refused:
+            _logger.warning("preload thread could not start (RuntimeError)")
         return {"loaded": loaded, "loading": loading, "holders": holders}
+
+    def _load_in_progress(self) -> bool:
+        """Lock held by the caller. The preload thread forgets itself only
+        after releasing its mlx state, so once get() has published the
+        engine `_preload` alone would report a load beside a loaded model."""
+        return self._loading or (self._preload is not None and self._engine is None)
 
     def _run_preload(self) -> None:
         try:
@@ -622,25 +643,29 @@ class EngineManager:
             with self._lock:
                 self._preload = None
 
-    def _prune_holders(self) -> bool:
-        """Drop every holder whose process is gone; True when that emptied
-        the registry. Lock held by the caller — the psutil check is
-        sub-millisecond, once per poll, and the registry it reads must not
-        change under it."""
+    def _prune_holders(self) -> None:
+        """Drop every holder whose process is gone, and when that empties the
+        registry restart the idle clock: the last session just left, so its
+        idle time starts now and a relaunch inside idle_unload_minutes never
+        pays a reload. Lock held by the caller — the psutil check is
+        sub-millisecond per holder, and the registry it reads must not
+        change under it. Idempotent, so status() and hold() prune too and
+        never report a session that has ended; the clock restart lands on
+        whichever caller sees the departure first."""
+        if not self._holders:
+            return
         gone = [
             pid for pid, started in self._holders.items() if not self._holder_alive(pid, started)
         ]
         for pid in gone:
             del self._holders[pid]
             _logger.info(f"hold released pid={pid} (holders={len(self._holders)})")
-        return bool(gone) and not self._holders
+        if gone and not self._holders and self._last_used is not None:
+            self._last_used = self._clock()
 
     def unload_if_idle(self) -> bool:
         with self._changed:
-            if self._prune_holders() and self._last_used is not None:
-                # The last session just left: its idle time starts now, so a
-                # relaunch inside idle_unload_minutes never pays a reload.
-                self._last_used = self._clock()
+            self._prune_holders()
             # _engine is None while a load or an unload is in progress too,
             # so both are refused here without a second check.
             if self._engine is None or self._last_used is None:
@@ -667,10 +692,11 @@ class EngineManager:
 
     def status(self) -> dict:
         with self._lock:
-            idle = (self._clock() - self._last_used) if self._last_used else None
+            self._prune_holders()
+            idle = (self._clock() - self._last_used) if self._last_used is not None else None
             out = {
                 "loaded": self._engine is not None,
-                "loading": self._loading or self._preload is not None,
+                "loading": self._load_in_progress(),
                 "model_id": self._config.model_id,
                 "idle_seconds": idle,
                 "holders": len(self._holders),
