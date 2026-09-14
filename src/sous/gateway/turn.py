@@ -270,7 +270,7 @@ class TurnRunner:
             # Same race as run(): this whole call happens outside _gen_lock.
             with self._engines.lease():
                 engine = self._engines.get()
-                load_seconds = time.monotonic() - started  # the lease wait too, as in run()
+                load_seconds = time.monotonic() - started  # the get() wait too, as in run()
                 count = engine.count_tokens(messages, tools)
             self._engines.touch()
             return CountResult(count, load_seconds, time.monotonic() - started)

@@ -628,9 +628,10 @@ def test_a_turn_with_no_delta_has_no_ttft(tmp_path: Path):
 
 
 def test_load_seconds_includes_waiting_out_another_threads_load(tmp_path: Path):
-    """engines.lease() waits on the lock get() holds for a whole load, so a
-    turn or a count that arrives mid-load pays for that load as surely as if
-    it had started it — and must say so."""
+    """get() waits out a load another thread is in the middle of, so a turn
+    or a count that arrives mid-load pays for that load as surely as if it
+    had started it. `load_seconds` is measured from `started`, taken before
+    the lease, so it includes that wait — and must say so."""
     inner = FakeEngine(["a"])
     loading, release = threading.Event(), threading.Event()
 
