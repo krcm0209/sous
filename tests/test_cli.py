@@ -1154,6 +1154,26 @@ def test_daemon_status_reads_sous_status_over_http():
         fake.close()
 
 
+def test_loopback_calls_ignore_a_configured_proxy(monkeypatch):
+    """The daemon is loopback; a stray HTTP_PROXY/ALL_PROXY (no matching
+    no_proxy) must never route _daemon_status or _hold through it, or see
+    the hold body — same rule as gateway/upstream.py's trust_env=False."""
+    from sous import cli
+
+    monkeypatch.setenv("HTTP_PROXY", "http://10.255.255.1:9")
+    monkeypatch.setenv("HTTPS_PROXY", "http://10.255.255.1:9")
+    monkeypatch.setenv("ALL_PROXY", "http://10.255.255.1:9")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+
+    fake = _FakeSousHTTP(_status())
+    try:
+        assert cli._daemon_status(fake.port) == _status()
+        assert cli._hold(fake.port) == {"loaded": False, "loading": True, "holders": 1}
+    finally:
+        fake.close()
+
+
 def test_daemon_status_treats_a_404_as_a_daemon_that_predates_this_cli(capsys):
     """An older daemon has no /sous/status: with the gateway on it forwards
     the path upstream and relays the API's 404, with it off Starlette 404s.

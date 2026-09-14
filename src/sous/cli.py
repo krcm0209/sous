@@ -121,7 +121,13 @@ def _daemon_status(port: int) -> dict | None:
     if not _port_open(port):
         return None
     try:
-        reply = httpx.get(f"http://127.0.0.1:{port}/sous/status", timeout=_STATUS_TIMEOUT_SECONDS)
+        # 127.0.0.1 is loopback: a proxy variable must never route or see
+        # this call — same rule as gateway/upstream.py's trust_env=False.
+        reply = httpx.get(
+            f"http://127.0.0.1:{port}/sous/status",
+            timeout=_STATUS_TIMEOUT_SECONDS,
+            trust_env=False,
+        )
     except httpx.HTTPError as exc:
         # The type only: an httpx message can carry the URL it was building.
         print(
@@ -159,8 +165,13 @@ def _hold(port: int) -> dict | None:
 
     body = {"pid": os.getpid(), "create_time": psutil.Process().create_time()}
     try:
+        # 127.0.0.1 is loopback: a proxy variable must never route or see
+        # this call — same rule as gateway/upstream.py's trust_env=False.
         reply = httpx.post(
-            f"http://127.0.0.1:{port}/sous/hold", json=body, timeout=_STATUS_TIMEOUT_SECONDS
+            f"http://127.0.0.1:{port}/sous/hold",
+            json=body,
+            timeout=_STATUS_TIMEOUT_SECONDS,
+            trust_env=False,
         )
         reply.raise_for_status()
         answer = reply.json()
