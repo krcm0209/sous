@@ -94,7 +94,11 @@ class Inflight:
     @property
     def version(self) -> int:
         """Bumped by every change: a reader that saw the same number twice
-        saw the same registry twice. Read without the lock — one int."""
+        saw the same registry twice. Read without the lock — one int. Read
+        this before calling `snapshot()`, not after: a probe answer landing
+        inside that call also bumps it, so reading it afterward records a
+        version newer than the snapshot it is meant to describe and the
+        change in between goes unseen."""
         return self._version
 
     def begin(self, turn_id: str, *, model: str, stream: bool, max_tokens: int) -> None:
@@ -179,6 +183,7 @@ class Inflight:
                 turn = self._turns.get(turn_id)
                 if turn is not None and turn.phase == "prefill":
                     turn.reused_tokens, turn.to_prefill = reused, to_prefill
+                    self._version += 1
             typical = self._typical_output()
             return {
                 "inflight": [self._entry(turn, now, typical) for turn in self._turns.values()],

@@ -188,6 +188,20 @@ def test_a_probe_that_raises_or_answers_late_is_not_an_error():
     assert reg.snapshot()["inflight"] == []
 
 
+def test_a_decided_probe_answer_bumps_the_version_and_a_repeat_snapshot_does_not():
+    reg, _ = _registry()
+    _begin(reg)
+    reg.phase("msg_a", "prefill", probe=lambda: (0, 10))
+    before = reg.version
+    snap = reg.snapshot()
+    assert reg.version == before + 1
+    (entry,) = [e for e in snap["inflight"] if e["id"] == "msg_a"]
+    assert entry["to_prefill"] == 10
+    after = reg.version
+    reg.snapshot()
+    assert reg.version == after
+
+
 def test_the_rolling_prefill_rate_ignores_small_prefills_and_smooths_the_rest():
     reg, _ = _registry()
     reg.finished(_summary(prefilled_tokens=100, prefill_s=1.0))  # below the floor
