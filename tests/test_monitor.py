@@ -113,6 +113,7 @@ def test_hold_refuses_every_other_shape_with_an_anthropic_shaped_400(tmp_path: P
         json.dumps(_hold_body(create_time="now")),
         json.dumps(_hold_body(create_time=1e999)),
         b'{"pid": 1, "create_time": NaN}',
+        b'{"pid": 1, "create_time": ' + b"9" * 400 + b"}",
         json.dumps(_hold_body(create_time=1.0)).encode() + b" " * HOLD_BODY_LIMIT,
     ]
     for body in bad:

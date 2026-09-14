@@ -56,13 +56,17 @@ async def _hold_body(request: Request) -> tuple[int, float]:
     pid, create_time = body["pid"], body["create_time"]
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         raise _invalid("pid must be a positive integer")
-    if (
-        isinstance(create_time, bool)
-        or not isinstance(create_time, int | float)
-        or not math.isfinite(create_time)
-    ):
+    if isinstance(create_time, bool) or not isinstance(create_time, int | float):
         raise _invalid("create_time must be a finite number")
-    return pid, float(create_time)
+    try:
+        create_time = float(create_time)
+    except OverflowError:
+        # math.isfinite converts its argument to a C double; an int too
+        # large for one raises OverflowError rather than answering False.
+        raise _invalid("create_time must be a finite number") from None
+    if not math.isfinite(create_time):
+        raise _invalid("create_time must be a finite number")
+    return pid, create_time
 
 
 def mount_monitor(mcp: MCPServer, engines: EngineManager, status: Callable[[], dict]) -> None:
