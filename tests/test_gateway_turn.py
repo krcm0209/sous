@@ -682,3 +682,43 @@ def test_load_seconds_is_paid_once(tmp_path: Path):
     first = runner.run(MSGS, [], 100, RecordingSink())
     second = runner.run(MSGS, [], 100, RecordingSink())
     assert first.load_seconds >= 0.05 and second.load_seconds < 0.05
+
+
+def test_a_turn_abandoned_while_waiting_out_another_threads_load_never_generates(tmp_path: Path):
+    """get() parks a turn behind a load another thread is running — minutes
+    when a hold started it — and the client can leave meanwhile. The check
+    before get() cannot see that; the one after it must, or a generation
+    nobody reads holds the gateway's one slot ahead of every live turn."""
+    inner = FakeEngine(["a"])
+    loading, release = threading.Event(), threading.Event()
+
+    def gated(model_id: str):
+        loading.set()
+        assert release.wait(10)
+        return inner
+
+    engines = EngineManager(_cfg(tmp_path), engine_factory=gated)
+    runner = TurnRunner(engines, _cfg(tmp_path))
+    loader = threading.Thread(target=engines.get, daemon=True)
+    loader.start()
+    assert loading.wait(5)
+
+    abandoned = threading.Event()
+    outcome: list[str] = []
+
+    def turn():
+        try:
+            runner.run(MSGS, [], 100, RecordingSink(), abandoned)
+            outcome.append("generated")
+        except TurnAbandoned:
+            outcome.append("abandoned")
+
+    t = threading.Thread(target=turn, daemon=True)
+    t.start()
+    time.sleep(0.2)
+    assert outcome == [], "the turn should be parked behind the load"
+    abandoned.set()  # the client disconnects while the model loads
+    release.set()  # the load finishes
+    t.join(10)
+    loader.join(10)
+    assert outcome == ["abandoned"] and inner.calls == []

@@ -159,6 +159,12 @@ class TurnRunner:
                 # unload another thread is in the middle of, which costs this
                 # turn exactly what loading the model itself would.
                 load_seconds = time.monotonic() - started
+                if abandoned is not None and abandoned.is_set():
+                    # That wait is minutes when a hold started the load, and
+                    # the client may have left during it: the check above ran
+                    # before it, and the lease no longer parks a turn behind
+                    # the load the way the manager lock once did.
+                    raise TurnAbandoned
                 session = self._session_for(engine)
                 counting = time.monotonic()
                 input_tokens = engine.count_tokens(messages, tools)
