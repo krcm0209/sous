@@ -343,6 +343,7 @@ def test_server_status(svc):
     assert s["engine"]["holders"] == 0 and "memory_gb" in s["engine"]
     assert s["inflight"] == []
     assert s["config"]["model_id"]
+    assert s["config"]["idle_unload_minutes"] == 30
     assert ["pytest"] in s["config"]["allowlist"]
     # The MCP tool's answer is the document without the two recent lists:
     # a frontier model pays to read every key.

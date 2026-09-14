@@ -262,6 +262,7 @@ class SousService:
             },
             "config": {
                 "model_id": self.config.model_id,
+                "idle_unload_minutes": self.config.idle_unload_minutes,
                 "port": self.config.server_port,
                 "max_turns": self.config.max_turns,
                 "max_minutes": self.config.max_minutes,

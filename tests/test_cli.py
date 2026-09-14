@@ -1669,3 +1669,37 @@ def test_statusline_imports_nothing_heavy(tmp_path):
         fake.close()
     assert done.returncode == 0, done.stderr
     assert done.stdout == "sous: idle · 5 slots\n[]\n"
+
+
+# --- sous top ---------------------------------------------------------------------------
+
+
+def test_top_and_status_watch_run_the_terminal(tmp_path, monkeypatch):
+    from sous import cli, tui
+    from sous.config import SousConfig
+
+    cfg = SousConfig(server_port=8391, data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    ports: list[int] = []
+    monkeypatch.setattr(tui, "run_top", lambda port: (ports.append(port), 3)[1])
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["top"])
+    assert exc.value.code == 3
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["status", "--watch"])
+    assert exc.value.code == 3
+    assert ports == [8391, 8391]
+
+
+def test_only_sous_top_imports_textual(tmp_path):
+    """The daemon, the launcher's module and the status line load without
+    the UI framework; a fresh interpreter proves it, since this process has
+    imported it for the terminal's own tests."""
+    probe = (
+        "import sys\n"
+        "import sous.cli, sous.server, sous.monitor, sous.inflight\n"
+        "print('textual' in sys.modules)\n"
+    )
+    done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "False\n"

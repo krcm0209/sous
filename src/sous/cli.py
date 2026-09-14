@@ -1,4 +1,5 @@
-"""sous CLI: serve / status / wait / stop / mcp / claude / install- and uninstall-launchd."""
+"""sous CLI: serve / status / top / statusline / wait / stop / mcp / claude / install- and
+uninstall-launchd."""
 
 from __future__ import annotations
 
@@ -454,6 +455,15 @@ def _cmd_statusline() -> None:
     print(statusline_text(document, time.time()))
 
 
+def _cmd_top() -> None:
+    """The terminal. Textual is imported here and nowhere else in sous, so
+    the daemon and every other subcommand run without it."""
+    config = load_config()
+    from sous.tui import run_top
+
+    raise SystemExit(run_top(config.server_port))
+
+
 def _cmd_wait(task_id: str, timeout: float | None, interval: float) -> None:
     """Block until the task needs attention, so agents can park this in a
     background shell instead of tight-polling task_status — or, worse, reading
@@ -850,11 +860,13 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="sous", description="local MLX sous-chef for Claude")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="run the daemon (MCP over HTTP on 127.0.0.1)")
-    sub.add_parser("status", help="check the daemon and recent tasks")
+    status = sub.add_parser("status", help="check the daemon and recent tasks")
+    status.add_argument("--watch", action="store_true", help="the live terminal (sous top)")
     sub.add_parser(
         "statusline",
         help="one line for Claude Code's statusLine setting (reads and ignores its stdin JSON)",
     )
+    sub.add_parser("top", help="watch the pass live: the order on it, the line, the recent orders")
     wait = sub.add_parser("wait", help="block until a task finishes or requests a command approval")
     wait.add_argument("task_id")
     wait.add_argument(
@@ -887,7 +899,9 @@ def main(argv: list[str] | None = None) -> None:
 
         raise SystemExit(sous.proxy.run())
     elif args.command == "status":
-        _cmd_status()
+        _cmd_top() if args.watch else _cmd_status()
+    elif args.command == "top":
+        _cmd_top()
     elif args.command == "statusline":
         _cmd_statusline()
     elif args.command == "wait":
