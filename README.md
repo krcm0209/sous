@@ -345,8 +345,9 @@ turn gives up, stated plainly:
   the default model's native context is 262144, and `max_context_tokens =
   262144` moves the classic threshold to ~229K at the cost of one more
   window of KV reserved out of the auto prompt-cache budget (8 GiB on the
-  default model — the ~27 GiB above becomes ~19 GiB on a 64 GB machine,
-  still room for a tools fork beside a retaining conversation). Where the
+  default model — the ~27 GiB auto budget described under `prompt_cache_gb`
+  below becomes ~19 GiB on a 64 GB machine, still room for a tools fork
+  beside a retaining conversation). Where the
   earlier precompute trigger lands at that window is not known until
   measured: its fraction comes from Claude Code's remote configuration,
   keyed by window size. Restart the daemon after the edit; `sous claude`
