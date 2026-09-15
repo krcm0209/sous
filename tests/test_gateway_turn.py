@@ -27,6 +27,9 @@ def _keep_main_thread_mlx_state(monkeypatch):
     # the retiring session thread it runs on in production. These tests run it
     # synchronously on the main pytest thread, whose mlx stream state other
     # test files own — a real release there tears that state down under them.
+    # Left in place, it fails every later mlx op on this thread with "There is
+    # no Stream(gpu, 0) in current thread" — tests/test_int8prefill.py is
+    # where that first shows.
     monkeypatch.setattr(turn, "release_mlx_thread_state", lambda: None)
 
 
@@ -346,8 +349,6 @@ def test_a_turn_queued_while_closing_refuses_to_start(tmp_path: Path):
 
 
 def test_run_releases_mlx_thread_state_and_touches_the_engine(tmp_path: Path, monkeypatch):
-    import sous.gateway.turn as turn
-
     released: list[bool] = []
     monkeypatch.setattr(turn, "release_mlx_thread_state", lambda: released.append(True))
     inner = FakeEngine(["ok"])
@@ -359,8 +360,6 @@ def test_run_releases_mlx_thread_state_and_touches_the_engine(tmp_path: Path, mo
 
 
 def test_count_tokens_uses_the_engine_and_releases(tmp_path: Path, monkeypatch):
-    import sous.gateway.turn as turn
-
     released: list[bool] = []
     monkeypatch.setattr(turn, "release_mlx_thread_state", lambda: released.append(True))
     inner = FakeEngine([])
