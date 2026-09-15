@@ -24,6 +24,9 @@ from sous.engine.base import EngineManager
 from sous.gateway.convert import RequestError, _invalid
 from sous.inflight import Inflight
 from sous.loopback import ALL_METHODS, check_loopback
+from sous.sse import PING as _PING
+from sous.sse import PING_INTERVAL_SECONDS as EVENT_PING_SECONDS
+from sous.sse import SEP as _SEP
 
 _logger = logging.getLogger("sous.monitor")
 
@@ -37,11 +40,6 @@ EVENT_TICK_SECONDS = 0.1
 # Engine state (a load starting, a holder leaving, the idle clock) is not
 # in the registry, so the document also goes out this often unchanged.
 EVENT_HEARTBEAT_SECONDS = 1.0
-# sse-starlette's keepalive, for a client behind something that closes a
-# silent connection; the daemon's own /v1 stream uses the same interval.
-EVENT_PING_SECONDS = 10
-_SEP = "\n"
-_PING = ServerSentEvent(event="ping", data='{"type": "ping"}', sep=_SEP)
 
 
 async def _status_events(
@@ -55,17 +53,19 @@ async def _status_events(
     or encoding the document ends the stream rather than raising through
     uvicorn: the client sees the connection close and redials, the same as
     any other daemon failure logs its type and never its message."""
-    seen: int | None = None
-    sent = float("-inf")
+    seen: int | None = None  # None: nothing sent yet, whatever the clock says
+    sent = time.monotonic()
     while True:
         version = inflight.version
         now = time.monotonic()
         if version != seen or now - sent >= EVENT_HEARTBEAT_SECONDS:
             try:
                 document = await run_sync(status)
-                # Encoded under the same guard: a value json cannot serialize
-                # would otherwise leave as a traceback through uvicorn.
-                data = json.dumps(document, separators=(",", ":"))
+                # Encoded under the same guard, and as strictly as /sous/status
+                # (Starlette's JSONResponse refuses non-finite numbers): a value
+                # json cannot serialize would otherwise leave as a traceback
+                # through uvicorn, and a NaN as a token no other parser reads.
+                data = json.dumps(document, separators=(",", ":"), allow_nan=False)
             except Exception as e:  # noqa: BLE001 — logged and the stream ends, never raised
                 _logger.error(f"GET /sous/events failed ({type(e).__name__})")
                 return
@@ -134,9 +134,10 @@ def mount_monitor(
     """Register GET /sous/status, GET /sous/events, POST /sous/hold and a
     404 for every other /sous/ path. `status` builds the full status
     document (recent turns and tasks included); `inflight` is the registry
-    whose version the event stream watches. Every handler hands its work to
-    a thread: status() reads the task store and hold() takes the engine
-    manager's lock, and neither belongs on the event loop."""
+    whose version the event stream watches. The status and hold handlers
+    hand their work to a thread — status() reads the task store and hold()
+    takes the engine manager's lock, and neither belongs on the event loop —
+    and the event stream builds each of its documents the same way."""
     # sse-starlette logs every frame it sends at DEBUG — the status document,
     # verbatim, up to ten times a second — and the gateway's own pin of this
     # logger only runs when the gateway is mounted. /sous/events is mounted

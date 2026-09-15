@@ -15,6 +15,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -49,20 +50,22 @@ _LSP_OFF = ["--disallowedTools", "LSP"]
 _NO_HOLD_FLAGS = ("--help", "-h", "--version", "-v")
 # Model load plus a long prefill: minutes, not the SDK's default.
 _API_TIMEOUT_MS = "3000000"
-# Nothing about /sous/status or /sous/hold is slow: one reads the queue
-# counts and the config snapshot, the other registers a pid; neither waits
-# for the model.
+# Nothing about /sous/status or /sous/hold is slow: one reads the task
+# store, the engine's counters and the turn registry (a millisecond), the
+# other registers a pid; neither waits for the model.
 _STATUS_TIMEOUT_SECONDS = 15.0
-# The status document is a few KB and a hold reply is three fields; a reply
-# past this is not the daemon's.
+# The status document is tens of KB with its ring of recent turns and a hold
+# reply is three fields; a reply past this is not the daemon's.
 _REPLY_LIMIT = 1 << 20
 _PREDATES_MESSAGE = (
     "sous claude: the running daemon predates this CLI; restart it (sous stop; sous serve)"
 )
 # Claude Code runs the status-line command about once a second and shows
-# whatever it prints; a slow answer is a frozen line, so the whole call is
+# whatever it prints; a slow answer is a frozen line, so the whole call —
+# the stdin drain and the fetch, on a thread joined for this long — is
 # bounded well inside that second.
 _STATUSLINE_TIMEOUT_SECONDS = 0.5
+_STATUSLINE_DOWN = "sous: daemon down"
 
 
 def claude_argv(user_args: list[str]) -> list[str]:
@@ -408,16 +411,19 @@ def statusline_text(document: dict, now: float) -> str:
         return " · ".join(parts)
     turn = inflight[0]
     phase = turn.get("phase", "queued")
+    # A turn has a size — and an ETA worth printing — once it decodes, or
+    # prefills a render the cache has measured.
+    sized = phase == "decode" or (phase == "prefill" and bool(turn.get("to_prefill")))
     head = f"sous: {phase}"
     parts: list[str] = []
     if phase == "decode":
         head = f"{head} {turn.get('generated_tokens', 0):,} tok"
         if turn.get("decode_tps"):
             parts.append(f"{turn['decode_tps']:.1f} tok/s")
-    elif phase == "prefill" and turn.get("to_prefill"):
+    elif sized:
         head = f"{head} {turn['to_prefill']:,} tok"
     eta = turn.get("eta_seconds")
-    if eta is not None and (phase == "decode" or (phase == "prefill" and turn.get("to_prefill"))):
+    if eta is not None and sized:
         parts.append(f"eta {int(eta)}s")
     elif turn.get("started_at") is not None:
         parts.append(_clock(now - turn["started_at"]))
@@ -426,10 +432,14 @@ def statusline_text(document: dict, now: float) -> str:
     return " · ".join([head, *parts])
 
 
-def _cmd_statusline() -> None:
+def _statusline_fetch(port: int) -> str | None:
+    """The line for the status bar, or None when nothing on `port` answered
+    as the daemon. Runs on a thread of its own: nothing here carries a
+    deadline of its own — a stdin held open blocks the drain, and urllib's
+    timeout re-arms on every byte, so a listener that dribbles never
+    returns — and the thread is what the budget is applied to."""
     import urllib.request
 
-    config = load_config()
     # Claude Code writes its own JSON (model, cwd, cost) to stdin; none of
     # it is needed here, but a pipe nobody reads can block the writer. A
     # stdin that cannot be read (a closed handle, pytest's capture) is as
@@ -440,28 +450,51 @@ def _cmd_statusline() -> None:
     # No proxy, whatever the environment says: 127.0.0.1 is loopback, the
     # same rule as the launcher's httpx client and the gateway's forwarder.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    url = f"http://127.0.0.1:{config.server_port}/sous/status"
+    url = f"http://127.0.0.1:{port}/sous/status"
     try:
         with opener.open(url, timeout=_STATUSLINE_TIMEOUT_SECONDS) as reply:
-            document = json.loads(reply.read(_REPLY_LIMIT))
-    except OSError, ValueError:
-        # urllib's URLError and HTTPError are OSErrors; a body that is not
-        # JSON, or is JSON but not an object, is not the daemon's.
-        print("sous: daemon down")
-        return
-    if not isinstance(document, dict) or "engine" not in document:
+            document = _json_object(reply.read(_REPLY_LIMIT))
+    except Exception:  # noqa: BLE001 — whatever holds the port is not the daemon
+        # urllib's URLError and HTTPError are OSErrors, but http.client's own
+        # BadStatusLine and IncompleteRead — a listener that is not HTTP, a
+        # body cut short — are not, and anything escaping this thread would
+        # print a traceback beside the line.
+        return None
+    if document is None or "engine" not in document:
         # A JSON object without the engine block is some other service on the
         # port, and reading it as a document would print a confident
         # `sous: idle` about a daemon that isn't there.
-        print("sous: daemon down")
-        return
-    print(statusline_text(document, time.time()))
+        return None
+    return statusline_text(document, time.time())
+
+
+def _cmd_statusline() -> None:
+    config = load_config()
+    answer: list[str | None] = []
+    worker = threading.Thread(
+        target=lambda: answer.append(_statusline_fetch(config.server_port)), daemon=True
+    )
+    worker.start()
+    # The wall-clock bound. A worker still parked past it is left to the
+    # process exit — a daemon thread — and the bar says the daemon is down.
+    worker.join(_STATUSLINE_TIMEOUT_SECONDS)
+    line = answer[0] if answer else None
+    print(_STATUSLINE_DOWN if line is None else line)
+
+
+def _has_terminal() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
 
 
 def _cmd_top() -> None:
     """The terminal. Textual is imported here and nowhere else in sous, so
     the daemon and every other subcommand run without it."""
     config = load_config()
+    if not _has_terminal():
+        # Textual would draw the pass into the pipe and wait for a key that
+        # never comes: an agent's shell, or a redirect, gets told instead.
+        print("sous top: needs a terminal (try sous status, or sous statusline)", file=sys.stderr)
+        raise SystemExit(2)
     from sous.tui import run_top
 
     raise SystemExit(run_top(config.server_port))

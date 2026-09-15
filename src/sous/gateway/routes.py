@@ -46,6 +46,9 @@ from sous.gateway.upstream import SynthesizedError, Upstream
 from sous.inflight import Inflight
 from sous.loopback import ALL_METHODS, check_loopback
 from sous.protocol import ToolSet
+from sous.sse import PING as _PING
+from sous.sse import PING_INTERVAL_SECONDS
+from sous.sse import SEP as _SEP
 
 # Anthropic's own request cap. The MCP transport's 4 MiB limit wraps only the
 # /mcp handler; custom routes get nothing unless they enforce it themselves.
@@ -57,12 +60,6 @@ MAX_REQUEST_BYTES = 32 * 1024 * 1024
 # a smaller one. RecursionError is not a reliable "too deep" signal because
 # the C recursion guard is stack-size dependent, not payload-size dependent.
 MAX_BODY_DEPTH = 128
-# Claude Code disconnects when nothing arrives for a while (oMLX saw it on
-# 90k-token prefills). Both official SDKs drop `ping` events in the SSE
-# iterator before their accumulator sees anything, so pings are safe anywhere
-# in the stream — including before message_start, which is where the lock
-# wait, the model load and the prefill all happen.
-PING_INTERVAL_SECONDS = 10
 # The turn pool's executor queue is unbounded: without this, a burst beyond
 # _turns' worker count sits in that queue holding its parsed request while
 # GatewayBusy's timeout has not even started — an untimed wait instead of a
@@ -77,12 +74,6 @@ MAX_PENDING_TURNS = 8
 # 32 MiB) while the 2 _counts workers serialize on the tokenizer. Without this,
 # a burst of counts queues unboundedly instead of getting a timely 529.
 MAX_PENDING_COUNTS = 8
-
-# A ServerSentEvent carries its own separator (the response-level `sep` only
-# applies to dicts and strings), and its default is "\r\n"; every frame here
-# says "\n" so the whole stream is one canonical shape.
-_SEP = "\n"
-_PING = ServerSentEvent(event="ping", data='{"type": "ping"}', sep=_SEP)
 
 # How much of the dropped-tool set the log names. Anthropic's identifiers are
 # short and few, so these bounds only ever bite on a client sending junk.
@@ -214,7 +205,7 @@ def _turn_summary(
         "ts": time.time(),
         "id": assembler.message_id,
         "model": _model_label(chat),
-        "stream": int(stream),
+        "stream": stream,
         "status": 200,
         "error": None,
         "stop_reason": assembler.stop_reason,
@@ -251,13 +242,15 @@ def _turn_summary(
 
 
 def _turn_line(s: dict) -> str:
+    # `stream` is a boolean in the document, like every other flag there; the
+    # line has always printed it as 0/1.
     diag = ""
     if s["cache"] == "miss":
         bounds = ",".join(str(b) for b in s["bounds"])
         diag = f" lcp={s['lcp']} lcp_region={s['lcp_region']} bounds=[{bounds}]"
     return (
         f"POST /v1/messages id={s['id']} model={s['model']} "
-        f"stream={s['stream']} status=200 "
+        f"stream={int(s['stream'])} status=200 "
         f"input_tokens={s['input_tokens']} output_tokens={s['output_tokens']} "
         f"stop={s['stop_reason']} cache={s['cache']} took={s['took']} "
         f"reused_tokens={s['reused_tokens']} prefilled_tokens={s['prefilled_tokens']} "
@@ -281,11 +274,18 @@ def _failure_summary(
         "ts": time.time(),
         "id": turn_id,
         "model": model,
-        "stream": int(stream),
+        "stream": stream,
         "status": status,
         "error": error,
         "seconds": time.monotonic() - received,
     }
+
+
+def _failure_line(s: dict) -> str:
+    return (
+        f"POST /v1/messages id={s['id']} model={s['model']} stream={int(s['stream'])} "
+        f"status={s['status']} error={s['error']} seconds={s['seconds']:.1f}"
+    )
 
 
 def _reject_constant(name: str) -> None:
@@ -616,20 +616,14 @@ class Gateway:
         # work, so almost nothing sits between acquire and dispatch — and
         # what does is guarded below, so a failure there still releases.
         if not self._pending.acquire(blocking=False):
-            _log(
-                f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
-                f"stream={int(chat.stream)} status=529 error=overloaded_error{_elapsed(received)}",
+            self._failed(
+                assembler,
+                chat,
+                stream=chat.stream,
+                status=529,
+                error="overloaded_error",
+                received=received,
                 level=logging.WARNING,
-            )
-            self._inflight.finished(
-                _failure_summary(
-                    assembler.message_id,
-                    _model_label(chat),
-                    chat.stream,
-                    529,
-                    "overloaded_error",
-                    received,
-                )
             )
             return _error_response(529, "overloaded_error", "too many turns queued")
         if chat.stream:
@@ -669,20 +663,14 @@ class Gateway:
                         )
                     )
                 except TurnAbandoned:
-                    _log(
-                        f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
-                        f"stream=1 status=499 error=abandoned{_elapsed(received)}",
+                    self._failed(
+                        assembler,
+                        chat,
+                        stream=True,
+                        status=499,
+                        error="abandoned",
+                        received=received,
                         level=logging.WARNING,
-                    )
-                    self._inflight.finished(
-                        _failure_summary(
-                            assembler.message_id,
-                            _model_label(chat),
-                            True,
-                            499,
-                            "abandoned",
-                            received,
-                        )
                     )
                     # Ends the drain _stream left waiting for this turn's outcome.
                     sink.put(("abandoned", None))
@@ -714,15 +702,14 @@ class Gateway:
             result = await future
         except Exception as e:  # noqa: BLE001 — every failure becomes an Anthropic error body
             status, error_type, message = _classify(e)
-            _log(
-                f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} "
-                f"stream=0 status={status} error={error_type}{_elapsed(received)}",
+            self._failed(
+                assembler,
+                chat,
+                stream=False,
+                status=status,
+                error=error_type,
+                received=received,
                 level=_status_level(status),
-            )
-            self._inflight.finished(
-                _failure_summary(
-                    assembler.message_id, _model_label(chat), False, status, error_type, received
-                )
             )
             return _error_response(status, error_type, message)
         assembler.start(result.input_tokens)
@@ -869,17 +856,37 @@ class Gateway:
         status, error_type, _ = _classify(exc)
         # status=200 because the SSE headers already went out; the level
         # follows the failure itself.
-        _log(
-            f"POST /v1/messages id={assembler.message_id} model={_model_label(chat)} stream=1 "
-            f"status=200 error={error_type}{_elapsed(received)}",
+        self._failed(
+            assembler,
+            chat,
+            stream=True,
+            status=200,
+            error=error_type,
+            received=received,
             level=_status_level(status),
         )
-        self._inflight.finished(
-            # The client saw 200: the SSE headers had gone out before the failure.
-            _failure_summary(
-                assembler.message_id, _model_label(chat), True, 200, error_type, received
-            )
+
+    def _failed(
+        self,
+        assembler: TurnAssembler,
+        chat: ChatRequest,
+        *,
+        stream: bool,
+        status: int,
+        error: str,
+        received: float,
+        level: int,
+    ) -> None:
+        """A turn that produced no result: one record for the registry, and
+        the line printed from it, so the two cannot disagree. `level` is the
+        caller's, not the record's: a failure on a stream that had already
+        started is logged as the failure it was while its `status` stays the
+        200 the client saw."""
+        summary = _failure_summary(
+            assembler.message_id, _model_label(chat), stream, status, error, received
         )
+        self._inflight.finished(summary)
+        _log(_failure_line(summary), level=level)
 
     def _log_turn(
         self, chat: ChatRequest, result: TurnResult, assembler: TurnAssembler, *, stream: bool

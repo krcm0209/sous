@@ -110,17 +110,23 @@ def _prefill_plan(
     engine: ManagedEngine, owner: threading.Thread, before: dict
 ) -> tuple[int, int] | None:
     """(reused, to_prefill) once the cache has taken a slot for the turn and
-    sized what it must prefill — it adds the reuse at the take and assigns
-    the prefilled gauge on entering its run, both before the first prefill
-    call — or None while it is still deciding, when both read zero. Called
-    from a status reader's thread: the stats are a copy under the cache's
-    own lock, which no prefill holds."""
+    sized what it must prefill — a hit or a miss moves the owner's `hits` or
+    `misses` past the turn's baseline, and its run assigns the prefilled
+    gauge on entry, both before the first prefill call — or None while it is
+    still deciding. The gauge alone says nothing: it is zeroed only inside
+    the generation, on the session thread, after the hand-off, the
+    engine-lock wait and the render, and until then it still reads the
+    previous turn's size. Called from a status reader's thread: the stats
+    are a copy under the cache's own lock, which no prefill holds."""
     after = engine.prompt_cache_stats(owner=owner)
-    reused = max(0, after.get("reused_tokens", 0) - before.get("reused_tokens", 0))
+
+    def delta_of(key: str) -> int:
+        return max(0, after.get(key, 0) - before.get(key, 0))
+
     to_prefill = after.get("prefilled_tokens", 0)
-    if not reused and not to_prefill:
+    if not (delta_of("hits") or delta_of("misses")) or not to_prefill:
         return None
-    return reused, to_prefill
+    return delta_of("reused_tokens"), to_prefill
 
 
 class TurnRunner:
@@ -166,9 +172,12 @@ class TurnRunner:
             live.begin(turn_id, model=model, stream=stream, max_tokens=max_tokens)
         try:
             return self._turn(messages, tools, max_tokens, sink, abandoned, live, turn_id)
-        finally:
+        except GatewayBusy:
+            # Refused before the lock: _turn retires the registration in the
+            # finally it runs once it holds the lock, and this turn never did.
             if live is not None:
                 live.end(turn_id)
+            raise
 
     def _turn(
         self,
@@ -328,6 +337,11 @@ class TurnRunner:
                 # after this — joining it would make a turn thread wait on
                 # shutdown work, which it must never do.
                 self._drop_session()
+            if live is not None:
+                # Out of the registry before the lock goes: the turn that
+                # takes it next registers as running at once, and a reader
+                # must never find the two side by side.
+                live.end(turn_id)
             self._lock.release()
             # engines.get() may have loaded the model on this thread. Pool
             # threads outlive the call, but the invariant is per thread that

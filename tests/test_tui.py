@@ -329,6 +329,36 @@ def test_the_palette_reads_on_a_black_and_a_white_ground():
 # --- the app --------------------------------------------------------------------------
 
 
+def test_sse_frames_follow_the_format_the_daemon_and_the_spec_write():
+    """The daemon's frames as sse-starlette encodes them, and the shapes the
+    format allows that it happens not to send: a frame with no event name,
+    data split over lines, no space after the colon, comment and retry
+    lines, and data that is JSON but not an object."""
+    from sse_starlette import ServerSentEvent
+
+    chunks = [
+        ServerSentEvent(event="status", data='{"a": 1}', sep="\n").encode().decode(),
+        ': a comment\nretry: 1000\ndata: {"b":\ndata:  2}\n\n',
+        'event: ping\ndata: {"type": "ping"}\n\n',
+        "event: status\ndata: [1, 2]\n\n",
+    ]
+
+    async def lines():
+        for chunk in chunks:
+            for line in chunk.split("\n")[:-1]:  # what aiter_lines yields
+                yield line
+
+    async def collect():
+        return [frame async for frame in tui.sse_frames(lines())]
+
+    assert asyncio.run(collect()) == [
+        ("status", {"a": 1}),
+        ("message", {"b": 2}),
+        ("ping", {"type": "ping"}),
+        ("status", {}),
+    ]
+
+
 class Feed:
     """A scripted feed: documents put on the queue are delivered in order;
     None makes the stream drop (FeedDown) and the next factory call
@@ -500,7 +530,7 @@ def test_a_quiet_kitchen_shows_the_card_and_stops_the_ticker():
         assert card.border_title == "THE PASS IS CLEAR" and card.has_class("card-quiet")
         body = _plain(app, "#card-body")
         assert "KITCHEN QUIET  no orders on the rail for 4m 12s" in body
-        assert "LIGHTS OUT in 25m 48s   idle unload at 30m" in body
+        assert "LINE IS OPEN · hold 1 · no idle unload while held" in body
         assert "HI-SCORE 10.5 tok/s  best plate rate today, set" in body
         assert "ORDER UP 3 · DROPPED IT 1 · WALKED OUT 1 · SCRATCH 1 miss" in body
         assert "s o u s" not in body and "▒▒▒▒▒" in _plain(app, "#card-art")
@@ -541,6 +571,62 @@ def test_a_quiet_kitchens_idle_tick_only_moves_the_steam():
         assert _plain(app, "#card-body") == body
 
     _run(test)
+
+
+def test_a_quiet_kitchen_counts_down_to_lights_out_only_when_nothing_holds_the_model():
+    """The idle sweep never unloads under a `sous claude` hold, however
+    long the rail stays empty: a countdown beside `hold 1` ran to a
+    lights-out that never came."""
+
+    async def test(app, pilot, feed, clock):
+        document = _doc(None, recent=RECENT)
+        document["engine"]["holders"] = 0
+        await _deliver(feed, pilot, document)
+        assert "LIGHTS OUT in 25m 48s   idle unload at 30m" in _plain(app, "#card-body")
+        document = _doc(None, recent=RECENT, loaded=False)
+        document["engine"]["holders"] = 0
+        await _deliver(feed, pilot, document)
+        assert "LIGHTS OUT · the next order preheats the model" in _plain(app, "#card-body")
+
+    _run(test)
+
+
+def test_the_sear_gauge_holds_still_through_a_decode_tick(monkeypatch):
+    """The 10 fps tick asks the SEAR gauge for the same full bar all through
+    a decode; each ask restarted its tween and repainted it."""
+    painted: list[str] = []
+    real_refresh = tui.Widget.refresh
+
+    def spy(self, *args, **kwargs):
+        painted.append(f"{type(self).__name__}#{self.id}")
+        return real_refresh(self, *args, **kwargs)
+
+    async def test(app, pilot, feed, clock):
+        await _deliver(feed, pilot, _doc(_turn()))
+        await pilot.wait_for_animation()
+        assert app._ticker is not None and app._ticker._active.is_set()
+        monkeypatch.setattr(tui.Widget, "refresh", spy)
+        await pilot.pause(0.35)  # three ticks against a pinned clock
+        assert "Gauge#sear" not in painted, painted
+
+    _run(test)
+
+
+def test_live_rates_are_the_last_sixty_seconds_not_the_last_sixty_samples():
+    """A sample lands once a second while a turn decodes and nothing clears
+    them, so sixty samples could span an hour of one-line orders under a
+    label that says 60s."""
+
+    async def test(app, pilot, feed, clock):
+        await _deliver(feed, pilot, _doc(_turn(decode_tps=8.0)))
+        clock.now = BASE + 30.0
+        await _deliver(feed, pilot, _doc(_turn(decode_tps=9.0)))
+        clock.now = BASE + 100.0
+        await _deliver(feed, pilot, _doc(_turn(decode_tps=10.0)))
+        assert app._live_rates(clock.now) == [10.0]
+        assert "floor 10.0 · 60s" in _plain(app, "#rate-text")
+
+    _run(test, size=(120, 30))
 
 
 def test_a_heartbeat_repaints_only_the_lines_whose_words_changed(monkeypatch):
@@ -863,6 +949,54 @@ def test_a_new_ticket_on_the_rail_is_highlighted_then_settles():
         app.motion = False
         await _deliver(feed, pilot, _doc(_turn(), recent=[_summary(9), *RECENT]))
         assert not isinstance(rail.get_row(_summary(9)["id"])[0], Text)
+
+    _run(test)
+
+
+def test_a_second_ticket_inside_the_fade_does_not_reflash_the_first():
+    """The highlight's last two steps are timers holding the cells as they
+    were. A second ticket landing inside those 200 ms rebuilds the book, and
+    the first ticket's pending steps — left running — restyled its row from
+    a snapshot the rebuild had replaced: bold again, or a stale value."""
+
+    async def test(app, pilot, feed, clock):
+        await _deliver(feed, pilot, _doc(_turn(), recent=RECENT[1:]))
+        rail = app.query_one(tui.Rail)
+        first, second = RECENT[0]["id"], _summary(9)["id"]
+        await feed.queue.put(_doc(_turn(), recent=RECENT))
+        await _until(pilot, lambda: first in rail._shown)
+        await feed.queue.put(_doc(_turn(), recent=[_summary(9), *RECENT]))
+        await _until(pilot, lambda: second in rail._shown)
+        # The second rebuild drew the first ticket's row plain; the first's
+        # own steps, had they run on, would bold it at the 100 ms mark.
+        for _ in range(6):
+            await pilot.pause(0.05)
+            assert not isinstance(rail.get_row(first)[0], Text), rail.get_row(first)[0]
+        await pilot.pause(0.3)
+        assert not isinstance(rail.get_row(second)[0], Text)
+
+    _run(test)
+
+
+def test_a_paused_rail_holds_new_orders_through_a_resize():
+    """`p` freezes the book so a ticket can be read and opened; a resize
+    rebuilds the table for its new widths, and rebuilt from the orders the
+    pause was holding back it published them — cursor and all."""
+
+    async def test(app, pilot, feed, clock):
+        await _deliver(feed, pilot, _doc(_turn(), recent=RECENT[3:]))
+        rail = app.query_one(tui.Rail)
+        assert rail.row_count == 2
+        await pilot.press("p")
+        await _deliver(feed, pilot, _doc(_turn(), recent=RECENT))
+        assert rail.paused and rail.row_count == 2
+        await pilot.resize_terminal(80, 30)
+        await pilot.pause(0.2)
+        assert rail.paused and rail.row_count == 2, "the resize published what the pause held"
+        assert [t["id"] for t in rail.turns] == [t["id"] for t in RECENT[3:]]
+        await pilot.press("p")
+        await pilot.pause(0.1)
+        assert rail.row_count == 5
 
     _run(test)
 

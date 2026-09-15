@@ -130,11 +130,12 @@ Claude Code use stretches further — evaluate features against that goal.
   because a load, a hold and the idle clock are not registry changes);
   never wake it from a writer. The routes record a summary for *every*
   `POST /v1/messages id=…` line — refused, abandoned and failed included —
-  and the served line is printed from that summary (`_turn_line`), so a
-  row and a line cannot disagree; the dict is in memory only and does not
-  survive a restart. Textual is imported only inside the `sous top` command
-  function: `sous serve`, `sous claude` and `sous statusline` (stdlib only,
-  half-second budget) never load it. The terminal runs with `ansi_color=True`
+  and the served line is printed from that summary (`_turn_line`,
+  `_failure_line`), so a row and a line cannot disagree; the dict is in
+  memory only and does not survive a restart. Textual is imported only
+  inside the `sous top` command function: `sous serve`, `sous claude` and
+  `sous statusline` (no Textual, httpx or psutil; half-second budget) never
+  load it. The terminal runs with `ansi_color=True`
   and the `ansi-dark` theme pinned explicitly — foreground and background
   are the terminal's own — and paints hex accents on top of that ground,
   each chosen to clear 3:1 on black and on white (a test asserts it); nothing

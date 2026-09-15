@@ -790,6 +790,26 @@ def test_status_memory_probe_releases_mlx_thread_state(svc, monkeypatch):
     assert released
 
 
+def test_status_document_releases_mlx_thread_state_when_the_build_fails(svc, monkeypatch):
+    """The engine's status and the registry's snapshot can free mlx arrays
+    on the building thread before the memory read releases its state; the
+    routes catch a failure in between and hand the pooled thread back, so
+    the release cannot depend on reaching the read."""
+    import sous.server as server
+
+    service, _, _ = svc
+    released = []
+    monkeypatch.setattr(server, "release_mlx_thread_state", lambda: released.append(True))
+
+    def boom():
+        raise RuntimeError("the probe failed")
+
+    monkeypatch.setattr(service.inflight, "snapshot", boom)
+    with pytest.raises(RuntimeError):
+        service.status_document(recent=True)
+    assert released
+
+
 def test_server_status_reports_gateway_config(svc):
     """The gateway is off by default and experimental; the MCP-visible status
     is how a user confirms which model ids the daemon would serve locally."""

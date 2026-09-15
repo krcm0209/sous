@@ -788,7 +788,7 @@ def test_the_registry_sees_the_turn_while_it_generates(tmp_path: Path):
     def generate(messages, tools, max_tokens, on_delta=None):
         # Before the cache decides: the probe has nothing to say.
         seen.append(live.snapshot()["inflight"][0])
-        inner.stats = {"reused_tokens": 55175, "prefilled_tokens": 3120}
+        inner.stats = {"reused_tokens": 55175, "prefilled_tokens": 3120, "hits": 1}
         seen.append(live.snapshot()["inflight"][0])
         return original(messages, tools, max_tokens, on_delta)
 
@@ -854,10 +854,85 @@ def test_the_prefill_probe_reads_the_owners_counters_against_the_turns_baseline(
     inner = FakeEngine([])
     engine = ManagedEngine(inner)
     owner = threading.current_thread()
-    inner.stats = {"reused_tokens": 40, "prefilled_tokens": 0}
-    assert _prefill_plan(engine, owner, {"reused_tokens": 40}) is None
-    inner.stats = {"reused_tokens": 90, "prefilled_tokens": 12}
-    assert _prefill_plan(engine, owner, {"reused_tokens": 40}) == (50, 12)
-    inner.stats = {"reused_tokens": 40, "prefilled_tokens": 12}
-    assert _prefill_plan(engine, owner, {"reused_tokens": 40}) == (0, 12)
+    # The previous turn's gauges, which this turn's generation has not yet
+    # zeroed: a hit's reuse and the size it prefilled, and no take of its own.
+    before = {"reused_tokens": 40, "prefilled_tokens": 12, "hits": 1, "misses": 0}
+    inner.stats = dict(before)
+    assert _prefill_plan(engine, owner, before) is None
+    # Taken but not yet sized: the instant between the take and the run.
+    inner.stats = {"reused_tokens": 90, "prefilled_tokens": 0, "hits": 2, "misses": 0}
+    assert _prefill_plan(engine, owner, before) is None
+    inner.stats = {"reused_tokens": 90, "prefilled_tokens": 3000, "hits": 2, "misses": 0}
+    assert _prefill_plan(engine, owner, before) == (50, 3000)
+    inner.stats = {"reused_tokens": 40, "prefilled_tokens": 62000, "hits": 1, "misses": 1}
+    assert _prefill_plan(engine, owner, before) == (0, 62000)
     assert inner.stats_owners[-1] is owner
+
+
+def test_the_probe_answers_nothing_before_this_turns_take_against_a_real_cache(monkeypatch):
+    """The owner's gauges carry the previous turn's prefill size until the
+    cache's own begin_turn zeroes them — on the session thread, after the
+    hand-off, the engine-lock wait and the render. Until this turn's take
+    the probe must say it is undecided, not report that size as this
+    turn's; a status reader polls ten times a second and lands there on
+    every turn after a session's first."""
+    from typing import cast
+
+    from sous.engine.promptcache import PrefixCache
+    from sous.gateway.turn import _prefill_plan
+    from tests.test_promptcache import FULL_1, FULL_2, STABLE_1, STABLE_2, FakeHooks
+
+    class Shim:  # what ManagedEngine forwards: one owner's counters
+        def __init__(self, pc: PrefixCache) -> None:
+            self._pc = pc
+
+        def prompt_cache_stats(self, owner=None) -> dict:
+            return self._pc.stats(owner)
+
+    pc = PrefixCache(FakeHooks(trimmable=True), max_bytes=1 << 40)
+    engine = cast(ManagedEngine, Shim(pc))
+    owner = threading.current_thread()
+    pc.generate(STABLE_1, FULL_1, 16)
+    before = pc.stats(owner)
+    assert before["prefilled_tokens"] > 0, "the previous turn's size is still on the gauge"
+    assert _prefill_plan(engine, owner, before) is None
+    seen: list[tuple[int, int] | None] = []
+    original = PrefixCache._run
+
+    def spy_run(self, *args, **kwargs):
+        seen.append(_prefill_plan(engine, owner, before))  # taken, not yet sized
+        text = original(self, *args, **kwargs)
+        seen.append(_prefill_plan(engine, owner, before))  # sized
+        return text
+
+    monkeypatch.setattr(PrefixCache, "_run", spy_run)
+    pc.generate(STABLE_2, FULL_2, 16)
+    after = pc.stats(owner)
+    reused = after["reused_tokens"] - before["reused_tokens"]
+    assert seen == [None, (reused, after["prefilled_tokens"])]
+
+
+def test_a_turn_leaves_the_registry_before_it_releases_the_lock(tmp_path: Path):
+    """The lock's next holder registers as running the instant it wakes;
+    a finished turn still listed beside it would be the one a reader put on
+    the pass."""
+    live = Inflight()
+    engines = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: FakeEngine(["ok"]))
+    runner = TurnRunner(engines, _cfg(tmp_path), live)
+    seen: list[list[dict]] = []
+    inner = runner._lock
+
+    class SpyLock:
+        def acquire(self, timeout: float = -1) -> bool:
+            return inner.acquire(timeout=timeout)
+
+        def release(self) -> None:
+            seen.append(live.snapshot()["inflight"])
+            inner.release()
+
+        def locked(self) -> bool:
+            return inner.locked()
+
+    runner._lock = SpyLock()  # ty: ignore[invalid-assignment]
+    runner.run(MSGS, [], 4096, RecordingSink(), turn_id="msg_1")
+    assert seen == [[]]

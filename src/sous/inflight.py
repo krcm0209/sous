@@ -19,7 +19,6 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-PHASES = ("queued", "loading", "tokenizing", "prefill", "decode")
 RECENT_TURNS = 50
 # The rolling decode rate is tokens over the deltas of the last few seconds:
 # long enough to smooth a drafter's bursts of one to four tokens, short
@@ -167,7 +166,7 @@ class Inflight:
             pending = [
                 (turn.id, turn.probe)
                 for turn in self._turns.values()
-                if turn.phase == "prefill" and turn.probe is not None and turn.to_prefill is None
+                if turn.phase == "prefill" and turn.probe is not None
             ]
         decided: dict[str, tuple[int, int]] = {}
         for turn_id, probe in pending:
@@ -181,14 +180,33 @@ class Inflight:
         with self._lock:
             for turn_id, (reused, to_prefill) in decided.items():
                 turn = self._turns.get(turn_id)
-                if turn is not None and turn.phase == "prefill":
+                if turn is None or turn.phase != "prefill":
+                    continue
+                # Asked on every snapshot while the turn prefills, so a later
+                # answer — a warm attempt retried cold prefills the whole
+                # render — supersedes the first. A new size restarts the
+                # phase clock: the prefill's compute began when the cache
+                # decided, not when the runner declared the phase, and the
+                # engine-lock wait and the render sit between the two.
+                if to_prefill != turn.to_prefill:
+                    turn.phase_since = now
+                if (reused, to_prefill) != (turn.reused_tokens, turn.to_prefill):
                     turn.reused_tokens, turn.to_prefill = reused, to_prefill
                     self._version += 1
             typical = self._typical_output()
             return {
-                "inflight": [self._entry(turn, now, typical) for turn in self._turns.values()],
+                "inflight": [self._entry(turn, now, typical) for turn in self._ordered()],
                 "recent_turns": [dict(s) for s in self._recent],
             }
+
+    def _ordered(self) -> list[_Turn]:
+        """Lock held by the caller. The turn on the pass first — the one past
+        `queued` that most recently moved, since the runner holds the gateway
+        lock from `loading` on and registration order says nothing about who
+        won that lock — then the queue in arrival order."""
+        running = [t for t in self._turns.values() if t.phase != "queued"]
+        running.sort(key=lambda t: t.phase_since, reverse=True)
+        return running + [t for t in self._turns.values() if t.phase == "queued"]
 
     def _typical_output(self) -> int | None:
         """Lock held by the caller. The median output of the newest turns

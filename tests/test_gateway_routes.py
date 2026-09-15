@@ -1911,7 +1911,7 @@ def test_a_served_turn_is_recorded_with_the_lines_fields(tmp_path: Path):
     message_id = started[0]["message"]["id"]
     (turn,) = _recent(gateway)
     assert turn["id"] == message_id and turn["model"] == "sous-local"
-    assert turn["status"] == 200 and turn["error"] is None and turn["stream"] == 1
+    assert turn["status"] == 200 and turn["error"] is None and turn["stream"] is True
     assert turn["cache"] == "hit" and turn["took"] == "turn@100"
     assert turn["stop_reason"] == "end_turn"
     assert turn["output_tokens"] == 1 and turn["reused_tokens"] == 100
@@ -1952,8 +1952,8 @@ def test_failed_and_refused_turns_are_recorded_with_their_error(tmp_path: Path, 
     _post(app, _body(stream=True))
     recent = _recent(gateway)
     assert [(t["status"], t["error"], t["stream"]) for t in recent] == [
-        (200, "api_error", 1),  # the stream's headers had gone out
-        (500, "api_error", 0),
+        (200, "api_error", True),  # the stream's headers had gone out
+        (500, "api_error", False),
     ]
     assert all(t["id"].startswith("msg_") and t["seconds"] >= 0 for t in recent)
     assert all("stop_reason" not in t for t in recent)
@@ -1973,7 +1973,7 @@ def test_an_abandoned_stream_is_recorded_as_499(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(gateway._runner, "run", gone)
     _post(app, _body(stream=True))
     (turn,) = _recent(gateway)
-    assert (turn["status"], turn["error"], turn["stream"]) == (499, "abandoned", 1)
+    assert (turn["status"], turn["error"], turn["stream"]) == (499, "abandoned", True)
 
 
 def test_the_turn_line_is_printed_from_the_recorded_summary(tmp_path: Path, capsys):

@@ -64,7 +64,7 @@ PHASE_WORDS = {
 DONE_WORD = "ORDER UP"
 STALLED_WORD = "IN THE WINDOW"
 CACHE_WORDS = {"hit": "REHEAT", "fork": "WARM DRAWER", "miss": "SCRATCH"}
-RAIL_CACHE_WORDS = {"hit": "REHEAT", "fork": "DRAWER", "miss": "SCRATCH"}
+RAIL_CACHE_WORDS = {**CACHE_WORDS, "fork": "DRAWER"}  # the rail's column is narrower
 STOP_WORDS = {
     "end_turn": "ORDER UP",
     "tool_use": "ORDER UP",
@@ -138,7 +138,8 @@ STALL_SECONDS = 5.0
 STALL_QUESTION_SECONDS = 10.0
 # The reconnect backoff: first wait, then doubled up to the cap.
 RETRY_SECONDS = (0.5, 8.0)
-# Samples on the tok/s sparkline, one a second.
+# The tok/s window, in seconds and in samples: one sample a second while a
+# turn decodes, and nothing older than the window whatever it served before.
 SPARK_SAMPLES = 60
 # Breakpoints: below the first only the footer shows; below the second the
 # columns stack; at the third the big rate readout appears.
@@ -485,6 +486,27 @@ class FeedDown(Exception):
     """The daemon did not answer, refused, or hung up."""
 
 
+async def sse_frames(lines: AsyncIterator[str]) -> AsyncIterator[tuple[str, dict]]:
+    """(event, data) per frame of an SSE stream: the event's name (`message`
+    when it carries none) and its data lines joined, as the JSON object they
+    hold or `{}` when they hold anything else. Comment, id and retry lines
+    are passed over, as the format says."""
+    event: str | None = None
+    data: list[str] = []
+    async for line in lines:
+        if line.startswith("event:"):
+            event = line[len("event:") :].strip()
+        elif line.startswith("data:"):
+            data.append(line[len("data:") :].removeprefix(" "))
+        elif line == "" and (event is not None or data):
+            try:
+                payload = json.loads("\n".join(data))
+            except ValueError:
+                payload = {}
+            yield event or "message", payload if isinstance(payload, dict) else {}
+            event, data = None, []
+
+
 async def sse_feed(port: int) -> AsyncIterator[tuple[str, dict]]:
     """`GET /sous/events` as (event, data) pairs until the daemon hangs up.
     The read timeout sits well past the daemon's 10 s ping, so a silent
@@ -500,20 +522,8 @@ async def sse_feed(port: int) -> AsyncIterator[tuple[str, dict]]:
         ):
             if reply.status_code != 200:
                 raise FeedDown(f"status {reply.status_code}")
-            event: str | None = None
-            data = ""
-            async for line in reply.aiter_lines():
-                if line.startswith("event: "):
-                    event = line[len("event: ") :]
-                elif line.startswith("data: "):
-                    data = line[len("data: ") :]
-                elif line == "" and event is not None:
-                    try:
-                        payload = json.loads(data)
-                    except ValueError:
-                        payload = {}
-                    yield event, payload if isinstance(payload, dict) else {}
-                    event, data = None, ""
+            async for frame in sse_frames(reply.aiter_lines()):
+                yield frame
     except httpx.HTTPError as exc:
         # The type only: an httpx message can carry the URL it was building.
         raise FeedDown(type(exc).__name__) from None
@@ -645,6 +655,7 @@ class Gauge(Widget):
         self._colour = colour
         self.detail = ""
         self.phase_time = 0.0
+        self._target: tuple[float | None, str] | None = None
 
     def show(
         self,
@@ -657,6 +668,12 @@ class Gauge(Widget):
         """`ease` is a tween's duration in seconds; 0 snaps. Only a number
         tweens to a number — the pulse (None) never tweens."""
         self.detail, self.phase_time = detail, phase_time
+        if fraction is not None and (fraction, detail) == self._target:
+            # The bar already drawn, or tweening to it: the 10 fps tick asks
+            # for it again all through a decode, and each ask restarted the
+            # tween and repainted. The pulse (None) moves with phase_time.
+            return
+        self._target = (fraction, detail)
         if ease and self.fraction is not None and fraction is not None:
             self.animate("fraction", fraction, duration=ease, easing="out_cubic")
         else:
@@ -743,7 +760,7 @@ class Slip(Vertical):
     def _motion(self) -> bool:
         return getattr(self.app, "motion", True)
 
-    def show(self, view: TurnView, behind: int, now: float, spark: list[float]) -> None:
+    def show(self, view: TurnView, behind: int, spark: list[float]) -> None:
         changed = view.phase != self._phase
         self._phase = view.phase
         for phase in PHASE_WORDS:
@@ -899,7 +916,7 @@ class Card(Vertical):
     def show_quiet(
         self, engine: dict, config: dict, recent: list[dict], now: float, motion: bool
     ) -> None:
-        self._state("quiet", TEAL)
+        self._state("quiet")
         _retitle(self, title="THE PASS IS CLEAR")
         idle = engine.get("idle_seconds") or 0.0
         minutes = config.get("idle_unload_minutes")
@@ -908,7 +925,13 @@ class Card(Vertical):
         self.query_one("#card-art", Line).show("\n".join([steam, *POT]))
         self.query_one("#card-lead", Line).show("\n\n  stock on, nobody ordering")
         lines = ["", f" {QUIET_WORD}  no orders on the rail for {span_text(idle)}"]
-        if minutes and minutes * 60 > idle:
+        holders = engine.get("holders") or 0
+        if engine.get("loaded") and holders:
+            # The idle sweep never unloads under a hold, however long the
+            # rail stays empty: a countdown here would run to a lights-out
+            # that never comes.
+            lines.append(f" {ENGINE_WORDS['loaded']} · hold {holders} · no idle unload while held")
+        elif engine.get("loaded") and minutes and minutes * 60 > idle:
             lines.append(
                 f" {ENGINE_WORDS['unloaded']} in {span_text(minutes * 60 - idle)}   "
                 f"idle unload at {minutes}m"
@@ -947,7 +970,7 @@ class Card(Vertical):
         now: float,
         motion: bool,
     ) -> None:
-        self._state("firing", MUSTARD)
+        self._state("firing")
         _retitle(self, title=ENGINE_WORDS["loading"], subtitle=f"{elapsed:.0f}s loading")
         self.query_one("#card-chef", Chef).show("loading", now, motion=motion)
         self.query_one("#card-art", Line).show("")
@@ -960,7 +983,7 @@ class Card(Vertical):
     def show_redial(
         self, attempt: int, wait: float, why: str, as_of: str, now: float, motion: bool
     ) -> None:
-        self._state("vhs", SLATE)
+        self._state("vhs")
         self._attempt, self._why, self._wait_text = attempt, why, f"{wait:.0f}"
         _retitle(self, title="VHS TRACKING", subtitle=f"as of {as_of}" if as_of else "")
         self.query_one("#card-chef", Chef).show("vhs", now, motion=motion)
@@ -971,7 +994,7 @@ class Card(Vertical):
         self.query_one("#card-body", Line).show("")
 
     def show_closed(self, port: int, attempt: int, wait: float, now: float) -> None:
-        self._state("closed", CHILLI)
+        self._state("closed")
         self._attempt, self._wait_text = attempt, f"{wait:.0f}"
         _retitle(
             self,
@@ -987,7 +1010,7 @@ class Card(Vertical):
             "\n  (or: sous install-launchd)   q leaves; the screen keeps trying meanwhile"
         )
 
-    def _state(self, state: str, colour: str) -> None:
+    def _state(self, state: str) -> None:
         for s in ("quiet", "firing", "vhs", "closed"):
             self.set_class(s == state, f"card-{s}")
         firing = self.query_one("#firing", LoadingIndicator)
@@ -1151,17 +1174,12 @@ class Rail(DataTable):
         if columns == self._columns and widths == self._widths:
             return
         self._columns, self._widths = columns, widths
-        for timer in self._fading:
-            # The steps still pending were measured against the columns this
-            # rebuild is about to drop: stopping them keeps the old widths'
-            # text out of the new cells.
-            timer.stop()
-        self._fading = []
+        self._stop_fading()
         self.clear(columns=True)
         for name in columns:
             self.add_column(Text(name, style=SLATE), width=widths[name], key=name)
         self._shown = []
-        self._rebuild(self._pending if self._pending is not None else self.turns)
+        self._rebuild(self.turns)
 
     def show(self, turns: list[dict]) -> list[str]:
         """Rebuild when the set of ids changed; returns the ids that are new."""
@@ -1177,6 +1195,7 @@ class Rail(DataTable):
             return []
         new = [i for i in ids if i not in self._shown]
         had_rows = bool(self._shown)
+        self._stop_fading()
         self.clear()
         self.turns = turns
         for turn in turns:
@@ -1199,6 +1218,16 @@ class Rail(DataTable):
         if new and had_rows and getattr(self.app, "motion", True):
             self._highlight(new)
         return new
+
+    def _stop_fading(self) -> None:
+        """A highlight's last two steps are timers holding the cells of the
+        table as it was. A rebuild that replaces those rows — or the columns
+        they were measured against — stops the steps first: left running,
+        they restyle rows the rebuild has already redrawn, and a second
+        ticket landing inside the 200 ms re-flashed the first."""
+        for timer in self._fading:
+            timer.stop()
+        self._fading = []
 
     def _highlight(self, ids: list[str]) -> None:
         """Three 100 ms steps — reverse, bold, then what the rebuild put
@@ -1424,7 +1453,7 @@ class Top(App[int]):
         self._why = ""
         self._firing_since: float | None = None
         self._done_until = 0.0
-        self._spark: deque[float] = deque(maxlen=SPARK_SAMPLES)
+        self._spark: deque[tuple[float, float]] = deque(maxlen=SPARK_SAMPLES)
         self._spark_at = float("-inf")
         self._counters: dict[str, int] = {}
         self._ticker: Timer | None = None
@@ -1573,7 +1602,7 @@ class Top(App[int]):
         if self._turn is not None:
             view = turn_view(self._turn, now, self._received_at)
             if not resize and view.phase == "decode" and now - self._spark_at >= 1.0:
-                self._spark.append(view.tps or 0.0)
+                self._spark.append((now, view.tps or 0.0))
                 self._spark_at = now
             self._show_left(view)
         else:
@@ -1582,11 +1611,12 @@ class Top(App[int]):
             self._firing_since = None
         mood = self._mood(engine, now)
         self.query_one(LinePanel).show(mood, engine, config, queue, recent, now, self.motion)
-        best, _ = hi_score(recent, list(self._spark))
-        live = [r for r in self._spark if r]
+        live = self._live_rates(now)
+        best, _ = hi_score(recent, live)
+        floor = [r for r in live if r]
         self.query_one(RatePanel).show(
             self._turn and turn_view(self._turn, now, self._received_at).tps,
-            min(live) if live else None,
+            min(floor) if floor else None,
             best,
             f"{PHASE_WORDS.get(self._turn.get('phase', ''), '')}  {self._turn.get('phase', '')}"
             if self._turn
@@ -1643,8 +1673,15 @@ class Top(App[int]):
             return f"{QUIET_WORD} {span_text(engine.get('idle_seconds') or 0)}", TEAL
         if self._turn is None:
             return ENGINE_WORDS["unloaded"], SLATE
-        best, _ = hi_score(recent, list(self._spark))
+        best, _ = hi_score(recent, self._live_rates(now))
         return (f"HI-SCORE {best:.1f} tok/s", PINK) if best else ("first order", PINK)
+
+    def _live_rates(self, now: float) -> list[float]:
+        """The tok/s samples of the last SPARK_SAMPLES seconds, so the
+        sparkline, the floor and the HI-SCORE's live half mean the window
+        they are labelled with — not sixty samples of decode spread over
+        whatever the pass served in the last hour."""
+        return [tps for t, tps in self._spark if now - t <= SPARK_SAMPLES]
 
     def _show_left(self, view: TurnView | None) -> None:
         """The slip and the stub when a turn is on the pass; the card when
@@ -1660,7 +1697,7 @@ class Top(App[int]):
         recent = self._document.get("recent_turns") or []
         if view is not None and self._connected:
             slip.display, card.display = True, False
-            slip.show(view, len(self._behind), now, list(self._spark))
+            slip.show(view, len(self._behind), self._live_rates(now))
             stub.show(self._behind[0] if self._behind else None, len(self._behind) - 1, now)
             return
         slip.display, card.display = False, True

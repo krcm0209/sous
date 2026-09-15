@@ -161,7 +161,7 @@ def test_the_prefill_eta_comes_from_the_probe_and_the_rolling_rate():
     reg.finished(_summary(prefilled_tokens=4000, prefill_s=2.0))  # 2000 tok/s
     _begin(reg)
     answers: list[tuple[int, int] | None] = [None, (55175, 3000)]
-    reg.phase("msg_a", "prefill", probe=lambda: answers.pop(0))
+    reg.phase("msg_a", "prefill", probe=lambda: answers.pop(0) if answers else (55175, 3000))
     entry = _entry(reg)
     # The cache has not decided yet: nothing to size the bar with.
     assert entry["reused_tokens"] is None and entry["to_prefill"] is None
@@ -169,13 +169,55 @@ def test_the_prefill_eta_comes_from_the_probe_and_the_rolling_rate():
     clock.tick(0.5)
     entry = _entry(reg)
     assert entry["reused_tokens"] == 55175 and entry["to_prefill"] == 3000
-    assert entry["eta_seconds"] == 1.0  # 3000 / 2000 tok/s, less the 0.5 s spent
-    assert answers == []  # decided once; never asked again
+    # 3000 tok at 2000 tok/s, counted from the moment the cache decided: the
+    # half second before it was the engine-lock wait and the render.
+    assert entry["eta_seconds"] == 1.5 and entry["phase_since"] == clock.now
+    clock.tick(0.5)
+    assert _entry(reg)["eta_seconds"] == 1.0
     clock.tick(5.0)
     assert _entry(reg)["eta_seconds"] == 0.0
     reg.progress("msg_a", 1)
     entry = _entry(reg)
     assert entry["phase"] == "decode" and entry["to_prefill"] == 3000
+
+
+def test_a_later_probe_answer_supersedes_the_first_and_restarts_the_phase_clock():
+    """A warm attempt retried cold prefills the whole render: the size the
+    cache first decided is not the one it is prefilling. So the probe is
+    asked on every snapshot while the turn prefills, a changed answer
+    replaces the first, and an unchanged one is no change at all — no
+    version bump, no clock restart."""
+    reg, clock = _registry()
+    _begin(reg)
+    answers = [(4000, 300), (4000, 300), (4000, 62000)]
+    reg.phase("msg_a", "prefill", probe=lambda: answers.pop(0))
+    assert _entry(reg)["to_prefill"] == 300
+    decided_at, version = clock.now, reg.version
+    clock.tick(1.0)
+    entry = _entry(reg)
+    assert entry["to_prefill"] == 300 and entry["phase_since"] == decided_at
+    assert reg.version == version
+    clock.tick(1.0)
+    entry = _entry(reg)
+    assert (entry["reused_tokens"], entry["to_prefill"]) == (4000, 62000)
+    assert entry["phase_since"] == clock.now and reg.version == version + 1
+
+
+def test_the_turn_past_queued_leads_the_list_whatever_the_arrival_order():
+    """Turns admitted together wait on the gateway lock in registration
+    order, but the lock is not a queue: whichever it wakes is the turn on
+    the pass, and a reader takes the first entry as that turn."""
+    reg, clock = _registry()
+    _begin(reg, "msg_a")
+    _begin(reg, "msg_b")
+    reg.phase("msg_b", "loading")
+    assert [e["id"] for e in reg.snapshot()["inflight"]] == ["msg_b", "msg_a"]
+    reg.progress("msg_b", 3)
+    assert [e["id"] for e in reg.snapshot()["inflight"]] == ["msg_b", "msg_a"]
+    # Its successor takes the lock while it is still listed: newest first.
+    clock.tick(1.0)
+    reg.phase("msg_a", "loading")
+    assert [e["id"] for e in reg.snapshot()["inflight"]] == ["msg_a", "msg_b"]
 
 
 def test_a_probe_that_raises_or_answers_late_is_not_an_error():

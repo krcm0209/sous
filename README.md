@@ -278,9 +278,9 @@ Add to `~/.claude/settings.json`:
 `refreshInterval` matters: without it Claude Code re-runs the command only on
 session events — a new assistant message, a compaction, a mode change — so the
 line goes quiet for a whole subagent turn; with it the command runs every
-second as well. The
-command imports nothing beyond the standard library and gives up inside
-half a second, so it costs the status bar nothing.
+second as well. The command loads none of the heavy dependencies (no
+Textual, httpx or psutil) and gives up inside half a second, so it costs the
+status bar nothing.
 
 To bracket a subagent from the outside as well, a `SubagentStart` /
 `SubagentStop` hook can append its own record — `{ts, agent_id,

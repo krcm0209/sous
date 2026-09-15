@@ -461,6 +461,33 @@ def test_a_document_json_cannot_encode_ends_the_stream_too(tmp_path: Path, monke
     ]
 
 
+def test_a_non_finite_number_ends_the_stream_as_status_refuses_it(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """`/sous/status` answers through Starlette's JSONResponse, which refuses
+    NaN; the stream's own encoder must too, or the one document is a 500 on
+    one route and a `NaN` token no other parser reads on the other."""
+    import logging
+
+    from sous.server import SousService
+
+    monkeypatch.setattr(
+        SousService,
+        "status_document",
+        lambda self, *, recent: {"engine": {"memory_gb": float("nan")}},
+    )
+    app, _ = _app(tmp_path)
+    with caplog.at_level(logging.ERROR, logger="sous.monitor"):
+        status, frames = _collect_events(app, want=0)
+        assert _request(app, "GET", "/sous/status").status_code == 500
+    assert status == [200]
+    assert [f for f in frames if f[0] == "status"] == []
+    assert [r.getMessage() for r in caplog.records if r.name == "sous.monitor"] == [
+        "GET /sous/events failed (ValueError)",
+        "GET /sous/status failed (ValueError)",
+    ]
+
+
 def test_mounting_the_monitor_pins_sse_starlette_above_debug(tmp_path: Path, monkeypatch):
     """/sous/events is mounted whether or not the gateway is, and sse-starlette
     logs every frame it sends at DEBUG — the pin must not depend on the

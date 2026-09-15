@@ -830,9 +830,9 @@ _DEFAULT_STATUS = object()
 
 
 def _status(**gateway) -> dict:
-    """The shape of `GET /sous/status` — `SousService.server_status()` — of
-    which the launcher reads `config.gateway` for its checks and
-    `engine.model_id` for its one line."""
+    """The keys of `GET /sous/status` — `SousService.status_document()`,
+    less the recent turns and tasks — of which the launcher reads
+    `config.gateway` for its checks and `engine.model_id` for its one line."""
     return {
         "engine": {
             "model_id": "mlx-community/Qwen3.8-27B-4bit",
@@ -1625,6 +1625,70 @@ def test_statusline_treats_a_wrong_answer_as_daemon_down(tmp_path, capsys, monke
     assert capsys.readouterr().out == "sous: daemon down\n"
 
 
+class _RawListener:
+    """A socket on 127.0.0.1 that answers its first connection with
+    `script` — (seconds to wait, bytes to send) in order — then hangs up:
+    what a port held by something other than an HTTP server, or by a server
+    that dribbles, looks like to the status line."""
+
+    def __init__(self, script: list[tuple[float, bytes]]):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(1)
+        self.port = self.sock.getsockname()[1]
+        self.script = script
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self) -> None:
+        try:
+            conn, _ = self.sock.accept()
+            with conn:
+                for delay, chunk in self.script:
+                    time.sleep(delay)
+                    conn.sendall(chunk)
+        except OSError:
+            pass  # the test closed the listener, or the client is gone
+
+    def close(self) -> None:
+        self.sock.close()
+
+
+def test_statusline_treats_a_listener_that_is_not_http_as_daemon_down(
+    tmp_path, capsys, monkeypatch
+):
+    """urllib's URLError is an OSError; http.client's BadStatusLine — a port
+    held by something that does not speak HTTP — is not, and once a second
+    a traceback is no status line."""
+    from sous import cli
+
+    listener = _RawListener([(0.0, b"i am not http\r\n\r\n")])
+    try:
+        _statusline_config(tmp_path, monkeypatch, listener.port)
+        cli.main(["statusline"])
+    finally:
+        listener.close()
+    assert capsys.readouterr().out == "sous: daemon down\n"
+
+
+def test_statusline_gives_up_on_a_listener_that_dribbles(tmp_path, capsys, monkeypatch):
+    """urllib's timeout is per socket read and re-arms on every byte, so a
+    listener that dribbles one byte at a time would hold the line for as
+    long as it liked. The budget is wall-clock, on the whole call."""
+    from sous import cli
+
+    headers = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n"
+    listener = _RawListener([(0.0, headers), *([(0.3, b"{")] * 10)])
+    started = time.monotonic()
+    try:
+        _statusline_config(tmp_path, monkeypatch, listener.port)
+        cli.main(["statusline"])
+    finally:
+        listener.close()
+    assert capsys.readouterr().out == "sous: daemon down\n"
+    assert time.monotonic() - started < 1.5
+
+
 def test_statusline_treats_someone_elses_json_as_daemon_down(tmp_path, capsys, monkeypatch):
     """A JSON object from whatever else holds the port is not a status
     document: without the engine block it would read as a loaded, idle
@@ -1695,6 +1759,7 @@ def test_top_and_status_watch_run_the_terminal(tmp_path, monkeypatch):
 
     cfg = SousConfig(server_port=8391, data_dir=tmp_path, config_path=tmp_path / "c.toml")
     monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "_has_terminal", lambda: True)
     ports: list[int] = []
     monkeypatch.setattr(tui, "run_top", lambda port: (ports.append(port), 3)[1])
     with pytest.raises(SystemExit) as exc:
@@ -1704,6 +1769,25 @@ def test_top_and_status_watch_run_the_terminal(tmp_path, monkeypatch):
         cli.main(["status", "--watch"])
     assert exc.value.code == 3
     assert ports == [8391, 8391]
+
+
+def test_top_without_a_terminal_says_so_instead_of_drawing_into_the_pipe(
+    tmp_path, capsys, monkeypatch
+):
+    """An agent's shell, or a redirect: Textual would paint the pass into
+    the pipe and wait for a key that never comes."""
+    from sous import cli, tui
+    from sous.config import SousConfig
+
+    cfg = SousConfig(server_port=8391, data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "_has_terminal", lambda: False)
+    monkeypatch.setattr(tui, "run_top", lambda port: pytest.fail("the terminal was started"))
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["top"])
+    assert exc.value.code == 2
+    out, err = capsys.readouterr()
+    assert out == "" and err == "sous top: needs a terminal (try sous status, or sous statusline)\n"
 
 
 def test_only_sous_top_imports_textual(tmp_path):

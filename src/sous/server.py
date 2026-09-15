@@ -248,14 +248,21 @@ class SousService:
         every key it reads. Runs on a worker thread: the task store is
         SQLite, the engine's status takes its lock, and the registry's
         snapshot may call into the prompt cache."""
-        counts = self.store.count_by_state()
-        engine = self.engines.status()
-        live = self.inflight.snapshot()
-        # Last of all: the read releases this thread's mlx state, and the
-        # snapshot's probe reaches the prompt cache, which can free mlx
-        # arrays. Freeing after the release is what segfaults the thread on
-        # its way out (ml-explore/mlx#4327).
-        engine["memory_gb"] = _mlx_memory_gb()
+        try:
+            counts = self.store.count_by_state()
+            engine = self.engines.status()
+            live = self.inflight.snapshot()
+            # Last of all: the read releases this thread's mlx state, and the
+            # snapshot's probe reaches the prompt cache, which can free mlx
+            # arrays. Freeing after the release is what segfaults the thread
+            # on its way out (ml-explore/mlx#4327).
+            engine["memory_gb"] = _mlx_memory_gb()
+        finally:
+            # The status and the snapshot free arrays the same way before the
+            # memory read, and the routes that call this catch whatever they
+            # raise: a build that fails between the two would otherwise hand
+            # a pooled thread back with its mlx state live.
+            release_mlx_thread_state()
         document = {
             "engine": engine,
             "inflight": live["inflight"],
