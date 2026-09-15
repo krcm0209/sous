@@ -32,10 +32,11 @@ _logger = logging.getLogger("sous.monitor")
 # A hold body is two numbers; anything larger is not one.
 HOLD_BODY_LIMIT = 1024
 # The event stream polls the composite version the service hands it — the
-# in-flight registry, the engine manager and the task store — this often: a
-# burst of changes inside one tick is one event, and a change is on the wire
-# within a tick. Ten a second is what a terminal can show and what a
-# token-per-delta feed produces at the default model's decode speed.
+# in-flight registry, the engine manager, the task store and the config
+# file's stamp — this often: a burst of changes inside one tick is one
+# event, and a change is on the wire within a tick. Ten a second is what a
+# terminal can show and what a token-per-delta feed produces at the default
+# model's decode speed.
 EVENT_TICK_SECONDS = 0.1
 # While a turn is in flight, a delegated task is running or a load is
 # under way the document also goes out this often unchanged: the terminal

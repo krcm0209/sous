@@ -705,7 +705,8 @@ class EngineManager:
                 self._preload = None
                 # Forgetting the thread is what ends `loading` when the load
                 # failed — get()'s own bump left _preload set — so a client
-                # that hears no version move keeps painting a dead load.
+                # that hears no version move keeps painting a dead load. A
+                # load that succeeded pays one extra document for it.
                 self._bump()
 
     def _prune_holders(self) -> None:
