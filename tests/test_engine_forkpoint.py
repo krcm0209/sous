@@ -194,6 +194,7 @@ def _vlm_engine(tokenizer) -> tuple[VLMEngine, Recording]:
     # VLMEngine._tokenizer reads `processor.tokenizer` when there is one, and
     # falls back to the processor itself — which is what the fake is.
     engine._processor = tokenizer
+    engine._positional = True
     engine._memo = PromptMemo()
     engine._tokenize_lock = threading.Lock()
     rec = Recording()

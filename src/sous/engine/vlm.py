@@ -69,12 +69,11 @@ class VLMEngine:
 
         self.model_id = model_id
         self._model, self._processor = load(model_id)
-        # Which side owns the rotary positions, decided once here so the
-        # model-load line records it and _positions never re-asks: the
-        # engine's when the text-only embedding helper returns positions of
-        # its own, the model's otherwise.
-        self._positional: bool | None = self._helper_returns_positions()
-        self.positions = "engine" if self._positional else "model"
+        # Which side owns the rotary positions, decided once here — before
+        # any turn, and on the loading thread — so the model-load line records
+        # it and _positions never re-asks: the engine's when the text-only
+        # embedding helper returns positions of its own, the model's otherwise.
+        self._positional = self._helper_returns_positions()
         # Before the drafter loads (so it is never tagged) and before the cache
         # budget is measured (so warm-up temporaries are already released).
         self.int8_prefill_status = int8prefill.enable(self._model, enabled=int8_prefill)
@@ -101,6 +100,12 @@ class VLMEngine:
         self._cache = PrefixCache(
             self, enabled=prompt_cache, max_bytes=cache_budget, reserve_bytes=reserve_bytes
         )
+
+    @property
+    def positions(self) -> str:
+        """Which side supplies the rotary positions behind a warm cache — the
+        model-load line's and the status document's `positions` token."""
+        return "engine" if self._positional else "model"
 
     def _loaded(self) -> tuple:
         """The (model, processor) pair, or a clear error if already unloaded.
@@ -197,20 +202,26 @@ class VLMEngine:
         continuation generate_step chunks — so the fused MRoPE kernel reads a
         zero-length buffer out of bounds and every continued token lands at
         position 0 (keys off by 127–170 % on the default model). The array
-        covers the cache from 0 because the same kwargs reach every prompt
-        chunk and the model slices each at its own offset; a suffix-only
-        array is sliced past its end the same way. `rope_deltas` travels
-        with it so the engine, not the helper, owns the delta the model
-        adopts into the state a drafter run nulls and positions the
-        generated tokens from."""
+        is absolute from 0 because the model always slices at its own cache
+        offset, whether the prompt reaches it in one call or in chunks that
+        all receive the same kwargs; a suffix-only array is sliced past its
+        end the same way. `rope_deltas` travels with it so the engine, not
+        the helper, owns the delta the model adopts into the state a drafter
+        run nulls and positions the generated tokens from — today the helper's
+        own text-only delta is the same zero, so this guards the helper that
+        returns positions without one, after which the model would have no
+        delta at all. Both arrays are the text-only special case of the
+        model's `get_rope_index`: a prompt carrying pixels needs the helper's
+        grid-aware positions instead, and this override would hide them."""
         import mlx.core as mx
 
-        if self._positional is None:
-            self._positional = self._helper_returns_positions()
         if not self._positional:
             return {}
         # The attention layers share one offset; a recurrent layer has none
-        # (the same read promptcache.snapshot makes).
+        # (the same read promptcache.snapshot makes). The max only sizes the
+        # array — the model slices it at its own offset — so reading a layer
+        # that counts more than the model's does is harmless, and none counts
+        # less.
         offset = max((int(getattr(c, "offset", 0) or 0) for c in cache), default=0)
         return {
             "position_ids": mx.arange(offset + n_tokens, dtype=mx.int32)[None],
@@ -219,22 +230,28 @@ class VLMEngine:
 
     def _helper_returns_positions(self) -> bool:
         """Whether this model's text-only embedding helper returns rotary
-        positions, probed with a single token; the caller memoises the
-        answer. The families that do (the Qwen lineage) are exactly the ones
-        whose language model slices a caller's positions at its cache offset;
-        the others derive `cache_offset + rope_deltas` themselves and consume
-        a caller's array verbatim in their own rank, so handing them an
-        absolute rank-2 array would be an index error, not a repair."""
+        positions, probed with a single token; __init__ memoises the answer.
+        The families that do (the Qwen lineage) are exactly the ones whose
+        language model slices a caller's positions at its cache offset; the
+        others derive `cache_offset + rope_deltas` themselves and consume a
+        caller's array verbatim in their own rank, so handing them an absolute
+        rank-2 array would be an index error, not a repair. Called once, at
+        load, never from a turn: several helpers outside that lineage null the
+        language model's rotary state as a side effect of running."""
         import mlx.core as mx
 
         model, _ = self._loaded()
         try:
-            out = model.get_input_embeddings(mx.zeros((1, 1), dtype=mx.int32))
+            # The call generate_step makes for a text-only prompt — the second
+            # positional is pixel_values — so a helper this cannot run is one
+            # no real turn could run either.
+            out = model.get_input_embeddings(mx.zeros((1, 1), dtype=mx.int32), None, mask=None)
         except Exception as e:  # noqa: BLE001 — degrade, never block the model
-            # A helper that needs pixels positions from the cache offset
-            # itself, so the fallback is right for it; anything else here is
-            # a probe that could not run, and continuations would then be
-            # silently mispositioned — say so once.
+            # A helper that cannot run text-only raises on every real turn
+            # too, so nothing is lost by answering "model" here. What this
+            # branch really covers is a probe that failed for some other
+            # reason, and for a model whose helper returns positions that
+            # answer mispositions every continuation — say so.
             warnings.warn(
                 f"sous: could not probe {self.model_id}'s embedding helper for rotary"
                 f" positions ({e}); continuations fall back to the model's own positions,"

@@ -95,9 +95,13 @@ Claude Code use stretches further — evaluate features against that goal.
   per engine: the Qwen lineage — `qwen2_vl`, `qwen2_5_vl`, `qwen3_5`,
   `qwen3_vl`, `qwen3_vl_moe`, `qwen3_omni_moe` and the families that reuse
   their model classes (verified on `qwen3_5` and `qwen2_vl`; the rest share the
-  code); the other mRoPE families return none, position from the cache offset
-  themselves, and several would fail on an array of another rank). A helper
-  that cannot be probed gets no kwargs and one warning. Load-bearing: mlx-vlm's
+  rotary contract — `qwen3_omni_moe` has classes of its own over the same
+  `apply_rotary`); the other mRoPE families return none, position from the
+  cache offset themselves, and several would fail on an array of another
+  rank). The probe calls the helper the way `generate_step` does (ids, no
+  pixels, `mask=None`), once, at load — several helpers outside the lineage
+  null the model's rotary state when run; a helper that cannot be probed gets
+  no kwargs and one warning. Load-bearing: mlx-vlm's
   helper returns positions local to the ids it is given and `generate_step`
   merges them into the model's kwargs, and the Qwen language models slice that
   array at the cache offset — past its end for any continuation `generate_step`
@@ -118,14 +122,20 @@ Claude Code use stretches further — evaluate features against that goal.
   exactly — reading every layer on a pure-attention model but only the first
   attention layer on a hybrid, whose deeper layers drift by tens of percent
   between a one-pass and a split prefill for reasons that have nothing to do
-  with positions. The LM backend needs none of this (mlx-lm's text models take
-  positions from the cache offset). The model-load line records which side owns
-  them (`positions=engine` when the helper returned them, `positions=model`
-  otherwise); `position_ids`/`rope_deltas` are pass-through kwargs mlx-vlm's
-  `GenerateKwargs` does not declare, so that token and a manual `uv run pytest
-  -m model tests/test_engine_vlm.py` on the M5 Pro are the only guards across
-  an mlx-vlm bump — CI cannot load the models. Slots built before this fix hold
-  mispositioned keys: only a daemon restart drops them.
+  with positions, and it witnesses generated tokens too — the model positions
+  those from its cache offset and the delta it adopted, never from
+  `position_ids`. The LM backend needs none of this (mlx-lm's text models take
+  positions from the cache offset). The model-load line and the status
+  document's `positions` record which side owns them (`engine` when the
+  helper returned them, `model` otherwise); `position_ids`/`rope_deltas` are
+  pass-through kwargs mlx-vlm's `GenerateKwargs` does not declare, so across
+  an mlx-vlm bump the guards are that token, the contract test in
+  `tests/test_engine_positions.py` (the real `generate_step` over a stub
+  model, in CI: the engine's kwargs must reach the language model over the
+  helper's) and a manual `uv run pytest -m model tests/test_engine_vlm.py` on
+  the M5 Pro for the kernels themselves — CI cannot load the models. Slots
+  built before this fix hold mispositioned keys: only a daemon restart drops
+  them.
 - Prompt-cache per-turn gauges (`promptcache.TURN_GAUGES`, reset by
   `PromptCacheStats.begin_turn` on every `generate()` and again on a cold
   retry) are assigned per turn and read back directly from the owner-scoped

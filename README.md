@@ -229,7 +229,8 @@ the gateway is on:
 
 - `GET /sous/status` — one JSON document: `engine` (`loaded`, `loading`,
   `model_id`, `idle_seconds`, `holders`, `memory_gb`, the `prompt_cache`
-  counters), `inflight` (the turn the model is serving right now — its
+  counters, and on the VLM backend `positions`, the load line's
+  `engine|model`), `inflight` (the turn the model is serving right now — its
   `msg_` id, phase, tokens so far, rate and ETA — usually empty or one
   entry, ordered with the turn on the pass first and then the queue in
   arrival order), `queue` (delegated task counts), `recent_turns` (the last 50,

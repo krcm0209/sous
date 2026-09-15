@@ -747,4 +747,9 @@ class EngineManager:
                 int8 = self._engine.int8_prefill_status
                 if int8 is not None:
                     out["int8_prefill"] = dict(int8)
+                # Which side supplies the rotary positions behind a warm
+                # cache: the load line says it once, this says it for as long
+                # as the model is resident.
+                if self._engine.positions is not None:
+                    out["positions"] = self._engine.positions
             return out

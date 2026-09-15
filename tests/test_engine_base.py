@@ -1137,16 +1137,69 @@ def test_status_carries_the_int8_prefill_view_when_the_engine_reports_one(tmp_pa
     assert manager.status()["int8_prefill"] == {"state": "active", "reason": None, "routed": 336}
 
 
+def test_status_carries_the_positions_view_when_the_engine_reports_one(tmp_path):
+    """The load line says which side owns the rotary positions once; the
+    status document says it for as long as the model is resident, so an
+    mlx-vlm bump that flips the probe is readable without a reload."""
+    inner = FakeEngine([])
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    assert "positions" not in manager.status(), "fakes without the attribute stay silent"
+    inner.positions = "engine"  # ty: ignore[unresolved-attribute]
+    assert manager.status()["positions"] == "engine"
+
+
+def _positionless_model() -> types.SimpleNamespace:
+    """A stub model whose text-only embedding helper returns no positions of
+    its own, in the shape every mlx-vlm helper returns."""
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(model_type="fake"),
+        get_input_embeddings=lambda *a, **kw: types.SimpleNamespace(position_ids=None),
+    )
+
+
+def test_vlm_engine_finds_the_positions_its_helper_returns(monkeypatch):
+    """A Qwen-lineage model's text-only embedding helper returns rotary
+    positions of its own; the probe in __init__ must land on `engine`, once,
+    asking the helper the way generate_step does (ids, no pixels, mask=None)."""
+    from sous.engine.vlm import VLMEngine
+
+    calls: list[tuple[tuple, dict]] = []
+
+    def helper(*args, **kwargs):
+        calls.append((args, kwargs))
+        return types.SimpleNamespace(position_ids=object())
+
+    model = types.SimpleNamespace(
+        config=types.SimpleNamespace(model_type="fake"), get_input_embeddings=helper
+    )
+    _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, _RecordingTokenizer()))
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+    engine = VLMEngine("test/model", cache_budget=0)
+    assert engine.positions == "engine" and engine._positional is True
+    assert len(calls) == 1
+    (ids, pixels), kwargs = calls[0]
+    assert ids.shape == (1, 1) and pixels is None and kwargs == {"mask": None}
+
+
+def test_vlm_engine_leaves_positions_to_a_model_whose_helper_returns_none(monkeypatch):
+    from sous.engine.vlm import VLMEngine
+
+    _stub(
+        monkeypatch,
+        "mlx_vlm",
+        load=lambda model_id: (_positionless_model(), _RecordingTokenizer()),
+    )
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+    engine = VLMEngine("test/model", cache_budget=0)
+    assert engine.positions == "model" and engine._positional is False
+
+
 def test_vlm_engine_enables_int8_prefill_on_the_loaded_model(monkeypatch):
     from sous.engine import int8prefill
     from sous.engine.vlm import VLMEngine
 
-    model = types.SimpleNamespace(
-        config=types.SimpleNamespace(model_type="fake"),
-        # A model whose helper returns no positions of its own — the eager
-        # probe in VLMEngine.__init__ needs this to resolve without raising.
-        get_input_embeddings=lambda *a, **kw: None,
-    )
+    model = _positionless_model()
     processor = types.SimpleNamespace(tokenizer=_RecordingTokenizer())
     _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
     _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
@@ -1289,12 +1342,7 @@ def test_vlm_tokenization_is_serialized(monkeypatch):
     from sous.engine.vlm import VLMEngine
 
     tokenizer = _RecordingTokenizer()
-    model = types.SimpleNamespace(
-        config=types.SimpleNamespace(model_type="fake"),
-        # A model whose helper returns no positions of its own — the eager
-        # probe in VLMEngine.__init__ needs this to resolve without raising.
-        get_input_embeddings=lambda *a, **kw: None,
-    )
+    model = _positionless_model()
     processor = types.SimpleNamespace(tokenizer=tokenizer)
     _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
     _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
