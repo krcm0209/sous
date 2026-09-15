@@ -97,7 +97,9 @@ def test_a_helper_that_returns_no_positions_means_no_kwargs():
 
 
 def test_a_helper_that_cannot_run_text_only_means_no_kwargs():
-    assert _engine(_Model(positions=None))._positions([_Layer(offset=40)], 7) == {}
+    engine = _engine(_Model(positions=None))
+    with pytest.warns(UserWarning, match="could not probe"):
+        assert engine._positions([_Layer(offset=40)], 7) == {}
 
 
 def test_a_helper_that_cannot_run_text_only_warns_once():
