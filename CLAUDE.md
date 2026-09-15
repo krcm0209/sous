@@ -82,6 +82,39 @@ Claude Code use stretches further — evaluate features against that goal.
   `kern.memorystatus_vm_pressure_level`, never psutil's free RAM: right after
   a model load the weight files sit in the page cache as "active", that
   figure read low, and the valve evicted the forks a cold turn had just made.
+- Every `prefill()` and `decode()` on the VLM backend hands mlx-vlm explicit
+  `position_ids` covering the cache from 0 through the tokens being appended,
+  plus a zero `rope_deltas` (`VLMEngine._positions`), for the model families
+  whose text-only embedding helper returns positions of its own (probed once
+  per engine: the Qwen lineage — `qwen2_vl`, `qwen2_5_vl`, `qwen3_5`,
+  `qwen3_vl`, `qwen3_vl_moe`, `qwen3_omni_moe` and the families that reuse
+  their model classes; the other mRoPE families return none, position from
+  the cache offset themselves, and several would fail on an array of another
+  rank). Load-bearing: mlx-vlm's helper
+  returns positions local to the ids it is given and `generate_step` merges
+  them into the model's kwargs, and the Qwen language models slice that
+  array at the cache offset — past its end for any continuation
+  `generate_step` chunks — so on 0.7.x the fused MRoPE Metal kernel reads a
+  zero-length buffer out of bounds and every continued token lands at
+  position 0 (on 0.6.17 the same tokens landed at `0..n-1`; measured
+  2026-09-14 on the default model: keys off by 130–170 % either way, prefill
+  and decode, drafter or not). Only from 0.7.0 does `generate_step` re-apply
+  a caller's positions over the helper's — hence the `mlx-vlm>=0.7.0` floor;
+  below it the kwargs are silently overwritten. A suffix-only array is sliced
+  the same way, so the array is always absolute from 0; `rope_deltas` goes
+  with it so the engine owns the delta the model adopts into the state a
+  drafter run nulls and positions the generated tokens from. mlx-vlm's own
+  `_prime_cached_prefix_rope_state` does this only on its
+  `prompt_cache_state`/APC paths, which sous never enters.
+  `tests/test_engine_vlm.py` pins it by comparing cached keys, not greedy
+  text — a mispositioned block has reproduced the reference's words exactly
+  — reading every layer on a pure-attention model but only the first
+  attention layer on a hybrid, whose deeper layers drift by tens of percent
+  between a one-pass and a split prefill for reasons that have nothing to
+  do with positions. The LM backend needs none
+  of this (mlx-lm's text models take positions from the cache offset).
+  Slots built before this fix hold mispositioned keys: only a daemon restart
+  drops them.
 - Prompt-cache per-turn gauges (`promptcache.TURN_GAUGES`, reset by
   `PromptCacheStats.begin_turn` on every `generate()` and again on a cold
   retry) are assigned per turn and read back directly from the owner-scoped
