@@ -11,6 +11,7 @@ points, the way tests/test_engine_unloaded.py builds engines without weights."""
 import sys
 import threading
 import types
+import warnings
 
 import pytest
 
@@ -97,6 +98,17 @@ def test_a_helper_that_returns_no_positions_means_no_kwargs():
 
 def test_a_helper_that_cannot_run_text_only_means_no_kwargs():
     assert _engine(_Model(positions=None))._positions([_Layer(offset=40)], 7) == {}
+
+
+def test_a_helper_that_cannot_run_text_only_warns_once():
+    engine = _engine(_Model(positions=None))
+    with pytest.warns(UserWarning, match="could not probe test/model"):
+        assert engine._positions([_Layer(offset=40)], 7) == {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert (
+            engine._positions([_Layer(offset=40)], 7) == {}
+        )  # cached: no second probe, no second warning
 
 
 def test_the_helper_is_probed_once_per_engine():

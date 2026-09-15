@@ -227,7 +227,16 @@ class VLMEngine:
         model, _ = self._loaded()
         try:
             out = model.get_input_embeddings(mx.zeros((1, 1), dtype=mx.int32))
-        except Exception:  # noqa: BLE001 — a helper that needs pixels positions itself
+        except Exception as e:  # noqa: BLE001 — degrade, never block the model
+            # A helper that needs pixels positions from the cache offset
+            # itself, so the fallback is right for it; anything else here is
+            # a probe that could not run, and continuations would then be
+            # silently mispositioned — say so once.
+            warnings.warn(
+                f"sous: could not probe {self.model_id}'s embedding helper for rotary"
+                f" positions ({e}); continuations will use the model's own positions",
+                stacklevel=2,
+            )
             return False
         return getattr(out, "position_ids", None) is not None
 
