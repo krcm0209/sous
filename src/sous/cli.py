@@ -1,8 +1,10 @@
-"""sous CLI: serve / status / wait / stop / mcp / claude / install- and uninstall-launchd."""
+"""sous CLI: serve / status / top / statusline / wait / stop / mcp / claude / install- and
+uninstall-launchd."""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import math
@@ -13,6 +15,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -47,16 +50,22 @@ _LSP_OFF = ["--disallowedTools", "LSP"]
 _NO_HOLD_FLAGS = ("--help", "-h", "--version", "-v")
 # Model load plus a long prefill: minutes, not the SDK's default.
 _API_TIMEOUT_MS = "3000000"
-# Nothing about /sous/status or /sous/hold is slow: one reads the queue
-# counts and the config snapshot, the other registers a pid; neither waits
-# for the model.
+# Nothing about /sous/status or /sous/hold is slow: one reads the task
+# store, the engine's counters and the turn registry (a millisecond), the
+# other registers a pid; neither waits for the model.
 _STATUS_TIMEOUT_SECONDS = 15.0
-# The status document is a few KB and a hold reply is three fields; a reply
-# past this is not the daemon's.
+# The status document is tens of KB with its ring of recent turns and a hold
+# reply is three fields; a reply past this is not the daemon's.
 _REPLY_LIMIT = 1 << 20
 _PREDATES_MESSAGE = (
     "sous claude: the running daemon predates this CLI; restart it (sous stop; sous serve)"
 )
+# Claude Code runs the status-line command about once a second and shows
+# whatever it prints; a slow answer is a frozen line, so the whole call —
+# the stdin drain and the fetch, on a thread joined for this long — is
+# bounded well inside that second.
+_STATUSLINE_TIMEOUT_SECONDS = 0.5
+_STATUSLINE_DOWN = "sous: daemon down"
 
 
 def claude_argv(user_args: list[str]) -> list[str]:
@@ -314,7 +323,7 @@ def _cmd_claude(user_args: list[str]) -> None:
     exits_at_once = any(arg in _NO_HOLD_FLAGS for arg in user_args[:end])
     held = None if exits_at_once else _hold(config.server_port)
     if held is not None:
-        model_id = status.get("model", {}).get("model_id", "the model")
+        model_id = status.get("engine", {}).get("model_id", "the model")
         if held.get("loaded"):
             what = f"{model_id} already loaded"
         elif held.get("loading"):
@@ -377,6 +386,118 @@ def _cmd_status() -> None:
     store = TaskStore(config.data_dir / "tasks.db")
     for t in store.list_recent(limit=10):
         print(f"  {t.id}  {t.state:<18} {t.title}")
+
+
+def _clock(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def statusline_text(document: dict, now: float) -> str:
+    """One line for Claude Code's status bar from the status document: the
+    turn in flight if there is one, else the engine. Every number is the
+    daemon's; `now` is only for the elapsed time of a turn."""
+    engine = document.get("engine") or {}
+    inflight = document.get("inflight") or []
+    if not inflight:
+        if not engine.get("loaded"):
+            return "sous: loading" if engine.get("loading") else "sous: idle · model unloaded"
+        parts = ["sous: idle"]
+        slots = (engine.get("prompt_cache") or {}).get("slots")
+        if slots is not None:
+            parts.append(f"{slots} slots")
+        if engine.get("holders"):
+            parts.append("held")
+        return " · ".join(parts)
+    turn = inflight[0]
+    phase = turn.get("phase", "queued")
+    # A turn has a size — and an ETA worth printing — once it decodes, or
+    # prefills a render the cache has measured.
+    sized = phase == "decode" or (phase == "prefill" and bool(turn.get("to_prefill")))
+    head = f"sous: {phase}"
+    parts: list[str] = []
+    if phase == "decode":
+        head = f"{head} {turn.get('generated_tokens', 0):,} tok"
+        if turn.get("decode_tps"):
+            parts.append(f"{turn['decode_tps']:.1f} tok/s")
+    elif sized:
+        head = f"{head} {turn['to_prefill']:,} tok"
+    eta = turn.get("eta_seconds")
+    if eta is not None and sized:
+        parts.append(f"eta {int(eta)}s")
+    elif turn.get("started_at") is not None:
+        parts.append(_clock(now - turn["started_at"]))
+    if len(inflight) > 1:
+        parts.append(f"+{len(inflight) - 1} queued")
+    return " · ".join([head, *parts])
+
+
+def _statusline_fetch(port: int) -> str | None:
+    """The line for the status bar, or None when nothing on `port` answered
+    as the daemon. Runs on a thread of its own: nothing here carries a
+    deadline of its own — a stdin held open blocks the drain, and urllib's
+    timeout re-arms on every byte, so a listener that dribbles never
+    returns — and the thread is what the budget is applied to."""
+    import urllib.request
+
+    # Claude Code writes its own JSON (model, cwd, cost) to stdin; none of
+    # it is needed here, but a pipe nobody reads can block the writer. A
+    # stdin that cannot be read (a closed handle, pytest's capture) is as
+    # harmless as an empty one.
+    with contextlib.suppress(OSError, ValueError):
+        if not sys.stdin.isatty():
+            sys.stdin.read()
+    # No proxy, whatever the environment says: 127.0.0.1 is loopback, the
+    # same rule as the launcher's httpx client and the gateway's forwarder.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    url = f"http://127.0.0.1:{port}/sous/status"
+    try:
+        with opener.open(url, timeout=_STATUSLINE_TIMEOUT_SECONDS) as reply:
+            document = _json_object(reply.read(_REPLY_LIMIT))
+    except Exception:  # noqa: BLE001 — whatever holds the port is not the daemon
+        # urllib's URLError and HTTPError are OSErrors, but http.client's own
+        # BadStatusLine and IncompleteRead — a listener that is not HTTP, a
+        # body cut short — are not, and anything escaping this thread would
+        # print a traceback beside the line.
+        return None
+    if document is None or "engine" not in document:
+        # A JSON object without the engine block is some other service on the
+        # port, and reading it as a document would print a confident
+        # `sous: idle` about a daemon that isn't there.
+        return None
+    return statusline_text(document, time.time())
+
+
+def _cmd_statusline() -> None:
+    config = load_config()
+    answer: list[str | None] = []
+    worker = threading.Thread(
+        target=lambda: answer.append(_statusline_fetch(config.server_port)), daemon=True
+    )
+    worker.start()
+    # The wall-clock bound. A worker still parked past it is left to the
+    # process exit — a daemon thread — and the bar says the daemon is down.
+    worker.join(_STATUSLINE_TIMEOUT_SECONDS)
+    line = answer[0] if answer else None
+    print(_STATUSLINE_DOWN if line is None else line)
+
+
+def _has_terminal() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _cmd_top() -> None:
+    """The terminal. Textual is imported here and nowhere else in sous, so
+    the daemon and every other subcommand run without it."""
+    config = load_config()
+    if not _has_terminal():
+        # Textual would draw the pass into the pipe and wait for a key that
+        # never comes: an agent's shell, or a redirect, gets told instead.
+        print("sous top: needs a terminal (try sous status, or sous statusline)", file=sys.stderr)
+        raise SystemExit(2)
+    from sous.tui import run_top
+
+    raise SystemExit(run_top(config.server_port))
 
 
 def _cmd_wait(task_id: str, timeout: float | None, interval: float) -> None:
@@ -775,7 +896,13 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="sous", description="local MLX sous-chef for Claude")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="run the daemon (MCP over HTTP on 127.0.0.1)")
-    sub.add_parser("status", help="check the daemon and recent tasks")
+    status = sub.add_parser("status", help="check the daemon and recent tasks")
+    status.add_argument("--watch", action="store_true", help="the live terminal (sous top)")
+    sub.add_parser(
+        "statusline",
+        help="one line for Claude Code's statusLine setting (reads and ignores its stdin JSON)",
+    )
+    sub.add_parser("top", help="watch the pass live: the order on it, the line, the recent orders")
     wait = sub.add_parser("wait", help="block until a task finishes or requests a command approval")
     wait.add_argument("task_id")
     wait.add_argument(
@@ -808,7 +935,11 @@ def main(argv: list[str] | None = None) -> None:
 
         raise SystemExit(sous.proxy.run())
     elif args.command == "status":
-        _cmd_status()
+        _cmd_top() if args.watch else _cmd_status()
+    elif args.command == "top":
+        _cmd_top()
+    elif args.command == "statusline":
+        _cmd_statusline()
     elif args.command == "wait":
         _cmd_wait(args.task_id, args.timeout, args.interval)
     elif args.command == "stop":

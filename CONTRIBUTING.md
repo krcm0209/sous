@@ -146,7 +146,8 @@ setting is global and would cap the frontier main loop.
 LSP` keeps a language server from appending its schema mid-session and
 re-prefilling the whole conversation. Watch `~/.sous/daemon.log` for the
 `INFO sous.gateway:` lines (both streams land there; every line carries a
-timestamp and a level). The main loop's turns should now report `cache=hit`
+timestamp and a level), or `sous top` in a second terminal for the same
+turns as they happen. The main loop's turns should now report `cache=hit`
 after the first: Claude Code's small background queries (titles, suggestions)
 get slots of their own instead of evicting the main loop's, and each
 `~80K`-token main turn prefills only what the conversation gained. A subagent

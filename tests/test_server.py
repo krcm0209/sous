@@ -339,9 +339,72 @@ def test_server_status(svc):
     service.delegate_task("t", "x", str(root))
     s = service.server_status()
     assert s["queue"]["queued"] == 1
-    assert s["model"]["loaded"] is False
+    assert s["engine"]["loaded"] is False and s["engine"]["loading"] is False
+    assert s["engine"]["holders"] == 0 and "memory_gb" in s["engine"]
+    assert s["inflight"] == []
     assert s["config"]["model_id"]
+    assert s["config"]["idle_unload_minutes"] == 30
     assert ["pytest"] in s["config"]["allowlist"]
+    # The MCP tool's answer is the document without the two recent lists:
+    # a frontier model pays to read every key.
+    assert set(s) == {"engine", "inflight", "queue", "config"}
+
+
+def test_status_document_with_recents_lists_turns_and_tasks(svc):
+    from sous.inflight import Inflight
+
+    service, store, root = svc
+    assert isinstance(service.inflight, Inflight)
+    tid = service.delegate_task("scaffold the fixtures", "x", str(root))["task_id"]
+    store.claim_next()
+    service.inflight.begin("msg_1", model="sous-local", stream=True, max_tokens=64)
+    service.inflight.finished({"ts": 1.0, "id": "msg_0", "status": 200})
+    doc = service.status_document(recent=True)
+    assert set(doc) == {"engine", "inflight", "queue", "config", "recent_turns", "recent_tasks"}
+    assert [t["id"] for t in doc["inflight"]] == ["msg_1"]
+    # The MCP tool drops the two recent lists, never the turn in flight.
+    assert [t["id"] for t in service.server_status()["inflight"]] == ["msg_1"]
+    assert doc["recent_turns"] == [{"ts": 1.0, "id": "msg_0", "status": 200}]
+    (task,) = doc["recent_tasks"]
+    assert task["id"] == tid and task["state"] == "running"
+    assert task["title"] == "scaffold the fixtures" and task["seconds"] >= 0
+    assert set(task) == {"id", "state", "title", "seconds"}
+    assert doc["queue"] == {"queued": 0, "running": 1}
+
+
+def test_the_memory_read_is_the_last_thing_the_document_does(svc, monkeypatch):
+    """Reading mlx's memory releases this thread's mlx state; the registry's
+    snapshot probes the prompt cache, which can free mlx arrays. Freeing
+    after the release is what segfaults the thread on its way out."""
+    from sous import server as server_module
+
+    service, _, _ = svc
+    order: list[str] = []
+    monkeypatch.setattr(server_module, "_mlx_memory_gb", lambda: order.append("memory") or 1.5)
+    snapshot = service.inflight.snapshot
+
+    def probing_snapshot() -> dict:
+        order.append("snapshot")
+        return snapshot()
+
+    monkeypatch.setattr(service.inflight, "snapshot", probing_snapshot)
+    doc = service.status_document(recent=True)
+    assert order == ["snapshot", "memory"]
+    assert doc["engine"]["memory_gb"] == 1.5
+
+
+def test_recent_tasks_are_capped_at_ten_newest_first(svc):
+    service, store, root = svc
+    for n in range(12):
+        store.enqueue(
+            title=f"t{n}",
+            instructions="x",
+            project_root=str(root),
+            context_files=[],
+            verify_commands=[],
+        )
+    titles = [t["title"] for t in service.status_document(recent=True)["recent_tasks"]]
+    assert titles == [f"t{n}" for n in range(11, 1, -1)]
 
 
 def test_server_status_counts_past_200_tasks(svc):
@@ -724,6 +787,26 @@ def test_status_memory_probe_releases_mlx_thread_state(svc, monkeypatch):
     released = []
     monkeypatch.setattr(server, "release_mlx_thread_state", lambda: released.append(True))
     service.server_status()
+    assert released
+
+
+def test_status_document_releases_mlx_thread_state_when_the_build_fails(svc, monkeypatch):
+    """The engine's status and the registry's snapshot can free mlx arrays
+    on the building thread before the memory read releases its state; the
+    routes catch a failure in between and hand the pooled thread back, so
+    the release cannot depend on reaching the read."""
+    import sous.server as server
+
+    service, _, _ = svc
+    released = []
+    monkeypatch.setattr(server, "release_mlx_thread_state", lambda: released.append(True))
+
+    def boom():
+        raise RuntimeError("the probe failed")
+
+    monkeypatch.setattr(service.inflight, "snapshot", boom)
+    with pytest.raises(RuntimeError):
+        service.status_document(recent=True)
     assert released
 
 

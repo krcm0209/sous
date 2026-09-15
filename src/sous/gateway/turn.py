@@ -26,6 +26,7 @@ from sous.engine.base import (
     ReplaySafe,
     release_mlx_thread_state,
 )
+from sous.inflight import Inflight
 
 
 class Sink(Protocol):
@@ -105,8 +106,33 @@ class CountResult:
     seconds: float
 
 
+def _prefill_plan(
+    engine: ManagedEngine, owner: threading.Thread, before: dict
+) -> tuple[int, int] | None:
+    """(reused, to_prefill) once the cache has taken a slot for the turn and
+    sized what it must prefill — a hit or a miss moves the owner's `hits` or
+    `misses` past the turn's baseline, and its run assigns the prefilled
+    gauge on entry, both before the first prefill call — or None while it is
+    still deciding. The gauge alone says nothing: it is zeroed only inside
+    the generation, on the session thread, after the hand-off, the
+    engine-lock wait and the render, and until then it still reads the
+    previous turn's size. Called from a status reader's thread: the stats
+    are a copy under the cache's own lock, which no prefill holds."""
+    after = engine.prompt_cache_stats(owner=owner)
+
+    def delta_of(key: str) -> int:
+        return max(0, after.get(key, 0) - before.get(key, 0))
+
+    to_prefill = after.get("prefilled_tokens", 0)
+    if not (delta_of("hits") or delta_of("misses")) or not to_prefill:
+        return None
+    return delta_of("reused_tokens"), to_prefill
+
+
 class TurnRunner:
-    def __init__(self, engines: EngineManager, config: SousConfig):
+    def __init__(
+        self, engines: EngineManager, config: SousConfig, inflight: Inflight | None = None
+    ):
         self._engines = engines
         self._window = config.gateway_max_context_tokens
         self._timeout = float(config.gateway_generation_timeout_minutes * 60)
@@ -122,6 +148,10 @@ class TurnRunner:
         # (see run()'s finally), and any turn still queued on the lock must
         # refuse to start rather than outlive a gateway that gave up on it.
         self._closing = False
+        # Where a turn says what phase it is in and how far along. A runner
+        # built without one (tests) keeps a private registry nobody reads;
+        # the gateway hands in the daemon's.
+        self._inflight = inflight or Inflight()
 
     def run(
         self,
@@ -130,6 +160,34 @@ class TurnRunner:
         max_tokens: int,
         sink: Sink,
         abandoned: threading.Event | None = None,
+        *,
+        turn_id: str = "",
+        model: str = "-",
+        stream: bool = False,
+    ) -> TurnResult:
+        """`turn_id` is the response's `msg_` id: with one, the turn is
+        visible in the registry from here until it returns or raises."""
+        live = self._inflight if turn_id else None
+        if live is not None:
+            live.begin(turn_id, model=model, stream=stream, max_tokens=max_tokens)
+        try:
+            return self._turn(messages, tools, max_tokens, sink, abandoned, live, turn_id)
+        except GatewayBusy:
+            # Refused before the lock: _turn retires the registration in the
+            # finally it runs once it holds the lock, and this turn never did.
+            if live is not None:
+                live.end(turn_id)
+            raise
+
+    def _turn(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+        sink: Sink,
+        abandoned: threading.Event | None,
+        live: Inflight | None,
+        turn_id: str,
     ) -> TurnResult:
         queued = time.monotonic()
         if not self._lock.acquire(timeout=self._timeout):
@@ -143,6 +201,8 @@ class TurnRunner:
             raise GatewayBusy("gateway is shutting down")
         started = time.monotonic()
         queue_seconds = started - queued
+        if live is not None:
+            live.phase(turn_id, "loading")
         try:
             # The idle sweep runs on the worker's thread, and _gen_lock only
             # covers generate(): without a lease the model could be unloaded
@@ -165,6 +225,8 @@ class TurnRunner:
                     # before it, and the lease no longer parks a turn behind
                     # the load the way the manager lock once did.
                     raise TurnAbandoned
+                if live is not None:
+                    live.phase(turn_id, "tokenizing")
                 session = self._session_for(engine)
                 counting = time.monotonic()
                 input_tokens = engine.count_tokens(messages, tools)
@@ -172,6 +234,8 @@ class TurnRunner:
                 room = self._window - input_tokens
                 if room <= 0:
                     raise PromptTooLong(input_tokens, self._window)
+                if live is not None:
+                    live.sized(turn_id, input_tokens)
                 # Owner-scoped, so the before/after delta is exact: only this
                 # session's thread moves these counters, and the turn holds
                 # the gateway lock, so nothing else's hit or reset can land
@@ -186,6 +250,8 @@ class TurnRunner:
                     if first_delta_at is None:
                         first_delta_at = time.monotonic()
                     final = delta
+                    if live is not None:
+                        live.progress(turn_id, delta.output_tokens)
                     sink.delta(delta)
 
                 # ReplaySafe tells the prompt cache this callback's output
@@ -193,6 +259,14 @@ class TurnRunner:
                 # be retried cold — true exactly when the sink itself is.
                 callback = ReplaySafe(on_delta) if sink.replay_safe else on_delta
 
+                if live is not None:
+                    # The registry learns the prefill's size from the cache's
+                    # counters, read by whoever asks for status while this
+                    # thread is inside the generation.
+                    owner = session.thread
+                    live.phase(
+                        turn_id, "prefill", probe=lambda: _prefill_plan(engine, owner, before)
+                    )
                 generating = time.monotonic()
                 try:
                     text = session.generate(
@@ -263,6 +337,11 @@ class TurnRunner:
                 # after this — joining it would make a turn thread wait on
                 # shutdown work, which it must never do.
                 self._drop_session()
+            if live is not None:
+                # Out of the registry before the lock goes: the turn that
+                # takes it next registers as running at once, and a reader
+                # must never find the two side by side.
+                live.end(turn_id)
             self._lock.release()
             # engines.get() may have loaded the model on this thread. Pool
             # threads outlive the call, but the invariant is per thread that
