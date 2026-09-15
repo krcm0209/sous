@@ -116,15 +116,26 @@ Claude Code use stretches further — evaluate features against that goal.
   `recent_tasks` — the MCP tool drops the two lists because a frontier
   model pays for every key it reads.
 - `sous/inflight.py` is the in-flight turn registry: a gateway turn
-  registers under its `msg_` id in `TurnRunner.run` and is removed in its
-  `finally`; `progress()` runs on the engine's session thread from inside
-  the decode loop, so every registry method is a dict write under one lock
-  and never raises (an unknown id is ignored). The prefill's size is not
-  stamped by the runner — it is inside `session.generate()` for the whole
-  prefill — but read by a *probe* the registry calls from a status reader's
-  thread: the cache adds the reuse at the take and assigns `prefilled_tokens`
-  on entering `_run`, both before the first prefill call, and `stats(owner)`
-  is a locked dict copy no prefill holds the lock across. `/sous/events`
+  registers under its `msg_` id in `TurnRunner.run`; `progress()` runs on
+  the engine's session thread from inside the decode loop, so every
+  registry method is a dict write under one lock and never raises (an
+  unknown id is ignored). The runner retires a turn *before* it releases
+  the gateway lock — the lock is not a queue, so a finished turn left
+  registered could still be the entry a reader takes as the one on the
+  pass — and `snapshot()` lists the turn past `queued` first (the one whose
+  phase moved most recently), then the queue in arrival order. The
+  prefill's size is not stamped by the runner — it is inside
+  `session.generate()` for the whole prefill — but read by a *probe* the
+  registry calls from a status reader's thread: the probe answers only
+  once the owner's `hits`/`misses` have moved past the turn's baseline and
+  the `prefilled_tokens` gauge is non-zero, because `begin_turn` zeroes
+  that gauge only inside `generate()`, after the hand-off, the engine-lock
+  wait and the render — so a reader landing before the take sees no size
+  rather than the previous turn's. The registry re-asks on every snapshot
+  while the turn prefills; a later answer supersedes the first (a warm
+  attempt retried cold), and a new size restarts the phase clock.
+  `stats(owner)` is a locked dict copy no prefill holds the lock across.
+  `/sous/events`
   polls `Inflight.version` ten times a second and rebuilds the whole
   document on a worker thread when it moved (and once a second regardless,
   because a load, a hold and the idle clock are not registry changes);

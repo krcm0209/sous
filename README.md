@@ -231,7 +231,8 @@ the gateway is on:
   `model_id`, `idle_seconds`, `holders`, `memory_gb`, the `prompt_cache`
   counters), `inflight` (the turn the model is serving right now — its
   `msg_` id, phase, tokens so far, rate and ETA — usually empty or one
-  entry), `queue` (delegated task counts), `recent_turns` (the last 50,
+  entry, ordered with the turn on the pass first and then the queue in
+  arrival order), `queue` (delegated task counts), `recent_turns` (the last 50,
   every field of the turn line below), `recent_tasks` (the last 10) and
   `config`. The MCP `server_status` tool returns the same document without
   the two `recent_*` lists.
@@ -263,7 +264,10 @@ on its legend line; the numbers are the turn line's, in the terminal's own
 foreground, and nothing paints over the terminal's background. It reconnects
 with backoff if the daemon restarts and says so if none is running. It is
 the one command in sous that imports [Textual](https://textual.textualize.io);
-nothing else (the daemon included) loads it.
+nothing else (the daemon included) loads it. It needs a terminal: piped or
+run over a session with no pty, it prints a message on stderr and exits 2
+instead of painting the pass into a pipe and waiting for a key that cannot
+come.
 
 **`sous statusline`** prints one line for Claude Code's `statusLine`
 setting — `sous: decode 612 tok · 14.7 tok/s · eta 18s` during a turn,
@@ -279,8 +283,9 @@ Add to `~/.claude/settings.json`:
 session events — a new assistant message, a compaction, a mode change — so the
 line goes quiet for a whole subagent turn; with it the command runs every
 second as well. The command loads none of the heavy dependencies (no
-Textual, httpx or psutil) and gives up inside half a second, so it costs the
-status bar nothing.
+Textual, httpx or psutil); it drains stdin and fetches the status on a
+thread joined to a half-second budget, printing `sous: daemon down` if that
+runs out, so it costs the status bar nothing.
 
 To bracket a subagent from the outside as well, a `SubagentStart` /
 `SubagentStop` hook can append its own record — `{ts, agent_id,
