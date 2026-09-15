@@ -538,10 +538,11 @@ def test_a_quiet_kitchen_shows_the_card_and_stops_the_ticker():
         assert app.query_one("#card-chef", tui.Chef).mood in ("done", "quiet")
         assert "KITCHEN QUIET 4m 12s" in app.query_one(tui.Strip).render().plain
         assert app.query_one("#firing", tui.LoadingIndicator).auto_refresh is None
-        # Idle, the 10 fps clock is paused: a moved clock changes no headline.
+        # Idle, the 10 fps ticker is paused and the idle tick runs the clock.
+        assert app._ticker is not None and not app._ticker._active.is_set()
         clock.now = BASE + 30.0
-        await pilot.pause(0.25)
-        assert "no orders on the rail for 4m 12s" in _plain(app, "#card-body")
+        await pilot.pause(0.6)
+        assert "no orders on the rail for 4m 42s" in _plain(app, "#card-body")
         await _deliver(feed, pilot, _doc(None, loaded=False, loading=True))
         firing = app.query_one("#firing", tui.LoadingIndicator)
         assert card.border_title == "FIRING UP" and firing.display
@@ -587,6 +588,25 @@ def test_a_quiet_kitchens_idle_tick_moves_the_steam_and_the_clock():
         app._width = 50
         app._refresh_footer()
         assert _plain(app, "#footer") == " KITCHEN QUIET 4m 13s  q"
+
+    _run(test)
+
+
+def test_a_resize_while_quiet_repaints_the_clock_on_screen_not_the_documents():
+    """The document may be minutes old — nothing arrives while idle — so a
+    resize must redraw the card at the advanced second, never the received one."""
+
+    async def test(app, pilot, feed, clock):
+        document = _doc(None, recent=RECENT)
+        document["engine"]["holders"] = 0
+        await _deliver(feed, pilot, document)
+        clock.now = BASE + 10.0
+        await pilot.pause(0.6)
+        assert "no orders on the rail for 4m 22s" in _plain(app, "#card-body")
+        await pilot.resize_terminal(90, 30)
+        await pilot.pause(0.1)
+        assert "no orders on the rail for 4m 22s" in _plain(app, "#card-body")
+        assert "idle 4m 22s" in app.query_one(tui.LinePanel).border_subtitle
 
     _run(test)
 
@@ -700,7 +720,7 @@ def test_the_idle_clock_does_not_run_while_the_feed_is_down():
         await _deliver(feed, pilot, None)
         clock.now = BASE + 2.0
         await pilot.pause(0.6)
-        assert "4m 12s" not in _plain(app, "#card-body")
+        assert "redialing the daemon" in _plain(app, "#card-lead")
         assert "as of" in app.query_one(tui.LinePanel).border_subtitle
 
     _run(test)

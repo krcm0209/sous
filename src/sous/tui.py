@@ -1703,7 +1703,7 @@ class Top(App[int]):
             self.query_one(Stub),
             self.query_one(Card),
         )
-        engine = self._document.get("engine") or {}
+        engine = self._engine_now(now)
         config = self._document.get("config") or {}
         recent = self._document.get("recent_turns") or []
         if view is not None and self._connected:
