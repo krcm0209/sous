@@ -490,6 +490,31 @@ def test_events_beat_while_a_load_is_under_way(tmp_path: Path, monkeypatch):
     assert len(statuses) >= 3 and all(d["engine"]["loading"] for d in statuses[:2])
 
 
+def test_a_load_starting_reaches_the_client_before_it_finishes(tmp_path: Path, monkeypatch):
+    """The heartbeat is armed only by a document that already shows the
+    load, so the load's start must announce itself."""
+    monkeypatch.setattr(monitor, "EVENT_HEARTBEAT_SECONDS", 60.0)
+    monkeypatch.setattr(monitor, "EVENT_IDLE_TICK_SECONDS", 0.05)
+    release = threading.Event()
+
+    def slow_factory(model_id: str):
+        release.wait(5.0)
+        return FakeEngine([])
+
+    app, engines = _app(tmp_path, factory=slow_factory)
+    loader = threading.Thread(target=engines.get, daemon=True)
+    try:
+        _, frames = _collect_events(app, want=2, during=loader.start)
+        statuses = [d["engine"] for e, d in frames if e == "status"]
+        assert [s["loading"] for s in statuses] == [False, True]
+        assert statuses[1]["loaded"] is False
+    finally:
+        release.set()
+        loader.join(5.0)
+    _, frames = _collect_events(app, want=1)
+    assert [d["engine"]["loaded"] for e, d in frames if e == "status"] == [True]
+
+
 def test_a_load_a_hold_a_release_a_task_change_and_an_unload_each_reach_the_client(
     tmp_path: Path, monkeypatch
 ):

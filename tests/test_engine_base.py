@@ -1604,3 +1604,23 @@ def test_version_moves_on_load_unload_hold_release_and_idle_resets_and_nothing_e
     assert m.version == v + 2, "an unload is two changes: it started, it finished"
     assert m.unload_if_idle() is False
     assert m.version == v + 2, "a refused unload moved the version"
+
+
+def test_a_preload_that_fails_announces_its_end():
+    """The version must move when a failed preload's thread forgets itself:
+    `loading` is true until then, and a client that never hears the end
+    keeps painting a load that is over."""
+
+    def failing(model_id: str):
+        raise RuntimeError("no weights")
+
+    cfg = SousConfig(idle_unload_minutes=30)
+    m = EngineManager(cfg, engine_factory=failing, holder_alive=lambda pid, started: True)
+    v = m.version
+    m.hold(4242, 1.0)
+    deadline = time.monotonic() + 5.0
+    while m.status()["loading"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert m.status()["loading"] is False
+    # The hold, the load starting, its failure, the thread forgetting itself.
+    assert m.version == v + 4

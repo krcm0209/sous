@@ -249,12 +249,25 @@ class SousService:
             "seconds": round(end - t.started_at) if t.started_at else 0,
         }
 
-    def status_version(self) -> tuple[int, int, int]:
+    def _config_stamp(self) -> int:
+        """The config file's mtime_ns, -1 when there is no file: what the
+        allowlist memo and the status version key on."""
+        try:
+            return self.config.config_path.stat().st_mtime_ns
+        except OSError:
+            return -1
+
+    def status_version(self) -> tuple[int, int, int, int]:
         """What the event stream polls between documents: the in-flight
-        registry's version, the engine manager's and the task store's.
-        Three ints read without a lock; a change to any of them is a
-        document worth sending, and nothing else is."""
-        return (self.inflight.version, self.engines.version, self.store.version)
+        registry's version, the engine manager's, the task store's and the
+        config file's stamp. Four cheap reads and no lock; a change to any
+        of them is a document worth sending, and nothing else is."""
+        return (
+            self.inflight.version,
+            self.engines.version,
+            self.store.version,
+            self._config_stamp(),
+        )
 
     def _task_reads(self, *, recent: bool) -> tuple[dict, list[Task]]:
         # The version is read before the queries, so a write that lands
@@ -275,10 +288,8 @@ class SousService:
         return counts[1], tasks[1]
 
     def _allowlist_now(self) -> list[list[str]]:
-        try:
-            stamp = self.config.config_path.stat().st_mtime_ns
-        except OSError:
-            stamp = -1  # no file: the defaults, which current_allowlist knows
+        # No file stamps as -1: the defaults, which current_allowlist knows.
+        stamp = self._config_stamp()
         cached = self._allowlist_cache
         if cached is not None and cached[0] == stamp:
             return cached[1]

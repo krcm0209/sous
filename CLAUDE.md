@@ -199,7 +199,8 @@ Claude Code use stretches further — evaluate features against that goal.
   `/sous/events` polls `SousService.status_version()` — the registry's
   version, `EngineManager.version` (load, unload, hold, release, and
   every idle-clock reset: `touch()` and a `get()` hit) and
-  `TaskStore.version` (any connection that changed a row) — ten times a
+  `TaskStore.version` (any connection that changed a row) and the config
+  file's mtime — ten times a
   second while the last document showed a turn, a running task
   (`queue.running`) or a load, and twice a second otherwise, rebuilding
   the whole document on a worker thread when the tuple moved; the

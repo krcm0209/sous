@@ -703,6 +703,10 @@ class EngineManager:
             # thread touched nothing.
             with self._lock:
                 self._preload = None
+                # Forgetting the thread is what ends `loading` when the load
+                # failed — get()'s own bump left _preload set — so a client
+                # that hears no version move keeps painting a dead load.
+                self._bump()
 
     def _prune_holders(self) -> None:
         """Drop every holder whose process is gone, and when that empties the

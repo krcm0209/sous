@@ -872,13 +872,28 @@ def test_uvicorn_config_leaves_logging_to_the_daemon():
     assert cfg.access_log is False
 
 
-def test_status_version_is_the_three_counters(svc):
+def test_status_version_is_the_three_counters_and_the_config_stamp(svc):
+    import os
+
     service, store, _ = svc
+    path = service.config.config_path
     before = service.status_version()
-    assert before == (service.inflight.version, service.engines.version, store.version)
+    assert before == (
+        service.inflight.version,
+        service.engines.version,
+        store.version,
+        path.stat().st_mtime_ns,
+    )
     store.enqueue("t", "do it", "/tmp/nowhere", [], [])
     after = service.status_version()
-    assert after[2] == before[2] + 1 and after[:2] == before[:2]
+    assert after[2] == before[2] + 1 and after[:2] == before[:2] and after[3] == before[3]
+    # An edit changes the document's allowlist, so an idle client that hears
+    # no version move never sees it.
+    path.write_text('[commands]\nallowlist = ["pytest", "ruff"]\n')
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+    edited = service.status_version()
+    assert edited[3] > after[3] and edited[:3] == after[:3]
 
 
 def test_the_build_reads_the_task_store_only_when_it_changed(svc, monkeypatch):

@@ -541,7 +541,7 @@ def test_a_quiet_kitchen_shows_the_card_and_stops_the_ticker():
         # Idle, the 10 fps ticker is paused and the idle tick runs the clock.
         assert app._ticker is not None and not app._ticker._active.is_set()
         clock.now = BASE + 30.0
-        await pilot.pause(0.6)
+        await _until(pilot, lambda: "no orders on the rail for 4m 42s" in _plain(app, "#card-body"))
         assert "no orders on the rail for 4m 42s" in _plain(app, "#card-body")
         await _deliver(feed, pilot, _doc(None, loaded=False, loading=True))
         firing = app.query_one("#firing", tui.LoadingIndicator)
@@ -571,12 +571,12 @@ def test_a_quiet_kitchens_idle_tick_moves_the_steam_and_the_clock():
         assert "LIGHTS OUT in 25m 48s" in body
         steam_0 = _plain(app, "#card-art")
         clock.now = BASE + 0.5
-        await pilot.pause(0.6)
+        await _until(pilot, lambda: _plain(app, "#card-art") != steam_0)
         steam_1 = _plain(app, "#card-art")
         assert steam_1 != steam_0
         assert _plain(app, "#card-body") == body
         clock.now = BASE + 1.0
-        await pilot.pause(0.6)
+        await _until(pilot, lambda: "no orders on the rail for 4m 13s" in _plain(app, "#card-body"))
         steam_2 = _plain(app, "#card-art")
         assert steam_2 == steam_0 and steam_2 != steam_1
         body_1 = _plain(app, "#card-body")
@@ -601,7 +601,7 @@ def test_a_resize_while_quiet_repaints_the_clock_on_screen_not_the_documents():
         document["engine"]["holders"] = 0
         await _deliver(feed, pilot, document)
         clock.now = BASE + 10.0
-        await pilot.pause(0.6)
+        await _until(pilot, lambda: "no orders on the rail for 4m 22s" in _plain(app, "#card-body"))
         assert "no orders on the rail for 4m 22s" in _plain(app, "#card-body")
         await pilot.resize_terminal(90, 30)
         await pilot.pause(0.1)
@@ -694,7 +694,8 @@ def test_the_idle_tick_repaints_only_the_lines_whose_clock_changed(monkeypatch):
         for n in (1, 2, 3):
             painted.clear()
             clock.now = BASE + n
-            await pilot.pause(0.6)
+            second = f"no orders on the rail for 4m {12 + n}s"
+            await _until(pilot, lambda text=second: text in _plain(app, "#card-body"))
             # The card's own `since …` subtitle counts up with the same clock.
             assert len(painted) <= 4, painted
             assert "Line#card-body" in painted and "Card#card" in painted, painted

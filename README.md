@@ -240,9 +240,12 @@ the gateway is on:
 - `GET /sous/events` — the same document as a Server-Sent Events stream:
   once at connect, then whenever something on it changed — the turn in
   flight (at most ten times a second), a load, an unload, a hold or its
-  release, a task — and, only while a turn is in flight, a delegated task
-  running or a load under way, at least once a second; idle, nothing but
-  a `ping` every 10 s.
+  release, a task, an edit of the config file — and, only while a turn is
+  in flight, a delegated task running or a load under way, at least once a
+  second; idle, nothing but a `ping` every 10 s. The idle clock is not
+  refreshed between frames: a client advances `engine.idle_seconds` from
+  the time since the frame arrived, the way `sous top` does; `memory_gb`
+  likewise waits for the next frame.
 - `POST /sous/hold` — what `sous claude` posts (above).
 
 A `404` from `/sous/status` means the running daemon predates this CLI (the

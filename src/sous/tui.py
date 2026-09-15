@@ -1812,10 +1812,12 @@ class Top(App[int]):
 
     def _show_idle(self, engine: dict, now: float) -> None:
         """Repaint the lines that show the idle clock — the quiet card's
-        span, its lights-out countdown and its `since …` subtitle, THE
-        LINE's subtitle, the headline, the narrow footer — from the
-        advanced clock. Each widget skips text that did not change, so
-        this is three or four repaints a second."""
+        span, its lights-out countdown, THE LINE's subtitle, the headline,
+        the narrow footer — from the advanced clock. The card's `since …`
+        subtitle rides along on the same repaint: it counts from the recent
+        ring's oldest turn, not from the idle clock, but off the same `now`.
+        Each widget skips text that did not change, so this is three or four
+        repaints a second."""
         document = self._document
         config = document.get("config") or {}
         recent = document.get("recent_turns") or []
