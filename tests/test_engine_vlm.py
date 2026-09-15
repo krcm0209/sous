@@ -129,40 +129,50 @@ def test_vlm_a_continuation_is_positioned_behind_its_cache(model_id, is_hybrid):
     ids = e._encode("def f(x):\n    return x + 1\n" * 40)
     cut = len(ids) - 9
     head, tail = ids[:cut], ids[cut:]
+    # Generated tokens are positioned by the model from its cache offset and
+    # the delta it adopted from the engine, not from position_ids — so the
+    # decode path is witnessed through the tail AND a few tokens past it.
+    generated = 4
 
     whole = e.new_cache()
     e.prefill(whole, ids)
     warm = e.new_cache()
     e.prefill(warm, head)
 
-    def attention_keys(cache):
-        # Only an attention layer holds keys; a recurrent layer's state has no
-        # positions to check. On the hybrid, only the first attention layer.
-        layers = [c for c in cache if getattr(c, "keys", None) is not None]
-        if is_hybrid:
-            assert len(layers) < len(cache)
-            layers = layers[:1]
-        else:
-            assert len(layers) == len(cache)
-        return [c.keys[..., cut : len(ids), :].astype(mx.float32) for c in layers]
+    # Only an attention layer holds keys; a recurrent layer's state has no
+    # positions to check. On the hybrid, only the first attention layer.
+    attention = [i for i, c in enumerate(whole) if getattr(c, "keys", None) is not None]
+    if is_hybrid:
+        assert len(attention) < len(whole)
+        attention = attention[:1]
+    else:
+        assert len(attention) == len(whole)
 
-    want = attention_keys(whole)
+    def attention_keys(cache, stop):
+        return [cache[i].keys[..., cut:stop, :].astype(mx.float32) for i in attention]
 
-    def worst(cache):
+    def worst(cache, want, stop):
         return max(
             cast("float", (mx.abs(got - w).max() / mx.abs(w).max()).item())
-            for got, w in zip(attention_keys(cache), want, strict=True)
+            for got, w in zip(attention_keys(cache, stop), want, strict=True)
         )
 
     continued = e.new_cache()
     fork_copy(warm, continued, e.copy_array)
     e.prefill(continued, tail)
-    assert worst(continued) < 0.1
+    assert worst(continued, attention_keys(whole, len(ids)), len(ids)) < 0.1
 
+    # The decode reference runs the whole prompt through the same path in one
+    # pass; greedy decoding makes its generated tokens the ones the fork
+    # must reproduce, so their keys are comparable too.
+    reference = e.new_cache()
+    e.decode(reference, ids, generated)
     decoded = e.new_cache()
     fork_copy(warm, decoded, e.copy_array)
-    e.decode(decoded, tail, 1)
-    assert worst(decoded) < 0.1
+    e.decode(decoded, tail, generated)
+    stop = len(ids) + generated
+    assert all(cache[attention[0]].offset == stop for cache in (reference, decoded))
+    assert worst(decoded, attention_keys(reference, stop), stop) < 0.1
     e.unload()
 
 
