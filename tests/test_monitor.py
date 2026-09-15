@@ -172,6 +172,8 @@ def test_routes_are_loopback_guarded(tmp_path: Path):
         assert r.status_code == 403 and r.json()["error"]["type"] == "permission_error"
         r = _request(app, method, path, body, headers={"origin": "https://evil.example"})
         assert r.status_code == 403 and r.json()["error"]["type"] == "permission_error"
+        r = _request(app, method, path, body, headers={"sec-fetch-site": "cross-site"})
+        assert r.status_code == 403 and r.json()["error"]["type"] == "permission_error"
     assert engines.status()["holders"] == 0
 
 
@@ -331,12 +333,18 @@ def _collect_events(app, *, want: int, seconds: float = 3.0, headers=(), during=
                 await asyncio.wait_for(got.wait(), seconds)
             else:
                 # A refused request completes on its own; nothing to wait for.
-                await asyncio.wait_for(task, seconds)
+                try:
+                    await asyncio.wait_for(task, seconds)
+                except TimeoutError:
+                    pytest.fail(f"the request was served, not refused: status={status}")
         finally:
             disconnect.set()
             # The disconnect must end the stream: a generator that kept
             # running would be a client's whole session of work for nobody.
-            await asyncio.wait_for(task, 5)
+            # A timed-out wait above has already cancelled the task; a task
+            # that failed on its own still re-raises here.
+            if not task.cancelled():
+                await asyncio.wait_for(task, 5)
         return status, _frames(b"".join(chunks).decode())
 
     return asyncio.run(go())
@@ -398,6 +406,22 @@ def test_events_are_loopback_guarded_and_get_only(tmp_path: Path):
     assert status == [403] and frames == []
     r = _request(app, "POST", "/sous/events")
     assert r.status_code == 404 and r.json()["error"]["type"] == "not_found_error"
+
+
+def test_events_refuse_a_cross_site_fetch_and_serve_a_typed_url(tmp_path: Path):
+    """A page's <iframe src> or no-cors GET carries no Origin, so the
+    Origin rule cannot see it, but it does carry Sec-Fetch-Site — and one
+    such request would buy a perpetual status stream. The URL the user types
+    carries `none` and streams."""
+    app, _ = _app(tmp_path)
+    for site in (b"cross-site", b"same-site"):
+        status, frames = _collect_events(
+            app, want=0, headers=[(b"sec-fetch-site", site)], seconds=1.0
+        )
+        assert status == [403] and frames == [], site
+    for site in (b"none", b"same-origin"):
+        status, frames = _collect_events(app, want=1, headers=[(b"sec-fetch-site", site)])
+        assert status == [200] and frames[0][0] == "status", site
 
 
 def test_events_document_is_built_off_the_event_loop(tmp_path: Path, monkeypatch):

@@ -792,7 +792,9 @@ draft from a small local model costs your plan nothing.
   Code turn never touches `toolexec.py`: the gateway hands `tool_use` blocks
   back and Claude Code executes them under its own permission rules. The
   gateway binds to `127.0.0.1` only and refuses foreign `Host`/`Origin`
-  values on every route, forwarded ones included. It forwards the
+  values, and any browser request whose `Sec-Fetch-Site` is not `none` or
+  `same-origin` (a page's `<iframe>` or no-cors GET carries no `Origin`
+  to refuse), on every route, forwarded ones included. It forwards the
   `Authorization` header Claude Code sends with every request to
   `[gateway].upstream_url` unmodified and nowhere else, stores it nowhere,
   adds no credential of its own (no `~/.netrc`, no proxy environment), and
