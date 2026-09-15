@@ -1564,3 +1564,43 @@ def test_the_idle_clock_restarts_whichever_caller_sees_the_last_holder_leave():
     clock.now += 30 * 60 + 1
     assert mgr.unload_if_idle() is True
     assert created[0].unloaded is True
+
+
+def test_version_moves_on_load_unload_hold_release_and_idle_resets_and_nothing_else():
+    """What the event stream polls between documents. A read moves nothing;
+    every reset of the idle clock does, because the terminal runs that
+    clock itself between documents and must hear about a restart."""
+    created: list[FakeEngine] = []
+
+    def factory(model_id: str):
+        e = FakeEngine([])
+        created.append(e)
+        return e
+
+    alive = {"ok": True}
+    cfg = SousConfig(idle_unload_minutes=0)
+    m = EngineManager(cfg, engine_factory=factory, holder_alive=lambda pid, started: alive["ok"])
+    v = m.version
+    m.get()
+    assert m.version > v, "a load moved nothing"
+    v = m.version
+    m.status()
+    assert m.version == v, "a read moved the version"
+    m.get()
+    assert m.version == v + 1, "a hit resets the idle clock and moved nothing"
+    m.touch()
+    assert m.version == v + 2, "a touch resets the idle clock and moved nothing"
+    v = m.version
+    m.hold(4242, 1.0)
+    assert m.version == v + 1, "a hold moved nothing"
+    m.status()
+    assert m.version == v + 1, "a status read with a live holder moved the version"
+    alive["ok"] = False
+    m.status()
+    assert m.version == v + 2, "a pruned holder moved nothing"
+    v = m.version
+    time.sleep(0.01)
+    assert m.unload_if_idle() is True
+    assert m.version == v + 2, "an unload is two changes: it started, it finished"
+    assert m.unload_if_idle() is False
+    assert m.version == v + 2, "a refused unload moved the version"

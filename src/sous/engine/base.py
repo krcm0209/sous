@@ -544,6 +544,23 @@ class EngineManager:
         self._holder_alive: Callable[[int, float], bool] = holder_alive or _holder_alive
         self._preload: threading.Thread | None = None
         self._clock = clock
+        # Bumped on the transitions the status document shows and the
+        # in-flight registry cannot: a load starting or ending, an unload
+        # starting or ending, a hold taken, a holder pruned, and every
+        # reset of the idle clock — the terminal runs that clock itself
+        # between documents, so a reset it never hears about is a wrong
+        # number on screen until the next one.
+        self._version = 0
+
+    @property
+    def version(self) -> int:
+        """Read without the lock — one int; see Inflight.version for why a
+        poller reads it before, not after, the snapshot it describes."""
+        return self._version
+
+    def _bump(self) -> None:
+        """Lock held by the caller."""
+        self._version += 1
 
     def get(self) -> ManagedEngine:
         with self._changed:
@@ -551,20 +568,24 @@ class EngineManager:
                 self._changed.wait()
             if self._engine is not None:
                 self._last_used = self._clock()
+                self._bump()
                 return self._engine
             self._loading = True
+            self._bump()
         loading = time.monotonic()
         try:
             engine = ManagedEngine(self._load())
         except BaseException:
             with self._changed:
                 self._loading = False
+                self._bump()
                 self._changed.notify_all()
             raise
         with self._changed:
             self._engine = engine
             self._loading = False
             self._last_used = self._clock()
+            self._bump()
             self._changed.notify_all()
         # The one line that brackets a cold start in the daemon log —
         # before it, only huggingface_hub's own chatter said a load
@@ -610,6 +631,7 @@ class EngineManager:
     def touch(self) -> None:
         with self._lock:
             self._last_used = self._clock()
+            self._bump()
 
     @contextlib.contextmanager
     def lease(self):
@@ -640,6 +662,7 @@ class EngineManager:
         with self._lock:
             self._prune_holders()
             self._holders[pid] = create_time
+            self._bump()
             holders = len(self._holders)
             loaded = self._engine is not None
             preloading = not loaded and not self._loading and self._preload is None
@@ -698,6 +721,8 @@ class EngineManager:
         for pid in gone:
             del self._holders[pid]
             _logger.info(f"hold released pid={pid} (holders={len(self._holders)})")
+        if gone:
+            self._bump()
         if gone and not self._holders and self._last_used is not None:
             self._last_used = self._clock()
 
@@ -720,11 +745,13 @@ class EngineManager:
                 return False
             engine, self._engine = self._engine, None
             self._unloading = True
+            self._bump()
         try:
             engine.unload()
         finally:
             with self._changed:
                 self._unloading = False
+                self._bump()
                 self._changed.notify_all()
         return True
 
