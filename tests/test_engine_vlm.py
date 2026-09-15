@@ -118,7 +118,11 @@ def test_vlm_a_continuation_is_positioned_behind_its_cache(model_id, is_hybrid):
     deeper attention layers compound that drift into tens of percent, so
     there only the first attention layer is read: 0.009 fixed against 1.08
     unfixed on Qwen3.5-9B. The bound sits an order of magnitude above the
-    fixed values and below the defect on both."""
+    fixed values and below the defect on both. Those values were measured over
+    the tail; the decode half also reads the generated tokens' keys, which
+    ride the same bound on the argument that both greedy runs picked the
+    same tokens — asserted, not assumed, so a divergence names itself instead
+    of reading as a positions regression."""
     import mlx.core as mx
 
     from sous.engine.promptcache import fork_copy
@@ -163,15 +167,18 @@ def test_vlm_a_continuation_is_positioned_behind_its_cache(model_id, is_hybrid):
     assert worst(continued, attention_keys(whole, len(ids)), len(ids)) < 0.1
 
     # The decode reference runs the whole prompt through the same path in one
-    # pass; greedy decoding makes its generated tokens the ones the fork
-    # must reproduce, so their keys are comparable too.
+    # pass. The tail's keys are the measured comparison; the generated
+    # tokens' keys are comparable only if both greedy runs picked the same
+    # tokens, which the text assertion below checks before they are read.
     reference = e.new_cache()
-    e.decode(reference, ids, generated)
+    ref_text = e.decode(reference, ids, generated)
     decoded = e.new_cache()
     fork_copy(warm, decoded, e.copy_array)
-    e.decode(decoded, tail, generated)
+    got_text = e.decode(decoded, tail, generated)
     stop = len(ids) + generated
     assert all(cache[attention[0]].offset == stop for cache in (reference, decoded))
+    assert worst(decoded, attention_keys(reference, len(ids)), len(ids)) < 0.1
+    assert got_text == ref_text, f"continuations diverged: {got_text!r} != {ref_text!r}"
     assert worst(decoded, attention_keys(reference, stop), stop) < 0.1
     e.unload()
 
