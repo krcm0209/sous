@@ -257,6 +257,33 @@ def test_loopback_and_absent_origins_pass(tmp_path: Path):
     assert _request(app, "HEAD", "/api/hello").status_code == 200
 
 
+def test_a_cross_site_request_is_rejected_without_an_origin(tmp_path: Path):
+    """Browsers omit Origin on a no-cors GET — an <iframe>, <script> or <img>
+    src, a no-cors fetch — so a visited page's request arrives with a
+    legitimate loopback Host and no Origin to refuse; it does carry
+    Sec-Fetch-Site, which a page's script cannot set. Another loopback port
+    is another site's page."""
+    inner = FakeEngine(["never", "never"])
+    app = _app(tmp_path, inner)
+    for site in ("cross-site", "same-site"):
+        r = _post(app, _body(), headers={"sec-fetch-site": site})
+        assert r.status_code == 403, site
+        assert r.json()["error"]["type"] == "permission_error"
+        assert "same-origin" in r.json()["error"]["message"]
+        r = _request(app, "HEAD", "/api/hello", headers={"sec-fetch-site": site})
+        assert r.status_code == 403, site
+    assert inner.calls == []  # rejected before any generation
+
+
+def test_typed_urls_and_same_origin_requests_pass(tmp_path: Path):
+    """`none` is a URL the user typed into the address bar; `same-origin` is
+    a page the daemon itself served."""
+    app = _app(tmp_path, FakeEngine([]))
+    for site in ("none", "same-origin"):
+        r = _request(app, "HEAD", "/api/hello", headers={"sec-fetch-site": site})
+        assert r.status_code == 200, site
+
+
 # --- request validation ---------------------------------------------------------------
 
 

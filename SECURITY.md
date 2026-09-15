@@ -52,7 +52,9 @@ Anything that breaks a guarantee in the
 - **The MCP endpoint** — it binds to `127.0.0.1`; reachability beyond that, or
   anything exploitable through it, is in scope.
 - **The gateway** (`[gateway].enabled = true`) — it binds to `127.0.0.1` and
-  refuses foreign `Host`/`Origin` values; it forwards Claude Code's own
+  refuses foreign `Host`/`Origin` values and any browser request whose
+  `Sec-Fetch-Site` is not `none` or `same-origin` (a page's `<iframe>` or
+  no-cors GET carries no `Origin`); it forwards Claude Code's own
   `Authorization` header to `[gateway].upstream_url`. In scope: reachability
   from anything but a loopback client; a request body, header value or query
   string reaching a log at any level, including debug; a credential being
@@ -62,7 +64,8 @@ Anything that breaks a guarantee in the
   executing a tool (the gateway returns `tool_use` blocks and never runs one).
 - **The `/sous/` routes** (`GET /sous/status`, `GET /sous/events`,
   `POST /sous/hold`) — the daemon's own loopback routes, mounted whether or
-  not the gateway is enabled, behind the same `Host`/`Origin` refusal.
+  not the gateway is enabled, behind the same `Host`/`Origin`/`Sec-Fetch-Site`
+  refusal.
   `/sous/status` and `/sous/events` serve the status document (engine
   state, the turn in flight, recent turns and tasks — counts, durations,
   hashes and identifiers; task titles are the user's own); `/sous/hold`
