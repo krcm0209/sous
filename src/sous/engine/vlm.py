@@ -242,9 +242,12 @@ class VLMEngine:
 
         model, _ = self._loaded()
         try:
-            # The call generate_step makes for a text-only prompt — the second
-            # positional is pixel_values — so a helper this cannot run is one
-            # no real turn could run either.
+            # generate_step's positional and `mask` shape for a text-only
+            # prompt (the second positional is pixel_values), so a helper this
+            # cannot run is one no real turn could run either. A turn also
+            # splats the engine's own position_ids/rope_deltas into this call;
+            # every 0.7.x helper that returns positions declares **kwargs and
+            # ignores them.
             out = model.get_input_embeddings(mx.zeros((1, 1), dtype=mx.int32), None, mask=None)
         except Exception as e:  # noqa: BLE001 — degrade, never block the model
             # A helper that cannot run text-only raises on every real turn

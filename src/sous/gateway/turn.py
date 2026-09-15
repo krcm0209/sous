@@ -343,12 +343,17 @@ class TurnRunner:
                 # must never find the two side by side.
                 live.end(turn_id)
             self._lock.release()
-            # Nothing on this pool thread touches mlx — a load runs on a
-            # thread of its own (EngineManager._load) precisely because a
-            # release leaves the thread unable to touch mlx again and pool
-            # threads outlive the call — but the invariant is per thread
-            # (ml-explore/mlx#4327), and keeping it unconditional is what
-            # makes it checkable.
+            # Nothing on this pool thread needs an mlx stream: the load has a
+            # thread of its own (EngineManager._load) because a release leaves
+            # a thread unable to run stream-bound ops again and pool threads
+            # outlive the call, and generation runs on the session's thread,
+            # which releases in its own finally. The mlx this thread does
+            # touch is array freeing — a stalled turn's cache reset above,
+            # and the sweep inside prompt_cache_stats — so the release stays
+            # LAST: freeing after it is what segfaults the thread on its way
+            # out (ml-explore/mlx#4327, as in server.status_document). The
+            # invariant is per thread that touched mlx, and keeping it
+            # unconditional is what makes it checkable.
             release_mlx_thread_state()
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> CountResult:

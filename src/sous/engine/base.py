@@ -580,7 +580,8 @@ class EngineManager:
 
         A load touches mlx, and a thread that touched mlx must release its
         streams before it exits (ml-explore/mlx#4327) — a release after which
-        that thread cannot touch mlx again. The gateway's turn and count pools
+        that thread cannot run another op that needs a stream, a load
+        included. The gateway's turn and count pools
         call get() from threads that outlive the call and release
         unconditionally, so a load on one of them left it unable to load a
         second time: after an idle unload, the next cold start on that same
