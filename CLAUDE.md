@@ -28,7 +28,13 @@ Claude Code use stretches further — evaluate features against that goal.
   `engine.base.release_mlx_thread_state()` before it exits — mlx >= 0.32.1
   (ml-explore/mlx#4327) segfaults the whole daemon in the exiting thread's
   TLS teardown otherwise. CI cannot catch this (model tests are local-only);
-  after dependency changes, verify with one real delegated task.
+  after dependency changes, verify with one real delegated task. The release
+  also leaves that thread unable to touch mlx again ("There is no Stream(gpu,
+  0) in current thread"), so a thread that outlives its work must never touch
+  mlx: a model load runs on a `sous-model-load` thread of its own
+  (`EngineManager._load`). Before it had one, a load on a gateway pool
+  thread — which releases after every turn — made every later cold start on
+  that thread fail.
 - e2e_smoke.py often ends `failed` or `budget-exhausted` even when it worked —
   the 0.6B model can't reliably emit `finish`. Judge by hello.txt content.
 - Budget exhaustion is `done` with outcome `budget-exhausted`, never `failed`.

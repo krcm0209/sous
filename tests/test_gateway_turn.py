@@ -23,13 +23,14 @@ from tests.fake_engine import ChunkedFakeEngine, FakeEngine
 
 @pytest.fixture(autouse=True)
 def _keep_main_thread_mlx_state(monkeypatch):
-    # The runner releases mlx thread state unconditionally, which is right on
-    # the retiring session thread it runs on in production. These tests run it
-    # synchronously on the main pytest thread, whose mlx stream state other
-    # test files own — a real release there tears that state down under them.
-    # Left in place, it fails every later mlx op on this thread with "There is
-    # no Stream(gpu, 0) in current thread" — tests/test_int8prefill.py is
-    # where that first shows.
+    # The runner releases mlx thread state unconditionally. In production it
+    # runs on a gateway pool thread that never touches mlx (the load has a
+    # thread of its own, generation the session's), so the release is a no-op
+    # there. These tests run it synchronously on the main pytest thread, whose
+    # mlx stream state other test files own — a real release there tears that
+    # state down under them and fails every later mlx op on this thread with
+    # "There is no Stream(gpu, 0) in current thread"; tests/test_int8prefill.py
+    # is where that first shows.
     monkeypatch.setattr(turn, "release_mlx_thread_state", lambda: None)
 
 

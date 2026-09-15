@@ -343,10 +343,12 @@ class TurnRunner:
                 # must never find the two side by side.
                 live.end(turn_id)
             self._lock.release()
-            # engines.get() may have loaded the model on this thread. Pool
-            # threads outlive the call, but the invariant is per thread that
-            # touched mlx (ml-explore/mlx#4327), and keeping it unconditional
-            # is what makes it checkable.
+            # Nothing on this pool thread touches mlx — a load runs on a
+            # thread of its own (EngineManager._load) precisely because a
+            # release leaves the thread unable to touch mlx again and pool
+            # threads outlive the call — but the invariant is per thread
+            # (ml-explore/mlx#4327), and keeping it unconditional is what
+            # makes it checkable.
             release_mlx_thread_state()
 
     def count_tokens(self, messages: list[dict], tools: list[dict]) -> CountResult:
