@@ -410,6 +410,33 @@ def test_a_quiet_daemon_sends_no_status_frame_between_pings(tmp_path: Path, monk
     assert len([e for e, _ in frames if e == "ping"]) >= 3
 
 
+def test_an_idle_stream_polls_on_the_idle_tick_and_a_busy_one_on_the_fast_tick(
+    tmp_path: Path, monkeypatch
+):
+    """The idle saving is the slower poll: a change while nothing is on the
+    pass is seen on the idle tick, a change during a turn on the fast one."""
+    monkeypatch.setattr(monitor, "EVENT_HEARTBEAT_SECONDS", 60.0)
+    monkeypatch.setattr(monitor, "EVENT_TICK_SECONDS", 0.01)
+    monkeypatch.setattr(monitor, "EVENT_IDLE_TICK_SECONDS", 0.6)
+    store = TaskStore(tmp_path / "tasks.db")
+    registry = Inflight()
+    app, _ = _app(tmp_path, store=store, inflight=registry)
+    fired: list[float] = []
+
+    def change() -> None:
+        fired.append(time.monotonic())
+        store.enqueue("t", "do it", str(tmp_path), [], [])
+
+    _collect_events(app, want=2, during=change)
+    idle_wait = time.monotonic() - fired[0]
+    registry.begin("msg_1", model="sous-local", stream=True, max_tokens=1)
+    fired.clear()
+    _collect_events(app, want=2, during=change)
+    busy_wait = time.monotonic() - fired[0]
+    assert idle_wait >= 0.5, idle_wait
+    assert busy_wait < 0.3, busy_wait
+
+
 def test_events_beat_once_a_second_while_a_turn_is_in_flight(tmp_path: Path, monkeypatch):
     """The terminal reads a silent stream during a turn as a stalled daemon
     (a prefill can run for a minute without a registry change), so the
@@ -488,7 +515,8 @@ def test_a_load_a_hold_a_release_a_task_change_and_an_unload_each_reach_the_clie
         alive["ok"] = False
         # A departed holder is pruned inside engines.status(), which only a
         # document build calls — and a build needs a version change to cause
-        # it. The launcher's own poll and the worker's sweep do this read.
+        # it. The launcher's own /sous/status poll does this read; the
+        # worker's sweep prunes the same way through unload_if_idle().
         engines.status()
 
     _, frames = _collect_events(app, want=2, during=release)

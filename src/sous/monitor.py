@@ -76,7 +76,7 @@ async def _status_events(
     daemon failure logs its type and never its message."""
     seen: object = None  # nothing sent yet, whatever the clock says
     sent = time.monotonic()
-    busy = True
+    busy = True  # until the first document says otherwise
     while True:
         # Read before the build, not after: a change landing during it is
         # then a newer value on the next check, never one masked.
