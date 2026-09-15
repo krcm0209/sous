@@ -229,7 +229,8 @@ the gateway is on:
 
 - `GET /sous/status` — one JSON document: `engine` (`loaded`, `loading`,
   `model_id`, `idle_seconds`, `holders`, `memory_gb`, the `prompt_cache`
-  counters), `inflight` (the turn the model is serving right now — its
+  counters, and on the VLM backend `positions`, the load line's
+  `engine|model`), `inflight` (the turn the model is serving right now — its
   `msg_` id, phase, tokens so far, rate and ETA — usually empty or one
   entry, ordered with the turn on the pass first and then the queue in
   arrival order), `queue` (delegated task counts), `recent_turns` (the last 50,
@@ -497,8 +498,10 @@ the forwarder's own synthesized `499` for a client gone mid-forward
 (the model load it paid for), `count_s` (time inside the runner) and
 `seconds` (client-visible, from request receipt — it includes any wait for
 a free worker that `count_s` does not); the engine logs `model_load
-seconds=N.N model=<model_id>` when it loads. One more line names the
-Anthropic tool *types* a turn dropped, when any.
+seconds=N.N model=<model_id>` when it loads, plus `positions=engine|model` on
+the VLM backend (which side supplies the rotary positions behind a warm
+cache). One more line names the Anthropic tool *types* a turn dropped, when
+any.
 Each forwarded request logs one line too: `upstream`, method, path, the
 model id when the body named one, the upstream's status, and seconds to
 its headers — at `INFO` whatever the status, since that is the upstream's

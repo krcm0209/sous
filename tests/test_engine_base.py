@@ -105,6 +105,92 @@ def test_get_logs_the_load_once_with_its_duration(caplog):
     assert lines[0].startswith("model_load seconds=") and lines[0].endswith(" model=fake/model")
 
 
+def _positional_factory(model_id: str) -> FakeEngine:
+    """An engine that reports which side owns the rotary positions, the way
+    the VLM backend does."""
+    engine = FakeEngine([])
+    engine.positions = "engine"  # ty: ignore[unresolved-attribute]
+    return engine
+
+
+def test_get_logs_the_positions_the_engine_reports(caplog):
+    import logging
+
+    mgr = EngineManager(SousConfig(), engine_factory=_positional_factory)
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert len(lines) == 1 and lines[0].endswith(" model=fake/model positions=engine")
+
+
+def test_get_logs_no_positions_for_an_engine_without_them(caplog):
+    """The LM backend (and a plain FakeEngine, which stands in for it here)
+    has no such attribute, so the load line must not grow one."""
+    import logging
+
+    mgr, _ = _manager()
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert len(lines) == 1 and "positions=" not in lines[0]
+
+
+def test_get_loads_on_a_thread_of_its_own_that_releases_its_mlx_state(monkeypatch):
+    """The caller's thread never touches mlx: the factory runs on a loader
+    thread that releases its streams before it exits. A gateway pool thread
+    outlives its turn and releases unconditionally, and a load on it left it
+    unable to touch mlx again — every cold start after the first on that
+    thread failed."""
+    from sous.engine import base
+
+    seen: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        base,
+        "release_mlx_thread_state",
+        lambda: seen.append(("release", threading.get_ident())),
+    )
+
+    def factory(model_id: str) -> FakeEngine:
+        seen.append((threading.current_thread().name, threading.get_ident()))
+        return FakeEngine([])
+
+    EngineManager(SousConfig(), engine_factory=factory).get()
+    assert [name for name, _ in seen] == ["sous-model-load", "release"]
+    idents = {ident for _, ident in seen}
+    assert len(idents) == 1 and threading.get_ident() not in idents
+
+
+def test_a_thread_that_released_between_two_cold_loads_can_load_again():
+    """The gateway pool thread's life, on real mlx: load, release, idle
+    unload, load again. Before the load had a thread of its own the second
+    load raised "There is no Stream(gpu, 0) in current thread"."""
+    mx = pytest.importorskip("mlx.core")
+    from sous.engine.base import release_mlx_thread_state
+
+    def factory(model_id: str) -> FakeEngine:
+        mx.eval(mx.arange(4))  # the least a real load does on its thread
+        return FakeEngine([])
+
+    mgr = EngineManager(SousConfig(idle_unload_minutes=0), engine_factory=factory)
+    outcome: list = []
+
+    def pool_thread() -> None:
+        try:
+            for _ in range(2):
+                mgr.get()
+                release_mlx_thread_state()  # what TurnRunner.run's finally does
+                time.sleep(0.01)
+                assert mgr.unload_if_idle() is True
+            outcome.append("ok")
+        except Exception as exc:  # noqa: BLE001 — the failure is the assertion
+            outcome.append(exc)
+
+    thread = threading.Thread(target=pool_thread, name="sous-gateway-turn_0")
+    thread.start()
+    thread.join(10)
+    assert outcome == ["ok"]
+
+
 class _GatedFactory:
     """A model factory that blocks until released, so a test can look at the
     manager mid-load. `started` is set once the factory has been entered."""
@@ -375,16 +461,18 @@ def _join_preload(mgr: EngineManager) -> None:
     assert not thread.is_alive()
 
 
-def test_hold_starts_exactly_one_preload_which_releases_its_mlx_state(monkeypatch):
-    """The release is monkeypatched, so this pins that it happens on the
-    preload thread and once, not what the real call does to a loaded model;
-    the gateway's turn-pool thread already releases after a get() that may
-    have loaded the weights, and the real-daemon run is what exercises it."""
+def test_hold_starts_exactly_one_preload_whose_load_releases_its_mlx_state(monkeypatch):
+    """The release is monkeypatched, so this pins that it happens once, on
+    the loader thread get() spawns — the preload thread itself touches no
+    mlx — not what the real call does to a loaded model; the real-daemon run
+    is what exercises that."""
     from sous.engine import base
 
-    released_in: list[int] = []
+    released_in: list[str] = []
     monkeypatch.setattr(
-        base, "release_mlx_thread_state", lambda: released_in.append(threading.get_ident())
+        base,
+        "release_mlx_thread_state",
+        lambda: released_in.append(threading.current_thread().name),
     )
     mgr, factory = _gated_manager()
     first = mgr.hold(101, 5.0)
@@ -401,7 +489,7 @@ def test_hold_starts_exactly_one_preload_which_releases_its_mlx_state(monkeypatc
     preload.join(5)
     assert not preload.is_alive()
     assert len(factory.created) == 1
-    assert released_in == [preload.ident]
+    assert released_in == ["sous-model-load"]
     s = mgr.status()
     assert s["loaded"] is True and s["loading"] is False and s["holders"] == 2
     assert mgr.hold(103, 7.0) == {"loaded": True, "loading": False, "holders": 3}
@@ -1049,11 +1137,69 @@ def test_status_carries_the_int8_prefill_view_when_the_engine_reports_one(tmp_pa
     assert manager.status()["int8_prefill"] == {"state": "active", "reason": None, "routed": 336}
 
 
+def test_status_carries_the_positions_view_when_the_engine_reports_one(tmp_path):
+    """The load line says which side owns the rotary positions once; the
+    status document says it for as long as the model is resident, so an
+    mlx-vlm bump that flips the probe is readable without a reload."""
+    inner = FakeEngine([])
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    assert "positions" not in manager.status(), "fakes without the attribute stay silent"
+    inner.positions = "engine"  # ty: ignore[unresolved-attribute]
+    assert manager.status()["positions"] == "engine"
+
+
+def _positionless_model() -> types.SimpleNamespace:
+    """A stub model whose text-only embedding helper returns no positions of
+    its own, in the shape every mlx-vlm helper returns."""
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(model_type="fake"),
+        get_input_embeddings=lambda *a, **kw: types.SimpleNamespace(position_ids=None),
+    )
+
+
+def test_vlm_engine_finds_the_positions_its_helper_returns(monkeypatch):
+    """A Qwen-lineage model's text-only embedding helper returns rotary
+    positions of its own; the probe in __init__ must land on `engine`, once,
+    asking the helper the way generate_step does (ids, no pixels, mask=None)."""
+    from sous.engine.vlm import VLMEngine
+
+    calls: list[tuple[tuple, dict]] = []
+
+    def helper(*args, **kwargs):
+        calls.append((args, kwargs))
+        return types.SimpleNamespace(position_ids=object())
+
+    model = types.SimpleNamespace(
+        config=types.SimpleNamespace(model_type="fake"), get_input_embeddings=helper
+    )
+    _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, _RecordingTokenizer()))
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+    engine = VLMEngine("test/model", cache_budget=0)
+    assert engine.positions == "engine" and engine._positional is True
+    assert len(calls) == 1
+    (ids, pixels), kwargs = calls[0]
+    assert ids.shape == (1, 1) and pixels is None and kwargs == {"mask": None}
+
+
+def test_vlm_engine_leaves_positions_to_a_model_whose_helper_returns_none(monkeypatch):
+    from sous.engine.vlm import VLMEngine
+
+    _stub(
+        monkeypatch,
+        "mlx_vlm",
+        load=lambda model_id: (_positionless_model(), _RecordingTokenizer()),
+    )
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+    engine = VLMEngine("test/model", cache_budget=0)
+    assert engine.positions == "model" and engine._positional is False
+
+
 def test_vlm_engine_enables_int8_prefill_on_the_loaded_model(monkeypatch):
     from sous.engine import int8prefill
     from sous.engine.vlm import VLMEngine
 
-    model = types.SimpleNamespace(config=types.SimpleNamespace(model_type="fake"))
+    model = _positionless_model()
     processor = types.SimpleNamespace(tokenizer=_RecordingTokenizer())
     _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
     _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
@@ -1196,7 +1342,7 @@ def test_vlm_tokenization_is_serialized(monkeypatch):
     from sous.engine.vlm import VLMEngine
 
     tokenizer = _RecordingTokenizer()
-    model = types.SimpleNamespace(config=types.SimpleNamespace(model_type="fake"))
+    model = _positionless_model()
     processor = types.SimpleNamespace(tokenizer=tokenizer)
     _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
     _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)

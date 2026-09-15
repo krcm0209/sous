@@ -315,6 +315,12 @@ class ManagedEngine:
         # Optional on purpose: fakes and older engines have no such attribute.
         return getattr(self._inner, "int8_prefill_status", None)
 
+    @property
+    def positions(self) -> str | None:
+        # Optional on purpose: only the VLM backend sets this; the LM backend
+        # has no such attribute.
+        return getattr(self._inner, "positions", None)
+
     def generate(
         self,
         messages: list[dict],
@@ -549,7 +555,7 @@ class EngineManager:
             self._loading = True
         loading = time.monotonic()
         try:
-            engine = ManagedEngine(self._factory(self._config.model_id))
+            engine = ManagedEngine(self._load())
         except BaseException:
             with self._changed:
                 self._loading = False
@@ -563,8 +569,43 @@ class EngineManager:
         # The one line that brackets a cold start in the daemon log —
         # before it, only huggingface_hub's own chatter said a load
         # happened, and a turn's `seconds` could not be split.
-        _logger.info(f"model_load seconds={time.monotonic() - loading:.1f} model={engine.model_id}")
+        line = f"model_load seconds={time.monotonic() - loading:.1f} model={engine.model_id}"
+        if engine.positions is not None:
+            line += f" positions={engine.positions}"
+        _logger.info(line)
         return engine
+
+    def _load(self) -> Engine:
+        """Run the factory on a thread of its own and hand back what it built.
+
+        A load touches mlx, and a thread that touched mlx must release its
+        streams before it exits (ml-explore/mlx#4327) — a release after which
+        that thread cannot run another op that needs a stream, a load
+        included. The gateway's turn and count pools
+        call get() from threads that outlive the call and release
+        unconditionally, so a load on one of them left it unable to load a
+        second time: after an idle unload, the next cold start on that same
+        pool thread failed with "There is no Stream(gpu, 0) in current
+        thread", and the pool reuses its idle thread first, so every cold
+        start after the first did. A thread that exists only for the load is
+        the one shape the invariant fits: it releases on its way out, and the
+        caller never touches mlx at all."""
+        outcome: list = []
+
+        def run() -> None:
+            try:
+                outcome.append(self._factory(self._config.model_id))
+            except BaseException as exc:  # noqa: BLE001 — re-raised on the caller's thread
+                outcome.append(exc)
+            finally:
+                release_mlx_thread_state()
+
+        loader = threading.Thread(target=run, name="sous-model-load", daemon=True)
+        loader.start()
+        loader.join()
+        if isinstance(outcome[0], BaseException):
+            raise outcome[0]
+        return outcome[0]
 
     def touch(self) -> None:
         with self._lock:
@@ -623,7 +664,7 @@ class EngineManager:
 
     def _load_in_progress(self) -> bool:
         """Lock held by the caller. The preload thread forgets itself only
-        after releasing its mlx state, so once get() has published the
+        after its get() has returned, so once get() has published the
         engine `_preload` alone would report a load beside a loaded model."""
         return self._loading or (self._preload is not None and self._engine is None)
 
@@ -634,12 +675,9 @@ class EngineManager:
             # The type only: a loader's message can name a path.
             _logger.warning(f"preload failed ({type(exc).__name__})")
         finally:
-            # This thread loaded the model, so it touched mlx: the weights are
-            # arrays every later thread can use, the streams are this one's
-            # own (the gateway's turn thread releases the same way after a
-            # get() that loaded). Released before the registry forgets the
-            # thread, so `_preload is None` means it is done with everything.
-            release_mlx_thread_state()
+            # No mlx release here: get() loads on a thread of its own (see
+            # _load), which releases its streams before it exits, and this
+            # thread touched nothing.
             with self._lock:
                 self._preload = None
 
@@ -710,4 +748,9 @@ class EngineManager:
                 int8 = self._engine.int8_prefill_status
                 if int8 is not None:
                     out["int8_prefill"] = dict(int8)
+                # Which side supplies the rotary positions behind a warm
+                # cache: the load line says it once, this says it for as long
+                # as the model is resident.
+                if self._engine.positions is not None:
+                    out["positions"] = self._engine.positions
             return out

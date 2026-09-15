@@ -69,6 +69,11 @@ class VLMEngine:
 
         self.model_id = model_id
         self._model, self._processor = load(model_id)
+        # Which side owns the rotary positions, decided once here — before
+        # any turn, and on the loading thread — so the model-load line records
+        # it and _positions never re-asks: the engine's when the text-only
+        # embedding helper returns positions of its own, the model's otherwise.
+        self._positional = self._helper_returns_positions()
         # Before the drafter loads (so it is never tagged) and before the cache
         # budget is measured (so warm-up temporaries are already released).
         self.int8_prefill_status = int8prefill.enable(self._model, enabled=int8_prefill)
@@ -95,6 +100,12 @@ class VLMEngine:
         self._cache = PrefixCache(
             self, enabled=prompt_cache, max_bytes=cache_budget, reserve_bytes=reserve_bytes
         )
+
+    @property
+    def positions(self) -> str:
+        """Which side supplies the rotary positions behind a warm cache — the
+        model-load line's and the status document's `positions` token."""
+        return "engine" if self._positional else "model"
 
     def _loaded(self) -> tuple:
         """The (model, processor) pair, or a clear error if already unloaded.
@@ -177,7 +188,81 @@ class VLMEngine:
             verbose=False,
             prompt_cache=cache,
             input_ids=mx.array(token_ids)[None],
+            **self._positions(cache, len(token_ids)),
         )
+
+    def _positions(self, cache: list, n_tokens: int) -> dict[str, Any]:
+        """Explicit rotary positions for `n_tokens` appended behind `cache`,
+        or nothing for a model whose embedding helper returns none.
+
+        Load-bearing, not belt and braces: mlx-vlm's text-only embedding
+        helper returns positions local to the ids it is given, generate_step
+        merges them into the model's kwargs, and a Qwen-style language model
+        slices that array at its cache offset — past its end for any
+        continuation generate_step chunks — so the fused MRoPE kernel reads a
+        zero-length buffer out of bounds and every continued token lands at
+        position 0 (keys off by 127–170 % on the default model). The array
+        is absolute from 0 because the model always slices at its own cache
+        offset, whether the prompt reaches it in one call or in chunks that
+        all receive the same kwargs; a suffix-only array is sliced past its
+        end the same way. `rope_deltas` travels with it so the engine, not
+        the helper, owns the delta the model adopts into the state a drafter
+        run nulls and positions the generated tokens from — today the helper's
+        own text-only delta is the same zero, so this guards the helper that
+        returns positions without one, after which the model would have no
+        delta at all. Both arrays are the text-only special case of the
+        model's `get_rope_index`: a prompt carrying pixels needs the helper's
+        grid-aware positions instead, and this override would hide them."""
+        import mlx.core as mx
+
+        if not self._positional:
+            return {}
+        # The attention layers share one offset; a recurrent layer has none
+        # (the same read promptcache.snapshot makes). The max only sizes the
+        # array — the model slices it at its own offset — so reading a layer
+        # that counts more than the model's does is harmless, and none counts
+        # less.
+        offset = max((int(getattr(c, "offset", 0) or 0) for c in cache), default=0)
+        return {
+            "position_ids": mx.arange(offset + n_tokens, dtype=mx.int32)[None],
+            "rope_deltas": mx.zeros((1, 1), dtype=mx.int32),
+        }
+
+    def _helper_returns_positions(self) -> bool:
+        """Whether this model's text-only embedding helper returns rotary
+        positions, probed with a single token; __init__ memoises the answer.
+        The families that do (the Qwen lineage) are exactly the ones whose
+        language model slices a caller's positions at its cache offset; the
+        others derive `cache_offset + rope_deltas` themselves and consume a
+        caller's array verbatim in their own rank, so handing them an absolute
+        rank-2 array would be an index error, not a repair. Called once, at
+        load, never from a turn: several helpers outside that lineage null the
+        language model's rotary state as a side effect of running."""
+        import mlx.core as mx
+
+        model, _ = self._loaded()
+        try:
+            # generate_step's positional and `mask` shape for a text-only
+            # prompt (the second positional is pixel_values), so a helper this
+            # cannot run is one no real turn could run either. A turn also
+            # splats the engine's own position_ids/rope_deltas into this call;
+            # every 0.7.x helper that returns positions declares **kwargs and
+            # ignores them.
+            out = model.get_input_embeddings(mx.zeros((1, 1), dtype=mx.int32), None, mask=None)
+        except Exception as e:  # noqa: BLE001 — degrade, never block the model
+            # A helper that cannot run text-only raises on every real turn
+            # too, so nothing is lost by answering "model" here. What this
+            # branch really covers is a probe that failed for some other
+            # reason, and for a model whose helper returns positions that
+            # answer mispositions every continuation — say so.
+            warnings.warn(
+                f"sous: could not probe {self.model_id}'s embedding helper for rotary"
+                f" positions ({e}); continuations fall back to the model's own positions,"
+                " which are wrong for a model whose helper returns them",
+                stacklevel=2,
+            )
+            return False
+        return getattr(out, "position_ids", None) is not None
 
     def decode(
         self, cache: list, token_ids: list[int], max_tokens: int, on_delta: OnDelta | None = None
@@ -205,10 +290,9 @@ class VLMEngine:
         tokenizer = getattr(processor, "tokenizer", processor)
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
         chunks: list[str] = []
-        # prompt_cache plus input_ids, not prompt_cache_state. mlx-vlm primes
-        # Qwen mRoPE state before feeding a suffix, and that priming turns out
-        # to be bit-identical to no priming for text-only prompts — so sous
-        # owns the cache outright rather than driving mlx-vlm's reuse path.
+        # prompt_cache plus input_ids, not prompt_cache_state: sous owns the
+        # cache outright rather than driving mlx-vlm's reuse path, and so
+        # also owns the positions the suffix is encoded at (_positions).
         for r in stream_generate(
             model,
             processor,
@@ -218,6 +302,7 @@ class VLMEngine:
             verbose=False,
             prompt_cache=cache,
             input_ids=mx.array(token_ids)[None],
+            **self._positions(cache, len(token_ids)),
             **draft_kwargs,
         ):
             # Draft rows are the speculator's proposals, not accepted output;

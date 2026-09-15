@@ -1,3 +1,5 @@
+from typing import cast
+
 import pytest
 
 pytestmark = pytest.mark.model
@@ -87,6 +89,97 @@ def test_vlm_snapshot_restore_is_bit_exact(model_id, is_hybrid):
             d = mx.max(mx.abs(xa.astype(mx.float32) - xb.astype(mx.float32)))
             mx.eval(d)
             assert d.item() == 0.0
+    e.unload()
+
+
+@pytest.mark.parametrize(
+    ("model_id", "is_hybrid"),
+    [
+        pytest.param(TINY_VLM, False, id="pure-attention"),
+        pytest.param(HYBRID_VLM, True, id="linear-attention-hybrid"),
+    ],
+)
+def test_vlm_a_continuation_is_positioned_behind_its_cache(model_id, is_hybrid):
+    """A key is rotated by its position before it is cached, so a token fed
+    behind a warm cache must get the key the same token gets when the whole
+    prompt is prefilled in one pass from position 0. Both continuation paths
+    must hold it: the prefill of a suffix (a warm turn's new tokens, the tail
+    behind a fork boundary) and the decode of the generation block.
+
+    Greedy text is no witness — a mispositioned generation block has
+    reproduced the one-pass reference's words exactly — so this compares
+    cached keys, measured as max |got − want| / max |want| over the tail's
+    positions. Which layers depends on the cache shape. A pure-attention
+    model has nothing but attention layers between a one-pass and a split
+    prefill, so every layer is comparable: 0.004 fixed against 1.23 unfixed
+    on Qwen2-VL-2B (its first layer alone barely moves, 0.02 unfixed — every
+    other layer does). A hybrid's recurrent layers drift between the two
+    prefills for reasons that have nothing to do with positions, and the
+    deeper attention layers compound that drift into tens of percent, so
+    there only the first attention layer is read: 0.009 fixed against 1.08
+    unfixed on Qwen3.5-9B. The bound sits an order of magnitude above the
+    fixed values and below the defect on both. Those values were measured over
+    the tail; the decode half also reads the generated tokens' keys, which
+    ride the same bound on the argument that both greedy runs picked the
+    same tokens — asserted, not assumed, so a divergence names itself instead
+    of reading as a positions regression."""
+    import mlx.core as mx
+
+    from sous.engine.promptcache import fork_copy
+    from sous.engine.vlm import VLMEngine
+
+    e = VLMEngine(model_id, temperature=0.0)
+    assert e.positions == "engine"
+    ids = e._encode("def f(x):\n    return x + 1\n" * 40)
+    cut = len(ids) - 9
+    head, tail = ids[:cut], ids[cut:]
+    # Generated tokens are positioned by the model from its cache offset and
+    # the delta it adopted from the engine, not from position_ids — so the
+    # decode path is witnessed through the tail AND a few tokens past it.
+    generated = 4
+
+    whole = e.new_cache()
+    e.prefill(whole, ids)
+    warm = e.new_cache()
+    e.prefill(warm, head)
+
+    # Only an attention layer holds keys; a recurrent layer's state has no
+    # positions to check. On the hybrid, only the first attention layer.
+    attention = [i for i, c in enumerate(whole) if getattr(c, "keys", None) is not None]
+    if is_hybrid:
+        assert len(attention) < len(whole)
+        attention = attention[:1]
+    else:
+        assert len(attention) == len(whole)
+
+    def attention_keys(cache, stop):
+        return [cache[i].keys[..., cut:stop, :].astype(mx.float32) for i in attention]
+
+    def worst(cache, want, stop):
+        return max(
+            cast("float", (mx.abs(got - w).max() / mx.abs(w).max()).item())
+            for got, w in zip(attention_keys(cache, stop), want, strict=True)
+        )
+
+    continued = e.new_cache()
+    fork_copy(warm, continued, e.copy_array)
+    e.prefill(continued, tail)
+    assert worst(continued, attention_keys(whole, len(ids)), len(ids)) < 0.1
+
+    # The decode reference runs the whole prompt through the same path in one
+    # pass. The tail's keys are the measured comparison; the generated
+    # tokens' keys are comparable only if both greedy runs picked the same
+    # tokens, which the text assertion below checks before they are read.
+    reference = e.new_cache()
+    ref_text = e.decode(reference, ids, generated)
+    decoded = e.new_cache()
+    fork_copy(warm, decoded, e.copy_array)
+    got_text = e.decode(decoded, tail, generated)
+    stop = len(ids) + generated
+    assert all(cache[attention[0]].offset == stop for cache in (reference, decoded))
+    assert worst(decoded, attention_keys(reference, len(ids)), len(ids)) < 0.1
+    assert got_text == ref_text, f"continuations diverged: {got_text!r} != {ref_text!r}"
+    assert worst(decoded, attention_keys(reference, stop), stop) < 0.1
     e.unload()
 
 
