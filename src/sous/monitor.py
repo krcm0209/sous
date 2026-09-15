@@ -31,33 +31,58 @@ _logger = logging.getLogger("sous.monitor")
 
 # A hold body is two numbers; anything larger is not one.
 HOLD_BODY_LIMIT = 1024
-# The event stream polls the registry's version this often: a burst of
-# changes inside one tick is one event, and a change is on the wire within
-# a tick. Ten a second is what a terminal can show and what a token-per-
-# delta feed produces at the default model's decode speed.
+# The event stream polls the composite version the service hands it — the
+# in-flight registry, the engine manager and the task store — this often: a
+# burst of changes inside one tick is one event, and a change is on the wire
+# within a tick. Ten a second is what a terminal can show and what a
+# token-per-delta feed produces at the default model's decode speed.
 EVENT_TICK_SECONDS = 0.1
-# Engine state (a load starting, a holder leaving, the idle clock) is not
-# in the registry, so the document also goes out this often unchanged.
+# While a turn is in flight, a delegated task is running or a load is
+# under way the document also goes out this often unchanged: the terminal
+# reads a silent stream during a turn as a stalled daemon, a prefill runs
+# for a minute without a registry change, and a task's clock and the cache
+# counters it moves are in the document while the worker writes the store
+# once per tool call. Idle there is no heartbeat at all — a load, a hold
+# and a task change bump a version of their own, and the idle clock is the
+# terminal's to run.
 EVENT_HEARTBEAT_SECONDS = 1.0
+# Idle — no turn in flight, no load under way — nothing on the registry
+# moves without a turn starting, so the poll slows to this: a new order is
+# on screen within half a second, and the loop costs a fifth of the 10 Hz
+# one. Busy, the fast tick is what puts a token delta on the wire in time.
+EVENT_IDLE_TICK_SECONDS = 0.5
+
+
+def _busy(document: dict) -> bool:
+    # A delegated task counts: the worker never writes the registry, and
+    # `running` includes a task awaiting approval, whose clock runs too.
+    engine = document.get("engine") or {}
+    queue = document.get("queue") or {}
+    return bool(document.get("inflight") or queue.get("running") or engine.get("loading"))
 
 
 async def _status_events(
     status: Callable[[], dict], version: Callable[[], object]
 ) -> AsyncIterator[ServerSentEvent]:
-    """The document now, then again whenever the registry changed since the
-    last one went out — checked every tick — and at least once a heartbeat
-    regardless. Built on a worker thread each time. Nothing is buffered for
-    a client that is gone: the response cancels this generator on
-    disconnect, and the tick's sleep is where that lands. A failure building
-    or encoding the document ends the stream rather than raising through
-    uvicorn: the client sees the connection close and redials, the same as
-    any other daemon failure logs its type and never its message."""
+    """The document now, then again whenever `version()` moved since the
+    last one went out — checked every tick — and, only while the last
+    document showed a turn, a running task or a load, at least once a
+    heartbeat regardless.
+    Built on a worker thread each time. Nothing is buffered for a client
+    that is gone: the response cancels this generator on disconnect, and
+    the tick's sleep is where that lands. A failure building or encoding
+    the document ends the stream rather than raising through uvicorn: the
+    client sees the connection close and redials, the same as any other
+    daemon failure logs its type and never its message."""
     seen: object = None  # nothing sent yet, whatever the clock says
     sent = time.monotonic()
+    busy = True
     while True:
+        # Read before the build, not after: a change landing during it is
+        # then a newer value on the next check, never one masked.
         current = version()
         now = time.monotonic()
-        if current != seen or now - sent >= EVENT_HEARTBEAT_SECONDS:
+        if current != seen or (busy and now - sent >= EVENT_HEARTBEAT_SECONDS):
             try:
                 document = await run_sync(status)
                 # Encoded under the same guard, and as strictly as /sous/status
@@ -70,7 +95,8 @@ async def _status_events(
                 return
             yield ServerSentEvent(event="status", data=data, sep=_SEP)
             seen, sent = current, now
-        await asyncio.sleep(EVENT_TICK_SECONDS)
+            busy = _busy(document)
+        await asyncio.sleep(EVENT_TICK_SECONDS if busy else EVENT_IDLE_TICK_SECONDS)
 
 
 def _refused(e: RequestError) -> Response:

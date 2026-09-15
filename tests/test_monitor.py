@@ -27,17 +27,30 @@ from tests.fake_upstream import FakeUpstream
 
 
 def _app(
-    tmp_path: Path, *, gateway_enabled: bool = False, upstream=None, alive=None, inflight=None
+    tmp_path: Path,
+    *,
+    gateway_enabled: bool = False,
+    upstream=None,
+    alive=None,
+    inflight=None,
+    factory=None,
+    store=None,
+    idle_minutes=None,
 ):
     cfg = SousConfig(
         data_dir=tmp_path / "data",
         config_path=tmp_path / "config.toml",
         gateway_enabled=gateway_enabled,
+        **({} if idle_minutes is None else {"idle_unload_minutes": idle_minutes}),
     )
     engines = EngineManager(
-        cfg, engine_factory=lambda mid: FakeEngine([]), holder_alive=alive or (lambda pid, ct: True)
+        cfg,
+        engine_factory=factory or (lambda mid: FakeEngine([])),
+        holder_alive=alive or (lambda pid, ct: True),
     )
-    store = TaskStore(tmp_path / "tasks.db")
+    # The version counter is per instance, so a test that writes to the store
+    # must write through the app's own, the way `inflight=` hands in a registry.
+    store = store or TaskStore(tmp_path / "tasks.db")
     upstream = upstream or FakeUpstream().upstream()
     server = create_server(store, engines, cfg, upstream=upstream, inflight=inflight)
     return server.streamable_http_app(), engines
@@ -287,11 +300,14 @@ def _frames(text: str) -> list[tuple[str, dict]]:
     return out
 
 
-def _collect_events(app, *, want: int, seconds: float = 3.0, headers=(), during=None) -> list:
+def _collect_events(
+    app, *, want: int | None, seconds: float = 3.0, headers=(), during=None
+) -> list:
     """GET /sous/events straight through the ASGI app — httpx's transport
     buffers a response to its end, and this one has none — until `want`
-    non-ping frames have arrived, then disconnect and wait for the handler
-    to finish. `during(loop)` runs once the first frame is in."""
+    non-ping frames have arrived — or, with `want=None`, for `seconds`
+    regardless — then disconnect and wait for the handler to finish.
+    `during(loop)` runs once the first frame is in."""
 
     async def go():
         scope = {
@@ -324,12 +340,15 @@ def _collect_events(app, *, want: int, seconds: float = 3.0, headers=(), during=
                 frames = _frames(b"".join(chunks).decode())
                 if len(frames) == 1 and during is not None:
                     during()
-                if len([f for f in frames if f[0] != "ping"]) >= want:
+                if want is not None and len([f for f in frames if f[0] != "ping"]) >= want:
                     got.set()
 
         task = asyncio.create_task(app(scope, receive, send))
         try:
-            if want:
+            if want is None:
+                # A quiet stream: nothing to wait for but the clock.
+                await asyncio.sleep(seconds)
+            elif want:
                 await asyncio.wait_for(got.wait(), seconds)
             else:
                 # A refused request completes on its own; nothing to wait for.
@@ -379,22 +398,118 @@ def test_events_follow_registry_changes_coalesced(tmp_path: Path, monkeypatch):
     assert [t["id"] for t in statuses[-1]["inflight"]] == ["msg_last"]
 
 
-def test_events_beat_once_a_second_when_nothing_changes(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(monitor, "EVENT_HEARTBEAT_SECONDS", 0.2)
+def test_a_quiet_daemon_sends_no_status_frame_between_pings(tmp_path: Path, monkeypatch):
+    """The heartbeat cost an idle daemon a document rebuild a second per
+    connected terminal — a quarter of a percent of a core each, for a clock
+    the terminal can run itself. Idle, only the ping goes out."""
+    monkeypatch.setattr(monitor, "EVENT_PING_SECONDS", 0.2)
+    monkeypatch.setattr(monitor, "EVENT_IDLE_TICK_SECONDS", 0.05)
     app, _ = _app(tmp_path)
+    _, frames = _collect_events(app, want=None, seconds=1.2)
+    assert [e for e, _ in frames if e == "status"] == ["status"]
+    assert len([e for e, _ in frames if e == "ping"]) >= 3
+
+
+def test_events_beat_once_a_second_while_a_turn_is_in_flight(tmp_path: Path, monkeypatch):
+    """The terminal reads a silent stream during a turn as a stalled daemon
+    (a prefill can run for a minute without a registry change), so the
+    heartbeat stays for as long as a document shows a turn."""
+    monkeypatch.setattr(monitor, "EVENT_HEARTBEAT_SECONDS", 0.2)
+    registry = Inflight()
+    registry.begin("msg_1", model="sous-local", stream=True, max_tokens=1)
+    app, _ = _app(tmp_path, inflight=registry)
     started = time.monotonic()
     _, frames = _collect_events(app, want=3)
     assert len([e for e, _ in frames if e == "status"]) >= 3
     assert time.monotonic() - started < 2.0
 
 
+def test_events_beat_while_a_delegated_task_is_running(tmp_path: Path, monkeypatch):
+    """The worker writes the store once per tool call, but the task's own
+    clock and the cache counters it moves are in the document: a running
+    task keeps the heartbeat the way a gateway turn does."""
+    monkeypatch.setattr(monitor, "EVENT_HEARTBEAT_SECONDS", 0.2)
+    store = TaskStore(tmp_path / "tasks.db")
+    app, _ = _app(tmp_path, store=store)
+    store.enqueue("t", "do it", str(tmp_path), [], [])
+    assert store.claim_next() is not None
+    started = time.monotonic()
+    _, frames = _collect_events(app, want=3)
+    statuses = [d for e, d in frames if e == "status"]
+    assert len(statuses) >= 3 and all(d["queue"]["running"] == 1 for d in statuses)
+    assert time.monotonic() - started < 2.0
+
+
+def test_events_beat_while_a_load_is_under_way(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(monitor, "EVENT_HEARTBEAT_SECONDS", 0.2)
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_factory(model_id: str):
+        started.set()
+        release.wait(5.0)
+        return FakeEngine([])
+
+    app, engines = _app(tmp_path, factory=slow_factory)
+    loader = threading.Thread(target=engines.get, daemon=True)
+    loader.start()
+    assert started.wait(2.0)
+    try:
+        _, frames = _collect_events(app, want=3)
+    finally:
+        release.set()
+        loader.join(5.0)
+    statuses = [d for e, d in frames if e == "status"]
+    assert len(statuses) >= 3 and all(d["engine"]["loading"] for d in statuses[:2])
+
+
+def test_a_load_a_hold_a_release_a_task_change_and_an_unload_each_reach_the_client(
+    tmp_path: Path, monkeypatch
+):
+    """None of these is a registry change; each used to ride the heartbeat."""
+    monkeypatch.setattr(monitor, "EVENT_HEARTBEAT_SECONDS", 60.0)
+    monkeypatch.setattr(monitor, "EVENT_IDLE_TICK_SECONDS", 0.05)
+    alive = {"ok": True}
+    store = TaskStore(tmp_path / "tasks.db")
+    app, engines = _app(
+        tmp_path, alive=lambda pid, started: alive["ok"], store=store, idle_minutes=0
+    )
+
+    def load() -> None:
+        engines.get()
+
+    _, frames = _collect_events(app, want=2, during=load)
+    assert [d["engine"]["loaded"] for e, d in frames if e == "status"] == [False, True]
+
+    _, frames = _collect_events(app, want=2, during=lambda: engines.hold(4242, 1.0))
+    assert [d["engine"]["holders"] for e, d in frames if e == "status"] == [0, 1]
+
+    def release() -> None:
+        alive["ok"] = False
+        # A departed holder is pruned inside engines.status(), which only a
+        # document build calls — and a build needs a version change to cause
+        # it. The launcher's own poll and the worker's sweep do this read.
+        engines.status()
+
+    _, frames = _collect_events(app, want=2, during=release)
+    assert [d["engine"]["holders"] for e, d in frames if e == "status"][-1] == 0
+
+    _, frames = _collect_events(
+        app, want=2, during=lambda: store.enqueue("t", "do it", str(tmp_path), [], [])
+    )
+    assert [d["queue"]["queued"] for e, d in frames if e == "status"] == [0, 1]
+
+    time.sleep(0.01)  # idle_unload_minutes=0 still needs the clock to have moved
+    _, frames = _collect_events(app, want=2, during=engines.unload_if_idle)
+    assert [d["engine"]["loaded"] for e, d in frames if e == "status"] == [True, False]
+
+
 def test_events_ping_on_the_configured_cadence(tmp_path: Path, monkeypatch):
-    """The heartbeat keeps status frames flowing so the collector stays
-    connected past the first ping; the ping itself is sse-starlette's."""
+    """The ping is sse-starlette's, on the shared interval, whether or not
+    a document goes out."""
     monkeypatch.setattr(monitor, "EVENT_PING_SECONDS", 0.2)
-    monkeypatch.setattr(monitor, "EVENT_HEARTBEAT_SECONDS", 0.15)
     app, _ = _app(tmp_path)
-    _, frames = _collect_events(app, want=3, seconds=3.0)
+    _, frames = _collect_events(app, want=None, seconds=0.7)
     assert ("ping", {"type": "ping"}) in frames
 
 
