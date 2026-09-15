@@ -531,15 +531,15 @@ async def sse_feed(port: int) -> AsyncIterator[tuple[str, dict]]:
 
 
 # --- widgets ------------------------------------------------------------------------------
-# The feed sends a status document every second whether or not anything on it
-# moved, and a document is applied to every widget at once. Textual's
-# `Static.update` re-parses the text, drops the cached dimensions and lays the
-# region out again whatever it is handed, and the border-title setter refreshes
-# on every assignment: a heartbeat that changed only the idle clock cost
-# fifteen repaints. The compare therefore lives at the widget boundary — one
-# place, no caller to remember it, and no cached copy of the document, which
-# would have to be invalidated for the clock and the one or two lines that
-# genuinely tick.
+# The feed sends a status document whenever something on it moved — while a
+# turn is in flight, every second — and a document is applied to every widget
+# at once. Textual's `Static.update` re-parses the text, drops the cached
+# dimensions and lays the region out again whatever it is handed, and the
+# border-title setter refreshes on every assignment: a heartbeat that changed
+# only the idle clock cost fifteen repaints. The compare therefore lives at the
+# widget boundary — one place, no caller to remember it, and no cached copy of
+# the document, which would have to be invalidated for the clock and the one or
+# two lines that genuinely tick.
 
 
 class Line(Static):
@@ -1445,6 +1445,9 @@ class Top(App[int]):
         self._turn: dict | None = None
         self._behind: list[dict] = []
         self._received_at = 0.0
+        # The idle second last painted, so the tick repaints the clock's
+        # lines once a second and never twice for the same words.
+        self._idle_shown: int | None = None
         self._connected = False
         self._ever_connected = False
         self._attempt = 0
@@ -1583,7 +1586,13 @@ class Top(App[int]):
             self._retry_at = None
             for selector in ("#right", "#rail", "#tasks"):
                 self.query_one(selector).remove_class("stale")
-        engine = document.get("engine") or {}
+        # On a fresh document the offset is zero; on a resize it is the
+        # clock already on screen, never the document's older one.
+        engine = self._engine_now(now)
+        # The document paints its own second; the tick repaints only once
+        # the clock has moved past it.
+        idle_now = engine.get("idle_seconds")
+        self._idle_shown = int(idle_now) if idle_now is not None else None
         config = document.get("config") or {}
         inflight = document.get("inflight") or []
         recent = document.get("recent_turns") or []
@@ -1641,10 +1650,12 @@ class Top(App[int]):
         if self._ticker is not None:
             self._ticker.resume() if busy else self._ticker.pause()
         if self._idler is not None:
-            # Disconnected, the idle tick is the only thing that moves the
-            # redial countdown, so it keeps running with the motion off.
-            idle = not busy and (self.motion or not self._connected)
-            self._idler.resume() if idle else self._idler.pause()
+            # Idle against a live daemon the tick runs the idle clock — the
+            # daemon sends no document while nothing moves — and
+            # disconnected it is the only thing that moves the redial
+            # countdown, so it runs whenever nothing is on the pass, with
+            # the motion flag deciding only what it animates.
+            self._idler.resume() if not busy else self._idler.pause()
 
     def _mood(self, engine: dict, now: float) -> str:
         if not self._connected:
@@ -1750,7 +1761,7 @@ class Top(App[int]):
                 rate = f" {view.tps:.1f}t/s" if view.tps else ""
                 footer.show(f" {view.word} {gen}{rate} {clock_text(view.elapsed)}  q")
             elif self._connected:
-                engine = self._document.get("engine") or {}
+                engine = self._engine_now(now)
                 footer.show(f" {QUIET_WORD} {span_text(engine.get('idle_seconds') or 0)}  q")
             else:
                 footer.show(f" {CLOSED_WORD}  q")
@@ -1788,21 +1799,58 @@ class Top(App[int]):
             # left to draw on.
             return
 
+    def _engine_now(self, now: float) -> dict:
+        """The last document's engine block with its idle clock advanced by
+        the time since that document arrived. The daemon sends no document
+        while nothing moves, so between them the clock is the terminal's;
+        anything that would reset it (a turn, a hold leaving) is a document."""
+        engine = dict(self._document.get("engine") or {})
+        idle = engine.get("idle_seconds")
+        if idle is not None and self._connected:
+            engine["idle_seconds"] = idle + max(0.0, now - self._received_at)
+        return engine
+
+    def _show_idle(self, engine: dict, now: float) -> None:
+        """Repaint the lines that show the idle clock — the quiet card's
+        span, its lights-out countdown and its `since …` subtitle, THE
+        LINE's subtitle, the headline, the narrow footer — from the
+        advanced clock. Each widget skips text that did not change, so
+        this is three or four repaints a second."""
+        document = self._document
+        config = document.get("config") or {}
+        recent = document.get("recent_turns") or []
+        queue = document.get("queue") or {}
+        card = self.query_one(Card)
+        if card.display and not engine.get("loading"):
+            card.show_quiet(engine, config, recent, now, self.motion)
+        mood = self._mood(engine, now)
+        self.query_one(LinePanel).show(mood, engine, config, queue, recent, now, self.motion)
+        headline, colour = self._headline(engine, recent, now)
+        self.query_one(Strip).show(headline, colour)
+        self._refresh_footer()
+
     def _idle_tick(self) -> None:
         now = self._clock()
         try:
-            engine = self._document.get("engine") or {}
+            engine = self._engine_now(now)
             mood = self._mood(engine, now)
             self.query_one("#line-chef", Chef).show(mood, now, motion=self.motion)
             card = self.query_one(Card)
             if card.display:
                 # Only the chef's motion, the pot's steam, and — disconnected
                 # — the redial/closed countdown, never the rest of the
-                # card's text: that only a real document or retry changes,
-                # and rebuilding it twice a second is the idle tick's whole
-                # CPU budget gone on a picture that hasn't moved.
+                # card's text: that only a real document, a retry or the
+                # idle clock's next second changes.
                 wait = max(0.0, (self._retry_at or now) - now) if not self._connected else None
                 card.tick(now, motion=self.motion, wait=wait)
+            if self._connected and self._turn is None and engine.get("idle_seconds") is not None:
+                second = int(engine["idle_seconds"])
+                if second != self._idle_shown:
+                    self._idle_shown = second
+                    # The whole second, so the span and the countdown it is
+                    # subtracted from never disagree by one.
+                    engine["idle_seconds"] = float(second)
+                    self._show_idle(engine, now)
         except NoMatches:
             return
 

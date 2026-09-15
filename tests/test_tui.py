@@ -395,7 +395,8 @@ def _run(test, *, size=(100, 30), clock=None):
     return asyncio.run(go())
 
 
-async def _deliver(feed: Feed, pilot, document: dict) -> None:
+async def _deliver(feed: Feed, pilot, document: dict | None) -> None:
+    """A document, or None to drop the stream, and time for it to land."""
     await feed.queue.put(document)
     await pilot.pause(0.15)
 
@@ -553,11 +554,20 @@ def test_a_quiet_kitchen_shows_the_card_and_stops_the_ticker():
     _run(test)
 
 
-def test_a_quiet_kitchens_idle_tick_only_moves_the_steam():
+def test_a_quiet_kitchens_idle_tick_moves_the_steam_and_the_clock():
+    """The daemon sends no document while nothing moves, so the idle clock
+    is the terminal's to run: from the last document's idle_seconds plus
+    the time since it arrived, advanced on the idle tick, and painted only
+    when the second it shows changes."""
+
     async def test(app, pilot, feed, clock):
         await _deliver(feed, pilot, _doc(_turn()))
-        await _deliver(feed, pilot, _doc(None, recent=RECENT))
+        document = _doc(None, recent=RECENT)
+        document["engine"]["holders"] = 0  # the countdown is drawn only unheld
+        await _deliver(feed, pilot, document)
         body = _plain(app, "#card-body")
+        assert "no orders on the rail for 4m 12s" in body
+        assert "LIGHTS OUT in 25m 48s" in body
         steam_0 = _plain(app, "#card-art")
         clock.now = BASE + 0.5
         await pilot.pause(0.6)
@@ -568,7 +578,15 @@ def test_a_quiet_kitchens_idle_tick_only_moves_the_steam():
         await pilot.pause(0.6)
         steam_2 = _plain(app, "#card-art")
         assert steam_2 == steam_0 and steam_2 != steam_1
-        assert _plain(app, "#card-body") == body
+        body_1 = _plain(app, "#card-body")
+        assert "no orders on the rail for 4m 13s" in body_1
+        assert "LIGHTS OUT in 25m 47s" in body_1
+        assert "idle 4m 13s" in app.query_one(tui.LinePanel).border_subtitle
+        assert "KITCHEN QUIET 4m 13s" in app.query_one(tui.Strip).render().plain
+        # Below 60 columns the footer is the only clock on screen.
+        app._width = 50
+        app._refresh_footer()
+        assert _plain(app, "#footer") == " KITCHEN QUIET 4m 13s  q"
 
     _run(test)
 
@@ -629,11 +647,11 @@ def test_live_rates_are_the_last_sixty_seconds_not_the_last_sixty_samples():
     _run(test, size=(120, 30))
 
 
-def test_a_heartbeat_repaints_only_the_lines_whose_words_changed(monkeypatch):
-    """The feed sends a status document every second whether or not anything
-    on it moved. A quiet kitchen's heartbeat changes the idle clock and
-    nothing else, and only the lines that show that clock may cost a
-    repaint — a whole screen redrawn every second is 2–6% of a core."""
+def test_the_idle_tick_repaints_only_the_lines_whose_clock_changed(monkeypatch):
+    """A whole screen redrawn every second is 2–6 % of a core. With motion
+    off the idle tick still runs against a live daemon — the clock must
+    move — but it may repaint only the lines that show the clock, and only
+    when the second they show changes."""
     painted: list[str] = []
     real_refresh = tui.Widget.refresh
 
@@ -642,22 +660,24 @@ def test_a_heartbeat_repaints_only_the_lines_whose_words_changed(monkeypatch):
         return real_refresh(self, *args, **kwargs)
 
     async def test(app, pilot, feed, clock):
-        # Motion off parks the idle tick against a live daemon, so every
-        # repaint counted below is the document's own: the chef holds still
-        # and the pot's steam does not move.
         app.motion = False
         await _deliver(feed, pilot, _doc(None, recent=RECENT))
         await _deliver(feed, pilot, _doc(None, recent=RECENT))
-        assert app._idler is not None and not app._idler._active.is_set()
+        assert app._idler is not None and app._idler._active.is_set()
         assert "no orders on the rail for 4m 12s" in _plain(app, "#card-body")
         monkeypatch.setattr(tui.Widget, "refresh", spy)
         await _deliver(feed, pilot, _doc(None, recent=RECENT))
         assert painted == [], f"a document that changed nothing repainted {painted}"
+        clock.now = BASE + 0.5
+        await pilot.pause(0.6)
+        assert painted == [], f"a tick inside the same second repainted {painted}"
         for n in (1, 2, 3):
             painted.clear()
-            await _deliver(feed, pilot, _doc(None, recent=RECENT, idle_seconds=252.0 + n))
-            assert len(painted) <= 3, painted
-            assert "Line#card-body" in painted, painted
+            clock.now = BASE + n
+            await pilot.pause(0.6)
+            # The card's own `since …` subtitle counts up with the same clock.
+            assert len(painted) <= 4, painted
+            assert "Line#card-body" in painted and "Card#card" in painted, painted
             assert f"no orders on the rail for 4m {12 + n}s" in _plain(app, "#card-body")
         # The memo is at the widget, not over the document: a turn arriving
         # still draws the slip.
@@ -666,6 +686,22 @@ def test_a_heartbeat_repaints_only_the_lines_whose_words_changed(monkeypatch):
         assert "Line#headline" in painted and "Slip#slip" in painted, painted
         assert app.query_one(tui.Slip).display
         assert _plain(app, "#headline").startswith(" PLATING  decode 412 tok")
+
+    _run(test)
+
+
+def test_the_idle_clock_does_not_run_while_the_feed_is_down():
+    """A stale document's idle clock is a number about a daemon that is
+    gone; the card shows the redial countdown instead, and the panel
+    subtitle says when the document arrived."""
+
+    async def test(app, pilot, feed, clock):
+        await _deliver(feed, pilot, _doc(None, recent=RECENT))
+        await _deliver(feed, pilot, None)
+        clock.now = BASE + 2.0
+        await pilot.pause(0.6)
+        assert "4m 12s" not in _plain(app, "#card-body")
+        assert "as of" in app.query_one(tui.LinePanel).border_subtitle
 
     _run(test)
 
