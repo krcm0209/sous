@@ -70,6 +70,14 @@ class SousService:
         # The gateway's turns report here; create_server hands the same
         # registry to both, so the status document sees what the gateway does.
         self.inflight = inflight or Inflight()
+        # The status document is built up to ten times a second during a
+        # turn, and the task counts, the recent listing and the allowlist
+        # change only when a task or the config file does: each is read
+        # once per change and served from here in between. A whole tuple
+        # is replaced at once, so the builder threads never see half of one.
+        self._counts_cache: tuple[int, dict] | None = None
+        self._recent_cache: tuple[int, list[Task]] | None = None
+        self._allowlist_cache: tuple[int, list[list[str]]] | None = None
 
     def delegate_task(
         self,
@@ -241,6 +249,43 @@ class SousService:
             "seconds": round(end - t.started_at) if t.started_at else 0,
         }
 
+    def status_version(self) -> tuple[int, int, int]:
+        """What the event stream polls between documents: the in-flight
+        registry's version, the engine manager's and the task store's.
+        Three ints read without a lock; a change to any of them is a
+        document worth sending, and nothing else is."""
+        return (self.inflight.version, self.engines.version, self.store.version)
+
+    def _task_reads(self, *, recent: bool) -> tuple[dict, list[Task]]:
+        # The version is read before the queries, so a write that lands
+        # while they run is a newer number next time, never masked. Two
+        # slots: the narrow build (the MCP tool) never pays for a listing
+        # it does not show.
+        version = self.store.version
+        counts = self._counts_cache
+        if counts is None or counts[0] != version:
+            counts = (version, self.store.count_by_state())
+            self._counts_cache = counts
+        if not recent:
+            return counts[1], []
+        tasks = self._recent_cache
+        if tasks is None or tasks[0] != version:
+            tasks = (version, self.store.list_recent(limit=10))
+            self._recent_cache = tasks
+        return counts[1], tasks[1]
+
+    def _allowlist_now(self) -> list[list[str]]:
+        try:
+            stamp = self.config.config_path.stat().st_mtime_ns
+        except OSError:
+            stamp = -1  # no file: the defaults, which current_allowlist knows
+        cached = self._allowlist_cache
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        entries = current_allowlist(self.config.config_path)
+        self._allowlist_cache = (stamp, entries)
+        return entries
+
     def status_document(self, *, recent: bool) -> dict:
         """The one document every status surface serves. `recent` adds the
         last fifty turns and the last ten tasks — for the HTTP routes and
@@ -249,7 +294,7 @@ class SousService:
         SQLite, the engine's status takes its lock, and the registry's
         snapshot may call into the prompt cache."""
         try:
-            counts = self.store.count_by_state()
+            counts, tasks = self._task_reads(recent=recent)
             engine = self.engines.status()
             live = self.inflight.snapshot()
             # Last of all: the read releases this thread's mlx state, and the
@@ -277,7 +322,7 @@ class SousService:
                 "port": self.config.server_port,
                 "max_turns": self.config.max_turns,
                 "max_minutes": self.config.max_minutes,
-                "allowlist": current_allowlist(self.config.config_path),
+                "allowlist": self._allowlist_now(),
                 "context": {
                     "mode": self.config.context_mode,
                     "fraction": self.config.context_fraction,
@@ -296,9 +341,7 @@ class SousService:
         }
         if recent:
             document["recent_turns"] = live["recent_turns"]
-            document["recent_tasks"] = [
-                self._task_summary(t) for t in self.store.list_recent(limit=10)
-            ]
+            document["recent_tasks"] = [self._task_summary(t) for t in tasks]
         return document
 
     def server_status(self) -> dict:
@@ -463,7 +506,7 @@ def create_server(
     # with a catch-all that forwards upstream, and a /sous/ path must never
     # get there. Mounted whatever the gateway flag says — `sous claude`
     # asks /sous/status whether the gateway is on.
-    mount_monitor(mcp, engines, lambda: svc.status_document(recent=True), inflight)
+    mount_monitor(mcp, engines, lambda: svc.status_document(recent=True), svc.status_version)
     if config.gateway_enabled:
         mounted_gateway.append(
             mount_gateway(mcp, engines, config, upstream=upstream, inflight=inflight)

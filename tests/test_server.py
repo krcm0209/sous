@@ -870,3 +870,88 @@ def test_uvicorn_config_leaves_logging_to_the_daemon():
     cfg = uvicorn_config(object(), "127.0.0.1", 0)
     assert cfg.log_config is None
     assert cfg.access_log is False
+
+
+def test_status_version_is_the_three_counters(svc):
+    service, store, _ = svc
+    before = service.status_version()
+    assert before == (service.inflight.version, service.engines.version, store.version)
+    store.enqueue("t", "do it", "/tmp/nowhere", [], [])
+    after = service.status_version()
+    assert after[2] == before[2] + 1 and after[:2] == before[:2]
+
+
+def test_the_build_reads_the_task_store_only_when_it_changed(svc, monkeypatch):
+    """Ten documents a second during a turn opened twenty SQLite connections
+    a second for counts and a listing that change only when a task does."""
+    import sqlite3
+
+    service, store, root = svc
+    opened: list[str] = []
+    real_connect = sqlite3.connect
+
+    def counting(path, *args, **kwargs):
+        opened.append(str(path))
+        return real_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", counting)
+    service.status_document(recent=False)
+    assert len(opened) == 1, "the narrow build reads the counts and nothing else"
+    service.status_document(recent=True)
+    assert len(opened) == 2, "the wide build adds the listing, once"
+    service.status_document(recent=True)
+    service.status_document(recent=False)
+    assert len(opened) == 2, "a build with no task change opened a connection"
+    out = service.delegate_task("t", "do it", str(root))
+    opened.clear()
+    doc = service.status_document(recent=True)
+    assert opened, "a task change did not reach the build"
+    assert doc["queue"]["queued"] == 1
+    assert [t["id"] for t in doc["recent_tasks"]] == [out["task_id"]]
+
+
+def test_a_running_tasks_seconds_keep_moving_between_task_changes(svc, monkeypatch):
+    """What is cached is the rows, never the summaries: a running task's
+    `seconds` is the clock minus its start, and a cached summary froze it."""
+    from sous import server as server_module
+
+    service, store, root = svc
+    out = service.delegate_task("t", "do it", str(root))
+    task = store.claim_next()
+    assert task is not None and task.id == out["task_id"]
+    started = task.started_at
+    assert started is not None, "claim_next stamps started_at"
+    monkeypatch.setattr(server_module.time, "time", lambda: started + 5.0)
+    assert service.status_document(recent=True)["recent_tasks"][0]["seconds"] == 5
+    monkeypatch.setattr(server_module.time, "time", lambda: started + 9.0)
+    assert service.status_document(recent=True)["recent_tasks"][0]["seconds"] == 9
+
+
+def test_the_allowlist_is_reparsed_only_when_the_config_file_changed(svc, monkeypatch):
+    """An edit still takes effect on the next build — the file's mtime is
+    the key — but ten builds a second no longer parse TOML ten times."""
+    import os
+
+    from sous import server as server_module
+
+    service, _, _ = svc
+    parses: list[Path] = []
+    real = server_module.current_allowlist
+
+    def counting(path):
+        parses.append(path)
+        return real(path)
+
+    monkeypatch.setattr(server_module, "current_allowlist", counting)
+    assert service.status_document(recent=False)["config"]["allowlist"] == [["pytest"]]
+    service.status_document(recent=False)
+    assert len(parses) == 1
+    path = service.config.config_path
+    path.write_text('[commands]\nallowlist = ["pytest", "ruff"]\n')
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+    assert service.status_document(recent=False)["config"]["allowlist"] == [
+        ["pytest"],
+        ["ruff"],
+    ]
+    assert len(parses) == 2

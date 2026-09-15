@@ -22,7 +22,6 @@ from starlette.responses import JSONResponse, Response
 
 from sous.engine.base import EngineManager
 from sous.gateway.convert import RequestError, _invalid
-from sous.inflight import Inflight
 from sous.loopback import ALL_METHODS, check_loopback
 from sous.sse import PING as _PING
 from sous.sse import PING_INTERVAL_SECONDS as EVENT_PING_SECONDS
@@ -43,7 +42,7 @@ EVENT_HEARTBEAT_SECONDS = 1.0
 
 
 async def _status_events(
-    status: Callable[[], dict], inflight: Inflight
+    status: Callable[[], dict], version: Callable[[], object]
 ) -> AsyncIterator[ServerSentEvent]:
     """The document now, then again whenever the registry changed since the
     last one went out — checked every tick — and at least once a heartbeat
@@ -53,12 +52,12 @@ async def _status_events(
     or encoding the document ends the stream rather than raising through
     uvicorn: the client sees the connection close and redials, the same as
     any other daemon failure logs its type and never its message."""
-    seen: int | None = None  # None: nothing sent yet, whatever the clock says
+    seen: object = None  # nothing sent yet, whatever the clock says
     sent = time.monotonic()
     while True:
-        version = inflight.version
+        current = version()
         now = time.monotonic()
-        if version != seen or now - sent >= EVENT_HEARTBEAT_SECONDS:
+        if current != seen or now - sent >= EVENT_HEARTBEAT_SECONDS:
             try:
                 document = await run_sync(status)
                 # Encoded under the same guard, and as strictly as /sous/status
@@ -70,7 +69,7 @@ async def _status_events(
                 _logger.error(f"GET /sous/events failed ({type(e).__name__})")
                 return
             yield ServerSentEvent(event="status", data=data, sep=_SEP)
-            seen, sent = version, now
+            seen, sent = current, now
         await asyncio.sleep(EVENT_TICK_SECONDS)
 
 
@@ -129,15 +128,19 @@ async def _served(route: str, fn: Callable[..., dict], *args: object) -> Respons
 
 
 def mount_monitor(
-    mcp: MCPServer, engines: EngineManager, status: Callable[[], dict], inflight: Inflight
+    mcp: MCPServer,
+    engines: EngineManager,
+    status: Callable[[], dict],
+    version: Callable[[], object],
 ) -> None:
     """Register GET /sous/status, GET /sous/events, POST /sous/hold and a
     404 for every other /sous/ path. `status` builds the full status
-    document (recent turns and tasks included); `inflight` is the registry
-    whose version the event stream watches. The status and hold handlers
-    hand their work to a thread — status() reads the task store and hold()
-    takes the engine manager's lock, and neither belongs on the event loop —
-    and the event stream builds each of its documents the same way."""
+    document (recent turns and tasks included); `version` is what the event
+    stream polls — a value that differs from the last one whenever the
+    document would. The status and hold handlers hand their work to a
+    thread — status() reads the task store and hold() takes the engine
+    manager's lock, and neither belongs on the event loop — and the event
+    stream builds each of its documents the same way."""
     # sse-starlette logs every frame it sends at DEBUG — the status document,
     # verbatim, up to ten times a second — and the gateway's own pin of this
     # logger only runs when the gateway is mounted. /sous/events is mounted
@@ -157,7 +160,7 @@ def mount_monitor(
         except RequestError as e:
             return _refused(e)
         return EventSourceResponse(
-            _status_events(status, inflight),
+            _status_events(status, version),
             ping=EVENT_PING_SECONDS,
             ping_message_factory=lambda: _PING,
             sep=_SEP,
