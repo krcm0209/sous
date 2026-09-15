@@ -315,6 +315,12 @@ class ManagedEngine:
         # Optional on purpose: fakes and older engines have no such attribute.
         return getattr(self._inner, "int8_prefill_status", None)
 
+    @property
+    def positions(self) -> str | None:
+        # Optional on purpose: only the VLM backend sets this; the LM backend
+        # has no such attribute.
+        return getattr(self._inner, "positions", None)
+
     def generate(
         self,
         messages: list[dict],
@@ -563,7 +569,11 @@ class EngineManager:
         # The one line that brackets a cold start in the daemon log —
         # before it, only huggingface_hub's own chatter said a load
         # happened, and a turn's `seconds` could not be split.
-        _logger.info(f"model_load seconds={time.monotonic() - loading:.1f} model={engine.model_id}")
+        positions = getattr(engine, "positions", None)
+        line = f"model_load seconds={time.monotonic() - loading:.1f} model={engine.model_id}"
+        if positions is not None:
+            line += f" positions={positions}"
+        _logger.info(line)
         return engine
 
     def touch(self) -> None:

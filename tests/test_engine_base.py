@@ -105,6 +105,28 @@ def test_get_logs_the_load_once_with_its_duration(caplog):
     assert lines[0].startswith("model_load seconds=") and lines[0].endswith(" model=fake/model")
 
 
+def test_get_logs_positions_only_when_the_engine_reports_them(caplog):
+    """The VLM backend sets `positions`; the LM backend (and a plain
+    FakeEngine, which stands in for it here) has no such attribute, so the
+    load line must not grow one."""
+    import logging
+
+    def _positional_factory(model_id: str) -> FakeEngine:
+        engine = FakeEngine([])
+        engine.positions = "engine"  # ty: ignore[unresolved-attribute]
+        return engine
+
+    positional_mgr = EngineManager(SousConfig(), engine_factory=_positional_factory)
+    plain_mgr, _ = _manager()
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        positional_mgr.get()
+        plain_mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert len(lines) == 2
+    assert lines[0].endswith(" positions=engine")
+    assert "positions=" not in lines[1]
+
+
 class _GatedFactory:
     """A model factory that blocks until released, so a test can look at the
     manager mid-load. `started` is set once the factory has been entered."""
@@ -1053,7 +1075,12 @@ def test_vlm_engine_enables_int8_prefill_on_the_loaded_model(monkeypatch):
     from sous.engine import int8prefill
     from sous.engine.vlm import VLMEngine
 
-    model = types.SimpleNamespace(config=types.SimpleNamespace(model_type="fake"))
+    model = types.SimpleNamespace(
+        config=types.SimpleNamespace(model_type="fake"),
+        # A model whose helper returns no positions of its own — the eager
+        # probe in VLMEngine.__init__ needs this to resolve without raising.
+        get_input_embeddings=lambda *a, **kw: None,
+    )
     processor = types.SimpleNamespace(tokenizer=_RecordingTokenizer())
     _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
     _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
@@ -1196,7 +1223,12 @@ def test_vlm_tokenization_is_serialized(monkeypatch):
     from sous.engine.vlm import VLMEngine
 
     tokenizer = _RecordingTokenizer()
-    model = types.SimpleNamespace(config=types.SimpleNamespace(model_type="fake"))
+    model = types.SimpleNamespace(
+        config=types.SimpleNamespace(model_type="fake"),
+        # A model whose helper returns no positions of its own — the eager
+        # probe in VLMEngine.__init__ needs this to resolve without raising.
+        get_input_embeddings=lambda *a, **kw: None,
+    )
     processor = types.SimpleNamespace(tokenizer=tokenizer)
     _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
     _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)

@@ -69,9 +69,12 @@ class VLMEngine:
 
         self.model_id = model_id
         self._model, self._processor = load(model_id)
-        # Whether the text-only embedding helper returns rotary positions —
-        # decided by _helper_returns_positions on the first prefill or decode.
-        self._positional: bool | None = None
+        # Which side owns the rotary positions, decided once here so the
+        # model-load line records it and _positions never re-asks: the
+        # engine's when the text-only embedding helper returns positions of
+        # its own, the model's otherwise.
+        self._positional: bool | None = self._helper_returns_positions()
+        self.positions = "engine" if self._positional else "model"
         # Before the drafter loads (so it is never tagged) and before the cache
         # budget is measured (so warm-up temporaries are already released).
         self.int8_prefill_status = int8prefill.enable(self._model, enabled=int8_prefill)
@@ -193,7 +196,7 @@ class VLMEngine:
         slices that array at its cache offset — past its end for any
         continuation generate_step chunks — so the fused MRoPE kernel reads a
         zero-length buffer out of bounds and every continued token lands at
-        position 0 (keys off by 130–170 % on the default model). The array
+        position 0 (keys off by 127–170 % on the default model). The array
         covers the cache from 0 because the same kwargs reach every prompt
         chunk and the model slices each at its own offset; a suffix-only
         array is sliced past its end the same way. `rope_deltas` travels
@@ -216,12 +219,12 @@ class VLMEngine:
 
     def _helper_returns_positions(self) -> bool:
         """Whether this model's text-only embedding helper returns rotary
-        positions, probed once with a single token. The families that do (the
-        Qwen lineage) are exactly the ones whose language model slices a
-        caller's positions at its cache offset; the others derive
-        `cache_offset + rope_deltas` themselves and consume a caller's array
-        verbatim in their own rank, so handing them an absolute rank-2 array
-        would be an index error, not a repair."""
+        positions, probed with a single token; the caller memoises the
+        answer. The families that do (the Qwen lineage) are exactly the ones
+        whose language model slices a caller's positions at its cache offset;
+        the others derive `cache_offset + rope_deltas` themselves and consume
+        a caller's array verbatim in their own rank, so handing them an
+        absolute rank-2 array would be an index error, not a repair."""
         import mlx.core as mx
 
         model, _ = self._loaded()
@@ -234,7 +237,8 @@ class VLMEngine:
             # silently mispositioned — say so once.
             warnings.warn(
                 f"sous: could not probe {self.model_id}'s embedding helper for rotary"
-                f" positions ({e}); continuations will use the model's own positions",
+                f" positions ({e}); continuations fall back to the model's own positions,"
+                " which are wrong for a model whose helper returns them",
                 stacklevel=2,
             )
             return False

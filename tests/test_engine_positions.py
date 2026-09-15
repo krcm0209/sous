@@ -53,7 +53,7 @@ class _Model:
 
 
 def _engine(model: _Model) -> VLMEngine:
-    from sous.engine.promptcache import PrefixCache, PromptMemo
+    from sous.engine.promptcache import PromptMemo
 
     engine = object.__new__(VLMEngine)
     engine.model_id = "test/model"
@@ -69,7 +69,6 @@ def _engine(model: _Model) -> VLMEngine:
     engine._draft = None
     engine._draft_kind = ""
     engine._draft_block_size = 0
-    engine._cache = PrefixCache(engine, enabled=True)
     return engine
 
 
@@ -85,9 +84,10 @@ def test_positions_cover_the_cache_from_zero_through_the_new_tokens():
     assert kw["rope_deltas"].item() == 0
 
 
-def test_an_empty_cache_positions_from_zero():
+def test_a_cache_at_offset_zero_positions_from_zero():
     kw = _engine(_Model())._positions([_Layer(offset=0), _Layer()], 3)
     assert kw["position_ids"].tolist() == [[0, 1, 2]]
+    assert _engine(_Model())._positions([], 3)["position_ids"].tolist() == [[0, 1, 2]]
 
 
 def test_a_helper_that_returns_no_positions_means_no_kwargs():

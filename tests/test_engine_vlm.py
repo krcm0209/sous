@@ -125,6 +125,7 @@ def test_vlm_a_continuation_is_positioned_behind_its_cache(model_id, is_hybrid):
     from sous.engine.vlm import VLMEngine
 
     e = VLMEngine(model_id, temperature=0.0)
+    assert e.positions == "engine"
     ids = e._encode("def f(x):\n    return x + 1\n" * 40)
     cut = len(ids) - 9
     head, tail = ids[:cut], ids[cut:]
