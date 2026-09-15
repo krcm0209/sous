@@ -28,7 +28,20 @@ Claude Code use stretches further — evaluate features against that goal.
   `engine.base.release_mlx_thread_state()` before it exits — mlx >= 0.32.1
   (ml-explore/mlx#4327) segfaults the whole daemon in the exiting thread's
   TLS teardown otherwise. CI cannot catch this (model tests are local-only);
-  after dependency changes, verify with one real delegated task.
+  after dependency changes, verify with one real delegated task. After the
+  release that thread cannot run another mlx op that needs a stream — any
+  array op, `mx.eval`, a model load — with "There is no Stream(gpu, 0) in
+  current thread"; device and allocator calls (`device_info`,
+  `get_active_memory`, `get_cache_memory`, `clear_cache`) and the freeing of
+  arrays made earlier still work, which is what `server._mlx_memory_gb` and
+  `context._live_memory` rely on from threads that are reused. So a thread
+  that releases before each unit of work ends — a gateway pool thread, which
+  releases after every turn — may keep querying and freeing, but must never
+  run a load: a load runs on a `sous-model-load` thread of its own
+  (`EngineManager._load`). Before it had one, a load on a pool thread made
+  every later cold start on that thread fail. A thread that controls its own
+  exit, like the worker loop, touches mlx freely and releases once on the
+  way out.
 - e2e_smoke.py often ends `failed` or `budget-exhausted` even when it worked —
   the 0.6B model can't reliably emit `finish`. Judge by hello.txt content.
 - Budget exhaustion is `done` with outcome `budget-exhausted`, never `failed`.
@@ -82,6 +95,54 @@ Claude Code use stretches further — evaluate features against that goal.
   `kern.memorystatus_vm_pressure_level`, never psutil's free RAM: right after
   a model load the weight files sit in the page cache as "active", that
   figure read low, and the valve evicted the forks a cold turn had just made.
+- Every `prefill()` and `decode()` on the VLM backend hands mlx-vlm explicit
+  `position_ids` covering the cache from 0 through the tokens being appended,
+  plus a zero `rope_deltas` (`VLMEngine._positions`), for the model families
+  whose text-only embedding helper returns positions of its own (probed once
+  per engine: the Qwen lineage — `qwen2_vl`, `qwen2_5_vl`, `qwen3_5`,
+  `qwen3_vl`, `qwen3_vl_moe`, `qwen3_omni_moe` and the families that reuse
+  their model classes (verified on `qwen3_5` and `qwen2_vl`; the rest share the
+  rotary contract — `qwen3_omni_moe` has classes of its own over the same
+  `apply_rotary`); the other mRoPE families return none, position from the
+  cache offset themselves, and several would fail on an array of another
+  rank). The probe calls the helper the way `generate_step` does (ids, no
+  pixels, `mask=None`), once, at load — several helpers outside the lineage
+  null the model's rotary state when run; a helper that cannot be probed gets
+  no kwargs and one warning. Load-bearing: mlx-vlm's
+  helper returns positions local to the ids it is given and `generate_step`
+  merges them into the model's kwargs, and the Qwen language models slice that
+  array at the cache offset — past its end for any continuation `generate_step`
+  chunks — so on 0.7.x the fused MRoPE Metal kernel reads a zero-length buffer
+  out of bounds and every continued token lands at position 0 (on 0.6.17 the
+  same tokens landed at `0..n-1`; measured 2026-09-14 on the default model:
+  keys off by 127–170 % either way, prefill and decode, drafter or not). Only
+  from 0.7.0 does `generate_step` re-apply a caller's positions over the
+  helper's — hence the `mlx-vlm>=0.7.0` floor; below it the kwargs are silently
+  overwritten. A suffix-only array is sliced the same way, so the array is
+  always absolute from 0; `rope_deltas` goes with it so the engine owns the
+  delta the model adopts into the state a drafter run nulls and positions the
+  generated tokens from. mlx-vlm's own `_prime_cached_prefix_rope_state` does
+  this only on its `prompt_cache_state`/APC paths, which sous never enters.
+  `tests/test_engine_positions.py` pins the kwargs and the probe;
+  `tests/test_engine_vlm.py` pins the positions by comparing cached keys, not
+  greedy text — a mispositioned block has reproduced the reference's words
+  exactly — reading every layer on a pure-attention model but only the first
+  attention layer on a hybrid, whose deeper layers drift by tens of percent
+  between a one-pass and a split prefill for reasons that have nothing to do
+  with positions, and it witnesses generated tokens too — the model positions
+  those from its cache offset and the delta it adopted, never from
+  `position_ids`. The LM backend needs none of this (mlx-lm's text models take
+  positions from the cache offset). The model-load line and the status
+  document's `positions` record which side owns them (`engine` when the
+  helper returned them, `model` otherwise); `position_ids`/`rope_deltas` are
+  pass-through kwargs mlx-vlm's `GenerateKwargs` does not declare, so across
+  an mlx-vlm bump the guards are that token, the contract test in
+  `tests/test_engine_positions.py` (the real `generate_step` over a stub
+  model, in CI: the engine's kwargs must reach the language model over the
+  helper's) and a manual `uv run pytest -m model tests/test_engine_vlm.py` on
+  the M5 Pro for the kernels themselves — CI cannot load the models. Slots
+  built before this fix hold mispositioned keys: only a daemon restart drops
+  them.
 - Prompt-cache per-turn gauges (`promptcache.TURN_GAUGES`, reset by
   `PromptCacheStats.begin_turn` on every `generate()` and again on a cold
   retry) are assigned per turn and read back directly from the owner-scoped

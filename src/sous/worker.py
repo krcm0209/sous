@@ -436,8 +436,10 @@ def run_worker_loop(
     try:
         _worker_loop(store, engines, config, stop, poll_interval)
     finally:
-        # This thread touches mlx (model load, idle unload). The ordinary
-        # shutdown is SIGTERM -> os._exit, which never runs thread teardown —
+        # This thread touches mlx: the idle unload, the per-task prompt-cache
+        # retire, and auto context sizing. The load itself runs on a thread
+        # of its own (EngineManager._load). The ordinary shutdown is
+        # SIGTERM -> os._exit, which never runs thread teardown —
         # but on the non-signal path (mcp.run returning) the loop exits while
         # the process is still tearing down, and an exiting thread holding
         # mlx state segfaults it (ml-explore/mlx#4327). Deliberately NOT

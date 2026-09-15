@@ -1413,7 +1413,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=2.0,<3" },
     { name = "mlx", specifier = ">=0.31" },
     { name = "mlx-lm", specifier = ">=0.31" },
-    { name = "mlx-vlm", specifier = ">=0.6.16" },
+    { name = "mlx-vlm", specifier = ">=0.7.0" },
     { name = "psutil", specifier = ">=7" },
     { name = "rich", specifier = ">=15" },
     { name = "sse-starlette", specifier = ">=3.4" },
