@@ -497,8 +497,10 @@ the forwarder's own synthesized `499` for a client gone mid-forward
 (the model load it paid for), `count_s` (time inside the runner) and
 `seconds` (client-visible, from request receipt — it includes any wait for
 a free worker that `count_s` does not); the engine logs `model_load
-seconds=N.N model=<model_id>` when it loads. One more line names the
-Anthropic tool *types* a turn dropped, when any.
+seconds=N.N model=<model_id>` when it loads, plus `positions=engine|model` on
+the VLM backend (which side supplies the rotary positions behind a warm
+cache). One more line names the Anthropic tool *types* a turn dropped, when
+any.
 Each forwarded request logs one line too: `upstream`, method, path, the
 model id when the body named one, the upstream's status, and seconds to
 its headers — at `INFO` whatever the status, since that is the upstream's
