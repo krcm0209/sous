@@ -711,10 +711,11 @@ def test_the_idle_tick_repaints_only_the_lines_whose_clock_changed(monkeypatch):
     _run(test)
 
 
-def test_the_idle_clock_does_not_run_while_the_feed_is_down():
+def test_a_stale_document_leaves_no_idle_clock_running_while_the_feed_is_down():
     """A stale document's idle clock is a number about a daemon that is
     gone; the card shows the redial countdown instead, and the panel
-    subtitle says when the document arrived."""
+    subtitle says when the document arrived — a resize, which re-applies
+    that stale document, included."""
 
     async def test(app, pilot, feed, clock):
         await _deliver(feed, pilot, _doc(None, recent=RECENT))
@@ -723,6 +724,9 @@ def test_the_idle_clock_does_not_run_while_the_feed_is_down():
         await pilot.pause(0.6)
         assert "redialing the daemon" in _plain(app, "#card-lead")
         assert "as of" in app.query_one(tui.LinePanel).border_subtitle
+        await pilot.resize_terminal(90, 30)
+        await pilot.pause(0.1)
+        assert app.query_one(tui.LinePanel).border_subtitle.startswith("as of")
 
     _run(test)
 

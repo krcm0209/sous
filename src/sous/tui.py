@@ -1567,12 +1567,14 @@ class Top(App[int]):
             self._idler.resume()  # the redial countdown and the tracking bands
         for selector in ("#right", "#rail", "#tasks"):
             self.query_one(selector).add_class("stale")
-        _retitle(
-            self.query_one(LinePanel),
-            subtitle=f"as of {local_time(self._received_at)}" if self._ever_connected else "",
-        )
+        _retitle(self.query_one(LinePanel), subtitle=self._stale_subtitle())
         self._show_left(None)
         self._refresh_footer()
+
+    def _stale_subtitle(self) -> str:
+        """THE LINE's subtitle while the feed is down: when the document on
+        screen arrived, or nothing at all before the first one ever did."""
+        return f"as of {local_time(self._received_at)}" if self._ever_connected else ""
 
     # -- the document ---------------------------------------------------------------
 
@@ -1620,6 +1622,10 @@ class Top(App[int]):
             self._firing_since = None
         mood = self._mood(engine, now)
         self.query_one(LinePanel).show(mood, engine, config, queue, recent, now, self.motion)
+        if not self._connected:
+            # A resize re-applies the stale document, and the panel's own
+            # tail (`idle …`, `ON RAIL …`) is a live daemon's line.
+            _retitle(self.query_one(LinePanel), subtitle=self._stale_subtitle())
         live = self._live_rates(now)
         best, _ = hi_score(recent, live)
         floor = [r for r in live if r]
