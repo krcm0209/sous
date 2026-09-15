@@ -1,3 +1,5 @@
+from typing import cast
+
 import pytest
 
 pytestmark = pytest.mark.model
@@ -87,6 +89,79 @@ def test_vlm_snapshot_restore_is_bit_exact(model_id, is_hybrid):
             d = mx.max(mx.abs(xa.astype(mx.float32) - xb.astype(mx.float32)))
             mx.eval(d)
             assert d.item() == 0.0
+    e.unload()
+
+
+@pytest.mark.parametrize(
+    ("model_id", "is_hybrid"),
+    [
+        pytest.param(TINY_VLM, False, id="pure-attention"),
+        pytest.param(HYBRID_VLM, True, id="linear-attention-hybrid"),
+    ],
+)
+def test_vlm_a_continuation_is_positioned_behind_its_cache(model_id, is_hybrid):
+    """A key is rotated by its position before it is cached, so a token fed
+    behind a warm cache must get the key the same token gets when the whole
+    prompt is prefilled in one pass from position 0. Both continuation paths
+    must hold it: the prefill of a suffix (a warm turn's new tokens, the tail
+    behind a fork boundary) and the decode of the generation block.
+
+    Greedy text is no witness — a mispositioned generation block has
+    reproduced the one-pass reference's words exactly — so this compares
+    cached keys, measured as max |got − want| / max |want| over the tail's
+    positions. Which layers depends on the cache shape. A pure-attention
+    model has nothing but attention layers between a one-pass and a split
+    prefill, so every layer is comparable: 0.004 fixed against 1.23 unfixed
+    on Qwen2-VL-2B (its first layer alone barely moves, 0.02 unfixed — every
+    other layer does). A hybrid's recurrent layers drift between the two
+    prefills for reasons that have nothing to do with positions, and the
+    deeper attention layers compound that drift into tens of percent, so
+    there only the first attention layer is read: 0.009 fixed against 1.08
+    unfixed on Qwen3.5-9B. The bound sits an order of magnitude above the
+    fixed values and below the defect on both."""
+    import mlx.core as mx
+
+    from sous.engine.promptcache import fork_copy
+    from sous.engine.vlm import VLMEngine
+
+    e = VLMEngine(model_id, temperature=0.0)
+    ids = e._encode("def f(x):\n    return x + 1\n" * 40)
+    cut = len(ids) - 9
+    head, tail = ids[:cut], ids[cut:]
+
+    whole = e.new_cache()
+    e.prefill(whole, ids)
+    warm = e.new_cache()
+    e.prefill(warm, head)
+
+    def attention_keys(cache):
+        # Only an attention layer holds keys; a recurrent layer's state has no
+        # positions to check. On the hybrid, only the first attention layer.
+        layers = [c for c in cache if getattr(c, "keys", None) is not None]
+        if is_hybrid:
+            assert len(layers) < len(cache)
+            layers = layers[:1]
+        else:
+            assert len(layers) == len(cache)
+        return [c.keys[..., cut : len(ids), :].astype(mx.float32) for c in layers]
+
+    want = attention_keys(whole)
+
+    def worst(cache):
+        return max(
+            cast("float", (mx.abs(got - w).max() / mx.abs(w).max()).item())
+            for got, w in zip(attention_keys(cache), want, strict=True)
+        )
+
+    continued = e.new_cache()
+    fork_copy(warm, continued, e.copy_array)
+    e.prefill(continued, tail)
+    assert worst(continued) < 0.1
+
+    decoded = e.new_cache()
+    fork_copy(warm, decoded, e.copy_array)
+    e.decode(decoded, tail, 1)
+    assert worst(decoded) < 0.1
     e.unload()
 
 

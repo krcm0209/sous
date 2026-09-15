@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import sous.gateway.turn as turn
 from sous.config import SousConfig
 from sous.engine.base import Delta, EngineManager, GenerationStalled, ManagedEngine, ReplaySafe
 from sous.gateway.turn import (
@@ -18,6 +19,15 @@ from sous.gateway.turn import (
 )
 from sous.inflight import Inflight
 from tests.fake_engine import ChunkedFakeEngine, FakeEngine
+
+
+@pytest.fixture(autouse=True)
+def _keep_main_thread_mlx_state(monkeypatch):
+    # The runner releases mlx thread state unconditionally, which is right on
+    # the retiring session thread it runs on in production. These tests run it
+    # synchronously on the main pytest thread, whose mlx stream state other
+    # test files own — a real release there tears that state down under them.
+    monkeypatch.setattr(turn, "release_mlx_thread_state", lambda: None)
 
 
 class RecordingSink:
