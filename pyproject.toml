@@ -52,12 +52,21 @@ dependencies = [
     "mlx-lm>=0.31",
     "mlx-vlm>=0.6.16",
     "psutil>=7",
+    # `sous top` (src/sous/tui.py) imports rich.text.Text directly. Textual
+    # pulls rich in, but a direct import must be a direct dependency — same
+    # rule as the sse-starlette block below.
+    "rich>=15",
     # The gateway (src/sous/gateway) and server.serve import these directly.
     # mcp already pulls all three in, but a direct import must be a direct
     # dependency: mcp is free to drop or swap them in a minor release and
     # lockfile drift would hide it.
     "sse-starlette>=3.4",
     "starlette>=1.6",
+    # `sous top` only (src/sous/tui.py), imported inside that command
+    # function: the daemon, the launcher and the status line never load it.
+    # Pinned below the next major: Textual's CSS and widget APIs move between
+    # majors, and the render snapshot in tests/snapshots pins one rendering.
+    "textual>=8.2,<9",
     "tomlkit>=0.13",
     "uvicorn>=0.31",
 ]

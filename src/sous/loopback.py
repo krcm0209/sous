@@ -48,3 +48,9 @@ def check_loopback(request: Request) -> None:
         hostname = ""
     if hostname not in ALLOWED_ORIGIN_HOSTS:
         raise RequestError(403, "permission_error", "loopback origins only")
+
+
+# Every verb the gateway's catch-all forwards and the daemon's /sous/ 404
+# answers: the two lists must stay one, or a verb would fall through one
+# and reach the other.
+ALL_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")

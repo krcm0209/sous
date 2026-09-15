@@ -830,11 +830,11 @@ _DEFAULT_STATUS = object()
 
 
 def _status(**gateway) -> dict:
-    """The shape of `GET /sous/status` — `SousService.server_status()` — of
-    which the launcher reads `config.gateway` for its checks and
-    `model.model_id` for its one line."""
+    """The keys of `GET /sous/status` — `SousService.status_document()`,
+    less the recent turns and tasks — of which the launcher reads
+    `config.gateway` for its checks and `engine.model_id` for its one line."""
     return {
-        "model": {
+        "engine": {
             "model_id": "mlx-community/Qwen3.8-27B-4bit",
             "loaded": True,
             "loading": False,
@@ -854,8 +854,8 @@ def _status(**gateway) -> dict:
 
 def _claude_setup(tmp_path, monkeypatch, *, status=_DEFAULT_STATUS, **overrides):
     """A gateway-enabled config file, a `claude` on PATH, a daemon that answers
-    server_status, and an execve that records instead of replacing the
-    process. `status=None` is a daemon that does not answer at all."""
+    `GET /sous/status`, and an execve that records instead of replacing the
+    process."""
     import os
 
     from sous import cli
@@ -1508,3 +1508,297 @@ def test_claude_reports_a_hold_that_is_neither_loaded_nor_loading(tmp_path, caps
         "sous claude: mlx-community/Qwen3.8-27B-4bit not loaded yet; held while this session runs"
         in capsys.readouterr().err
     )
+
+
+# --- sous statusline --------------------------------------------------------------
+
+
+def _document(**overrides) -> dict:
+    doc = {
+        "engine": {"loaded": True, "loading": False, "holders": 0, "prompt_cache": {"slots": 5}},
+        "inflight": [],
+        "queue": {"queued": 0, "running": 0},
+        "config": {},
+        "recent_turns": [],
+        "recent_tasks": [],
+    }
+    doc.update(overrides)
+    return doc
+
+
+def _turn(**overrides) -> dict:
+    turn = {
+        "id": "msg_1",
+        "phase": "decode",
+        "started_at": 1_000.0,
+        "phase_since": 1_010.0,
+        "generated_tokens": 612,
+        "to_prefill": None,
+        "decode_tps": 14.7,
+        "eta_seconds": 18.4,
+    }
+    turn.update(overrides)
+    return turn
+
+
+def test_statusline_text_for_each_state():
+    from sous.cli import statusline_text
+
+    now = 1_042.0
+    assert statusline_text(_document(inflight=[_turn()]), now) == (
+        "sous: decode 612 tok · 14.7 tok/s · eta 18s"
+    )
+    assert statusline_text(_document(inflight=[_turn(decode_tps=None, eta_seconds=None)]), now) == (
+        "sous: decode 612 tok · 00:42"
+    )
+    assert (
+        statusline_text(
+            _document(inflight=[_turn(phase="prefill", to_prefill=3120, eta_seconds=4.0)]), now
+        )
+        == "sous: prefill 3,120 tok · eta 4s"
+    )
+    assert statusline_text(_document(inflight=[_turn(phase="prefill")]), now) == (
+        "sous: prefill · 00:42"
+    )
+    assert statusline_text(_document(inflight=[_turn(phase="loading")]), now) == (
+        "sous: loading · 00:42"
+    )
+    queued = _document(inflight=[_turn(), _turn(id="msg_2", phase="queued")])
+    assert statusline_text(queued, now) == (
+        "sous: decode 612 tok · 14.7 tok/s · eta 18s · +1 queued"
+    )
+    assert statusline_text(_document(), now) == "sous: idle · 5 slots"
+    assert statusline_text(_document(engine={"loaded": True, "holders": 2}), now) == (
+        "sous: idle · held"
+    )
+    assert statusline_text(_document(engine={"loaded": False, "loading": True}), now) == (
+        "sous: loading"
+    )
+    assert statusline_text(_document(engine={"loaded": False, "loading": False}), now) == (
+        "sous: idle · model unloaded"
+    )
+    assert statusline_text({}, now) == "sous: idle · model unloaded"
+
+
+def _statusline_config(tmp_path, monkeypatch, port: int):
+    from sous import cli
+    from sous.config import SousConfig
+
+    cfg = SousConfig(server_port=port, data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+
+
+def test_statusline_reads_the_daemon_and_prints_one_line(tmp_path, capsys, monkeypatch):
+    import io
+
+    from sous import cli
+
+    fake = _FakeSousHTTP(_document(inflight=[_turn()]))
+    try:
+        _statusline_config(tmp_path, monkeypatch, fake.port)
+        # Claude Code pipes its own JSON in; it is read and ignored.
+        monkeypatch.setattr(sys, "stdin", io.StringIO('{"model": {"id": "claude-opus-5"}}'))
+        cli.main(["statusline"])
+    finally:
+        fake.close()
+    out = capsys.readouterr().out
+    assert out == "sous: decode 612 tok · 14.7 tok/s · eta 18s\n"
+
+
+def test_statusline_says_daemon_down_and_exits_zero(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    _statusline_config(tmp_path, monkeypatch, _free_cli_port())
+    cli.main(["statusline"])
+    assert capsys.readouterr().out == "sous: daemon down\n"
+
+
+def test_statusline_treats_a_wrong_answer_as_daemon_down(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    fake = _FakeSousHTTP(None, raw=b"<html>not sous</html>")
+    try:
+        _statusline_config(tmp_path, monkeypatch, fake.port)
+        cli.main(["statusline"])
+    finally:
+        fake.close()
+    assert capsys.readouterr().out == "sous: daemon down\n"
+
+
+class _RawListener:
+    """A socket on 127.0.0.1 that answers its first connection with
+    `script` — (seconds to wait, bytes to send) in order — then hangs up:
+    what a port held by something other than an HTTP server, or by a server
+    that dribbles, looks like to the status line."""
+
+    def __init__(self, script: list[tuple[float, bytes]]):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(1)
+        self.port = self.sock.getsockname()[1]
+        self.script = script
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self) -> None:
+        try:
+            conn, _ = self.sock.accept()
+            with conn:
+                for delay, chunk in self.script:
+                    time.sleep(delay)
+                    conn.sendall(chunk)
+        except OSError:
+            pass  # the test closed the listener, or the client is gone
+
+    def close(self) -> None:
+        self.sock.close()
+
+
+def test_statusline_treats_a_listener_that_is_not_http_as_daemon_down(
+    tmp_path, capsys, monkeypatch
+):
+    """urllib's URLError is an OSError; http.client's BadStatusLine — a port
+    held by something that does not speak HTTP — is not, and once a second
+    a traceback is no status line."""
+    from sous import cli
+
+    listener = _RawListener([(0.0, b"i am not http\r\n\r\n")])
+    try:
+        _statusline_config(tmp_path, monkeypatch, listener.port)
+        cli.main(["statusline"])
+    finally:
+        listener.close()
+    assert capsys.readouterr().out == "sous: daemon down\n"
+
+
+def test_statusline_gives_up_on_a_listener_that_dribbles(tmp_path, capsys, monkeypatch):
+    """urllib's timeout is per socket read and re-arms on every byte, so a
+    listener that dribbles one byte at a time would hold the line for as
+    long as it liked. The budget is wall-clock, on the whole call."""
+    from sous import cli
+
+    headers = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n"
+    listener = _RawListener([(0.0, headers), *([(0.3, b"{")] * 10)])
+    started = time.monotonic()
+    try:
+        _statusline_config(tmp_path, monkeypatch, listener.port)
+        cli.main(["statusline"])
+    finally:
+        listener.close()
+    assert capsys.readouterr().out == "sous: daemon down\n"
+    assert time.monotonic() - started < 1.5
+
+
+def test_statusline_treats_someone_elses_json_as_daemon_down(tmp_path, capsys, monkeypatch):
+    """A JSON object from whatever else holds the port is not a status
+    document: without the engine block it would read as a loaded, idle
+    daemon and say so."""
+    from sous import cli
+
+    fake = _FakeSousHTTP({"ok": True})
+    try:
+        _statusline_config(tmp_path, monkeypatch, fake.port)
+        cli.main(["statusline"])
+    finally:
+        fake.close()
+    assert capsys.readouterr().out == "sous: daemon down\n"
+
+
+def test_statusline_ignores_a_configured_proxy(tmp_path, capsys, monkeypatch):
+    from sous import cli
+
+    fake = _FakeSousHTTP(_document())
+    try:
+        _statusline_config(tmp_path, monkeypatch, fake.port)
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+        monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+        cli.main(["statusline"])
+    finally:
+        fake.close()
+    assert capsys.readouterr().out == "sous: idle · 5 slots\n"
+
+
+def test_statusline_imports_nothing_heavy(tmp_path):
+    """It runs once a second under Claude Code: the stdlib only. Checked in
+    a fresh interpreter, since this test process has long since imported
+    httpx for the launcher's tests."""
+    fake = _FakeSousHTTP(_document())
+    try:
+        probe = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from sous import cli\n"
+            "from sous.config import SousConfig\n"
+            f"cfg = SousConfig(server_port={fake.port}, data_dir=Path(sys.argv[1]), "
+            "config_path=Path(sys.argv[1]) / 'c.toml')\n"
+            "cli.load_config = lambda: cfg\n"
+            "cli.main(['statusline'])\n"
+            "print(sorted(m for m in ('textual', 'httpx', 'mlx', 'psutil') if m in sys.modules))\n"
+        )
+        done = subprocess.run(
+            [sys.executable, "-c", probe, str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+    finally:
+        fake.close()
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "sous: idle · 5 slots\n[]\n"
+
+
+# --- sous top ---------------------------------------------------------------------------
+
+
+def test_top_and_status_watch_run_the_terminal(tmp_path, monkeypatch):
+    from sous import cli, tui
+    from sous.config import SousConfig
+
+    cfg = SousConfig(server_port=8391, data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "_has_terminal", lambda: True)
+    ports: list[int] = []
+    monkeypatch.setattr(tui, "run_top", lambda port: (ports.append(port), 3)[1])
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["top"])
+    assert exc.value.code == 3
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["status", "--watch"])
+    assert exc.value.code == 3
+    assert ports == [8391, 8391]
+
+
+def test_top_without_a_terminal_says_so_instead_of_drawing_into_the_pipe(
+    tmp_path, capsys, monkeypatch
+):
+    """An agent's shell, or a redirect: Textual would paint the pass into
+    the pipe and wait for a key that never comes."""
+    from sous import cli, tui
+    from sous.config import SousConfig
+
+    cfg = SousConfig(server_port=8391, data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "_has_terminal", lambda: False)
+    monkeypatch.setattr(tui, "run_top", lambda port: pytest.fail("the terminal was started"))
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["top"])
+    assert exc.value.code == 2
+    out, err = capsys.readouterr()
+    assert out == "" and err == "sous top: needs a terminal (try sous status, or sous statusline)\n"
+
+
+def test_only_sous_top_imports_textual(tmp_path):
+    """The daemon, the launcher's module and the status line load without
+    the UI framework; a fresh interpreter proves it, since this process has
+    imported it for the terminal's own tests."""
+    probe = (
+        "import sys\n"
+        "import sous.cli, sous.server, sous.monitor, sous.inflight\n"
+        "print('textual' in sys.modules)\n"
+    )
+    done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "False\n"

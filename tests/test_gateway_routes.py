@@ -23,6 +23,7 @@ from starlette.requests import Request
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
 from sous.gateway.routes import MAX_BODY_DEPTH, Gateway, mount_gateway
+from sous.gateway.turn import TurnAbandoned
 from sous.server import create_server
 from sous.tasks import TaskStore
 from tests.fake_engine import ChunkedFakeEngine, FakeEngine
@@ -1800,10 +1801,10 @@ def test_lcp_region_places_the_divergence(lcp, lo, hi, region):
 
 
 def test_rates_and_optional_fields_print_a_dash_when_undefined():
-    from sous.gateway.routes import _opt, _rate
+    from sous.gateway.routes import _opt, _per_second
 
-    assert _rate(100, 0.0) == "-" and _rate(100, 4.0) == "25.0" and _rate(59, 4.0) == "14.8"
-    assert _opt(None) == "-" and _opt(1.234) == "1.2"
+    assert _per_second(100, 0.0) is None and _per_second(100, 4.0) == 25.0
+    assert _opt(None) == "-" and _opt(1.234) == "1.2" and _opt(_per_second(59, 4.0)) == "14.8"
 
 
 def test_a_fork_hit_prints_took_fork(tmp_path: Path, capsys):
@@ -1880,3 +1881,131 @@ def test_a_moved_turn_slot_prints_took_turn_moved(tmp_path: Path, capsys):
     _post(app, _body())
     f = _fields(_turn_lines(capsys.readouterr().err)[1])
     assert f["cache"] == "hit" and f["took"] == "turn-moved@40"
+
+
+# --- the registry and the recent ring --------------------------------------------
+
+
+def _recent(gateway: Gateway) -> list[dict]:
+    return gateway._inflight.snapshot()["recent_turns"]
+
+
+def test_a_served_turn_is_recorded_with_the_lines_fields(tmp_path: Path):
+    inner = FakeEngine(["first", "second reply here"])
+    inner.stats = dict(_ALL_GAUGES)
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        inner.stats["hits"] += 1
+        inner.stats["reused_tokens"] += 100
+        inner.stats["prefilled_tokens"] = 6
+        inner.stats["prefill_seconds"] = 2.0
+        inner.stats["decode_seconds"] = 4.0
+        inner.stats["took_kind"], inner.stats["took_len"] = "turn", 100
+        return original(messages, tools, max_tokens, on_delta)
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    gateway, app = _gateway_app(tmp_path, inner)
+    r = _post(app, _body(stream=True))
+    started = [d for e, d in _events(r.text) if e == "message_start"]
+    message_id = started[0]["message"]["id"]
+    (turn,) = _recent(gateway)
+    assert turn["id"] == message_id and turn["model"] == "sous-local"
+    assert turn["status"] == 200 and turn["error"] is None and turn["stream"] is True
+    assert turn["cache"] == "hit" and turn["took"] == "turn@100"
+    assert turn["stop_reason"] == "end_turn"
+    assert turn["output_tokens"] == 1 and turn["reused_tokens"] == 100
+    assert turn["prefilled_tokens"] == 6 and turn["prefill_s"] == 2.0 and turn["decode_s"] == 4.0
+    assert turn["prefill_tps"] == 3.0 and turn["decode_tps"] == 0.25
+    assert turn["lcp"] is None and turn["lcp_region"] is None and turn["bounds"] is None
+    assert turn["tools_hash"] is None and isinstance(turn["ts"], float)
+    assert set(turn) == {
+        "ts", "id", "model", "stream", "status", "error", "stop_reason", "cache", "took",
+        "input_tokens", "output_tokens", "reused_tokens", "prefilled_tokens", "lcp",
+        "lcp_region", "bounds", "forks", "evicted", "pressure", "load_s", "queue_s",
+        "engine_wait_s", "tokenize_s", "ttft_s", "prefill_s", "decode_s", "prefill_tps",
+        "decode_tps", "seconds", "tools_hash", "system_hash",
+    }  # fmt: skip
+    _post(app, _body(stream=False))
+    ids = [t["id"] for t in _recent(gateway)]
+    assert len(ids) == 2 and ids[1] == message_id  # newest first
+
+
+def test_a_miss_is_recorded_with_its_lcp_and_bounds(tmp_path: Path):
+    inner = FakeEngine(["reply"])
+    inner.stats = dict(_ALL_GAUGES, misses=1, miss_lcp=62851, bound_lo=62298, bound_hi=62856)
+    gateway, app = _gateway_app(tmp_path, inner)
+    _post(app, _body())
+    (turn,) = _recent(gateway)
+    assert turn["cache"] == "miss" and turn["took"] == "none"
+    assert turn["lcp"] == 62851 and turn["lcp_region"] == "system"
+    assert turn["bounds"] == [62298, 62856]
+
+
+def test_failed_and_refused_turns_are_recorded_with_their_error(tmp_path: Path, monkeypatch):
+    class Boom(FakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            raise RuntimeError("engine down")
+
+    gateway, app = _gateway_app(tmp_path, Boom([]))
+    _post(app, _body(stream=False))
+    _post(app, _body(stream=True))
+    recent = _recent(gateway)
+    assert [(t["status"], t["error"], t["stream"]) for t in recent] == [
+        (200, "api_error", True),  # the stream's headers had gone out
+        (500, "api_error", False),
+    ]
+    assert all(t["id"].startswith("msg_") and t["seconds"] >= 0 for t in recent)
+    assert all("stop_reason" not in t for t in recent)
+    monkeypatch.setattr("sous.gateway.routes.MAX_PENDING_TURNS", 0)
+    gateway, app = _gateway_app(tmp_path, FakeEngine(["never"]))
+    assert _post(app, _body()).status_code == 529
+    (refused,) = _recent(gateway)
+    assert (refused["status"], refused["error"]) == (529, "overloaded_error")
+
+
+def test_an_abandoned_stream_is_recorded_as_499(tmp_path: Path, monkeypatch):
+    gateway, app = _gateway_app(tmp_path, FakeEngine(["never"]))
+
+    def gone(*args, **kwargs):
+        raise TurnAbandoned
+
+    monkeypatch.setattr(gateway._runner, "run", gone)
+    _post(app, _body(stream=True))
+    (turn,) = _recent(gateway)
+    assert (turn["status"], turn["error"], turn["stream"]) == (499, "abandoned", True)
+
+
+def test_the_turn_line_is_printed_from_the_recorded_summary(tmp_path: Path, capsys):
+    """One dict, two consumers: the log line and the recent ring must never
+    disagree, so the line is formatted from the summary the ring keeps."""
+    inner = FakeEngine(["reply"])
+    inner.stats = dict(_ALL_GAUGES)
+    gateway, app = _gateway_app(tmp_path, inner)
+    _post(app, _body())
+    (turn,) = _recent(gateway)
+    (line,) = [ln for ln in _turn_lines(capsys.readouterr().err) if "status=200" in ln]
+    fields = _fields(line)
+    assert fields["id"] == turn["id"] and fields["cache"] == turn["cache"]
+    assert fields["seconds"] == f"{turn['seconds']:.1f}"
+    assert fields["prefill_tps"] == "-" and turn["prefill_tps"] is None
+
+
+def test_the_registry_sees_a_streamed_turn_under_its_message_id(tmp_path: Path):
+    inner = FakeEngine(["reply"])
+    gateway, app = _gateway_app(tmp_path, inner)
+    seen: list[dict] = []
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        seen.extend(gateway._inflight.snapshot()["inflight"])
+        return original(messages, tools, max_tokens, on_delta)
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    r = _post(app, _body(stream=True))
+    started = [d for e, d in _events(r.text) if e == "message_start"]
+    (entry,) = seen
+    assert entry["id"] == started[0]["message"]["id"]
+    assert entry["phase"] == "prefill" and entry["stream"] is True
+    assert entry["model"] == "sous-local" and entry["max_tokens"] == 4096
+    assert gateway._inflight.snapshot()["inflight"] == []
