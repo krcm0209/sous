@@ -345,3 +345,23 @@ def test_connection_closed_when_setup_fails(store: TaskStore, monkeypatch: pytes
             pass  # pragma: no cover — _conn raises on __enter__
 
     assert _open_fd_count() <= baseline + 2
+
+
+def test_version_moves_once_per_connection_that_changed_a_row(tmp_path: Path):
+    """The event stream polls this number: a read, and a claim that found
+    nothing to claim, must not move it, or an idle daemon would rebuild
+    its document twice a second for the worker's empty polls."""
+    store = TaskStore(tmp_path / "tasks.db")
+    v0 = store.version
+    store.count_by_state()
+    store.list_recent(limit=10)
+    assert store.claim_next() is None
+    assert store.version == v0
+    task = store.enqueue("t", "do it", str(tmp_path), [], [])
+    v1 = store.version
+    assert v1 == v0 + 1
+    assert store.claim_next() is not None
+    v2 = store.version
+    assert v2 == v1 + 1
+    store.set_activity(task.id, "working", 1)
+    assert store.version == v2 + 1

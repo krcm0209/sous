@@ -22,7 +22,6 @@ from starlette.responses import JSONResponse, Response
 
 from sous.engine.base import EngineManager
 from sous.gateway.convert import RequestError, _invalid
-from sous.inflight import Inflight
 from sous.loopback import ALL_METHODS, check_loopback
 from sous.sse import PING as _PING
 from sous.sse import PING_INTERVAL_SECONDS as EVENT_PING_SECONDS
@@ -32,33 +31,72 @@ _logger = logging.getLogger("sous.monitor")
 
 # A hold body is two numbers; anything larger is not one.
 HOLD_BODY_LIMIT = 1024
-# The event stream polls the registry's version this often: a burst of
-# changes inside one tick is one event, and a change is on the wire within
-# a tick. Ten a second is what a terminal can show and what a token-per-
-# delta feed produces at the default model's decode speed.
+# The event stream polls the composite version the service hands it — the
+# in-flight registry, the engine manager, the task store and the config
+# file's stamp — this often: a burst of changes inside one tick is one
+# event, and a change is on the wire within a tick. Ten a second is what a
+# terminal can show and what a token-per-delta feed produces at the default
+# model's decode speed.
 EVENT_TICK_SECONDS = 0.1
-# Engine state (a load starting, a holder leaving, the idle clock) is not
-# in the registry, so the document also goes out this often unchanged.
+# While a turn is in flight, a delegated task is running or a load or an
+# unload is under way the document also goes out this often unchanged: the
+# terminal reads a silent stream during a turn as a stalled daemon, a
+# prefill runs for a minute without a registry change, a task's clock and
+# the cache counters it moves are in the document while the worker writes
+# the store once per tool call, and an unload frees the weights over
+# seconds with `memory_gb` the only sign of it. Idle there is no heartbeat
+# at all — a load, a hold and a task change bump a version of their own,
+# and the idle clock is the terminal's to run.
 EVENT_HEARTBEAT_SECONDS = 1.0
+# Idle — no turn in flight, no delegated task running, no load or unload
+# under way — nothing on the registry moves without a turn starting, so the poll slows to
+# this: a new order is on screen within half a second, and the loop costs a
+# fifth of the 10 Hz one. Busy, the fast tick is what puts a token delta on
+# the wire in time.
+EVENT_IDLE_TICK_SECONDS = 0.5
+
+
+def _busy(document: dict) -> bool:
+    # A delegated task counts: the worker never writes the registry, and
+    # `running` includes a task awaiting approval, whose clock runs too.
+    engine = document.get("engine") or {}
+    queue = document.get("queue") or {}
+    return bool(
+        document.get("inflight")
+        or queue.get("running")
+        or engine.get("loading")
+        or engine.get("unloading")
+    )
 
 
 async def _status_events(
-    status: Callable[[], dict], inflight: Inflight
+    status: Callable[[], dict], version: Callable[[], object]
 ) -> AsyncIterator[ServerSentEvent]:
-    """The document now, then again whenever the registry changed since the
-    last one went out — checked every tick — and at least once a heartbeat
-    regardless. Built on a worker thread each time. Nothing is buffered for
-    a client that is gone: the response cancels this generator on
-    disconnect, and the tick's sleep is where that lands. A failure building
-    or encoding the document ends the stream rather than raising through
-    uvicorn: the client sees the connection close and redials, the same as
-    any other daemon failure logs its type and never its message."""
-    seen: int | None = None  # None: nothing sent yet, whatever the clock says
+    """The document now, then again whenever `version()` moved since the
+    last one went out — checked every tick — and, only while the last
+    document showed a turn, a running task, a load or an unload, at least
+    once a heartbeat regardless.
+    Built on a worker thread each time. Nothing is buffered for a client
+    that is gone: the response cancels this generator on disconnect, and
+    the tick's sleep is where that lands. A failure building or encoding
+    the document ends the stream rather than raising through uvicorn: the
+    client sees the connection close and redials, the same as any other
+    daemon failure logs its type and never its message."""
+    seen: object = None  # nothing sent yet, whatever the clock says
     sent = time.monotonic()
+    busy = False  # the first document always goes out, and sets the real value
     while True:
-        version = inflight.version
+        # Read before the build, not after: a change landing during it is
+        # then a newer value on the next check, never one masked. Guarded
+        # like the build: the callable stats a file, and a failure here
+        # would otherwise leave through uvicorn, message included.
+        try:
+            current = version()
+        except Exception as e:  # noqa: BLE001 — logged and the stream ends, never raised
+            _logger.error(f"GET /sous/events failed ({type(e).__name__})")
+            return
         now = time.monotonic()
-        if version != seen or now - sent >= EVENT_HEARTBEAT_SECONDS:
+        if current != seen or (busy and now - sent >= EVENT_HEARTBEAT_SECONDS):
             try:
                 document = await run_sync(status)
                 # Encoded under the same guard, and as strictly as /sous/status
@@ -70,8 +108,9 @@ async def _status_events(
                 _logger.error(f"GET /sous/events failed ({type(e).__name__})")
                 return
             yield ServerSentEvent(event="status", data=data, sep=_SEP)
-            seen, sent = version, now
-        await asyncio.sleep(EVENT_TICK_SECONDS)
+            seen, sent = current, now
+            busy = _busy(document)
+        await asyncio.sleep(EVENT_TICK_SECONDS if busy else EVENT_IDLE_TICK_SECONDS)
 
 
 def _refused(e: RequestError) -> Response:
@@ -129,15 +168,19 @@ async def _served(route: str, fn: Callable[..., dict], *args: object) -> Respons
 
 
 def mount_monitor(
-    mcp: MCPServer, engines: EngineManager, status: Callable[[], dict], inflight: Inflight
+    mcp: MCPServer,
+    engines: EngineManager,
+    status: Callable[[], dict],
+    version: Callable[[], object],
 ) -> None:
     """Register GET /sous/status, GET /sous/events, POST /sous/hold and a
     404 for every other /sous/ path. `status` builds the full status
-    document (recent turns and tasks included); `inflight` is the registry
-    whose version the event stream watches. The status and hold handlers
-    hand their work to a thread — status() reads the task store and hold()
-    takes the engine manager's lock, and neither belongs on the event loop —
-    and the event stream builds each of its documents the same way."""
+    document (recent turns and tasks included); `version` is what the event
+    stream polls — a value that differs from the last one whenever the
+    document would. The status and hold handlers hand their work to a
+    thread — status() reads the task store and hold() takes the engine
+    manager's lock, and neither belongs on the event loop — and the event
+    stream builds each of its documents the same way."""
     # sse-starlette logs every frame it sends at DEBUG — the status document,
     # verbatim, up to ten times a second — and the gateway's own pin of this
     # logger only runs when the gateway is mounted. /sous/events is mounted
@@ -157,7 +200,7 @@ def mount_monitor(
         except RequestError as e:
             return _refused(e)
         return EventSourceResponse(
-            _status_events(status, inflight),
+            _status_events(status, version),
             ping=EVENT_PING_SECONDS,
             ping_message_factory=lambda: _PING,
             sep=_SEP,
