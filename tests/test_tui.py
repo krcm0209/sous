@@ -380,13 +380,15 @@ class Feed:
             yield "status", document
 
 
-def _run(test, *, size=(100, 30), clock=None):
-    """Run `test(app, pilot, feed, clock)` inside the pilot."""
+def _run(test, *, size=(100, 30), clock=None, monotonic=None):
+    """Run `test(app, pilot, feed, clock)` inside the pilot. One pinned clock
+    serves as both the wall and the monotonic one unless a test needs them
+    to disagree."""
     clock = clock or Clock()
     feed = Feed()
 
     async def go():
-        app = Top(feed, port=8383, clock=clock)
+        app = Top(feed, port=8383, clock=clock, monotonic=monotonic or clock)
         async with app.run_test(size=size) as pilot:
             await pilot.pause(0.1)
             await test(app, pilot, feed, clock)
@@ -395,7 +397,8 @@ def _run(test, *, size=(100, 30), clock=None):
     return asyncio.run(go())
 
 
-async def _deliver(feed: Feed, pilot, document: dict) -> None:
+async def _deliver(feed: Feed, pilot, document: dict | None) -> None:
+    """A document, or None to drop the stream, and time for it to land."""
     await feed.queue.put(document)
     await pilot.pause(0.15)
 
@@ -537,10 +540,11 @@ def test_a_quiet_kitchen_shows_the_card_and_stops_the_ticker():
         assert app.query_one("#card-chef", tui.Chef).mood in ("done", "quiet")
         assert "KITCHEN QUIET 4m 12s" in app.query_one(tui.Strip).render().plain
         assert app.query_one("#firing", tui.LoadingIndicator).auto_refresh is None
-        # Idle, the 10 fps clock is paused: a moved clock changes no headline.
+        # Idle, the 10 fps ticker is paused and the idle tick runs the clock.
+        assert app._ticker is not None and not app._ticker._active.is_set()
         clock.now = BASE + 30.0
-        await pilot.pause(0.25)
-        assert "no orders on the rail for 4m 12s" in _plain(app, "#card-body")
+        await _until(pilot, lambda: "no orders on the rail for 4m 42s" in _plain(app, "#card-body"))
+        assert "no orders on the rail for 4m 42s" in _plain(app, "#card-body")
         await _deliver(feed, pilot, _doc(None, loaded=False, loading=True))
         firing = app.query_one("#firing", tui.LoadingIndicator)
         assert card.border_title == "FIRING UP" and firing.display
@@ -553,22 +557,80 @@ def test_a_quiet_kitchen_shows_the_card_and_stops_the_ticker():
     _run(test)
 
 
-def test_a_quiet_kitchens_idle_tick_only_moves_the_steam():
+def test_a_quiet_kitchens_idle_tick_moves_the_steam_and_the_clock():
+    """The daemon sends no document while nothing moves, so the idle clock
+    is the terminal's to run: from the last document's idle_seconds plus
+    the time since it arrived, advanced on the idle tick, and painted only
+    when the second it shows changes."""
+
     async def test(app, pilot, feed, clock):
         await _deliver(feed, pilot, _doc(_turn()))
-        await _deliver(feed, pilot, _doc(None, recent=RECENT))
+        document = _doc(None, recent=RECENT)
+        document["engine"]["holders"] = 0  # the countdown is drawn only unheld
+        await _deliver(feed, pilot, document)
         body = _plain(app, "#card-body")
+        assert "no orders on the rail for 4m 12s" in body
+        assert "LIGHTS OUT in 25m 48s" in body
         steam_0 = _plain(app, "#card-art")
         clock.now = BASE + 0.5
-        await pilot.pause(0.6)
+        await _until(pilot, lambda: _plain(app, "#card-art") != steam_0)
         steam_1 = _plain(app, "#card-art")
         assert steam_1 != steam_0
         assert _plain(app, "#card-body") == body
         clock.now = BASE + 1.0
-        await pilot.pause(0.6)
+        await _until(pilot, lambda: "no orders on the rail for 4m 13s" in _plain(app, "#card-body"))
         steam_2 = _plain(app, "#card-art")
         assert steam_2 == steam_0 and steam_2 != steam_1
-        assert _plain(app, "#card-body") == body
+        # Only the two clock lines moved; the rest of the card is the same bytes.
+        body_1 = _plain(app, "#card-body")
+        assert body_1 == body.replace("4m 12s", "4m 13s").replace("25m 48s", "25m 47s")
+        assert "idle 4m 13s" in app.query_one(tui.LinePanel).border_subtitle
+        assert "KITCHEN QUIET 4m 13s" in app.query_one(tui.Strip).render().plain
+        # Below 60 columns the footer is the only clock on screen.
+        app._width = 50
+        app._refresh_footer()
+        assert _plain(app, "#footer") == " KITCHEN QUIET 4m 13s  q"
+
+    _run(test)
+
+
+def test_the_idle_clock_runs_on_the_monotonic_clock_not_the_wall_clock():
+    """The daemon keeps its idle clock on the monotonic clock, which a system
+    sleep does not advance; the terminal's copy must run on the same one, or
+    an hour asleep is an hour on the card the daemon never counted, with no
+    document coming while idle to say otherwise."""
+    wall, mono = Clock(), Clock()
+
+    async def test(app, pilot, feed, clock):
+        document = _doc(None, recent=RECENT)
+        document["engine"]["holders"] = 0
+        await _deliver(feed, pilot, document)
+        wall.now = BASE + 3600.0
+        mono.now = BASE + 1.0
+        await _until(pilot, lambda: "no orders on the rail for 4m 13s" in _plain(app, "#card-body"))
+        body = _plain(app, "#card-body")
+        assert "no orders on the rail for 4m 13s" in body
+        assert "LIGHTS OUT in 25m 47s" in body
+        assert "KITCHEN QUIET 4m 13s" in app.query_one(tui.Strip).render().plain
+
+    _run(test, clock=wall, monotonic=mono)
+
+
+def test_a_resize_while_quiet_repaints_the_clock_on_screen_not_the_documents():
+    """The document may be minutes old — nothing arrives while idle — so a
+    resize must redraw the card at the advanced second, never the received one."""
+
+    async def test(app, pilot, feed, clock):
+        document = _doc(None, recent=RECENT)
+        document["engine"]["holders"] = 0
+        await _deliver(feed, pilot, document)
+        clock.now = BASE + 10.0
+        await _until(pilot, lambda: "no orders on the rail for 4m 22s" in _plain(app, "#card-body"))
+        assert "no orders on the rail for 4m 22s" in _plain(app, "#card-body")
+        await pilot.resize_terminal(90, 30)
+        await pilot.pause(0.1)
+        assert "no orders on the rail for 4m 22s" in _plain(app, "#card-body")
+        assert "idle 4m 22s" in app.query_one(tui.LinePanel).border_subtitle
 
     _run(test)
 
@@ -629,11 +691,11 @@ def test_live_rates_are_the_last_sixty_seconds_not_the_last_sixty_samples():
     _run(test, size=(120, 30))
 
 
-def test_a_heartbeat_repaints_only_the_lines_whose_words_changed(monkeypatch):
-    """The feed sends a status document every second whether or not anything
-    on it moved. A quiet kitchen's heartbeat changes the idle clock and
-    nothing else, and only the lines that show that clock may cost a
-    repaint — a whole screen redrawn every second is 2–6% of a core."""
+def test_the_idle_tick_repaints_only_the_lines_whose_clock_changed(monkeypatch):
+    """A whole screen redrawn every second is 2–6 % of a core. With motion
+    off the idle tick still runs against a live daemon — the clock must
+    move — but it may repaint only the lines that show the clock, and only
+    when the second they show changes."""
     painted: list[str] = []
     real_refresh = tui.Widget.refresh
 
@@ -642,22 +704,25 @@ def test_a_heartbeat_repaints_only_the_lines_whose_words_changed(monkeypatch):
         return real_refresh(self, *args, **kwargs)
 
     async def test(app, pilot, feed, clock):
-        # Motion off parks the idle tick against a live daemon, so every
-        # repaint counted below is the document's own: the chef holds still
-        # and the pot's steam does not move.
         app.motion = False
         await _deliver(feed, pilot, _doc(None, recent=RECENT))
         await _deliver(feed, pilot, _doc(None, recent=RECENT))
-        assert app._idler is not None and not app._idler._active.is_set()
+        assert app._idler is not None and app._idler._active.is_set()
         assert "no orders on the rail for 4m 12s" in _plain(app, "#card-body")
         monkeypatch.setattr(tui.Widget, "refresh", spy)
         await _deliver(feed, pilot, _doc(None, recent=RECENT))
         assert painted == [], f"a document that changed nothing repainted {painted}"
+        clock.now = BASE + 0.5
+        await pilot.pause(0.6)
+        assert painted == [], f"a tick inside the same second repainted {painted}"
         for n in (1, 2, 3):
             painted.clear()
-            await _deliver(feed, pilot, _doc(None, recent=RECENT, idle_seconds=252.0 + n))
-            assert len(painted) <= 3, painted
-            assert "Line#card-body" in painted, painted
+            clock.now = BASE + n
+            second = f"no orders on the rail for 4m {12 + n}s"
+            await _until(pilot, lambda text=second: text in _plain(app, "#card-body"))
+            # The card's own `since …` subtitle counts up with the same clock.
+            assert len(painted) <= 4, painted
+            assert "Line#card-body" in painted and "Card#card" in painted, painted
             assert f"no orders on the rail for 4m {12 + n}s" in _plain(app, "#card-body")
         # The memo is at the widget, not over the document: a turn arriving
         # still draws the slip.
@@ -666,6 +731,26 @@ def test_a_heartbeat_repaints_only_the_lines_whose_words_changed(monkeypatch):
         assert "Line#headline" in painted and "Slip#slip" in painted, painted
         assert app.query_one(tui.Slip).display
         assert _plain(app, "#headline").startswith(" PLATING  decode 412 tok")
+
+    _run(test)
+
+
+def test_a_stale_document_leaves_no_idle_clock_running_while_the_feed_is_down():
+    """A stale document's idle clock is a number about a daemon that is
+    gone; the card shows the redial countdown instead, and the panel
+    subtitle says when the document arrived — a resize, which re-applies
+    that stale document, included."""
+
+    async def test(app, pilot, feed, clock):
+        await _deliver(feed, pilot, _doc(None, recent=RECENT))
+        await _deliver(feed, pilot, None)
+        clock.now = BASE + 2.0
+        await pilot.pause(0.6)
+        assert "redialing the daemon" in _plain(app, "#card-lead")
+        assert "as of" in app.query_one(tui.LinePanel).border_subtitle
+        await pilot.resize_terminal(90, 30)
+        await pilot.pause(0.1)
+        assert app.query_one(tui.LinePanel).border_subtitle.startswith("as of")
 
     _run(test)
 

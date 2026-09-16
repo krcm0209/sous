@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -95,6 +96,13 @@ class TaskStore:
         schema."""
         self.db_path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Bumped once per connection that changed a row. The event stream
+        # polls it to learn that a task moved without a heartbeat; the
+        # worker and the server share this one instance, so an in-process
+        # counter sees every write. The lock is for the increment only —
+        # readers take one int.
+        self._version = 0
+        self._version_lock = threading.Lock()
         with self._conn() as c:
             c.executescript(_SCHEMA)
             # CREATE TABLE IF NOT EXISTS won't add new columns to an existing
@@ -102,6 +110,22 @@ class TaskStore:
             cols = {r["name"] for r in c.execute("PRAGMA table_info(tasks)")}
             if "changed_files" not in cols:
                 c.execute("ALTER TABLE tasks ADD COLUMN changed_files TEXT")
+
+    @property
+    def version(self) -> int:
+        """Bumped once per connection whose statements inserted, updated or
+        deleted a row — sqlite's total_changes, which counts an UPDATE that
+        rewrote a value already there the same as one that changed it, and
+        nothing for a WHERE that matched no row (the worker's idle claim). Two reads that
+        saw the same number saw the same rows; two different numbers need
+        not mean different bytes. Per instance, and only writes through this
+        one move it: the daemon builds a single store for the worker and
+        every route, and the status document's memo of the counts and the
+        listing is right only because nothing else writes the file. Read it
+        BEFORE the reads it guards, so a write landing during them shows up
+        as a newer number on the next check rather than hiding behind one
+        read after the fact."""
+        return self._version
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -117,6 +141,12 @@ class TaskStore:
             conn.execute("PRAGMA journal_mode=WAL")
             with conn:
                 yield conn
+            # After the commit. total_changes counts the rows this connection
+            # inserted, updated or deleted — DDL and an UPDATE that matched
+            # nothing (the worker's idle claim) leave it at zero.
+            if conn.total_changes:
+                with self._version_lock:
+                    self._version += 1
         finally:
             conn.close()
 

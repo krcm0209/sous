@@ -1564,3 +1564,99 @@ def test_the_idle_clock_restarts_whichever_caller_sees_the_last_holder_leave():
     clock.now += 30 * 60 + 1
     assert mgr.unload_if_idle() is True
     assert created[0].unloaded is True
+
+
+def test_version_moves_on_load_unload_hold_release_and_idle_resets_and_nothing_else():
+    """What the event stream polls between documents. A read moves nothing;
+    every reset of the idle clock does, because the terminal runs that
+    clock itself between documents and must hear about a restart."""
+    created: list[FakeEngine] = []
+
+    def factory(model_id: str):
+        e = FakeEngine([])
+        created.append(e)
+        return e
+
+    alive = {"ok": True}
+    cfg = SousConfig(idle_unload_minutes=0)
+    m = EngineManager(cfg, engine_factory=factory, holder_alive=lambda pid, started: alive["ok"])
+    v = m.version
+    m.get()
+    assert m.version > v, "a load moved nothing"
+    v = m.version
+    m.status()
+    assert m.version == v, "a read moved the version"
+    m.get()
+    assert m.version == v + 1, "a hit resets the idle clock and moved nothing"
+    m.touch()
+    assert m.version == v + 2, "a touch resets the idle clock and moved nothing"
+    v = m.version
+    m.hold(4242, 1.0)
+    assert m.version == v + 1, "a hold moved nothing"
+    m.status()
+    assert m.version == v + 1, "a status read with a live holder moved the version"
+    alive["ok"] = False
+    m.status()
+    assert m.version == v + 2, "a pruned holder moved nothing"
+    v = m.version
+    time.sleep(0.01)
+    assert m.unload_if_idle() is True
+    assert m.version == v + 2, "an unload is two changes: it started, it finished"
+    assert m.unload_if_idle() is False
+    assert m.version == v + 2, "a refused unload moved the version"
+
+
+def test_status_reports_an_unload_in_progress():
+    """The weights come off the GPU over seconds with nothing else in the
+    document to show for it, and the event stream keeps its heartbeat for
+    the span only if the document says the span is on."""
+    slow = _SlowUnloadEngine()
+    mgr = EngineManager(SousConfig(idle_unload_minutes=0), engine_factory=lambda mid: slow)
+    mgr.get()
+    assert mgr.status()["unloading"] is False
+    time.sleep(0.01)
+    sweeper = threading.Thread(target=mgr.unload_if_idle, daemon=True)
+    sweeper.start()
+    assert slow.unloading.wait(5)
+    s = mgr.status()
+    assert s["unloading"] is True and s["loaded"] is False and s["loading"] is False
+    slow.release.set()
+    sweeper.join(5)
+    assert mgr.status()["unloading"] is False
+
+
+def test_a_preload_that_succeeds_costs_no_document_after_the_load():
+    """get() published the engine and bumped; the thread forgetting itself
+    afterwards changes nothing a document shows, so it must not bump."""
+    cfg = SousConfig(idle_unload_minutes=30)
+    m = EngineManager(
+        cfg, engine_factory=lambda mid: FakeEngine([]), holder_alive=lambda pid, started: True
+    )
+    v = m.version
+    m.hold(4242, 1.0)
+    deadline = time.monotonic() + 5.0
+    while m._preload is not None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert m._preload is None and m.status()["loaded"] is True
+    # The hold, the load starting, the load ending — nothing for the thread's exit.
+    assert m.version == v + 3
+
+
+def test_a_preload_that_fails_announces_its_end():
+    """The version must move when a failed preload's thread forgets itself:
+    `loading` is true until then, and a client that never hears the end
+    keeps painting a load that is over."""
+
+    def failing(model_id: str):
+        raise RuntimeError("no weights")
+
+    cfg = SousConfig(idle_unload_minutes=30)
+    m = EngineManager(cfg, engine_factory=failing, holder_alive=lambda pid, started: True)
+    v = m.version
+    m.hold(4242, 1.0)
+    deadline = time.monotonic() + 5.0
+    while m.status()["loading"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert m.status()["loading"] is False
+    # The hold, the load starting, its failure, the thread forgetting itself.
+    assert m.version == v + 4
