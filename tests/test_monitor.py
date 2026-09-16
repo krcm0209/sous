@@ -614,7 +614,9 @@ def test_events_ping_on_the_configured_cadence(tmp_path: Path, monkeypatch, busy
     if busy:
         registry.begin("msg_1", model="sous-local", stream=True, max_tokens=1)
     app, _ = _app(tmp_path, inflight=registry)
-    _, frames = _collect_events(app, want=None, seconds=0.7)
+    # Busy, wait for the frames rather than the clock: a slow runner must
+    # not turn a heartbeat that is merely late into a failure.
+    _, frames = _collect_events(app, want=3 if busy else None, seconds=3.0 if busy else 0.7)
     assert ("ping", {"type": "ping"}) in frames
     statuses = [e for e, _ in frames if e == "status"]
     assert len(statuses) >= 3 if busy else statuses == ["status"]
@@ -684,6 +686,30 @@ def test_a_failing_status_build_ends_the_events_stream_not_a_traceback(
     messages = [r.getMessage() for r in caplog.records if r.name == "sous.monitor"]
     assert messages == ["GET /sous/events failed (RuntimeError)"]
     assert "locked" not in messages[0] and "tasks.db" not in messages[0]
+
+
+def test_a_failing_version_read_ends_the_events_stream_the_same_way(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """The version read stats the config file on every tick, on the event
+    loop: a failure there must end the stream with its type logged, like a
+    failed build, never leave through uvicorn with its message."""
+    import logging
+
+    from sous.server import SousService
+
+    def failing_version(self):
+        raise RuntimeError("stat: /nowhere/config.toml")
+
+    monkeypatch.setattr(SousService, "status_version", failing_version)
+    app, _ = _app(tmp_path)
+    with caplog.at_level(logging.ERROR, logger="sous.monitor"):
+        status, frames = _collect_events(app, want=0)
+    assert status == [200]
+    assert [f for f in frames if f[0] == "status"] == []
+    messages = [r.getMessage() for r in caplog.records if r.name == "sous.monitor"]
+    assert messages == ["GET /sous/events failed (RuntimeError)"]
+    assert "nowhere" not in messages[0]
 
 
 def test_a_document_json_cannot_encode_ends_the_stream_too(tmp_path: Path, monkeypatch, caplog):

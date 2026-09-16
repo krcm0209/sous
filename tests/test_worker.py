@@ -614,6 +614,9 @@ def test_an_idle_worker_poll_moves_no_version(env):
     document on the poll — the idle cost the stream exists to avoid."""
     root, cfg, store = env
     engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
+    # With the model resident the sweep runs its prune and its idle
+    # comparison on every poll, the path the daemon idles on for hours.
+    engines.get()
     stop = threading.Event()
     before = (store.version, engines.version)
     loop = threading.Thread(

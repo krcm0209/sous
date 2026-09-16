@@ -113,10 +113,10 @@ class TaskStore:
 
     @property
     def version(self) -> int:
-        """Bumped once per connection whose statements matched a row —
-        sqlite's total_changes, which counts an UPDATE that rewrote a value
-        already there the same as one that changed it, and nothing for a
-        WHERE that matched no row (the worker's idle claim). Two reads that
+        """Bumped once per connection whose statements inserted, updated or
+        deleted a row — sqlite's total_changes, which counts an UPDATE that
+        rewrote a value already there the same as one that changed it, and
+        nothing for a WHERE that matched no row (the worker's idle claim). Two reads that
         saw the same number saw the same rows; two different numbers need
         not mean different bytes. Per instance, and only writes through this
         one move it: the daemon builds a single store for the worker and

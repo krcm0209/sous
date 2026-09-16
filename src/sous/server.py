@@ -271,8 +271,9 @@ class SousService:
     def _config_stamp(self) -> tuple[int, int]:
         """The config file's mtime_ns and size, (-1, -1) when there is no
         file: what the allowlist memo and the status version key on. The
-        size is there for a write that keeps the mtime — a `cp -p`, a backup
-        restore — which the memo would otherwise never see."""
+        size is there for a write that keeps the mtime and changes the
+        length — a `cp -p`, a backup restore — which the memo would
+        otherwise never see; one that keeps both is still invisible."""
         try:
             st = self.config.config_path.stat()
         except OSError:

@@ -48,8 +48,8 @@ EVENT_TICK_SECONDS = 0.1
 # at all — a load, a hold and a task change bump a version of their own,
 # and the idle clock is the terminal's to run.
 EVENT_HEARTBEAT_SECONDS = 1.0
-# Idle — no turn in flight, no delegated task running, no load under way —
-# nothing on the registry moves without a turn starting, so the poll slows to
+# Idle — no turn in flight, no delegated task running, no load or unload
+# under way — nothing on the registry moves without a turn starting, so the poll slows to
 # this: a new order is on screen within half a second, and the loop costs a
 # fifth of the 10 Hz one. Busy, the fast tick is what puts a token delta on
 # the wire in time.
