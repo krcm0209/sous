@@ -38,14 +38,15 @@ HOLD_BODY_LIMIT = 1024
 # terminal can show and what a token-per-delta feed produces at the default
 # model's decode speed.
 EVENT_TICK_SECONDS = 0.1
-# While a turn is in flight, a delegated task is running or a load is
-# under way the document also goes out this often unchanged: the terminal
-# reads a silent stream during a turn as a stalled daemon, a prefill runs
-# for a minute without a registry change, and a task's clock and the cache
-# counters it moves are in the document while the worker writes the store
-# once per tool call. Idle there is no heartbeat at all — a load, a hold
-# and a task change bump a version of their own, and the idle clock is the
-# terminal's to run.
+# While a turn is in flight, a delegated task is running or a load or an
+# unload is under way the document also goes out this often unchanged: the
+# terminal reads a silent stream during a turn as a stalled daemon, a
+# prefill runs for a minute without a registry change, a task's clock and
+# the cache counters it moves are in the document while the worker writes
+# the store once per tool call, and an unload frees the weights over
+# seconds with `memory_gb` the only sign of it. Idle there is no heartbeat
+# at all — a load, a hold and a task change bump a version of their own,
+# and the idle clock is the terminal's to run.
 EVENT_HEARTBEAT_SECONDS = 1.0
 # Idle — no turn in flight, no delegated task running, no load under way —
 # nothing on the registry moves without a turn starting, so the poll slows to
@@ -60,7 +61,12 @@ def _busy(document: dict) -> bool:
     # `running` includes a task awaiting approval, whose clock runs too.
     engine = document.get("engine") or {}
     queue = document.get("queue") or {}
-    return bool(document.get("inflight") or queue.get("running") or engine.get("loading"))
+    return bool(
+        document.get("inflight")
+        or queue.get("running")
+        or engine.get("loading")
+        or engine.get("unloading")
+    )
 
 
 async def _status_events(
@@ -68,8 +74,8 @@ async def _status_events(
 ) -> AsyncIterator[ServerSentEvent]:
     """The document now, then again whenever `version()` moved since the
     last one went out — checked every tick — and, only while the last
-    document showed a turn, a running task or a load, at least once a
-    heartbeat regardless.
+    document showed a turn, a running task, a load or an unload, at least
+    once a heartbeat regardless.
     Built on a worker thread each time. Nothing is buffered for a client
     that is gone: the response cancels this generator on disconnect, and
     the tick's sleep is where that lands. A failure building or encoding
@@ -78,11 +84,17 @@ async def _status_events(
     daemon failure logs its type and never its message."""
     seen: object = None  # nothing sent yet, whatever the clock says
     sent = time.monotonic()
-    busy = True  # until the first document says otherwise
+    busy = False  # the first document always goes out, and sets the real value
     while True:
         # Read before the build, not after: a change landing during it is
-        # then a newer value on the next check, never one masked.
-        current = version()
+        # then a newer value on the next check, never one masked. Guarded
+        # like the build: the callable stats a file, and a failure here
+        # would otherwise leave through uvicorn, message included.
+        try:
+            current = version()
+        except Exception as e:  # noqa: BLE001 — logged and the stream ends, never raised
+            _logger.error(f"GET /sous/events failed ({type(e).__name__})")
+            return
         now = time.monotonic()
         if current != seen or (busy and now - sent >= EVENT_HEARTBEAT_SECONDS):
             try:

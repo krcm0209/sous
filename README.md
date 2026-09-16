@@ -228,7 +228,7 @@ The preflight itself is plain HTTP. The daemon's own routes live under
 the gateway is on:
 
 - `GET /sous/status` — one JSON document: `engine` (`loaded`, `loading`,
-  `model_id`, `idle_seconds`, `holders`, `memory_gb`, the `prompt_cache`
+  `unloading`, `model_id`, `idle_seconds`, `holders`, `memory_gb`, the `prompt_cache`
   counters, and on the VLM backend `positions`, the load line's
   `engine|model`), `inflight` (the turn the model is serving right now — its
   `msg_` id, phase, tokens so far, rate and ETA — usually empty or one
@@ -241,8 +241,8 @@ the gateway is on:
   once at connect, then whenever something on it changed — the turn in
   flight (at most ten times a second), a load, an unload, a hold or its
   release, a task, an edit of the config file — and, only while a turn is
-  in flight, a delegated task running or a load under way, at least once a
-  second; idle, nothing but a `ping` every 10 s. The idle clock is not
+  in flight, a delegated task running or a load or unload under way, at
+  least once a second; idle, nothing but a `ping` every 10 s. The idle clock is not
   refreshed between frames: a client advances `engine.idle_seconds` from
   the time since the frame arrived, the way `sous top` does; `memory_gb`
   likewise waits for the next frame.

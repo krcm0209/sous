@@ -607,6 +607,28 @@ def test_worker_loop_survives_bookkeeping_exception(env, capsys):
     assert calls["n"] >= 2  # survived the first failure and polled again
 
 
+def test_an_idle_worker_poll_moves_no_version(env):
+    """The event stream sends a document per version move, and the worker
+    polls an empty queue and a refused sweep twice a second forever: if
+    either moved a version, every connected terminal would rebuild the
+    document on the poll — the idle cost the stream exists to avoid."""
+    root, cfg, store = env
+    engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
+    stop = threading.Event()
+    before = (store.version, engines.version)
+    loop = threading.Thread(
+        target=run_worker_loop,
+        args=(store, engines, cfg, stop),
+        kwargs={"poll_interval": 0.01},
+    )
+    loop.start()
+    time.sleep(0.1)
+    stop.set()
+    loop.join(5.0)
+    assert not loop.is_alive()
+    assert (store.version, engines.version) == before
+
+
 def test_engine_exception_fails_task_cleanly(env):
     root, cfg, store = env
     task = _start(store, root)

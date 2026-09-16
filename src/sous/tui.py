@@ -30,6 +30,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from time import localtime, strftime
+from time import monotonic as _monotonic_clock
 from time import time as _wall_clock
 
 import httpx
@@ -1067,7 +1068,11 @@ class LinePanel(Vertical):
         recent: list[dict],
         now: float,
         motion: bool,
+        subtitle: str | None = None,
     ) -> None:
+        """`subtitle` replaces the panel's own tail (`idle …`, `ON RAIL …`),
+        which is a live daemon's line: while the feed is down the caller
+        hands in when the document on screen arrived instead."""
         self.query_one("#line-chef", Chef).show(mood, now, motion=motion)
         model = (config.get("model_id") or "-").rsplit("/", 1)[-1]
         memory = engine.get("memory_gb")
@@ -1120,7 +1125,7 @@ class LinePanel(Vertical):
         tail = f"idle {span_text(idle)}" if idle is not None and engine.get("loaded") else literal
         if compact:
             tail = f"ON RAIL {queue.get('queued', 0)} · COOKING {queue.get('running', 0)} · {tail}"
-        _retitle(self, subtitle=tail)
+        _retitle(self, subtitle=tail if subtitle is None else subtitle)
 
 
 class RatePanel(Vertical):
@@ -1431,7 +1436,14 @@ class Top(App[int]):
         Binding("r", "reconnect", "reconnect"),
     ]
 
-    def __init__(self, feed: Feed, *, port: int, clock: Clock = _wall_clock) -> None:
+    def __init__(
+        self,
+        feed: Feed,
+        *,
+        port: int,
+        clock: Clock = _wall_clock,
+        monotonic: Clock = _monotonic_clock,
+    ) -> None:
         super().__init__(ansi_color=True)
         # ansi_color alone leaves the default theme in place; the ANSI theme
         # is what makes foreground and background the terminal's own, and
@@ -1440,11 +1452,17 @@ class Top(App[int]):
         self._feed = feed
         self._port = port
         self._clock = clock
+        # The wall clock is for what the daemon stamps in wall time and for
+        # `as of …`; the monotonic one runs the idle clock alone, which the
+        # daemon keeps on its monotonic clock — a system sleep moves one and
+        # not the other, and no heartbeat arrives to reconcile them.
+        self._monotonic = monotonic
         self.motion = True
         self._document: dict = {}
         self._turn: dict | None = None
         self._behind: list[dict] = []
         self._received_at = 0.0
+        self._received_mono = 0.0
         # The idle second last painted, so the tick repaints the clock's
         # lines once a second and never twice for the same words.
         self._idle_shown: int | None = None
@@ -1583,14 +1601,16 @@ class Top(App[int]):
         if not resize:
             self._document = document
             self._received_at = now
+            self._received_mono = self._monotonic()
             self._connected = self._ever_connected = True
             self._attempt = 0
             self._retry_at = None
             for selector in ("#right", "#rail", "#tasks"):
                 self.query_one(selector).remove_class("stale")
-        # On a fresh document the offset is zero; on a resize it is the
-        # clock already on screen, never the document's older one.
-        engine = self._engine_now(now)
+        # On a fresh document the offset is nothing; on a resize it is the
+        # clock already on screen, never the document's older one. Read once
+        # and handed down, so every widget this paints shows one second.
+        engine = self._engine_now()
         # The document paints its own second; the tick repaints only once
         # the clock has moved past it.
         idle_now = engine.get("idle_seconds")
@@ -1615,30 +1635,12 @@ class Top(App[int]):
             if not resize and view.phase == "decode" and now - self._spark_at >= 1.0:
                 self._spark.append((now, view.tps or 0.0))
                 self._spark_at = now
-            self._show_left(view)
+            self._show_left(view, now, engine)
         else:
-            self._show_left(None)
+            self._show_left(None, now, engine)
         if not engine.get("loading"):
             self._firing_since = None
-        mood = self._mood(engine, now)
-        self.query_one(LinePanel).show(mood, engine, config, queue, recent, now, self.motion)
-        if not self._connected:
-            # A resize re-applies the stale document, and the panel's own
-            # tail (`idle …`, `ON RAIL …`) is a live daemon's line.
-            _retitle(self.query_one(LinePanel), subtitle=self._stale_subtitle())
-        live = self._live_rates(now)
-        best, _ = hi_score(recent, live)
-        floor = [r for r in live if r]
-        self.query_one(RatePanel).show(
-            self._turn and turn_view(self._turn, now, self._received_at).tps,
-            min(floor) if floor else None,
-            best,
-            f"{PHASE_WORDS.get(self._turn.get('phase', ''), '')}  {self._turn.get('phase', '')}"
-            if self._turn
-            else QUIET_WORD,
-        )
-        headline, colour = self._headline(engine, recent, now)
-        self.query_one(Strip).show(headline, colour)
+        self._paint_line(engine, config, queue, recent, now)
         self.query_one(Rail).show(recent)
         self._show_tasks(document.get("recent_tasks") or [])
         cache = engine.get("prompt_cache") or {}
@@ -1651,7 +1653,6 @@ class Top(App[int]):
             if self.motion and (rose["misses"] or rose["pressure_evictions"]):
                 self.query_one(LinePanel).add_class("flash")
                 self.set_timer(0.25, lambda: self.query_one(LinePanel).remove_class("flash"))
-        self._refresh_footer()
         busy = self._connected and (self._turn is not None or bool(engine.get("loading")))
         if self._ticker is not None:
             self._ticker.resume() if busy else self._ticker.pause()
@@ -1700,16 +1701,21 @@ class Top(App[int]):
         whatever the pass served in the last hour."""
         return [tps for t, tps in self._spark if now - t <= SPARK_SAMPLES]
 
-    def _show_left(self, view: TurnView | None) -> None:
+    def _show_left(
+        self, view: TurnView | None, now: float | None = None, engine: dict | None = None
+    ) -> None:
         """The slip and the stub when a turn is on the pass; the card when
-        not — quiet, firing up, redialing or closed."""
-        now = self._clock()
+        not — quiet, firing up, redialing or closed. A document hands in the
+        `now` and the engine block it painted the rest of the screen from,
+        so the card's idle second is the strip's; the other callers paint no
+        clock and read their own."""
+        now = self._clock() if now is None else now
         slip, stub, card = (
             self.query_one(Slip),
             self.query_one(Stub),
             self.query_one(Card),
         )
-        engine = self._engine_now(now)
+        engine = self._engine_now() if engine is None else engine
         config = self._document.get("config") or {}
         recent = self._document.get("recent_turns") or []
         if view is not None and self._connected:
@@ -1756,10 +1762,10 @@ class Top(App[int]):
             )
         self.query_one("#tasks", Line).show("\n".join(rows) if rows else " TASK  none on the rail")
 
-    def _refresh_footer(self) -> None:
+    def _refresh_footer(self, now: float | None = None, engine: dict | None = None) -> None:
         footer = self.query_one("#footer", Line)
         width = self._width
-        now = self._clock()
+        now = self._clock() if now is None else now
         if width < NARROW_COLUMNS:
             if self._turn is not None:
                 view = turn_view(self._turn, now, self._received_at)
@@ -1767,7 +1773,7 @@ class Top(App[int]):
                 rate = f" {view.tps:.1f}t/s" if view.tps else ""
                 footer.show(f" {view.word} {gen}{rate} {clock_text(view.elapsed)}  q")
             elif self._connected:
-                engine = self._engine_now(now)
+                engine = self._engine_now() if engine is None else engine
                 footer.show(f" {QUIET_WORD} {span_text(engine.get('idle_seconds') or 0)}  q")
             else:
                 footer.show(f" {CLOSED_WORD}  q")
@@ -1799,31 +1805,70 @@ class Top(App[int]):
                 )
                 self.query_one("#line-chef", Chef).show("loading", now, motion=self.motion)
             if self._width < NARROW_COLUMNS:
-                self._refresh_footer()
+                self._refresh_footer(now)
         except NoMatches:
             # A tick that lands while the screen is being torn down: nothing
             # left to draw on.
             return
 
-    def _engine_now(self, now: float) -> dict:
+    def _engine_now(self) -> dict:
         """The last document's engine block with its idle clock advanced by
-        the time since that document arrived. The daemon sends no document
-        while nothing moves, so between them the clock is the terminal's;
-        anything that would reset it (a turn, a hold leaving) is a document."""
+        the time since that document arrived — on the monotonic clock, the
+        one the daemon runs that clock on: a wall-clock delta would add a
+        system sleep the daemon's clock never saw, with no heartbeat to
+        correct it. The daemon sends no document while nothing moves, so
+        between them the clock is the terminal's; anything that would reset
+        it (a turn, a hold leaving) is a document."""
         engine = dict(self._document.get("engine") or {})
         idle = engine.get("idle_seconds")
         if idle is not None and self._connected:
-            engine["idle_seconds"] = idle + max(0.0, now - self._received_at)
+            engine["idle_seconds"] = idle + max(0.0, self._monotonic() - self._received_mono)
         return engine
+
+    def _paint_line(
+        self, engine: dict, config: dict, queue: dict, recent: list[dict], now: float
+    ) -> None:
+        """THE LINE, PLATE RATE, the headline and the footer from one engine
+        block and one `now` — what a document paints and what the idle tick
+        repaints once a second, so the two cannot drift apart. The card is
+        not here: a document paints it through _show_left, whose closed,
+        redial and firing branches the idle tick never needs."""
+        mood = self._mood(engine, now)
+        self.query_one(LinePanel).show(
+            mood,
+            engine,
+            config,
+            queue,
+            recent,
+            now,
+            self.motion,
+            subtitle=None if self._connected else self._stale_subtitle(),
+        )
+        # The sixty-second floor expires on the idle tick too: nothing else
+        # repaints the panel while the daemon is quiet.
+        live = self._live_rates(now)
+        best, _ = hi_score(recent, live)
+        floor = [r for r in live if r]
+        self.query_one(RatePanel).show(
+            turn_view(self._turn, now, self._received_at).tps if self._turn else None,
+            min(floor) if floor else None,
+            best,
+            f"{PHASE_WORDS.get(self._turn.get('phase', ''), '')}  {self._turn.get('phase', '')}"
+            if self._turn
+            else QUIET_WORD,
+        )
+        headline, colour = self._headline(engine, recent, now)
+        self.query_one(Strip).show(headline, colour)
+        self._refresh_footer(now, engine)
 
     def _show_idle(self, engine: dict, now: float) -> None:
         """Repaint the lines that show the idle clock — the quiet card's
-        span, its lights-out countdown, THE LINE's subtitle, the headline,
-        the narrow footer — from the advanced clock. The card's `since …`
-        subtitle rides along on the same repaint: it counts from the recent
-        ring's oldest turn, not from the idle clock, but off the same `now`.
-        Each widget skips text that did not change, so this is three or four
-        repaints a second."""
+        span and its lights-out countdown, then THE LINE's subtitle, the
+        headline and the narrow footer through _paint_line — from the
+        advanced clock. The card's `since …` subtitle rides along on the
+        same repaint: it counts from the recent ring's oldest turn, not from
+        the idle clock, but off the same `now`. Each widget skips text that
+        did not change, so this is three or four repaints a second."""
         document = self._document
         config = document.get("config") or {}
         recent = document.get("recent_turns") or []
@@ -1831,16 +1876,12 @@ class Top(App[int]):
         card = self.query_one(Card)
         if card.display and not engine.get("loading"):
             card.show_quiet(engine, config, recent, now, self.motion)
-        mood = self._mood(engine, now)
-        self.query_one(LinePanel).show(mood, engine, config, queue, recent, now, self.motion)
-        headline, colour = self._headline(engine, recent, now)
-        self.query_one(Strip).show(headline, colour)
-        self._refresh_footer()
+        self._paint_line(engine, config, queue, recent, now)
 
     def _idle_tick(self) -> None:
         now = self._clock()
         try:
-            engine = self._engine_now(now)
+            engine = self._engine_now()
             mood = self._mood(engine, now)
             self.query_one("#line-chef", Chef).show(mood, now, motion=self.motion)
             card = self.query_one(Card)

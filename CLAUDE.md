@@ -199,10 +199,10 @@ Claude Code use stretches further — evaluate features against that goal.
   `/sous/events` polls `SousService.status_version()` — the registry's
   version, `EngineManager.version` (load, unload, hold, release, and
   every idle-clock reset: `touch()` and a `get()` hit),
-  `TaskStore.version` (any connection that changed a row) and the config
-  file's mtime — ten times a second while the last document showed a
-  turn, a running task (`queue.running`) or a load, and twice a second
-  otherwise, rebuilding
+  `TaskStore.version` (any connection that matched a row) and the config
+  file's mtime and size — ten times a second while the last document
+  showed a turn, a running task (`queue.running`), a load or an unload
+  (`engine.unloading`), and twice a second otherwise, rebuilding
   the whole document on a worker thread when the tuple moved; the
   once-a-second heartbeat runs only while busy (the TUI reads a silent
   stream during a turn as a stalled daemon, and a task's clock is in the
@@ -210,7 +210,7 @@ Claude Code use stretches further — evaluate features against that goal.
   (`Top._engine_now`, seeded by every reset the engine version carries).
   The build memoises the task counts and listing on the store's version
   (two slots: the narrow MCP build never reads the listing) and the
-  allowlist on the config file's mtime; summaries are per build. Never
+  allowlist on the config file's mtime and size; summaries are per build. Never
   wake the loop from a writer. The routes record a summary for *every*
   `POST /v1/messages id=…` line — refused, abandoned and failed included —
   and the served line is printed from that summary (`_turn_line`,

@@ -873,16 +873,15 @@ def test_uvicorn_config_leaves_logging_to_the_daemon():
 
 
 def test_status_version_is_the_three_counters_and_the_config_stamp(svc):
-    import os
-
     service, store, _ = svc
     path = service.config.config_path
     before = service.status_version()
+    stat = path.stat()
     assert before == (
         service.inflight.version,
         service.engines.version,
         store.version,
-        path.stat().st_mtime_ns,
+        (stat.st_mtime_ns, stat.st_size),
     )
     store.enqueue("t", "do it", "/tmp/nowhere", [], [])
     after = service.status_version()
@@ -893,7 +892,23 @@ def test_status_version_is_the_three_counters_and_the_config_stamp(svc):
     stat = path.stat()
     os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
     edited = service.status_version()
-    assert edited[3] > after[3] and edited[:3] == after[:3]
+    assert edited[3] == (stat.st_mtime_ns + 1_000_000, stat.st_size) and edited[:3] == after[:3]
+
+
+def test_a_config_write_that_keeps_the_mtime_still_moves_the_stamp(svc):
+    """A `cp -p` or a backup restore lands the new bytes under the old
+    mtime; the size is the stamp's second chance to notice, or the served
+    allowlist would be the old one until an unrelated edit."""
+    service, _, _ = svc
+    path = service.config.config_path
+    assert service.status_document(recent=False)["config"]["allowlist"] == [["pytest"]]
+    stat = path.stat()
+    path.write_text('[commands]\nallowlist = ["pytest", "ruff"]\n')
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert service.status_document(recent=False)["config"]["allowlist"] == [
+        ["pytest"],
+        ["ruff"],
+    ]
 
 
 def test_the_build_reads_the_task_store_only_when_it_changed(svc, monkeypatch):
@@ -928,6 +943,8 @@ def test_the_build_reads_the_task_store_only_when_it_changed(svc, monkeypatch):
 def test_a_running_tasks_seconds_keep_moving_between_task_changes(svc, monkeypatch):
     """What is cached is the rows, never the summaries: a running task's
     `seconds` is the clock minus its start, and a cached summary froze it."""
+    from types import SimpleNamespace
+
     from sous import server as server_module
 
     service, store, root = svc
@@ -936,17 +953,18 @@ def test_a_running_tasks_seconds_keep_moving_between_task_changes(svc, monkeypat
     assert task is not None and task.id == out["task_id"]
     started = task.started_at
     assert started is not None, "claim_next stamps started_at"
-    monkeypatch.setattr(server_module.time, "time", lambda: started + 5.0)
+    # The module's own `time`, not the stdlib's: the store and the registry
+    # keep their real clocks.
+    monkeypatch.setattr(server_module, "time", SimpleNamespace(time=lambda: started + 5.0))
     assert service.status_document(recent=True)["recent_tasks"][0]["seconds"] == 5
-    monkeypatch.setattr(server_module.time, "time", lambda: started + 9.0)
+    monkeypatch.setattr(server_module, "time", SimpleNamespace(time=lambda: started + 9.0))
     assert service.status_document(recent=True)["recent_tasks"][0]["seconds"] == 9
 
 
 def test_the_allowlist_is_reparsed_only_when_the_config_file_changed(svc, monkeypatch):
-    """An edit still takes effect on the next build — the file's mtime is
-    the key — but ten builds a second no longer parse TOML ten times."""
-    import os
-
+    """An edit still takes effect on the next build — the file's mtime and
+    size are the key — but ten builds a second no longer parse TOML ten
+    times."""
     from sous import server as server_module
 
     service, _, _ = svc

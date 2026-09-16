@@ -15,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import IO
 
@@ -56,6 +56,24 @@ def _mlx_memory_gb() -> float | None:
         release_mlx_thread_state()
 
 
+class _Memo[K, V]:
+    """One value keyed on one stamp: `get` refetches when the key it was
+    stored under is not the one asked for. The slot is replaced whole, so a
+    reader on another thread sees the old pair or the new one, never half of
+    either; two readers that both miss both fetch, and a stale key stored
+    over a newer one costs the next reader a fetch, never a stale value."""
+
+    def __init__(self) -> None:
+        self._slot: tuple[K, V] | None = None
+
+    def get(self, key: K, fetch: Callable[[], V]) -> V:
+        slot = self._slot
+        if slot is None or slot[0] != key:
+            slot = (key, fetch())
+            self._slot = slot
+        return slot[1]
+
+
 class SousService:
     def __init__(
         self,
@@ -73,11 +91,12 @@ class SousService:
         # The status document is built up to ten times a second during a
         # turn, and the task counts, the recent listing and the allowlist
         # change only when a task or the config file does: each is read
-        # once per change and served from here in between. A whole tuple
-        # is replaced at once, so the builder threads never see half of one.
-        self._counts_cache: tuple[int, dict] | None = None
-        self._recent_cache: tuple[int, list[Task]] | None = None
-        self._allowlist_cache: tuple[int, list[list[str]]] | None = None
+        # once per change and served from here in between. Two task slots,
+        # not one: the narrow build (the MCP tool) never pays for a listing
+        # it does not show.
+        self._counts: _Memo[int, dict[str, int]] = _Memo()
+        self._recent: _Memo[int, list[Task]] = _Memo()
+        self._allowlist: _Memo[tuple[int, int], list[list[str]]] = _Memo()
 
     def delegate_task(
         self,
@@ -249,15 +268,18 @@ class SousService:
             "seconds": round(end - t.started_at) if t.started_at else 0,
         }
 
-    def _config_stamp(self) -> int:
-        """The config file's mtime_ns, -1 when there is no file: what the
-        allowlist memo and the status version key on."""
+    def _config_stamp(self) -> tuple[int, int]:
+        """The config file's mtime_ns and size, (-1, -1) when there is no
+        file: what the allowlist memo and the status version key on. The
+        size is there for a write that keeps the mtime — a `cp -p`, a backup
+        restore — which the memo would otherwise never see."""
         try:
-            return self.config.config_path.stat().st_mtime_ns
+            st = self.config.config_path.stat()
         except OSError:
-            return -1
+            return (-1, -1)
+        return (st.st_mtime_ns, st.st_size)
 
-    def status_version(self) -> tuple[int, int, int, int]:
+    def status_version(self) -> tuple[int, int, int, tuple[int, int]]:
         """What the event stream polls between documents: the in-flight
         registry's version, the engine manager's, the task store's and the
         config file's stamp. Four cheap reads and no lock; a change to any
@@ -270,32 +292,19 @@ class SousService:
         )
 
     def _task_reads(self, *, recent: bool) -> tuple[dict, list[Task]]:
-        # The version is read before the queries, so a write that lands
-        # while they run is a newer number next time, never masked. Two
-        # slots: the narrow build (the MCP tool) never pays for a listing
-        # it does not show.
+        # The version is read once, before the queries, so a write that
+        # lands while they run is a newer number next time, never masked.
         version = self.store.version
-        counts = self._counts_cache
-        if counts is None or counts[0] != version:
-            counts = (version, self.store.count_by_state())
-            self._counts_cache = counts
+        counts = self._counts.get(version, self.store.count_by_state)
         if not recent:
-            return counts[1], []
-        tasks = self._recent_cache
-        if tasks is None or tasks[0] != version:
-            tasks = (version, self.store.list_recent(limit=10))
-            self._recent_cache = tasks
-        return counts[1], tasks[1]
+            return counts, []
+        return counts, self._recent.get(version, lambda: self.store.list_recent(limit=10))
 
     def _allowlist_now(self) -> list[list[str]]:
-        # No file stamps as -1: the defaults, which current_allowlist knows.
-        stamp = self._config_stamp()
-        cached = self._allowlist_cache
-        if cached is not None and cached[0] == stamp:
-            return cached[1]
-        entries = current_allowlist(self.config.config_path)
-        self._allowlist_cache = (stamp, entries)
-        return entries
+        # No file stamps as (-1, -1): the defaults, which current_allowlist knows.
+        return self._allowlist.get(
+            self._config_stamp(), lambda: current_allowlist(self.config.config_path)
+        )
 
     def status_document(self, *, recent: bool) -> dict:
         """The one document every status surface serves. `recent` adds the

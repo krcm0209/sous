@@ -706,8 +706,12 @@ class EngineManager:
                 # Forgetting the thread is what ends `loading` when the load
                 # failed — get()'s own bump left _preload set — so a client
                 # that hears no version move keeps painting a dead load. A
-                # load that succeeded pays one extra document for it.
-                self._bump()
+                # load that succeeded published the engine and bumped in
+                # get() itself, and forgetting the thread then changes
+                # nothing a document shows: the engine is None here only
+                # after a failure, or once an unload took it back first.
+                if self._engine is None:
+                    self._bump()
 
     def _prune_holders(self) -> None:
         """Drop every holder whose process is gone, and when that empties the
@@ -767,6 +771,11 @@ class EngineManager:
             out = {
                 "loaded": self._engine is not None,
                 "loading": self._load_in_progress(),
+                # The weights come off the GPU over seconds, with memory_gb
+                # the only sign of it and no version move until it ends: the
+                # event stream keeps its heartbeat for this the way it does
+                # for a load.
+                "unloading": self._unloading,
                 "model_id": self._config.model_id,
                 "idle_seconds": idle,
                 "holders": len(self._holders),

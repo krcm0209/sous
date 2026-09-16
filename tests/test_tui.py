@@ -380,13 +380,15 @@ class Feed:
             yield "status", document
 
 
-def _run(test, *, size=(100, 30), clock=None):
-    """Run `test(app, pilot, feed, clock)` inside the pilot."""
+def _run(test, *, size=(100, 30), clock=None, monotonic=None):
+    """Run `test(app, pilot, feed, clock)` inside the pilot. One pinned clock
+    serves as both the wall and the monotonic one unless a test needs them
+    to disagree."""
     clock = clock or Clock()
     feed = Feed()
 
     async def go():
-        app = Top(feed, port=8383, clock=clock)
+        app = Top(feed, port=8383, clock=clock, monotonic=monotonic or clock)
         async with app.run_test(size=size) as pilot:
             await pilot.pause(0.1)
             await test(app, pilot, feed, clock)
@@ -579,9 +581,9 @@ def test_a_quiet_kitchens_idle_tick_moves_the_steam_and_the_clock():
         await _until(pilot, lambda: "no orders on the rail for 4m 13s" in _plain(app, "#card-body"))
         steam_2 = _plain(app, "#card-art")
         assert steam_2 == steam_0 and steam_2 != steam_1
+        # Only the two clock lines moved; the rest of the card is the same bytes.
         body_1 = _plain(app, "#card-body")
-        assert "no orders on the rail for 4m 13s" in body_1
-        assert "LIGHTS OUT in 25m 47s" in body_1
+        assert body_1 == body.replace("4m 12s", "4m 13s").replace("25m 48s", "25m 47s")
         assert "idle 4m 13s" in app.query_one(tui.LinePanel).border_subtitle
         assert "KITCHEN QUIET 4m 13s" in app.query_one(tui.Strip).render().plain
         # Below 60 columns the footer is the only clock on screen.
@@ -590,6 +592,28 @@ def test_a_quiet_kitchens_idle_tick_moves_the_steam_and_the_clock():
         assert _plain(app, "#footer") == " KITCHEN QUIET 4m 13s  q"
 
     _run(test)
+
+
+def test_the_idle_clock_runs_on_the_monotonic_clock_not_the_wall_clock():
+    """The daemon keeps its idle clock on the monotonic clock, which a system
+    sleep does not advance; the terminal's copy must run on the same one, or
+    an hour asleep is an hour on the card the daemon never counted, with no
+    document coming while idle to say otherwise."""
+    wall, mono = Clock(), Clock()
+
+    async def test(app, pilot, feed, clock):
+        document = _doc(None, recent=RECENT)
+        document["engine"]["holders"] = 0
+        await _deliver(feed, pilot, document)
+        wall.now = BASE + 3600.0
+        mono.now = BASE + 1.0
+        await _until(pilot, lambda: "no orders on the rail for 4m 13s" in _plain(app, "#card-body"))
+        body = _plain(app, "#card-body")
+        assert "no orders on the rail for 4m 13s" in body
+        assert "LIGHTS OUT in 25m 47s" in body
+        assert "KITCHEN QUIET 4m 13s" in app.query_one(tui.Strip).render().plain
+
+    _run(test, clock=wall, monotonic=mono)
 
 
 def test_a_resize_while_quiet_repaints_the_clock_on_screen_not_the_documents():

@@ -1606,6 +1606,42 @@ def test_version_moves_on_load_unload_hold_release_and_idle_resets_and_nothing_e
     assert m.version == v + 2, "a refused unload moved the version"
 
 
+def test_status_reports_an_unload_in_progress():
+    """The weights come off the GPU over seconds with nothing else in the
+    document to show for it, and the event stream keeps its heartbeat for
+    the span only if the document says the span is on."""
+    slow = _SlowUnloadEngine()
+    mgr = EngineManager(SousConfig(idle_unload_minutes=0), engine_factory=lambda mid: slow)
+    mgr.get()
+    assert mgr.status()["unloading"] is False
+    time.sleep(0.01)
+    sweeper = threading.Thread(target=mgr.unload_if_idle, daemon=True)
+    sweeper.start()
+    assert slow.unloading.wait(5)
+    s = mgr.status()
+    assert s["unloading"] is True and s["loaded"] is False and s["loading"] is False
+    slow.release.set()
+    sweeper.join(5)
+    assert mgr.status()["unloading"] is False
+
+
+def test_a_preload_that_succeeds_costs_no_document_after_the_load():
+    """get() published the engine and bumped; the thread forgetting itself
+    afterwards changes nothing a document shows, so it must not bump."""
+    cfg = SousConfig(idle_unload_minutes=30)
+    m = EngineManager(
+        cfg, engine_factory=lambda mid: FakeEngine([]), holder_alive=lambda pid, started: True
+    )
+    v = m.version
+    m.hold(4242, 1.0)
+    deadline = time.monotonic() + 5.0
+    while m._preload is not None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert m._preload is None and m.status()["loaded"] is True
+    # The hold, the load starting, the load ending — nothing for the thread's exit.
+    assert m.version == v + 3
+
+
 def test_a_preload_that_fails_announces_its_end():
     """The version must move when a failed preload's thread forgets itself:
     `loading` is true until then, and a client that never hears the end

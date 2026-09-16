@@ -113,11 +113,18 @@ class TaskStore:
 
     @property
     def version(self) -> int:
-        """Moves with every write that changed a row and with nothing else:
-        a reader that saw the same number twice saw the same rows twice.
-        Read it BEFORE the reads it guards, so a write landing during them
-        shows up as a newer number on the next check rather than hiding
-        behind one read after the fact."""
+        """Bumped once per connection whose statements matched a row —
+        sqlite's total_changes, which counts an UPDATE that rewrote a value
+        already there the same as one that changed it, and nothing for a
+        WHERE that matched no row (the worker's idle claim). Two reads that
+        saw the same number saw the same rows; two different numbers need
+        not mean different bytes. Per instance, and only writes through this
+        one move it: the daemon builds a single store for the worker and
+        every route, and the status document's memo of the counts and the
+        listing is right only because nothing else writes the file. Read it
+        BEFORE the reads it guards, so a write landing during them shows up
+        as a newer number on the next check rather than hiding behind one
+        read after the fact."""
         return self._version
 
     @contextmanager
