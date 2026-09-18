@@ -139,6 +139,8 @@ def _arm(
         fit_gateway_window=(
             min(user.gateway_max_context_tokens, own.window) if user.gateway_enabled else None
         ),
+        int8_prefill=user.int8_prefill,
+        greedy=user.temperature == 0,
     )
 
 
@@ -254,7 +256,7 @@ def winner_stage_arms(winner: Arm, *, nax: bool, checkpoint: Checkpoint) -> list
                 int8_prefill=True,
             )
         )
-    if winner.config.temperature != 0:
+    if not winner.greedy:
         arms.append(
             dataclasses.replace(
                 winner,

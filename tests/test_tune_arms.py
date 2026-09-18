@@ -268,6 +268,7 @@ def _winner(tmp_path, temperature=0.7, int8=False):
         current=True,
         fit_window=131072,
         int8_prefill=int8,
+        greedy=temperature == 0,
     )
 
 
@@ -320,3 +321,23 @@ def test_a_moe_checkpoint_gets_no_int8_arm(tmp_path):
     )
     arms = winner_stage_arms(_winner(tmp_path), nax=True, checkpoint=cp)
     assert [a.greedy for a in arms] == [True]
+
+
+def test_quick_arms_mirror_the_users_int8_and_greedy_settings(tmp_path):
+    user = SousConfig(
+        data_dir=tmp_path / "d",
+        config_path=tmp_path / "c.toml",
+        int8_prefill=True,
+        temperature=0.0,
+    )
+    arms, refusals = quick_arms(
+        user, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
+    )
+    assert refusals == []
+    for arm in arms:
+        assert arm.int8_prefill is True
+        assert arm.greedy is True
+        assert arm.suite_key == (*arm.key, True, True)
+        cp = _checkpoints()[arm.model_id]
+        extra_arms = winner_stage_arms(arm, nax=True, checkpoint=cp)
+        assert extra_arms == []
