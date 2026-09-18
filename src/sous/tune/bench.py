@@ -131,10 +131,10 @@ def _measure(
     turn = _Turn(engine, session, timeout)
     count = engine.count_tokens
     try:
+        short = build_prompt(count, SHORT_CONTEXT)
         decode_1k: list[float] = []
         ttfts: list[float] = []
         for _ in range(max(1, repeat)):
-            short = build_prompt(count, SHORT_CONTEXT)
             text, gauges, produced, _ = turn.run(short, DECODE_TOKENS)
             rate = _rate(produced, gauges.get("decode_seconds"))
             if rate is not None:
@@ -162,9 +162,11 @@ def _measure(
             _, gauges, produced, _ = turn.run(warm, DECODE_TOKENS)
             decode_16k = _rate(produced, gauges.get("decode_seconds"))
         spread = None
-        if decode_1k:
+        # One repeat has nothing to compare against — 0.0 would read as
+        # "perfectly stable" rather than "unmeasured".
+        if len(decode_1k) >= 2:
             spread = (max(decode_1k) - min(decode_1k)) / max(decode_1k)
-        return BenchRow(
+        row = BenchRow(
             label=arm.label,
             model_id=arm.model_id,
             drafter_id=arm.drafter_id,
@@ -181,14 +183,46 @@ def _measure(
             peak_memory_bytes=int(peak_memory()),
             spread=spread,
         )
-    finally:
-        session.close()
-        session.join(timeout)
-        manager.unload_now()
+    except BaseException as e:  # noqa: BLE001 — becomes the row's error
+        row = BenchRow(
+            label=arm.label,
+            model_id=arm.model_id,
+            drafter_id=arm.drafter_id,
+            block_size=arm.block_size,
+            window=arm.window,
+            ok=False,
+            error=f"{type(e).__name__}: {e}",
+            load_seconds=None,
+            prefill_tps_2k=None,
+            prefill_tps_16k=None,
+            decode_tps_1k=None,
+            decode_tps_16k=None,
+            ttft_seconds=None,
+            peak_memory_bytes=None,
+            spread=None,
+        )
+
+    # Teardown always runs, over whatever the try/except above produced: a
+    # row already built in `row` can no longer be discarded by a teardown
+    # problem the way a bare `finally` that returned from `try` could.
+    session.close()
+    # A wedged generation never dequeues _CLOSE, so this can't wait for one;
+    # it only gives a healthy thread time to release its mlx state.
+    session.join(5.0)
+    released = manager.unload_now()
+    if released["unloaded"]:
         deadline = time.monotonic() + _UNLOAD_WAIT_SECONDS
         while active_memory() > baseline + _UNLOAD_SLACK_BYTES and time.monotonic() < deadline:
             time.sleep(0.2)
-        out(f"  {arm.label}: done")
+    else:
+        # The weights are still resident — say so, and don't wait for memory
+        # that cannot come back; the next arm's peak reading will be too.
+        out(f"  {arm.label}: model not released ({released['reason']})")
+        suffix = f"unload refused: {released['reason']}"
+        row = dataclasses.replace(row, error=suffix if row.ok else f"{row.error}; {suffix}")
+
+    out(f"  {arm.label}: {'done' if row.ok else 'failed'}")
+    return row
 
 
 def _peak_memory() -> int:

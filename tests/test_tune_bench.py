@@ -2,6 +2,7 @@ import dataclasses
 
 from sous.config import SousConfig
 from sous.protocol import WORKER_TOOLS
+from sous.tune import bench
 from sous.tune.arms import Arm
 from sous.tune.bench import (
     DECODE_TOKENS,
@@ -141,3 +142,98 @@ def test_rows_round_trip_through_dicts():
     )
     assert BenchRow.from_dict(row.as_dict()) == row
     assert dataclasses.asdict(row)["label"] == "a"
+
+
+def test_a_refused_unload_is_recorded_and_skips_the_settle_wait(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        bench.EngineManager,
+        "unload_now",
+        lambda self: {"unloaded": False, "reason": "a generation is in flight"},
+    )
+    factory, _ = _fake()
+    memory_calls = []
+
+    def active_memory():
+        memory_calls.append(None)
+        return 0
+
+    row = bench_arm(
+        _arm(tmp_path),
+        factory=factory,
+        repeat=1,
+        peak_memory=lambda: 0,
+        reset_peak=lambda: None,
+        active_memory=active_memory,
+        out=lambda *a, **k: None,
+    )
+    assert row.ok is True
+    assert row.error == "unload refused: a generation is in flight"
+    # Just the pre-load baseline: a refused unload skips the settle-wait
+    # entirely rather than spinning on memory that cannot come back.
+    assert len(memory_calls) == 1
+
+
+def test_spread_is_none_with_a_single_repeat(tmp_path):
+    factory, _ = _fake()
+    row = bench_arm(
+        _arm(tmp_path),
+        factory=factory,
+        repeat=1,
+        peak_memory=lambda: 0,
+        reset_peak=lambda: None,
+        active_memory=lambda: 0,
+        out=lambda *a, **k: None,
+    )
+    assert row.ok is True
+    assert row.spread is None
+    assert row.decode_tps_1k == DECODE_TOKENS / 4.0
+
+
+def test_the_best_repeat_wins_and_the_gauges_are_read_per_owner(tmp_path):
+    class VariableDecodeEngine(FakeEngine):
+        """decode_seconds alternates across the calls that measure a full
+        decode (max_tokens == DECODE_TOKENS, as the short-context and the
+        16K decode turns do); prefill and ttft-probe turns see a constant
+        rate, the way the fixed-canned-gauge fake elsewhere does."""
+
+        def __init__(self, script):
+            super().__init__(script)
+            self.owners_seen = []
+            self._decode_calls = 0
+
+        def prompt_cache_stats(self, owner=None):
+            self.owners_seen.append(owner)
+            decode_seconds = 4.0
+            if self.max_tokens_seen and self.max_tokens_seen[-1] == DECODE_TOKENS:
+                decode_seconds = (4.0, 8.0)[self._decode_calls % 2]
+                self._decode_calls += 1
+            return {
+                "prefill_seconds": 2.0,
+                "prefilled_tokens": PREFILL_CONTEXT,
+                "decode_seconds": decode_seconds,
+            }
+
+    engines = []
+
+    def factory(model_id):
+        e = VariableDecodeEngine(["w " * DECODE_TOKENS] * 12)
+        engines.append(e)
+        return e
+
+    row = bench_arm(
+        _arm(tmp_path),
+        factory=factory,
+        repeat=2,
+        peak_memory=lambda: 0,
+        reset_peak=lambda: None,
+        active_memory=lambda: 0,
+        out=lambda *a, **k: None,
+    )
+    assert row.ok is True
+    # The first repeat's 4.0 s (64 tok/s) beats the second's 8.0 s (32 tok/s).
+    assert row.decode_tps_1k == DECODE_TOKENS / 4.0
+    assert row.spread == 0.5
+    owners = engines[0].owners_seen
+    assert len(owners) >= 2
+    assert len(set(owners)) == 1
+    assert owners[0] is not None
