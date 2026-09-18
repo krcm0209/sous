@@ -112,3 +112,22 @@ def test_other_models_never_win_and_a_missing_current_model_is_none(tmp_path):
     assert choice is not None and choice.model_id == M
     assert quick_decision(user, arms, [rows[1]]) is None
     assert quick_decision(user, arms, [_row("cur", ok=False)]) is None
+
+
+def test_a_row_whose_arm_is_gone_is_ignored(tmp_path):
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    arms = [_arm(user, "cur", current=True)]
+    rows = [_row("cur", d16k=18.0), _row("ghost", block=2, d16k=99.0)]
+    choice = quick_decision(user, arms, rows)
+    assert choice is not None and choice.label == "cur" and choice.changes == {}
+    assert quick_decision(user, arms, [_row("ghost", block=2, d16k=99.0)]) is None
+
+
+def test_without_a_current_arm_the_best_row_still_wins(tmp_path):
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    arms = [_arm(user, "b2", block=2), _arm(user, "b5", block=5)]
+    rows = [_row("b2", block=2, d16k=20.0), _row("b5", block=5, d16k=22.0)]
+    choice = quick_decision(user, arms, rows)
+    assert choice is not None and choice.label == "b5"
+    assert choice.changes == {"model": {"speculative_block_size": 5}}
+    assert len(choice.reasons) == 1

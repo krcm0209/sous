@@ -65,10 +65,14 @@ def _changes(user: SousConfig, arm: Arm) -> dict[str, dict[str, object]]:
 
 def quick_decision(user: SousConfig, arms: list[Arm], rows: list[BenchRow]) -> QuickChoice | None:
     by_label = {a.label: a for a in arms}
-    mine = [r for r in rows if r.model_id == user.model_id and score(r) is not None]
+    mine = [
+        r
+        for r in rows
+        if r.model_id == user.model_id and score(r) is not None and r.label in by_label
+    ]
     if not mine:
         return None
-    current = next((r for r in mine if by_label.get(r.label) and by_label[r.label].current), None)
+    current = next((r for r in mine if by_label[r.label].current), None)
     # A strict improvement over the current arm is required: a tie changes
     # nothing, and a re-run on a noisy afternoon must not flip a setting.
     winner = current
