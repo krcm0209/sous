@@ -483,6 +483,30 @@ def test_resume_skips_suite_runs_already_recorded(tmp_path, capsys):
     assert {r["kind"] for r in rows} == {"bench", "suite"}
 
 
+def test_resume_retries_a_run_the_runner_recorded_as_an_error(tmp_path, capsys):
+    """_error_run and the denier-failure relabel both leave a state="error"
+    row in results.jsonl — a row is appended, never rewritten — so a stale
+    error for a (task, index) sits beside its later retry. --resume must
+    still retry that pair rather than count the runner's own error as a
+    permanently done result."""
+    seen = []
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N), seen=seen)
+    assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 0
+    run_id = sorted(p.name for p in (tmp_path / "tune").iterdir())[-1]
+    run = RunDir.existing(tmp_path / "tune", run_id)
+    original = next(
+        SuiteRun.from_dict(r)
+        for r in run.rows("suite")
+        if r["label"] == CUR and r["task"] == "a" and r["index"] == 0
+    )
+    error_row = dataclasses.replace(original, state="error", outcome=None, error="disk full")
+    run.append("suite", error_row.as_dict())
+    seen.clear()
+    assert main(_args(quick=False, resume=run_id), config=_cfg(tmp_path), **deps) == 0
+    done_for_cur = next(done for label, done in seen if label == CUR)
+    assert ("a", 0) not in done_for_cur
+
+
 def test_a_suite_arm_whose_weights_stay_resident_stops_the_run(tmp_path, capsys):
     deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N))
     stuck = "unload refused: held by 1 session(s)"

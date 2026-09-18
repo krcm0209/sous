@@ -339,6 +339,23 @@ def test_summarize_ignores_runs_measured_at_another_window(tmp_path):
     assert s.mean_grade == 1.0
 
 
+def test_summarize_counts_the_latest_row_per_task_and_index(tmp_path):
+    """_suite_stage retries a (task, index) the runner recorded as an
+    infrastructure error; both rows land in results.jsonl (a row is never
+    rewritten, only appended), and summarize must count only the later one
+    or a successful retry gets summed with the failure it replaced."""
+    user = _user(tmp_path)
+    arm = _arm(user, "27 @3", current=True)
+    error = _run(arm, "t", grade=0.0, seconds=5.0, state="error")
+    retried = _run(arm, "t", grade=1.0, seconds=30.0, state="done")
+    s = summarize(arm, [error, retried], [])
+    assert s is not None
+    assert s.runs == 1
+    assert s.completed == 1
+    assert s.mean_grade == 1.0
+    assert s.wall_seconds == 30.0
+
+
 def test_a_faster_arm_within_the_margin_wins_and_changes_the_model(tmp_path):
     user = _user(tmp_path)
     cur = _arm(user, "27 @3", current=True, fit_window=131072)

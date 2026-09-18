@@ -86,11 +86,16 @@ def _suite_stage(
     time. Returns the text of what must stop the run — a daemon that is no
     longer free, or weights left resident — else None."""
     for arm in stage:
-        done = {
-            (r.task, r.index)
-            for r in suite_runs
-            if r.key == arm.suite_key and r.window == arm.window
-        }
+        mine = [r for r in suite_runs if r.key == arm.suite_key and r.window == arm.window]
+        # Only the latest attempt at a (task, index) decides whether it is
+        # done — a retry leaves its earlier row in suite_runs too, appended
+        # rather than replaced. And a runner-only "error" row (TaskState has
+        # no such state) is not a result to count as done; a task that ran
+        # and failed is.
+        latest: dict[tuple[str, int], runner_mod.SuiteRun] = {}
+        for r in mine:
+            latest[(r.task, r.index)] = r
+        done = {key for key, r in latest.items() if r.state != "error"}
         if len(done) >= len(tasks) * runs_per_task:
             continue
         # Minutes to hours have passed since the last check: a session or a

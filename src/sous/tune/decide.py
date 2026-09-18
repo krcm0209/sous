@@ -178,6 +178,15 @@ def summarize(arm: Arm, runs: list[SuiteRun], rows: list[BenchRow]) -> ArmSummar
     mine = [r for r in runs if r.key == arm.suite_key and r.window == arm.window]
     if not mine:
         return None
+    # A retried (task, index) — _suite_stage no longer treats a runner-only
+    # "error" row as done, so it runs again — leaves the stale row in
+    # results.jsonl beside the fresh one; only the later row (last write
+    # wins) should count, or a successful retry gets summed with the
+    # failure it replaced.
+    latest: dict[tuple[str, int], SuiteRun] = {}
+    for r in mine:
+        latest[(r.task, r.index)] = r
+    mine = list(latest.values())
     peak = next((r.peak_memory_bytes for r in rows if r.ok and r.key == arm.key), None)
     return ArmSummary(
         label=arm.label,
