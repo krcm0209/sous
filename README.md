@@ -751,8 +751,9 @@ Other models are measured and reported with a "quality untested" label; a
 quick run never changes the model.
 
 **`sous tune`** (about three hours on an M5 Pro for three fitting models; the
-estimate is printed after the quick stage from the measured speeds) does all
-of the above, then grades the candidates: for each model's fastest
+estimate is printed after the quick stage from the measured speeds and covers
+the model stage; the winner stage adds up to two arms of the same size) does
+all of the above, then grades the candidates: for each model's fastest
 quality-neutral arm, and for your current configuration, it runs a suite of
 eight mechanical coding tasks — implement a module from its spec, write
 tests for one, a docstring sweep, a cross-file rename, a bug fix, a dataclass
@@ -779,15 +780,15 @@ flag to understand. The full run may therefore change `[model].id`, the
 drafter and block size, the windows, `int8_prefill` and `temperature`.
 
 The daemon is asked to release the model first (`POST /sous/unload`) and
-refuses while a `sous claude` session holds it, a task is running or queued,
-or a load or unload is under way — the tune waits for none of them, it tells
-you, and it asks again before every model it loads. Results (`results.jsonl`
-with every bench row and suite run, `hardware.json`, `report.md`, and each
-suite run's project and transcript under `suite/`) land in
-`~/.sous/tune/<run-id>/`; `--resume <run-id>` continues an interrupted run
-from the rows it already has; `--models ID ...` measures ids of your own;
-`--yes` answers every prompt for scripted use, `--apply` skips only the final
-one. Adding a suite task or a curated candidate is described in
+refuses while a `sous claude` session holds it, a task is running or queued, or
+a load or unload is under way — the tune waits for none of them, it tells you,
+and it asks again right before its first bench load and before every model the
+suite loads. Results (`results.jsonl` with every bench row and suite run,
+`hardware.json`, `report.md`, and each suite run's project and transcript under
+`suite/`) land in `~/.sous/tune/<run-id>/`; `--resume <run-id>` continues an
+interrupted run from the rows it already has; `--models ID ...` measures ids of
+your own; `--yes` answers every prompt for scripted use, `--apply` skips only
+the final one. Adding a suite task or a curated candidate is described in
 [docs/tuning.md](docs/tuning.md).
 
 ## Smaller machines

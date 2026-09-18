@@ -514,3 +514,60 @@ def test_a_quick_run_never_touches_the_suite(tmp_path, capsys):
     deps["load_tasks"] = never
     assert main(_args(quick=True), config=_cfg(tmp_path), **deps) == 0
     assert "## Suite" not in capsys.readouterr().out
+
+
+def test_a_stopped_suite_still_reports_the_runs_it_recorded(tmp_path, capsys):
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N))
+
+    def suite(arm, tasks, *, runs, done, record, scratch, out, **kw):
+        r = SuiteRun(
+            task=tasks[0].name,
+            index=0,
+            label=arm.label,
+            model_id=arm.model_id,
+            drafter_id=arm.drafter_id,
+            block_size=arm.block_size,
+            int8_prefill=arm.int8_prefill,
+            greedy=arm.greedy,
+            window=arm.window,
+            state="done",
+            outcome="completed",
+            turns=3,
+            seconds=10.0,
+            output_tokens=100,
+            malformed=0,
+            repetitions=0,
+            approvals_denied=0,
+            grade=1.0,
+            grade_detail="",
+            error=None,
+            transcript_path=None,
+        )
+        record(r)
+        return SuiteOutcome([r], False, "unload refused: held by 1 session(s)")
+
+    deps["suite"] = suite
+    assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 1
+    out = capsys.readouterr().out
+    assert "## Suite" in out
+    suite_section = out.split("## Suite", 1)[1]
+    assert CUR in suite_section and "completed 1/1" in suite_section
+    assert "(no suite runs)" not in out
+
+
+def test_a_daemon_that_gets_busy_mid_suite_stops_with_the_resume_hint(tmp_path, capsys):
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N))
+    real = deps["ready"]
+    calls = []
+
+    def ready(port):
+        calls.append(port)
+        # ready: up front, before the first bench load, before the first
+        # suite arm; busy from the second suite arm on.
+        return real(port) if len(calls) <= 3 else Readiness(False, "held by 1 session(s)")
+
+    deps["ready"] = ready
+    assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 1
+    out = capsys.readouterr().out
+    assert "held by 1 session(s)" in out
+    assert "--resume" in out

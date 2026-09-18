@@ -97,7 +97,7 @@ def _suite_stage(
         # task that arrived since would load beside the suite's engine.
         readiness = ready(user.server_port)
         if not readiness.ready:
-            return f"daemon: {readiness.reason}"
+            return f"daemon: {readiness.reason}; re-run with --resume {run.run_id} once it is free"
         out(f"  {arm.label}: suite ...")
 
         def record(r: runner_mod.SuiteRun) -> None:
@@ -121,6 +121,16 @@ def _suite_stage(
                 f"this process and re-run with --resume {run.run_id}"
             )
     return None
+
+
+def _summaries(
+    arms: list[arms_mod.Arm],
+    suite_runs: list[runner_mod.SuiteRun],
+    rows: list[bench_mod.BenchRow],
+) -> list[ArmSummary]:
+    """Every arm with a suite run to summarize — including a stage a stop cut
+    short, so a run's report always matches what results.jsonl holds."""
+    return [s for a in arms if (s := summarize(a, suite_runs, rows)) is not None]
 
 
 def _full_stages(
@@ -151,7 +161,7 @@ def _full_stages(
         stage, tasks, runs_per_task, run, suite_runs, suite=suite, ready=ready, user=user, out=out
     )
     if stop is not None:
-        return None, [], stop
+        return None, _summaries(stage, suite_runs, rows), stop
     choice = full_decision(user, stage, suite_runs, rows, runs_per_task=runs_per_task)
     extra: list[arms_mod.Arm] = []
     if choice is not None:
@@ -173,7 +183,7 @@ def _full_stages(
                 out=out,
             )
             if stop is not None:
-                return None, [], stop
+                return None, _summaries([*stage, *extra], suite_runs, rows), stop
             choice = full_decision(
                 user,
                 [winner, *extra],
@@ -182,8 +192,7 @@ def _full_stages(
                 runs_per_task=runs_per_task,
                 reference=winner,
             )
-    summaries = [s for a in [*stage, *extra] if (s := summarize(a, suite_runs, rows)) is not None]
-    return choice, summaries, None
+    return choice, _summaries([*stage, *extra], suite_runs, rows), None
 
 
 def main(

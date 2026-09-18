@@ -29,7 +29,8 @@ def ready_for_tune(
 ) -> Readiness:
     """One reading of the daemon before the run: a point in time, not a
     reservation — nothing stops a task or a session arriving afterwards, so
-    `main` asks again right before the first model loads."""
+    `main` asks again before the first bench load and before every suite
+    arm."""
     import httpx
 
     from sous.cli import _json_object, _port_open, _sous_request, restart_hint
