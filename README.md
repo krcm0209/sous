@@ -723,29 +723,35 @@ still argmaxes to the same wrong output every time.
 
 ## Tuning
 
-`sous tune --quick` measures this machine and proposes the `[model]` settings
-that cannot change what the model says: the drafter, its block size, and a
-context window that fits. It detects the chip, the Metal working set and
-whether the GPU has tensor units, fits every curated candidate to memory
-(and prints the arithmetic for each one it refuses), lists every download it
-would need and asks about each one separately, then measures prefill and
-decode throughput of every arm through sous's own engine — the numbers a
-delegated task or a gateway turn would see. It ends with a report, a diff
-of `~/.sous/config.toml`, and a question:
+`sous tune` runs its quick stage only in this version — pass `--quick`, or it
+refuses and says so. It measures this machine and proposes the `[model]`
+settings that cannot change what the model says: the drafter, its block
+size, and a context window that fits. It detects the chip, the Metal working
+set and whether the GPU has tensor units, fits every curated candidate to
+memory (and prints the arithmetic for each one it refuses), lists every
+download it would need and asks about each one separately, then measures
+prefill and decode throughput of every arm through sous's own engine
+(`--repeat` sets how many attempts each arm gets, default 2 — the best
+attempt wins) — the numbers a delegated task or a gateway turn would see. It
+ends with a report, a diff of `~/.sous/config.toml`, and a question:
 
 ```
 Apply these changes to ~/.sous/config.toml? [y/N]
 ```
 
-Nothing is written before that yes; a backup is kept beside the file. The
-daemon is asked to release the model first (`POST /sous/unload`) and
-refuses while a `sous claude` session holds it or a task is running — the
-tune waits for neither, it tells you. Results and the report land under
-`~/.sous/tune/<run-id>/`; `--resume <run-id>` continues an interrupted run,
-`--models ID ...` measures ids of your own, `--yes` answers every prompt
-for scripted use. Other models than the configured one are measured and
-reported with a "quality untested" label; only the full run (a later
-release) may propose a model change.
+Nothing is written before that yes; `--apply` applies the diff without
+asking (downloads are still asked about individually unless `--yes`, which
+answers every prompt for scripted use). A backup is kept beside the config
+file. The daemon is asked to release the model first (`POST /sous/unload`)
+and refuses while a `sous claude` session holds it or a task is running —
+the tune waits for neither, it tells you. Applied changes take effect only
+when the daemon next starts — `sous stop`, then `sous serve` (or
+`launchctl kickstart -k gui/<uid>/<label>` for a managed one) — and the tune
+prints that exact command when a change needs it. Results and the report
+land under `~/.sous/tune/<run-id>/`; `--resume <run-id>` continues an
+interrupted run, `--models ID ...` measures ids of your own. Other models
+than the configured one are measured and reported with a "quality untested"
+label; only the full run (a later release) may propose a model change.
 
 ## Smaller machines
 
