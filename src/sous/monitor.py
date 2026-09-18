@@ -20,7 +20,7 @@ from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 
-from sous.engine.base import EngineManager
+from sous.engine.base import EngineManager, release_mlx_thread_state
 from sous.gateway.convert import RequestError, _invalid
 from sous.loopback import ALL_METHODS, check_loopback
 from sous.sse import PING as _PING
@@ -198,6 +198,15 @@ def mount_monitor(
     # unconditionally, so the no-bodies-in-logs rule cannot depend on that.
     logging.getLogger("sse_starlette").setLevel(logging.INFO)
 
+    def _unload() -> dict:
+        try:
+            return engines.unload_now()
+        finally:
+            # The pool thread that ran the unload freed mlx arrays; anyio
+            # retires idle workers, and a thread that exits with live mlx state
+            # takes the daemon down (ml-explore/mlx#4327).
+            release_mlx_thread_state()
+
     async def sous_status(request: Request) -> Response:
         try:
             check_loopback(request)
@@ -231,7 +240,7 @@ def mount_monitor(
             await _require_empty_body(request)
         except RequestError as e:
             return _refused(e)
-        reply = await _served("POST /sous/unload", engines.unload_now)
+        reply = await _served("POST /sous/unload", _unload)
         if reply.status_code != 200:
             return reply
         body = json.loads(bytes(reply.body))
@@ -239,7 +248,7 @@ def mount_monitor(
             return reply
         # The engine is busy or empty: a state the caller must wait out or
         # respect, not an error in its request.
-        return _refused(RequestError(409, "conflict_error", body["reason"]))
+        return _refused(RequestError(409, "conflict_error", body.get("reason") or "refused"))
 
     async def sous_unknown(request: Request) -> Response:
         try:

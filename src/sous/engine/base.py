@@ -768,8 +768,11 @@ class EngineManager:
         """Free the weights on request — `sous tune` needs the memory — with
         every refusal the idle sweep makes and none of its clock: a session
         holding the model, a leased engine or an in-flight generation each
-        keep it, and the caller learns which. `idle_seconds` reads None
-        afterwards, as after any unload."""
+        keep it, and the caller learns which. Unlike the idle sweep (which
+        leaves `_last_used` alone — the model was idle, not un-loaded), this
+        path also clears it: the caller asking for the memory back is not a
+        use of the model, so `idle_seconds` reads None afterwards rather than
+        the clock the sweep would have kept running."""
         with self._changed:
             self._prune_holders()
             if self._engine is None:

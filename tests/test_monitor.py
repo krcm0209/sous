@@ -808,3 +808,32 @@ def test_unload_refuses_a_body_and_a_cross_site_caller_like_hold(tmp_path: Path)
     assert r.json()["error"]["type"] == "invalid_request_error"
     r = _request(app, "POST", "/sous/unload", b"", headers={"sec-fetch-site": "cross-site"})
     assert r.status_code == 403
+
+
+def test_unload_releases_the_pool_threads_mlx_state_after_freeing_the_model(
+    tmp_path: Path, monkeypatch
+):
+    """anyio prunes idle pool threads after ~10s; one that exits with live mlx
+    state segfaults the whole daemon (ml-explore/mlx#4327). The release must
+    run on the same thread that freed the arrays, and only after it did."""
+    unload_thread: list[threading.Thread] = []
+
+    class RecordingEngine(FakeEngine):
+        def unload(self) -> None:
+            unload_thread.append(threading.current_thread())
+            super().unload()
+
+    released: list[tuple[threading.Thread, bool]] = []
+
+    def recording_release() -> None:
+        released.append((threading.current_thread(), bool(unload_thread)))
+
+    monkeypatch.setattr(monitor, "release_mlx_thread_state", recording_release)
+    app, engines = _app(tmp_path, factory=lambda mid: RecordingEngine([]))
+    engines.get()
+    r = _request(app, "POST", "/sous/unload", b"")
+    assert r.status_code == 200
+    assert len(released) == 1
+    release_thread, unload_already_ran = released[0]
+    assert unload_already_ran is True
+    assert unload_thread and release_thread == unload_thread[0]
