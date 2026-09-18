@@ -24,7 +24,7 @@ from sous.config import SousConfig
 
 # mlx-lm's KVCache grows its buffers in 256-token steps; an unaligned window
 # ends in a partially-usable step.
-_TOKEN_STEP = 256
+TOKEN_STEP = 256
 _GIB = 1 << 30
 
 
@@ -107,12 +107,12 @@ def auto_context_tokens(
     system = available + cache
     headroom = max(0, min(metal, system))
     raw = int(headroom * fraction) // bytes_per_token
-    aligned_native = native_max // _TOKEN_STEP * _TOKEN_STEP
-    tokens = min(raw // _TOKEN_STEP * _TOKEN_STEP, aligned_native)
+    aligned_native = native_max // TOKEN_STEP * TOKEN_STEP
+    tokens = min(raw // TOKEN_STEP * TOKEN_STEP, aligned_native)
     # The floor itself is bounded by the native maximum: a small model must
     # never be handed a window past its positional embeddings just because
     # the configured floor assumed a bigger one. Aligned like everything else.
-    floor = min(min_tokens // _TOKEN_STEP * _TOKEN_STEP, aligned_native)
+    floor = min(min_tokens // TOKEN_STEP * TOKEN_STEP, aligned_native)
     if tokens < floor:
         return ContextDecision(
             floor,

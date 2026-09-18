@@ -1660,3 +1660,86 @@ def test_a_preload_that_fails_announces_its_end():
     assert m.status()["loading"] is False
     # The hold, the load starting, its failure, the thread forgetting itself.
     assert m.version == v + 4
+
+
+def test_unload_now_frees_a_fresh_engine_and_reports_it():
+    """The tune asks the daemon to release the weights whatever the idle
+    clock says: the refusals are the sweep's, the clock is not."""
+    mgr, created = _manager(idle_minutes=30)
+    mgr.get()
+    mgr.touch()
+    assert mgr.unload_now() == {"unloaded": True, "reason": None}
+    assert created[0].unloaded is True
+    assert mgr.status()["loaded"] is False
+
+
+def test_unload_now_refuses_with_a_reason_when_nothing_is_loaded():
+    mgr, _ = _manager()
+    assert mgr.unload_now() == {"unloaded": False, "reason": "nothing loaded"}
+
+
+def test_unload_now_refuses_under_a_lease_a_holder_and_a_generation():
+    created: list[FakeEngine] = []
+
+    def factory(model_id: str):
+        e = FakeEngine([])
+        created.append(e)
+        return e
+
+    # The default holder check asks psutil about the pid; a fake pid would be
+    # pruned before the refusal is reached.
+    mgr = EngineManager(SousConfig(), engine_factory=factory, holder_alive=lambda pid, ct: True)
+    engine = mgr.get()
+    with mgr.lease():
+        assert mgr.unload_now() == {"unloaded": False, "reason": "the engine is leased by a turn"}
+    mgr.hold(4242, 1.0)
+    assert mgr.unload_now() == {"unloaded": False, "reason": "held by 1 session(s)"}
+    mgr._holders.clear()
+    with engine._gen_lock:
+        assert mgr.unload_now() == {"unloaded": False, "reason": "a generation is in flight"}
+    assert created[0].unloaded is False
+    assert mgr.unload_now()["unloaded"] is True
+
+
+def test_unload_now_bumps_the_version_and_clears_the_idle_clock():
+    mgr, _ = _manager()
+    mgr.get()
+    before = mgr.version
+    mgr.unload_now()
+    assert mgr.version > before
+    assert mgr.status()["idle_seconds"] is None
+
+
+def test_unload_now_names_a_load_or_an_unload_in_progress():
+    """`_engine` is None during both, and "nothing loaded" would send the
+    caller waiting for the memory back the wrong way."""
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowUnload(FakeEngine):
+        def unload(self) -> None:
+            started.set()
+            release.wait(5.0)
+            super().unload()
+
+    def factory(model_id: str):
+        started.set()
+        release.wait(5.0)
+        return SlowUnload([])
+
+    mgr = EngineManager(SousConfig(), engine_factory=factory)
+    loader = threading.Thread(target=mgr.get, daemon=True)
+    loader.start()
+    assert started.wait(5.0)
+    assert mgr.unload_now() == {"unloaded": False, "reason": "a model load is in progress"}
+    release.set()
+    loader.join(5.0)
+    started.clear()
+    release.clear()
+    unloader = threading.Thread(target=mgr.unload_now, daemon=True)
+    unloader.start()
+    assert started.wait(5.0)
+    assert mgr.unload_now() == {"unloaded": False, "reason": "an unload is in progress"}
+    release.set()
+    unloader.join(5.0)
+    assert mgr.unload_now() == {"unloaded": False, "reason": "nothing loaded"}

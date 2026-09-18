@@ -114,6 +114,7 @@ sous wait <task-id>     # block until a task finishes or needs approval
 sous claude             # Claude Code with local subagents (gateway mode, below)
 sous stop               # stop it (see below)
 sous uninstall-launchd  # stop it starting at login, and remove the agent
+sous tune --quick       # measure this machine and propose settings (see Tuning)
 ```
 
 `sous stop` deliberately refuses when launchd is managing the daemon, because
@@ -550,6 +551,10 @@ top_k = 20
 # a warning when the drafter can't serve the configured model.
 speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
 speculative_block_size = 3
+# `sous tune --quick` may rewrite speculative_draft_id, speculative_block_size
+# and max_context_tokens (and [gateway].max_context_tokens) after showing you
+# the diff; it never changes id or int8_prefill.
+
 # INT8-activation prefill on the M5 tensor units (M5-family or newer, macOS
 # 26.2+; warns once and prefills stock elsewhere). ~1.4x prefill on the default
 # model, but int8 activations change numerics — measured drift is inside what
@@ -716,12 +721,49 @@ sounds safer but isn't: it gives the model no way to escape a bad
 completion once it happens, since a near-identical prompt plus a nudge
 still argmaxes to the same wrong output every time.
 
+## Tuning
+
+`sous tune` runs its quick stage only in this version — pass `--quick`, or it
+refuses and says so. It measures this machine and proposes the `[model]`
+settings that cannot change what the model says: the drafter, its block
+size, and a context window that fits. It detects the chip, the Metal working
+set and whether the GPU has tensor units, fits every curated candidate to
+memory (and prints the arithmetic for each one it refuses), lists every
+download it would need and asks about each one separately, then measures
+prefill and decode throughput of every arm through sous's own engine
+(`--repeat` sets how many attempts each decode and short-prefill measurement
+gets, default 2 — the best attempt wins; the one 16K prefill is the prefix
+its decode continues from) — the numbers a delegated task or a gateway turn
+would see. It
+ends with a report, a diff of `~/.sous/config.toml`, and a question:
+
+```
+Apply these changes to ~/.sous/config.toml? [y/N]
+```
+
+Nothing is written before that yes; `--apply` applies the diff without
+asking (downloads are still asked about individually unless `--yes`, which
+answers every prompt for scripted use). A backup is kept beside the config
+file. The daemon is asked to release the model first (`POST /sous/unload`)
+and refuses while a `sous claude` session holds it, a task is running or
+queued, or a load or unload is under way — the tune waits for none of them,
+it tells you, and it asks once more right before its first model loads.
+Applied changes take effect only
+when the daemon next starts — `sous stop`, then `sous serve` (or
+`launchctl kickstart -k gui/<uid>/<label>` for a managed one) — and the tune
+prints that exact command when a change needs it. Results and the report
+land under `~/.sous/tune/<run-id>/`; `--resume <run-id>` continues an
+interrupted run, `--models ID ...` measures ids of your own. Other models
+than the configured one are measured and reported with a "quality untested"
+label; only the full run (a later release) may propose a model change.
+
 ## Smaller machines
 
-The default model fits 64 GB and 32 GB machines. The alternative below shares
-the default's `qwen3_5` architecture, so it loads through the exact same
-mlx-vlm path — edit `[model].id` in `~/.sous/config.toml` and the next
-delegation downloads and uses it.
+`sous tune --quick` tells you what fits and how fast it runs here; the table
+below is the fallback for a machine that cannot reach the Hub. The
+alternative shares the default's `qwen3_5` architecture, so it loads
+through the exact same mlx-vlm path — edit `[model].id` in
+`~/.sous/config.toml` and the next delegation downloads and uses it.
 
 | Unified memory | `[model].id` | Weights |
 |---|---|---|

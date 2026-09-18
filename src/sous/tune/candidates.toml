@@ -1,0 +1,58 @@
+# The curated candidates `sous tune` measures. A row carries only what a
+# checkpoint's config.json cannot say: its tier, the drafters known to pair
+# with it, and a note. Bytes, KV cost, quantization layout and drafter
+# compatibility are read from the checkpoint at run time.
+checked = 2026-09-17
+validated_with = "mlx-vlm 0.7.1"
+trusted_orgs = ["mlx-community", "z-lab"]
+publishers = ["Qwen"]
+
+[[candidate]]
+id = "mlx-community/Qwen3.8-27B-4bit"
+tier = "27b-dense"
+drafters = ["z-lab/Qwen3.8-27B-DFlash2"]
+note = "shipped default; affine 4-bit keeps the fast exact verifier"
+
+[[candidate]]
+id = "mlx-community/Qwen3.8-27B-oQ4"
+tier = "27b-dense"
+drafters = ["z-lab/Qwen3.8-27B-DFlash2"]
+note = "oMLX mixed precision; one 6-bit layer takes the slow verifier path"
+
+[[candidate]]
+id = "mlx-community/Qwen3.8-27B-mxfp4"
+tier = "27b-dense"
+drafters = ["z-lab/Qwen3.8-27B-DFlash2"]
+note = "fast exact verifier only from mlx-vlm 0.7.1"
+
+[[candidate]]
+id = "mlx-community/Qwen3.8-27B-OptiQ-4bit"
+tier = "27b-dense"
+drafters = ["z-lab/Qwen3.8-27B-DFlash2"]
+note = "half the layers at 8-bit: ~30% more bytes per token"
+
+[[candidate]]
+id = "mlx-community/Qwen3.8-27B-oQ6"
+tier = "27b-dense"
+drafters = []
+note = "6-bit base loses the fast exact verifier; quality tier only"
+
+[[candidate]]
+id = "mlx-community/Qwen3.5-35B-A3B-4bit"
+tier = "35b-moe"
+drafters = ["z-lab/Qwen3.5-35B-A3B-DFlash"]
+
+[[candidate]]
+id = "mlx-community/Qwen3.5-9B-MLX-4bit"
+tier = "9b"
+drafters = ["z-lab/Qwen3.5-9B-DFlash", "mlx-community/Qwen3.5-9B-MTP-4bit"]
+
+[[candidate]]
+id = "mlx-community/Qwen3.5-4B-MLX-4bit"
+tier = "4b"
+drafters = ["z-lab/Qwen3.5-4B-DFlash"]
+
+[[candidate]]
+id = "mlx-community/Qwen3.5-2B-MLX-4bit"
+tier = "2b"
+drafters = []

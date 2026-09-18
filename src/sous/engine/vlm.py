@@ -82,10 +82,12 @@ class VLMEngine:
         self._tokenize_lock = threading.Lock()
         self._draft = None
         self._draft_kind = ""
+        self._draft_id = ""
         self._draft_block_size = draft_block_size
         if draft_id:
             try:
                 self._draft, self._draft_kind = _load_quantized_drafter(self._model, draft_id)
+                self._draft_id = draft_id
             except Exception as e:  # noqa: BLE001 — degrade, never block the model
                 warnings.warn(
                     f"sous: speculative drafter {draft_id!r} unavailable for"
@@ -106,6 +108,13 @@ class VLMEngine:
         """Which side supplies the rotary positions behind a warm cache — the
         model-load line's and the status document's `positions` token."""
         return "engine" if self._positional else "model"
+
+    @property
+    def drafter(self) -> str:
+        """The drafter id speculative decoding actually runs with — "" when
+        none was asked for or the one asked for failed to load, which the
+        engine survives with a warning rather than an error."""
+        return self._draft_id
 
     def _loaded(self) -> tuple:
         """The (model, processor) pair, or a clear error if already unloaded.
