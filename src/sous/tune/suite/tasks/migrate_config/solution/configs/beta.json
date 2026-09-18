@@ -1,0 +1,9 @@
+{
+  "server": {
+    "host": "beta.local",
+    "port": "8081"
+  },
+  "limits": {
+    "retries": "5"
+  }
+}

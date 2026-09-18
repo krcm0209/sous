@@ -1,0 +1,9 @@
+{
+  "server": {
+    "host": "alpha.local",
+    "port": "8080"
+  },
+  "limits": {
+    "retries": "3"
+  }
+}
