@@ -171,7 +171,11 @@ def summarize(arm: Arm, runs: list[SuiteRun], rows: list[BenchRow]) -> ArmSummar
     """The arm's suite result in the rule's terms; None when it has no run.
     The peak comes from the bench row of the same model, drafter and block:
     the suite measures time and quality, the bench measured memory."""
-    mine = [r for r in runs if r.key == arm.suite_key]
+    # A resumed run whose window changed carries suite rows of two windows
+    # (see _suite_stage's own done-set, keyed the same way): only rows at
+    # this arm's window belong to it, or wall time and completed counts mix
+    # two different measurements.
+    mine = [r for r in runs if r.key == arm.suite_key and r.window == arm.window]
     if not mine:
         return None
     peak = next((r.peak_memory_bytes for r in rows if r.ok and r.key == arm.key), None)

@@ -324,6 +324,21 @@ def test_summarize_reads_the_runs_and_the_bench_peak(tmp_path):
     assert summarize(_arm(user, "27 @5", block=5), runs, []) is None
 
 
+def test_summarize_ignores_runs_measured_at_another_window(tmp_path):
+    """A resumed run whose max_context_tokens changed in between carries
+    suite rows of two windows, exactly like _suite_stage's own done-set:
+    only the rows measured at this arm's own window belong to it."""
+    user = _user(tmp_path)
+    arm = _arm(user, "27 @3", current=True)
+    mine = _run(arm, "t", grade=1.0, seconds=30.0)
+    other = dataclasses.replace(mine, window=32768)
+    s = summarize(arm, [mine, other], [])
+    assert s is not None
+    assert s.runs == 1
+    assert s.wall_seconds == 30.0
+    assert s.mean_grade == 1.0
+
+
 def test_a_faster_arm_within_the_margin_wins_and_changes_the_model(tmp_path):
     user = _user(tmp_path)
     cur = _arm(user, "27 @3", current=True, fit_window=131072)
