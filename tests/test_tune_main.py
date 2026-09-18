@@ -579,6 +579,42 @@ def test_a_stopped_suite_still_reports_the_runs_it_recorded(tmp_path, capsys):
     assert "(no suite runs)" not in out
 
 
+def test_a_stop_in_the_winner_stage_keeps_the_model_stages_choice(tmp_path, capsys):
+    """The winner stage measures extra settings (int8, greedy) on top of an
+    already-decided model-stage winner. A stop there must not discard that
+    decision — the report should still recommend what the model stage
+    chose, with a note that the winner-stage settings were left unmeasured
+    — and main must still exit 1 before applying anything."""
+    calls = []
+    deps, _ = _deps(
+        tmp_path,
+        scores={CUR: 30.0, "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @5": 28.0, NINE: 45.0},
+        cached=(M, D, N),
+        grades={NINE: 0.9, CUR: 0.92},
+        seconds={NINE: 5.0, CUR: 20.0},
+    )
+    real_suite = deps["suite"]
+    stuck = "unload refused: held by 1 session(s)"
+
+    def suite(arm, tasks, **kw):
+        calls.append(arm.label)
+        if len(calls) == 3:  # the winner stage's first arm: "NINE + int8 prefill"
+            return SuiteOutcome([], False, stuck)
+        return real_suite(arm, tasks, **kw)
+
+    deps["suite"] = suite
+    assert main(_args(quick=False, yes=True), config=_cfg(tmp_path), **deps) == 1
+    out = capsys.readouterr().out
+    assert calls == [CUR, NINE, f"{NINE} + int8 prefill"]
+    assert f"could not be released ({stuck})" in out
+    assert "## Choice" in out
+    choice_section = out.split("## Choice", 1)[1]
+    assert f"  {NINE}" in choice_section.splitlines()
+    assert "winner stage incomplete: the model could not be released" in choice_section
+    assert stuck in choice_section
+    assert "Apply these changes" not in out
+
+
 def test_a_daemon_that_gets_busy_mid_suite_stops_with_the_resume_hint(tmp_path, capsys):
     deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N))
     real = deps["ready"]

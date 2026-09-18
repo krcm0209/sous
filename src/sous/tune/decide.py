@@ -271,7 +271,10 @@ def full_decision(
         why = "the configured arm"
         if ref is None:
             ref = summaries[0]
-            why = "the fastest arm of the largest fitting tier; the configured arm has no runs"
+            why = (
+                "the first measured arm in the table's order (largest tier first); "
+                "the configured arm has no runs"
+            )
     if ref is None:
         return None
     ref_arm, ref_sum = ref

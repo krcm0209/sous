@@ -157,7 +157,8 @@ def metrics_from_transcript(path: Path) -> tuple[int, int]:
     transcript. An incident is the model looping on one tool: three identical
     consecutive executed calls, counted once per streak of three or more. A
     `tool` event is exactly one executed call with its arguments, so nothing
-    needs re-parsing; a `finish` never becomes one and cannot repeat."""
+    needs re-parsing; a `finish` reaches the transcript as a tool event only
+    when it lacked a summary, and three of those in a row are a loop too."""
     if not path.is_file():
         return 0, 0
     malformed = repetitions = streak = 0

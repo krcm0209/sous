@@ -30,6 +30,9 @@ Rules the loader and CI enforce (`tests/test_tune_suite.py`):
 - Standard library only, in the fixture, the grader and the solution: an end
   user's machine has nothing else, and the worker's allowlist is the shipped
   one plus `python -m unittest`.
+- Allowlisting `python -m unittest` runs the worker's own code on your
+  machine, like every other test runner in the shipped allowlist; the
+  sandbox confines the worker's file tools, not what its tests execute.
 - Hidden `test_*.py` modules run in a subprocess with the worker's project as
   the working directory (`python -m sous.tune.suite.unittests grade/`), so they
   import the worker's modules by bare name; import inside the test methods so

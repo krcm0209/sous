@@ -426,7 +426,8 @@ def test_without_runs_of_the_current_arm_the_first_measured_arm_is_the_reference
     runs = _runs(nine, [0.8], seconds=50.0) + _runs(four, [0.8], seconds=20.0)
     choice = full_decision(user, [cur, nine, four], runs, [], runs_per_task=1)
     assert choice is not None and choice.reference_label == "9" and choice.label == "4"
-    assert "reference: 9 (the fastest arm of the largest fitting tier" in choice.reasons[0]
+    expected = "reference: 9 (the first measured arm in the table's order (largest tier first)"
+    assert expected in choice.reasons[0]
     assert full_decision(user, [cur], [], [], runs_per_task=1) is None
 
 

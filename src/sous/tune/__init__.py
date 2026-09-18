@@ -4,6 +4,7 @@ settings, show the diff. `--quick` stops after the throughput stage."""
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 from collections.abc import Callable
 from datetime import date
@@ -188,7 +189,14 @@ def _full_stages(
                 out=out,
             )
             if stop is not None:
-                return None, _summaries([*stage, *extra], suite_runs, rows), stop
+                # The model stage already settled on `choice`; losing it here
+                # would report "nothing recommended" when a recommendation
+                # exists and only the winner stage's own extra settings (int8,
+                # greedy) were left unmeasured. FullChoice is frozen, so the
+                # note is appended onto a fresh copy rather than mutated in.
+                note = f"winner stage incomplete: {stop}"
+                incomplete = dataclasses.replace(choice, reasons=[*choice.reasons, note])
+                return incomplete, _summaries([*stage, *extra], suite_runs, rows), stop
             choice = full_decision(
                 user,
                 [winner, *extra],

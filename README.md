@@ -793,10 +793,10 @@ the final one. Adding a suite task or a curated candidate is described in
 
 ## Smaller machines
 
-`sous tune --quick` tells you what fits and how fast it runs here; the table
-below is the fallback for a machine that cannot reach the Hub. The
-alternative shares the default's `qwen3_5` architecture, so it loads
-through the exact same mlx-vlm path — edit `[model].id` in
+`sous tune` tells you what fits and grades it here (`--quick` measures
+throughput only); the table below is the fallback for a machine that cannot
+reach the Hub. The alternative shares the default's `qwen3_5` architecture,
+so it loads through the exact same mlx-vlm path — edit `[model].id` in
 `~/.sous/config.toml` and the next delegation downloads and uses it.
 
 | Unified memory | `[model].id` | Weights |
