@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 from datetime import date
 
 from sous.config import SousConfig, load_config
@@ -233,6 +234,30 @@ def test_a_mistyped_resume_is_refused_not_a_traceback(tmp_path, capsys):
     deps, _ = _deps(tmp_path, scores={}, cached=(M, D, "mlx-community/Qwen3.5-9B-MLX-4bit"))
     assert main(_args(resume="nope"), config=_cfg(tmp_path), **deps) == 2
     assert "nope" in capsys.readouterr().out
+
+
+def test_a_refused_release_stops_measuring_and_reports_what_was_done(tmp_path, capsys):
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, "mlx-community/Qwen3.5-9B-MLX-4bit"))
+    real = deps["bench"]
+    seen = []
+
+    def bench(arm, **kw):
+        seen.append(arm)
+        row = real(arm, **kw)
+        if len(seen) == 1:
+            row = dataclasses.replace(
+                row, released=False, error="unload refused: a generation is in flight"
+            )
+        return row
+
+    deps["bench"] = bench
+    assert main(_args(), config=_cfg(tmp_path), **deps) == 1
+    out = capsys.readouterr().out
+    assert "could not be released" in out and "a generation is in flight" in out
+    assert "arm(s) skipped" in out and "--resume" in out
+    assert "Apply these changes" not in out
+    run_id = next(p.name for p in (tmp_path / "tune").iterdir())
+    assert len(RunDir.existing(tmp_path / "tune", run_id).rows("bench")) == 1
 
 
 def test_a_bench_that_raises_is_exit_1_and_keeps_finished_rows(tmp_path, capsys):

@@ -110,7 +110,11 @@ def main(args: argparse.Namespace, *, config: SousConfig | None = None, **deps) 
         approved = {d.repo_id for d in plan}
     else:
         approved = hub_mod.ask_consent(
-            plan, hardware.disk_free_bytes, ask=deps.get("ask", input), out=out
+            plan,
+            hardware.disk_free_bytes,
+            hub_cache=hardware.hub_cache,
+            ask=deps.get("ask", input),
+            out=out,
         )
     arms = _consented(arms, plan, approved)
     if not arms:
@@ -132,13 +136,26 @@ def main(args: argparse.Namespace, *, config: SousConfig | None = None, **deps) 
     done = {r["label"] for r in run.rows("bench")}
     bench = deps.get("bench", bench_mod.bench_arm)
     out(f"measuring {len(arms)} arm(s); results in {run.path}")
+    released_failure = False
     try:
-        for arm in arms:
+        for i, arm in enumerate(arms):
             if arm.label in done:
                 continue
             out(f"  {arm.label} ...")
             row = bench(arm, repeat=getattr(args, "repeat", 2), out=out)
             run.append("bench", row.as_dict())
+            if not row.released:
+                # Two models resident at once would corrupt every later
+                # peak-memory reading in this run: stop rather than measure
+                # the remaining arms against a machine that isn't clean.
+                remaining = len(arms) - i - 1
+                out(
+                    f"sous tune: the model could not be released ({row.error}); "
+                    f"{remaining} arm(s) skipped — restart the daemon or this process "
+                    f"and re-run with --resume {run.run_id}"
+                )
+                released_failure = True
+                break
     except Exception as e:  # noqa: BLE001 — rows already appended stay on disk for --resume
         out(f"sous tune: failed while measuring: {type(e).__name__}: {e}")
         return EXIT_FAILED
@@ -156,6 +173,8 @@ def main(args: argparse.Namespace, *, config: SousConfig | None = None, **deps) 
     )
     run.write_text("report.md", text)
     out(text)
+    if released_failure:
+        return EXIT_FAILED
     if choice is None or not choice.changes:
         return EXIT_OK
     new_text, diff = report_mod.config_diff(user.config_path, choice.changes)

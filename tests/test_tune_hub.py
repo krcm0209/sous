@@ -23,7 +23,9 @@ def test_snapshot_bytes_prefers_the_on_disk_size_of_a_cached_snapshot(tmp_path):
     (tmp_path / "model.safetensors").write_bytes(b"x" * 100)
     (tmp_path / "config.json").write_bytes(b"{}")
     api = _Api({"model.safetensors": 10})
-    assert snapshot_bytes("x/y", api=api, cached_path=lambda rid: tmp_path) == 102
+    # Only the weights count, on disk as on the Hub branch: config.json's 2
+    # bytes must not inflate the figure the fit arithmetic budgets against.
+    assert snapshot_bytes("x/y", api=api, cached_path=lambda rid: tmp_path) == 100
 
 
 def test_snapshot_bytes_is_none_offline():
@@ -70,12 +72,15 @@ def test_consent_prints_the_block_up_front_then_asks_each_separately():
         events.append(("ask", prompt))
         return next(answers)
 
-    approved = ask_consent(plan, free_bytes=412 * 2**30, ask=ask, out=out)
+    approved = ask_consent(
+        plan, free_bytes=412 * 2**30, hub_cache="/mnt/data/hub", ask=ask, out=out
+    )
     # Every line of the block precedes the first question, so the user
     # decides each download knowing the whole plan.
     assert [kind for kind, _ in events] == ["out", "out", "out", "ask", "ask"]
     block = "\n".join(text for kind, text in events if kind == "out")
     assert "20.0 GB" in block and "0.8 GB" in block and "412.0 GiB" in block
+    assert "/mnt/data/hub" in block
     assert "org/big runs without a drafter" in block
     assert events[3][1].startswith("Download #1") and "org/big" in events[3][1]
     assert events[4][1].startswith("Download #2") and "org/draft" in events[4][1]

@@ -1,3 +1,5 @@
+import dataclasses
+
 from sous.config import SousConfig
 from sous.tune.arms import BLOCK_SIZES, quick_arms
 from sous.tune.candidates import Candidate, describe
@@ -111,3 +113,49 @@ def test_an_incompatible_drafter_is_dropped_before_any_arm_exists(tmp_path):
     arms, refusals = quick_arms(user, cands, cps, working_set_bytes=fx.M5_PRO_WORKING_SET)
     assert [a.drafter_id for a in arms if a.model_id == "mlx-community/Qwen3.8-27B-4bit"] == [""]
     assert any("hidden size" in r.reason for r in refusals)
+
+
+def test_a_drafter_with_unknown_bytes_is_refused_but_the_model_keeps_its_plain_arm(tmp_path):
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    cps = _checkpoints()
+    cps["z-lab/Qwen3.8-27B-DFlash2"] = dataclasses.replace(
+        cps["z-lab/Qwen3.8-27B-DFlash2"], bytes=None
+    )
+    arms, refusals = quick_arms(user, _candidates(), cps, working_set_bytes=fx.M5_PRO_WORKING_SET)
+    mine = [a for a in arms if a.model_id == "mlx-community/Qwen3.8-27B-4bit"]
+    assert [a.drafter_id for a in mine] == [""]  # the no-drafter arm survives
+    assert any(
+        r.model_id == "mlx-community/Qwen3.8-27B-4bit"
+        and r.drafter_id == "z-lab/Qwen3.8-27B-DFlash2"
+        and "size unknown" in r.reason
+        for r in refusals
+    )
+
+
+def test_a_configured_block_size_of_zero_for_auto_is_still_the_current_arm(tmp_path):
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=0)
+    arms, _ = quick_arms(
+        user, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
+    )
+    current = [a for a in arms if a.current]
+    assert len(current) == 1
+    assert current[0].block_size == 0
+    assert current[0].label.endswith("@auto")
+    assert current[0].config.speculative_block_size == 0
+
+
+def test_a_configured_block_size_outside_the_curated_set_is_added(tmp_path):
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=4)
+    arms, _ = quick_arms(
+        user, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
+    )
+    current = [a for a in arms if a.current]
+    assert len(current) == 1
+    assert current[0].block_size == 4
+    assert current[0].label.endswith("@4")
+    drafter_blocks = sorted(
+        a.block_size
+        for a in arms
+        if a.model_id == "mlx-community/Qwen3.8-27B-4bit" and a.drafter_id
+    )
+    assert drafter_blocks == [2, 3, 4, 5]

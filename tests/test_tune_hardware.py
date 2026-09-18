@@ -77,3 +77,24 @@ def test_a_missing_distribution_reads_as_absent_not_a_crash(tmp_path):
 def test_gib_formats_one_decimal():
     assert gib(55662788608) == "51.8 GiB"
     assert gib(0) == "0.0 GiB"
+
+
+def test_detect_measures_free_disk_at_the_nearest_existing_ancestor_of_a_missing_cache(tmp_path):
+    missing = str(tmp_path / "missing" / "hub")
+
+    def disk_usage(path):
+        if "missing" in path:
+            raise FileNotFoundError(path)
+        assert path == str(tmp_path)
+        return (1, 2, 99 * 2**30)
+
+    hw = detect(
+        device_info=_info,
+        mac_ver=lambda: ("26.6.2", ("", "", ""), "arm64"),
+        disk_usage=disk_usage,
+        availability=lambda: Availability(True),
+        version=lambda name: "x",
+        hub_cache=missing,
+    )
+    assert hw.disk_free_bytes == 99 * 2**30
+    assert hw.hub_cache == missing  # the display path is the real one, not the ancestor

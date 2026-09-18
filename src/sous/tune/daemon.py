@@ -46,11 +46,26 @@ def ready_for_tune(
         return Readiness(
             False, f"the daemon is busy: {running} task(s) running, {inflight} turn(s) in flight"
         )
-    if not (engine.get("loaded") or engine.get("loading")):
+    if engine.get("loading"):
+        # Posting the unload here would hit a daemon whose engine is not yet
+        # published (`_engine is None` while loading): unload_now() would
+        # say "nothing loaded", a reason that names the wrong problem.
+        return Readiness(
+            False,
+            "the daemon is loading a model; wait for the load to finish "
+            "(or stop the daemon) and retry",
+        )
+    if not engine.get("loaded"):
         return Readiness(True, "the daemon holds no model")
     status, raw = call(port, "POST", "/sous/unload")
     if status == 200:
         return Readiness(True, "the daemon released the model")
+    if status == 404:
+        return Readiness(
+            False,
+            "the daemon predates /sous/unload; restart it (sous stop, then sous serve; "
+            "launchctl kickstart -k gui/<uid>/com.sous.daemon when managed)",
+        )
     if status == 409:
         message = ((_body(raw).get("error") or {}).get("message")) or "the daemon refused"
         return Readiness(False, str(message))

@@ -1,4 +1,7 @@
 import os
+from pathlib import Path
+
+import pytest
 
 from sous.config import load_config
 from sous.engine.int8prefill import Availability
@@ -84,6 +87,92 @@ def test_the_report_has_every_section_and_labels_other_models_quality_untested(t
     assert "stale" not in text
 
 
+def test_nax_reason_none_renders_without_a_parenthetical(tmp_path):
+    hw = detect(
+        device_info=lambda: {
+            "device_name": "Apple M5 Pro",
+            "memory_size": 64 * 2**30,
+            "max_recommended_working_set_size": fx.M5_PRO_WORKING_SET,
+            "architecture": "applegpu_g17s",
+        },
+        mac_ver=lambda: ("26.6.2", ("", "", ""), "arm64"),
+        disk_usage=lambda p: (1, 2, 400 * 2**30),
+        availability=lambda: Availability(False),  # reason omitted, defaults to None
+        version=lambda n: "1.0",
+        hub_cache=str(tmp_path),
+    )
+    text = render_report(
+        hardware=hw,
+        table_age_days=1,
+        checkpoints={},
+        refusals=[],
+        rows=[],
+        choice=None,
+        current_model=M,
+    )
+    assert "NAX tensor units: no" in text
+    assert "no (None)" not in text
+
+
+def test_the_context_legend_lives_under_throughput_not_candidates(tmp_path):
+    text = render_report(
+        hardware=_hardware(tmp_path),
+        table_age_days=1,
+        checkpoints={},
+        refusals=[],
+        rows=[],
+        choice=None,
+        current_model=M,
+    )
+    legend = "(prefill/decode at 2K/16K and 1K/16K tokens of context)"
+    candidates_idx = text.index("## Candidates")
+    throughput_idx = text.index("## Throughput")
+    legend_idx = text.index(legend)
+    assert candidates_idx < throughput_idx < legend_idx
+
+
+def test_int8_excluded_layers_are_named_in_the_candidate_line(tmp_path):
+    cps = {
+        M: describe(
+            M,
+            config_fn=lambda m: fx.qwen_27b(fx.oq4_quantization()),
+            size_fn=lambda m: 16_100_000_000,
+        ),
+    }
+    text = render_report(
+        hardware=_hardware(tmp_path),
+        table_age_days=1,
+        checkpoints=cps,
+        refusals=[],
+        rows=[],
+        choice=None,
+        current_model=M,
+    )
+    assert "161 layers excluded" in text
+
+
+def test_a_drafter_checkpoint_renders_its_quantized_resident_size(tmp_path):
+    cps = {
+        "z-lab/Qwen3.8-27B-DFlash2": describe(
+            "z-lab/Qwen3.8-27B-DFlash2",
+            config_fn=lambda m: fx.dflash2_27b(),
+            size_fn=lambda m: 3_850_000_000,
+        ),
+    }
+    text = render_report(
+        hardware=_hardware(tmp_path),
+        table_age_days=1,
+        checkpoints=cps,
+        refusals=[],
+        rows=[],
+        choice=None,
+        current_model=M,
+    )
+    assert "z-lab/Qwen3.8-27B-DFlash2" in text and "drafter" in text
+    assert "1.1 GB resident after 4-bit quantization" in text
+    assert "KiB/token" not in text.split("## Throughput")[0]  # no KV line for a drafter
+
+
 def test_a_stale_table_and_a_missing_choice_are_said_plainly(tmp_path):
     text = render_report(
         hardware=_hardware(tmp_path),
@@ -133,9 +222,37 @@ def test_apply_writes_a_backup_then_the_new_text(tmp_path):
     assert apply_changes(tmp_path / "fresh.toml", new, "x") is None
 
 
-def test_restart_note_only_for_keys_the_daemon_reads_at_load():
-    assert restart_note({"model": {"speculative_block_size": 2}}, managed=False, label="l") is None
-    unmanaged = restart_note({"model": {"id": "o/9b"}}, managed=False, label="com.sous.daemon")
-    assert unmanaged and "sous stop" in unmanaged and "sous serve" in unmanaged
-    managed = restart_note({"model": {"int8_prefill": True}}, managed=True, label="com.sous.daemon")
-    assert managed and f"launchctl kickstart -k gui/{os.getuid()}/com.sous.daemon" in managed
+def test_apply_leaves_the_original_untouched_if_the_write_crashes_mid_way(tmp_path, monkeypatch):
+    p = tmp_path / "config.toml"
+    original = "[model]\nspeculative_block_size = 3\n"
+    p.write_text(original)
+    new, _ = config_diff(p, {"model": {"speculative_block_size": 2}})
+    real_write_text = Path.write_text
+
+    def crashing_write_text(self, *args, **kwargs):
+        if self.name.startswith(f"{p.name}.tmp-"):
+            raise OSError("disk full")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", crashing_write_text)
+    with pytest.raises(OSError):
+        apply_changes(p, new, "20260918-x")
+    assert p.read_text() == original  # the swap never ran; nothing was truncated
+
+
+def test_restart_note_fires_for_any_change_and_names_the_keys():
+    assert restart_note({}, managed=False, label="l") is None
+    unmanaged = restart_note(
+        {"model": {"speculative_block_size": 2, "max_context_tokens": 65536}},
+        managed=False,
+        label="com.sous.daemon",
+    )
+    assert unmanaged is not None
+    assert "speculative_block_size" in unmanaged and "max_context_tokens" in unmanaged
+    assert "sous stop" in unmanaged and "sous serve" in unmanaged
+    managed = restart_note(
+        {"model": {"speculative_draft_id": ""}}, managed=True, label="com.sous.daemon"
+    )
+    assert managed is not None
+    assert "speculative_draft_id" in managed
+    assert f"launchctl kickstart -k gui/{os.getuid()}/com.sous.daemon" in managed

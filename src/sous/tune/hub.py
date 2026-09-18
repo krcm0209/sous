@@ -45,6 +45,7 @@ def snapshot_bytes(
             os.path.getsize(os.path.join(root, f))
             for root, _, names in os.walk(local, followlinks=True)
             for f in names
+            if f.endswith(".safetensors")
         )
     try:
         info = (api or _hub_api()).model_info(repo_id, files_metadata=True)
@@ -88,10 +89,17 @@ def _size(n: int | None) -> str:
     return "size unknown" if n is None else f"{n / _GB:.1f} GB"
 
 
+def _default_hub_cache() -> str:
+    from huggingface_hub import constants
+
+    return str(constants.HF_HUB_CACHE)
+
+
 def ask_consent(
     plan: list[Download],
     free_bytes: int,
     *,
+    hub_cache: str | None = None,
     ask: Callable[[str], str] = input,
     out: Callable[..., None] = print,
 ) -> set[str]:
@@ -99,7 +107,7 @@ def ask_consent(
     each download knowing everything the run wants and what a no costs."""
     if not plan:
         return set()
-    hub = os.path.join("~", ".cache", "huggingface", "hub")
+    hub = hub_cache if hub_cache is not None else _default_hub_cache()
     out(f"Downloads needed (free disk {free_bytes / _GIB:.1f} GiB at {hub}):")
     for n, d in enumerate(plan, start=1):
         out(f"  {n}. {d.repo_id:45s} {_size(d.bytes):>13s}   {d.role}; refusing: {d.removes}")

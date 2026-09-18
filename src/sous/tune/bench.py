@@ -23,6 +23,10 @@ DECODE_TOKENS = 256
 _LONG_HEADROOM = 1024
 _UNLOAD_WAIT_SECONDS = 30.0
 _UNLOAD_SLACK_BYTES = 1 << 30
+# build_prompt's rough per-function token cost: each round adds enough
+# functions to close the gap to target_tokens in one step, so the final
+# overshoot is at most one function's worth rather than a doubling.
+_TOKENS_PER_FUNCTION = 60
 
 _SYSTEM = (
     "You are a coding assistant. Answer with code only, no prose, continuing the module "
@@ -47,13 +51,21 @@ class BenchRow:
     ttft_seconds: float | None
     peak_memory_bytes: int | None
     spread: float | None
+    # False when the arm's teardown could not free the weights (refused or
+    # raised): the row still reflects a finished measurement, but the run
+    # must stop rather than measure a second arm's numbers with two models
+    # resident. Defaults True so a results.jsonl written before this field
+    # existed still reads as "released" on --resume.
+    released: bool = True
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> BenchRow:
-        return cls(**{f.name: d[f.name] for f in dataclasses.fields(cls)})
+        kwargs = {f.name: d[f.name] for f in dataclasses.fields(cls) if f.name != "released"}
+        kwargs["released"] = d.get("released", True)
+        return cls(**kwargs)
 
 
 def _code_lines(rng: random.Random, n: int, start: int) -> list[str]:
@@ -72,8 +84,10 @@ def build_prompt(
     count: Callable[[list[dict], list[dict]], int], target_tokens: int, *, seed: int = 0
 ) -> list[dict]:
     """A code-shaped conversation of at least `target_tokens` tokens by the
-    engine's own count, grown geometrically so a 16K prompt costs a handful
-    of tokenizations rather than hundreds. Deterministic per seed."""
+    engine's own count, grown by an estimate of the remaining deficit each
+    round (`_TOKENS_PER_FUNCTION` per generated function) so a 16K prompt
+    costs a handful of tokenizations and the final overshoot is at most one
+    function, rather than doubling past the target. Deterministic per seed."""
     rng = random.Random(seed)
     lines: list[str] = []
 
@@ -82,10 +96,13 @@ def build_prompt(
         return [{"role": "system", "content": _SYSTEM}, {"role": "user", "content": body}]
 
     fn = 0
-    while count(render(), WORKER_TOOLS) < target_tokens:
-        n = max(16, len(lines) // 5)
+    current = count(render(), WORKER_TOOLS)
+    while current < target_tokens:
+        deficit = target_tokens - current
+        n = max(1, deficit // _TOKENS_PER_FUNCTION)
         lines.extend(_code_lines(rng, n, fn))
         fn += n
+        current = count(render(), WORKER_TOOLS)
     return render()
 
 
@@ -198,13 +215,12 @@ def _measure(
         prefill_2k = _prefill_rate(
             result.gauges, count(prefill_prompt, WORKER_TOOLS), result.first_delta_seconds
         )
+        long = build_prompt(count, LONG_CONTEXT, seed=2)
+        long_tokens = count(long, WORKER_TOOLS)
         prefill_16k = decode_16k = None
-        if arm.window >= LONG_CONTEXT + _LONG_HEADROOM:
-            long = build_prompt(count, LONG_CONTEXT, seed=2)
+        if long_tokens + DECODE_TOKENS + _LONG_HEADROOM <= arm.window:
             result = turn.run(long, 1)
-            prefill_16k = _prefill_rate(
-                result.gauges, count(long, WORKER_TOOLS), result.first_delta_seconds
-            )
+            prefill_16k = _prefill_rate(result.gauges, long_tokens, result.first_delta_seconds)
             warm = [
                 *long,
                 {"role": "assistant", "content": result.text},
@@ -260,22 +276,35 @@ def _measure(
 
     # Teardown always runs, over whatever the try/except above produced: a
     # row already built in `row` can no longer be discarded by a teardown
-    # problem the way a bare `finally` that returned from `try` could.
-    session.close()
-    # A wedged generation never dequeues _CLOSE, so this can't wait for one;
-    # it only gives a healthy thread time to release its mlx state.
-    session.join(5.0)
-    released = manager.unload_now()
-    if released["unloaded"]:
-        deadline = time.monotonic() + _UNLOAD_WAIT_SECONDS
-        while active_memory() > baseline + _UNLOAD_SLACK_BYTES and time.monotonic() < deadline:
-            time.sleep(0.2)
-    else:
-        # The weights are still resident — say so, and don't wait for memory
-        # that cannot come back; the next arm's peak reading will be too.
-        out(f"  {arm.label}: model not released ({released['reason']})")
-        suffix = f"unload refused: {released['reason']}"
-        row = dataclasses.replace(row, error=suffix if row.ok else f"{row.error}; {suffix}")
+    # problem the way a bare `finally` that returned from `try` could — and
+    # neither can a teardown step itself raising, caught below so the row
+    # survives that too.
+    try:
+        session.close()
+        # A wedged generation never dequeues _CLOSE, so this can't wait for
+        # one; it only gives a healthy thread time to release its mlx state.
+        session.join(5.0)
+        released = manager.unload_now()
+        if released["unloaded"]:
+            deadline = time.monotonic() + _UNLOAD_WAIT_SECONDS
+            while active_memory() > baseline + _UNLOAD_SLACK_BYTES and time.monotonic() < deadline:
+                time.sleep(0.2)
+        else:
+            # The weights are still resident — say so, and don't wait for
+            # memory that cannot come back; the next arm's peak reading will
+            # be too, and the caller must stop rather than measure a second
+            # arm with two models loaded.
+            out(f"  {arm.label}: model not released ({released['reason']})")
+            suffix = f"unload refused: {released['reason']}"
+            row = dataclasses.replace(
+                row, error=suffix if row.ok else f"{row.error}; {suffix}", released=False
+            )
+    except Exception as e:  # noqa: BLE001 — the row survives; only teardown failed
+        out(f"  {arm.label}: teardown failed ({type(e).__name__}: {e})")
+        suffix = f"teardown failed: {type(e).__name__}: {e}"
+        row = dataclasses.replace(
+            row, error=suffix if row.ok else f"{row.error}; {suffix}", released=False
+        )
 
     out(f"  {arm.label}: {'done' if row.ok else 'failed'}")
     return row

@@ -123,11 +123,27 @@ def test_a_row_whose_arm_is_gone_is_ignored(tmp_path):
     assert quick_decision(user, arms, [_row("ghost", block=2, d16k=99.0)]) is None
 
 
-def test_without_a_current_arm_the_best_row_still_wins(tmp_path):
+def test_without_a_current_arm_the_best_row_still_labels_the_choice_but_proposes_nothing(tmp_path):
+    """No arm is marked current — the user's own pair never measured at
+    all — so there is no baseline to diff the winner against; proposing
+    `changes` from the winner's numbers alone would trust one arm's speed
+    without ever knowing whether it beats what the user already has."""
     user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
     arms = [_arm(user, "b2", block=2), _arm(user, "b5", block=5)]
     rows = [_row("b2", block=2, d16k=20.0), _row("b5", block=5, d16k=22.0)]
     choice = quick_decision(user, arms, rows)
     assert choice is not None and choice.label == "b5"
-    assert choice.changes == {"model": {"speculative_block_size": 5}}
+    assert choice.changes == {}
     assert len(choice.reasons) == 1
+    assert "not measured" in choice.reasons[0]
+
+
+def test_a_failed_current_arm_proposes_no_change_but_names_the_failure(tmp_path):
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    arms = [_arm(user, "cur", current=True), _arm(user, "b2", block=2)]
+    rows = [_row("cur", ok=False), _row("b2", block=2, d16k=19.5)]
+    choice = quick_decision(user, arms, rows)
+    assert choice is not None and choice.label == "b2"
+    assert choice.changes == {}
+    assert "cur" in choice.reasons[0]
+    assert "did not measure" in choice.reasons[0] and "x" in choice.reasons[0]

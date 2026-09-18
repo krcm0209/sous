@@ -11,7 +11,7 @@ import tomlkit
 
 from sous.tune.arms import Refusal
 from sous.tune.bench import BenchRow
-from sous.tune.candidates import Checkpoint
+from sous.tune.candidates import DRAFTER_QUANT_DIVISOR, Checkpoint
 from sous.tune.decide import QuickChoice
 from sous.tune.hardware import Hardware, gib
 
@@ -35,17 +35,30 @@ def _quant(cp: Checkpoint) -> str:
     if q.verifier_slow_layers:
         verifier += f" ({q.verifier_slow_layers} slow layers)"
     int8 = "int8-routable" if q.int8_routable else "no int8 prefill"
+    if q.int8_excluded_layers:
+        int8 += f", {q.int8_excluded_layers} layers excluded"
     return f"{layout}; {verifier}; {int8}"
 
 
 def _candidate_line(cp: Checkpoint, refusal: Refusal | None) -> str:
-    size = "size unknown" if cp.bytes is None else f"{cp.bytes / _GB:.1f} GB"
-    kv = (
-        "KV unknown"
-        if cp.kv_bytes_per_token is None
-        else f"{cp.kv_bytes_per_token // _KIB} KiB/token"
-    )
-    line = f"  {cp.id:45s} {size:>12s}  {kv:>13s}  {_quant(cp)}"
+    # A drafter's own KV cost and quant layout are not what a reader wants
+    # here — it never runs unquantized and never on its own — just what it
+    # costs resident, the way the candidate table's note field does.
+    if cp.num_target_layers is not None:
+        if cp.bytes is None:
+            resident = "size unknown"
+        else:
+            gb = cp.bytes / DRAFTER_QUANT_DIVISOR / _GB
+            resident = f"{gb:.1f} GB resident after 4-bit quantization"
+        line = f"  {cp.id:45s} drafter  {resident}"
+    else:
+        size = "size unknown" if cp.bytes is None else f"{cp.bytes / _GB:.1f} GB"
+        kv = (
+            "KV unknown"
+            if cp.kv_bytes_per_token is None
+            else f"{cp.kv_bytes_per_token // _KIB} KiB/token"
+        )
+        line = f"  {cp.id:45s} {size:>12s}  {kv:>13s}  {_quant(cp)}"
     if refusal is not None:
         line += f"\n      refused: {refusal.reason}"
     return line
@@ -81,9 +94,12 @@ def render_report(
         f"  {hardware.chip}, {gib(hardware.memory_bytes)} unified memory, Metal working set "
         f"{gib(hardware.working_set_bytes)}, macOS {hardware.macos}"
     )
-    nax = (
-        "NAX tensor units: yes" if hardware.nax else f"NAX tensor units: no ({hardware.nax_reason})"
-    )
+    if hardware.nax:
+        nax = "NAX tensor units: yes"
+    elif hardware.nax_reason is None:
+        nax = "NAX tensor units: no"
+    else:
+        nax = f"NAX tensor units: no ({hardware.nax_reason})"
     out.append(f"  {nax}; " + ", ".join(f"{k} {v}" for k, v in hardware.versions.items()))
     out.append(f"  hub cache {hardware.hub_cache}: {gib(hardware.disk_free_bytes)} free")
     if table_age_days > STALE_AFTER_DAYS:
@@ -91,7 +107,7 @@ def render_report(
             f"  the candidate table is {table_age_days} days old and may be stale; "
             "`sous tune --discover` can look for newer checkpoints"
         )
-    out += ["", "## Candidates", "  (prefill/decode at 2K/16K and 1K/16K tokens of context)", ""]
+    out += ["", "## Candidates", ""]
     for cp in checkpoints.values():
         out.append(_candidate_line(cp, refused.get(cp.id)))
     for r in refusals:
@@ -99,7 +115,7 @@ def render_report(
             out.append(f"  {r.drafter_id:45s} dropped for {r.model_id}: {r.reason}")
         elif r.model_id not in checkpoints:
             out.append(f"  {r.model_id:45s} refused: {r.reason}")
-    out += ["", "## Throughput", ""]
+    out += ["", "## Throughput", "  (prefill/decode at 2K/16K and 1K/16K tokens of context)", ""]
     out += [_row_line(r, current_model) for r in rows] or ["  (nothing measured)"]
     out += ["", "## Choice", ""]
     if choice is None:
@@ -145,16 +161,26 @@ def apply_changes(config_path: Path, new_text: str, run_id: str) -> Path | None:
         backup = config_path.with_name(f"{config_path.name}.bak-tune-{run_id}")
         shutil.copyfile(config_path, backup)
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(new_text)
+    # Written to a temporary file first and swapped in with os.replace, which
+    # is atomic on the same filesystem: a crash mid-write leaves the temp
+    # file half-written, never the real config truncated.
+    tmp = config_path.with_name(f"{config_path.name}.tmp-{run_id}")
+    tmp.write_text(new_text)
+    os.replace(tmp, config_path)
     return backup
 
 
 def restart_note(changes: dict[str, dict[str, object]], *, managed: bool, label: str) -> str | None:
-    """Keys the daemon reads once at load need a restart to take effect;
-    everything a quick run writes is read per task or per turn."""
-    model = changes.get("model", {})
-    if "id" not in model and "int8_prefill" not in model:
+    """`server.py` reads the config once at startup and builds one
+    EngineManager closed over every [model]/[gateway] value; only the
+    allowlist is re-read at runtime. So every key `sous tune --quick` can
+    write — not just the model id or int8_prefill — needs a restart before
+    the daemon acts on it."""
+    keys = [key for section in changes.values() for key in section]
+    if not keys:
         return None
+    named = ", ".join(keys)
     if managed:
-        return f"restart the daemon to load it: launchctl kickstart -k gui/{os.getuid()}/{label}"
-    return "restart the daemon to load it: sous stop, then sous serve"
+        kickstart = f"launchctl kickstart -k gui/{os.getuid()}/{label}"
+        return f"restart the daemon to apply {named}: {kickstart}"
+    return f"restart the daemon to apply {named}: sous stop, then sous serve"

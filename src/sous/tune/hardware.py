@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import platform
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as dist_version
+
+from sous.engine.int8prefill import Availability
 
 DISTRIBUTIONS = ("mlx", "mlx-vlm", "mlx-lm", "sous-mcp")
 _GIB = 1 << 30
@@ -41,7 +44,7 @@ def _device_info() -> dict:
     return dict(mx.device_info())
 
 
-def _availability():
+def _availability() -> Availability:
     from sous.engine import int8prefill
 
     return int8prefill.availability()
@@ -53,12 +56,25 @@ def _hub_cache() -> str:
     return str(constants.HF_HUB_CACHE)
 
 
+def _nearest_existing(path: str) -> str:
+    """Walk up from `path` to the nearest directory that exists: the Hub
+    cache is created on its first download, so `disk_usage` on it raises
+    `FileNotFoundError` on a machine that has never fetched a model."""
+    current = path
+    while current and not os.path.exists(current):
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return current if current and os.path.exists(current) else os.path.expanduser("~")
+
+
 def detect(
     *,
     device_info: Callable[[], dict] | None = None,
     mac_ver: Callable[[], tuple] | None = None,
     disk_usage: Callable[[str], tuple] | None = None,
-    availability: Callable[[], object] | None = None,
+    availability: Callable[[], Availability] | None = None,
     version: Callable[[str], str] | None = None,
     hub_cache: str | None = None,
 ) -> Hardware:
@@ -67,7 +83,7 @@ def detect(
     info = (device_info or _device_info)()
     release = (mac_ver or platform.mac_ver)()[0]
     cache = hub_cache if hub_cache is not None else _hub_cache()
-    free = int((disk_usage or shutil.disk_usage)(cache)[2])
+    free = int((disk_usage or shutil.disk_usage)(_nearest_existing(cache))[2])
     nax = (availability or _availability)()
     read = version or dist_version
     versions: dict[str, str] = {}

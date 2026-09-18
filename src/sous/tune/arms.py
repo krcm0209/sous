@@ -42,7 +42,8 @@ def _short(repo_id: str) -> str:
 def label_for(model_id: str, drafter_id: str, block_size: int) -> str:
     if not drafter_id:
         return _short(model_id)
-    return f"{_short(model_id)} + {_short(drafter_id)} @{block_size}"
+    depth = "auto" if block_size == 0 else str(block_size)
+    return f"{_short(model_id)} + {_short(drafter_id)} @{depth}"
 
 
 def _with_current(user: SousConfig, candidates: list[Candidate]) -> list[Candidate]:
@@ -117,6 +118,11 @@ def quick_arms(
             if drafter is None:
                 refusals.append(Refusal(cand.id, drafter_id, "drafter unknown (offline?)"))
                 continue
+            if drafter.bytes is None:
+                # Unresolvable cost, not incompatibility: reaching fit() with
+                # it would refuse the whole model, drafterless arm included.
+                refusals.append(Refusal(cand.id, drafter_id, "drafter size unknown (offline?)"))
+                continue
             ok, why = drafter_compatible(target, drafter)
             if ok:
                 drafters.append(drafter)
@@ -132,6 +138,16 @@ def quick_arms(
             gateway_window = min(user.gateway_max_context_tokens, f.window)
         arms.append(_arm(user, cand, "", 0, f, gateway_window))
         for drafter in drafters:
-            for block in BLOCK_SIZES:
+            is_users_own_pair = cand.id == user.model_id and drafter.id == user.speculative_draft_id
+            # The user's own block size may sit outside the curated set (0 is
+            # the drafter's adaptive policy; anything else they set by hand),
+            # and it must still be measurable as `current` — every other pair
+            # sticks to the curated set.
+            blocks = (
+                sorted({*BLOCK_SIZES, user.speculative_block_size})
+                if is_users_own_pair
+                else BLOCK_SIZES
+            )
+            for block in blocks:
                 arms.append(_arm(user, cand, drafter.id, block, f, gateway_window))
     return arms, refusals

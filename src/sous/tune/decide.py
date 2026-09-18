@@ -63,6 +63,14 @@ def _changes(user: SousConfig, arm: Arm) -> dict[str, dict[str, object]]:
     return changes
 
 
+def _no_baseline_reason(current_arm: Arm | None, rows: list[BenchRow]) -> str:
+    if current_arm is None:
+        return "the configured arm was not measured; no change proposed"
+    failed = next((r for r in rows if r.label == current_arm.label), None)
+    detail = failed.error if failed is not None and failed.error else "not attempted"
+    return f"the configured arm ({current_arm.label}) did not measure: {detail}; no change proposed"
+
+
 def quick_decision(user: SousConfig, arms: list[Arm], rows: list[BenchRow]) -> QuickChoice | None:
     by_label = {a.label: a for a in arms}
     mine = [
@@ -72,6 +80,7 @@ def quick_decision(user: SousConfig, arms: list[Arm], rows: list[BenchRow]) -> Q
     ]
     if not mine:
         return None
+    current_arm = next((a for a in arms if a.current), None)
     current = next((r for r in mine if by_label[r.label].current), None)
     # A strict improvement over the current arm is required: a tie changes
     # nothing, and a re-run on a noisy afternoon must not flip a setting.
@@ -79,12 +88,29 @@ def quick_decision(user: SousConfig, arms: list[Arm], rows: list[BenchRow]) -> Q
     for row in mine:
         if winner is None or (score(row) or 0.0) > (score(winner) or 0.0):
             winner = row
-    assert winner is not None
+    if winner is None:
+        return None
     arm = by_label[winner.label]
+    # Without a scored measurement of the user's own configuration there is
+    # nothing to compare the winner against: diffing it against the config
+    # directly (_changes below) would propose a change on the strength of
+    # one arm's number alone, never knowing whether the arm actually beats
+    # what the user already has.
+    if current is None:
+        return QuickChoice(
+            label=arm.label,
+            model_id=arm.model_id,
+            drafter_id=arm.drafter_id,
+            block_size=arm.block_size,
+            window=arm.window,
+            gateway_window=arm.gateway_window,
+            changes={},
+            reasons=[_no_baseline_reason(current_arm, rows)],
+        )
     which = "decode at 16K context" if winner.decode_tps_16k is not None else "decode at 1K context"
     best = score(winner)
     reasons: list[str] = []
-    if current is not None and current.label != winner.label:
+    if current.label != winner.label:
         current_best = score(current)
         reasons.append(
             f"{which}: {best:.1f} tok/s for {winner.label}, "
@@ -92,7 +118,6 @@ def quick_decision(user: SousConfig, arms: list[Arm], rows: list[BenchRow]) -> Q
         )
     else:
         reasons.append(f"{which}: {best:.1f} tok/s for {winner.label}")
-    if current is not None and current.label == winner.label:
         reasons.append("the current arm is already the fastest measured")
     return QuickChoice(
         label=arm.label,

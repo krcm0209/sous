@@ -135,5 +135,11 @@ def test_fit_refuses_when_a_size_is_unknown():
     assert f.fits is False and "unknown" in f.detail
 
 
+def test_fit_refuses_when_the_drafters_size_is_unknown():
+    drafter = _cp(None, kv=2 * 5 * 8 * 128 * 2)
+    f = fit(_cp(16_100_000_000), drafter, window=131072, floor=8192, working_set_bytes=10**12)
+    assert f.fits is False and "drafter size unknown" in f.detail
+
+
 def test_fit_floor_for_the_gateway_is_claude_codes_minimum():
     assert GATEWAY_MIN_CONTEXT_TOKENS == 48 * 1024

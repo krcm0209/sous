@@ -1,5 +1,7 @@
 import dataclasses
 
+import pytest
+
 from sous.config import SousConfig
 from sous.protocol import WORKER_TOOLS
 from sous.tune import bench
@@ -26,6 +28,13 @@ def test_build_prompt_reaches_the_target_deterministically():
     assert _count(a, WORKER_TOOLS) >= 2048
     assert a[0]["role"] == "system" and a[1]["role"] == "user"
     assert "def " in a[1]["content"]
+
+
+@pytest.mark.parametrize("target", [1024, 2048, 16384])
+def test_build_prompt_overshoots_by_less_than_ten_percent(target):
+    counted = _count(build_prompt(_count, target), WORKER_TOOLS)
+    assert counted >= target
+    assert counted < target * 1.1
 
 
 def _arm(tmp_path, window=131072):
@@ -168,9 +177,39 @@ def test_a_refused_unload_is_recorded_and_skips_the_settle_wait(tmp_path, monkey
     )
     assert row.ok is True
     assert row.error == "unload refused: a generation is in flight"
+    assert row.released is False
     # Just the pre-load baseline: a refused unload skips the settle-wait
     # entirely rather than spinning on memory that cannot come back.
     assert len(memory_calls) == 1
+
+
+def test_a_teardown_exception_keeps_the_finished_row(tmp_path):
+    class RaisingUnloadEngine(FakeEngine):
+        def unload(self) -> None:
+            raise RuntimeError("weights pinned")
+
+    def factory(model_id):
+        e = RaisingUnloadEngine(["w " * DECODE_TOKENS] * 12)
+        e.stats = {
+            "prefill_seconds": 2.0,
+            "prefilled_tokens": PREFILL_CONTEXT,
+            "decode_seconds": 4.0,
+        }
+        return e
+
+    row = bench_arm(
+        _arm(tmp_path),
+        factory=factory,
+        repeat=1,
+        peak_memory=lambda: 0,
+        reset_peak=lambda: None,
+        active_memory=lambda: 0,
+        out=lambda *a, **k: None,
+    )
+    assert row.ok is True  # the measurement itself finished
+    assert row.error is not None
+    assert "teardown failed" in row.error and "weights pinned" in row.error
+    assert row.released is False
 
 
 def test_spread_is_none_with_a_single_repeat(tmp_path):

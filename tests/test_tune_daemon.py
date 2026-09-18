@@ -57,7 +57,7 @@ def test_a_held_model_a_running_task_and_a_turn_each_refuse_without_unloading():
 
 def test_a_refused_unload_reports_the_daemons_reason():
     request, _ = _request(
-        _status(loading=True),
+        _status(loaded=True),
         unload=(
             409,
             {
@@ -73,3 +73,23 @@ def test_a_refused_unload_reports_the_daemons_reason():
 def test_something_else_on_the_port_is_not_ready():
     r = ready_for_tune(8383, request=lambda *a, **k: (404, b"nope"), port_open=lambda p: True)
     assert r.ready is False and "404" in r.reason
+
+
+def test_a_daemon_mid_load_is_not_ready_and_the_unload_is_never_posted():
+    """The engine is unpublished while loading (`_engine is None`), so
+    unload_now() there would answer 'nothing loaded' — the wrong reason for
+    a daemon that is busy, not idle."""
+    request, calls = _request(_status(loading=True))
+    r = ready_for_tune(8383, request=request, port_open=lambda p: True)
+    assert r.ready is False and "loading a model" in r.reason
+    assert calls == [("GET", "/sous/status")]
+
+
+def test_a_daemon_that_predates_unload_names_the_restart():
+    request, _ = _request(
+        _status(loaded=True), unload=(404, {"error": {"type": "not_found_error", "message": "x"}})
+    )
+    r = ready_for_tune(8383, request=request, port_open=lambda p: True)
+    assert r.ready is False
+    assert "predates /sous/unload" in r.reason
+    assert "sous stop" in r.reason and "sous serve" in r.reason
