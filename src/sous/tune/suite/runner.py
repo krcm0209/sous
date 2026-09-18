@@ -204,21 +204,29 @@ class _Denier:
     def __init__(self, store: TaskStore, task_id: str, poll: float):
         self._store, self._task_id, self._poll = store, task_id, poll
         self.denied = 0
+        # Set once a store call raises: TaskStore._conn's own comment notes
+        # the WAL pragma can raise SQLITE_BUSY under contention. A run whose
+        # denier died silently would let every approval ride out the full
+        # timeout instead, mislabelling a budget-exhausted run as measured.
+        self.error: str | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="sous-tune-denier", daemon=True)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            task = self._store.get(self._task_id)
-            # respond_approval is true only for the decision that took
-            # effect, so a request seen twice before the worker polls it
-            # is counted once.
-            if (
-                task is not None
-                and task.state == TaskState.AWAITING_APPROVAL
-                and self._store.respond_approval(self._task_id, approve=False)
-            ):
-                self.denied += 1
+            try:
+                task = self._store.get(self._task_id)
+                # respond_approval is true only for the decision that took
+                # effect, so a request seen twice before the worker polls it
+                # is counted once.
+                if (
+                    task is not None
+                    and task.state == TaskState.AWAITING_APPROVAL
+                    and self._store.respond_approval(self._task_id, approve=False)
+                ):
+                    self.denied += 1
+            except Exception as e:  # noqa: BLE001 — transient; keep looping, don't kill the denier
+                self.error = f"{type(e).__name__}: {e}"
             self._stop.wait(self._poll)
 
     def __enter__(self) -> _Denier:
@@ -319,6 +327,16 @@ def run_one(
     # run_task counts turns itself in the report's budget block; the store's
     # turns_used is bumped only on tool calls, so it misses the finish turn.
     turns = int(budget.get("turns", final.turns_used))
+    state = final.state
+    error = None if final.state == TaskState.DONE else str(report.get("error") or final.state)
+    if denier.error is not None:
+        # The denier is the only thing answering approvals in a suite run;
+        # if its thread died mid-run, every request rode out the full
+        # approval timeout instead of being denied at once, so this run
+        # measured a wedged approval loop, not the arm. Every other field
+        # (grade included) still stands — only the label changes.
+        state = "error"
+        error = f"approval denier failed: {denier.error}"
     return SuiteRun(
         task=task.name,
         index=index,
@@ -329,7 +347,7 @@ def run_one(
         int8_prefill=arm.int8_prefill,
         greedy=arm.greedy,
         window=arm.window,
-        state=final.state,
+        state=state,
         outcome=final.outcome,
         turns=turns,
         seconds=finished - started,
@@ -339,7 +357,7 @@ def run_one(
         approvals_denied=denier.denied,
         grade=grade.score,
         grade_detail=grade.detail,
-        error=None if final.state == TaskState.DONE else str(report.get("error") or final.state),
+        error=error,
         transcript_path=str(transcript),
     )
 
@@ -390,46 +408,57 @@ def _run_suite(
         return SuiteOutcome([], True, f"load failed: {type(e).__name__}: {e}")
     results: list[SuiteRun] = []
     check_error: str | None = None
+    loop_error: str | None = None
+    # Everything that can raise after the load — the checks, the whole task
+    # loop, `record`, `out`, the scratch-directory bookkeeping — is inside
+    # this try, so the finally below always releases the weights: a raise
+    # anywhere here used to skip release() and still report released=True.
     try:
-        _check_drafter(arm, engine)
-        _check_int8(arm, engine)
-    except RuntimeError as e:
-        check_error = str(e)
-    if check_error is None:
-        for task in tasks:
-            for index in range(runs):
-                if (task.name, index) in done:
-                    continue
-                out(f"  {arm.label}: {task.name} #{index + 1} ...")
-                run_scratch = scratch / _slug(arm.label) / f"{task.name}-{index + 1}"
-                # A resumed run may have died mid-task here; nothing in a
-                # half-run scratch is worth keeping.
-                if run_scratch.exists():
-                    shutil.rmtree(run_scratch)
-                run_scratch.mkdir(parents=True)
-                try:
-                    result = run_one(
-                        task,
-                        index,
-                        arm,
-                        engine,
-                        counters[-1],
-                        run_scratch,
-                        python=python,
-                        poll=poll,
+        try:
+            _check_drafter(arm, engine)
+            _check_int8(arm, engine)
+        except RuntimeError as e:
+            check_error = str(e)
+        if check_error is None:
+            for task in tasks:
+                for index in range(runs):
+                    if (task.name, index) in done:
+                        continue
+                    out(f"  {arm.label}: {task.name} #{index + 1} ...")
+                    run_scratch = scratch / _slug(arm.label) / f"{task.name}-{index + 1}"
+                    # A resumed run may have died mid-task here; nothing in a
+                    # half-run scratch is worth keeping.
+                    if run_scratch.exists():
+                        shutil.rmtree(run_scratch)
+                    run_scratch.mkdir(parents=True)
+                    try:
+                        result = run_one(
+                            task,
+                            index,
+                            arm,
+                            engine,
+                            counters[-1],
+                            run_scratch,
+                            python=python,
+                            poll=poll,
+                        )
+                    except Exception as e:  # noqa: BLE001 — one run's failure, recorded; goes on
+                        result = _error_run(task, index, arm, f"{type(e).__name__}: {e}")
+                    # Appended before record() runs, so a run already
+                    # finished is kept even when the callback itself raises.
+                    results.append(result)
+                    record(result)
+                    out(
+                        f"    {task.name} #{index + 1}: {result.state}, grade {result.grade:.2f}, "
+                        f"{result.seconds:.0f} s, {result.turns} turn(s)"
                     )
-                except Exception as e:  # noqa: BLE001 — one run's failure, recorded; the suite goes on
-                    result = _error_run(task, index, arm, f"{type(e).__name__}: {e}")
-                record(result)
-                results.append(result)
-                out(
-                    f"    {task.name} #{index + 1}: {result.state}, grade {result.grade:.2f}, "
-                    f"{result.seconds:.0f} s, {result.turns} turn(s)"
-                )
-    teardown = release(
-        manager, None, baseline=baseline, active_memory=active_memory, label=arm.label, out=out
-    )
-    return SuiteOutcome(results, teardown is None, teardown or check_error)
+    except Exception as e:  # noqa: BLE001 — the arm's own failure; still released in finally
+        loop_error = f"{type(e).__name__}: {e}"
+    finally:
+        teardown = release(
+            manager, None, baseline=baseline, active_memory=active_memory, label=arm.label, out=out
+        )
+    return SuiteOutcome(results, teardown is None, teardown or loop_error or check_error)
 
 
 def run_suite(
@@ -478,9 +507,12 @@ def run_suite(
     worker.join()
     result = outcome[0]
     if isinstance(result, BaseException):
-        # Only a failure before the load finished reaches here (_run_suite
-        # turns everything after it into an outcome), so nothing is resident.
-        return SuiteOutcome([], True, f"{type(result).__name__}: {result}")
+        # _run_suite now releases on every ordinary-Exception path and only
+        # lets a BaseException (an interrupt) past that release, so only one
+        # can reach here — and whether the weights actually came off is then
+        # unknown, not "definitely not resident": the caller must stop
+        # rather than load a second model over an uncertain interrupt.
+        return SuiteOutcome([], False, f"{type(result).__name__}: {result}")
     return result
 
 

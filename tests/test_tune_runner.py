@@ -6,10 +6,13 @@ import json
 import os
 import sys
 import threading
+import time
 from pathlib import Path
+from typing import cast
 
 from sous.config import SousConfig
 from sous.engine.base import ManagedEngine, ReplaySafe
+from sous.tasks import TaskStore
 from sous.tune.arms import Arm
 from sous.tune.bench import BenchRow
 from sous.tune.suite import load_tasks
@@ -158,6 +161,39 @@ def test_an_engine_failure_is_a_failed_run_with_a_zero_grade(tmp_path):
     assert run.state == "failed" and not run.completed
     assert run.error and "engine error" in run.error
     assert run.grade == 0.0 and run.turns == 0
+
+
+def test_the_denier_survives_a_store_error_and_records_it():
+    from sous.tune.suite import runner
+
+    class BustedStore:
+        def get(self, task_id):
+            raise RuntimeError("busy")
+
+    with runner._Denier(cast(TaskStore, BustedStore()), "t", 0.01) as d:
+        time.sleep(0.05)
+        assert d._thread.is_alive()
+    assert d.error == "RuntimeError: busy"
+    assert d.denied == 0
+
+
+def test_a_denier_failure_marks_the_run_as_an_error(tmp_path, monkeypatch):
+    from sous.tune.suite import runner
+
+    class FailingDenier(runner._Denier):
+        def __enter__(self):
+            super().__enter__()
+            self.error = "RuntimeError: busy"
+            return self
+
+    monkeypatch.setattr(runner, "_Denier", FailingDenier)
+    task = _task()
+    counting = CountingEngine(FakeEngine([FINISH]))
+    run = run_one(
+        task, 0, _arm(tmp_path), ManagedEngine(counting), counting, tmp_path / "s", python=PYTHON
+    )
+    assert run.state == "error"
+    assert run.error == "approval denier failed: RuntimeError: busy"
 
 
 def test_run_suite_loads_once_runs_what_is_not_done_records_in_order_and_releases(tmp_path):
@@ -329,6 +365,34 @@ def test_a_run_that_raises_outside_the_worker_is_recorded_as_an_error_and_the_su
     assert calls == [0, 1]
     assert [r.state for r in outcome.runs] == ["error", "done"]
     assert outcome.runs[0].error == "OSError: disk full" and outcome.runs[0].grade == 0.0
+
+
+def test_a_record_callback_that_raises_still_releases_the_weights_and_keeps_the_runs(tmp_path):
+    task = _task()
+    inner = FakeEngine([FINISH])
+
+    def factory(model_id):
+        return inner
+
+    def record(run):
+        raise RuntimeError("disk full")
+
+    outcome = run_suite(
+        _arm(tmp_path),
+        [task],
+        runs=1,
+        done=set(),
+        record=record,
+        scratch=tmp_path / "scratch",
+        out=lambda *a: None,
+        factory=factory,
+        python=PYTHON,
+        active_memory=lambda: 0,
+    )
+    assert inner.unloaded
+    assert outcome.released
+    assert outcome.error == "RuntimeError: disk full"
+    assert len(outcome.runs) == 1
 
 
 def test_suite_runs_round_trip_through_dicts(tmp_path):
