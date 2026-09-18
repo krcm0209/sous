@@ -55,17 +55,30 @@ def test_plan_collapses_duplicates_drops_cached_and_keeps_order():
     assert plan[1].bytes is None
 
 
-def test_consent_prints_the_block_up_front_then_asks_each_separately(capsys):
+def test_consent_prints_the_block_up_front_then_asks_each_separately():
     plan = [
         Download("org/big", 20 * 10**9, "candidate (35b-moe tier)", "its arms"),
         Download("org/draft", 8 * 10**8, "drafter for org/big", "org/big runs without a drafter"),
     ]
+    events: list[tuple[str, str]] = []
     answers = iter(["y", "n"])
-    approved = ask_consent(plan, free_bytes=412 * 2**30, ask=lambda prompt: next(answers))
-    out = capsys.readouterr().out
-    assert out.index("org/big") < out.index("org/draft") < out.index("Download #1?")
-    assert "20.0 GB" in out and "0.8 GB" in out and "412.0 GiB" in out
-    assert "org/big runs without a drafter" in out
+
+    def out(*args, **kwargs):
+        events.append(("out", " ".join(str(a) for a in args)))
+
+    def ask(prompt):
+        events.append(("ask", prompt))
+        return next(answers)
+
+    approved = ask_consent(plan, free_bytes=412 * 2**30, ask=ask, out=out)
+    # Every line of the block precedes the first question, so the user
+    # decides each download knowing the whole plan.
+    assert [kind for kind, _ in events] == ["out", "out", "out", "ask", "ask"]
+    block = "\n".join(text for kind, text in events if kind == "out")
+    assert "20.0 GB" in block and "0.8 GB" in block and "412.0 GiB" in block
+    assert "org/big runs without a drafter" in block
+    assert events[3][1].startswith("Download #1") and "org/big" in events[3][1]
+    assert events[4][1].startswith("Download #2") and "org/draft" in events[4][1]
     assert approved == {"org/big"}
 
 

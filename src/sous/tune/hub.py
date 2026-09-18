@@ -105,8 +105,7 @@ def ask_consent(
         out(f"  {n}. {d.repo_id:45s} {_size(d.bytes):>13s}   {d.role}; refusing: {d.removes}")
     approved: set[str] = set()
     for n, d in enumerate(plan, start=1):
-        prompt = f"Download #{n}? [y/N] "
-        out(prompt, end="")
+        prompt = f"Download #{n} ({d.repo_id}, {_size(d.bytes)})? [y/N] "
         try:
             answer = ask(prompt)
         except EOFError:
