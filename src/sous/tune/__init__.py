@@ -27,6 +27,12 @@ def _managed() -> bool:
     return _launchd_loaded(LABEL)
 
 
+def _label() -> str:
+    from sous.cli import LABEL
+
+    return LABEL
+
+
 def _describe_all(ids: set[str], describe, out) -> dict[str, cand_mod.Checkpoint]:
     found: dict[str, cand_mod.Checkpoint] = {}
     for model_id in sorted(ids):
@@ -44,16 +50,14 @@ def _consented(arms, plan, approved) -> list:
     return [a for a in arms if a.model_id not in refused and a.drafter_id not in refused]
 
 
-def _prompting(ask: Callable[[str], str], out: Callable[..., None]) -> Callable[[str], str]:
-    """Echo each question through out before asking, then ask with no
-    prompt of its own: a fake ask in tests never prints its argument, and
-    a real input would otherwise print the question a second time."""
-
-    def wrapped(prompt: str) -> str:
-        out(prompt.rstrip())
-        return ask("")
-
-    return wrapped
+def _manual_candidate(model_id: str, user: SousConfig) -> cand_mod.Candidate:
+    """An id named by --models but absent from the table gets no curated
+    drafter — unless it is the user's own configured model, where dropping
+    the drafter would measure one undrafted arm and then propose removing it."""
+    drafters = ()
+    if model_id == user.model_id and user.speculative_draft_id:
+        drafters = (user.speculative_draft_id,)
+    return cand_mod.Candidate(model_id, "manual", drafters)
 
 
 def main(args: argparse.Namespace, *, config: SousConfig | None = None, **deps) -> int:
@@ -72,7 +76,7 @@ def main(args: argparse.Namespace, *, config: SousConfig | None = None, **deps) 
     candidates = list(table.candidates)
     if getattr(args, "models", None):
         candidates = [
-            next((c for c in table.candidates if c.id == m), cand_mod.Candidate(m, "manual", ()))
+            next((c for c in table.candidates if c.id == m), _manual_candidate(m, user))
             for m in args.models
         ]
     ids = {c.id for c in candidates} | {d for c in candidates for d in c.drafters}
@@ -90,10 +94,9 @@ def main(args: argparse.Namespace, *, config: SousConfig | None = None, **deps) 
             out(f"  {r.model_id}: {r.reason}")
         return EXIT_REFUSED
 
-    tiers = {a.model_id: a.tier for a in arms}
     items = []
     for a in arms:
-        items.append((a.model_id, f"candidate ({tiers[a.model_id]} tier)", "its arms"))
+        items.append((a.model_id, f"candidate ({a.tier} tier)", "its arms"))
         if a.drafter_id:
             items.append(
                 (a.drafter_id, f"drafter for {a.model_id}", f"{a.model_id} runs without a drafter")
@@ -103,11 +106,12 @@ def main(args: argparse.Namespace, *, config: SousConfig | None = None, **deps) 
         cached=deps.get("is_cached", hub_mod.is_cached),
         size=deps.get("size", hub_mod.snapshot_bytes),
     )
-    ask = _prompting(deps.get("ask", input), out)
     if getattr(args, "yes", False):
         approved = {d.repo_id for d in plan}
     else:
-        approved = hub_mod.ask_consent(plan, hardware.disk_free_bytes, ask=ask, out=out)
+        approved = hub_mod.ask_consent(
+            plan, hardware.disk_free_bytes, ask=deps.get("ask", input), out=out
+        )
     arms = _consented(arms, plan, approved)
     if not arms:
         out("nothing left to measure after the downloads you declined")
@@ -115,17 +119,29 @@ def main(args: argparse.Namespace, *, config: SousConfig | None = None, **deps) 
     hub_mod.fetch(sorted(approved), download=deps.get("download"), out=out)
 
     base = user.data_dir / "tune"
-    run = RunDir.existing(base, args.resume) if getattr(args, "resume", None) else RunDir.new(base)
-    run.write_json("hardware.json", hardware.as_dict())
+    resume = getattr(args, "resume", None)
+    if resume:
+        try:
+            run = RunDir.existing(base, resume)
+        except FileNotFoundError as e:
+            out(f"sous tune: {e}")
+            return EXIT_REFUSED
+    else:
+        run = RunDir.new(base)
+        run.write_json("hardware.json", hardware.as_dict())
     done = {r["label"] for r in run.rows("bench")}
     bench = deps.get("bench", bench_mod.bench_arm)
     out(f"measuring {len(arms)} arm(s); results in {run.path}")
-    for arm in arms:
-        if arm.label in done:
-            continue
-        out(f"  {arm.label} ...")
-        row = bench(arm, repeat=getattr(args, "repeat", 2))
-        run.append("bench", row.as_dict())
+    try:
+        for arm in arms:
+            if arm.label in done:
+                continue
+            out(f"  {arm.label} ...")
+            row = bench(arm, repeat=getattr(args, "repeat", 2), out=out)
+            run.append("bench", row.as_dict())
+    except Exception as e:  # noqa: BLE001 — rows already appended stay on disk for --resume
+        out(f"sous tune: failed while measuring: {type(e).__name__}: {e}")
+        return EXIT_FAILED
     rows = [bench_mod.BenchRow.from_dict(r) for r in run.rows("bench")]
 
     choice = quick_decision(user, arms, rows)
@@ -150,7 +166,7 @@ def main(args: argparse.Namespace, *, config: SousConfig | None = None, **deps) 
             out("not a terminal: nothing applied (pass --apply to write the changes)")
             return EXIT_OK
         try:
-            answer = ask(f"Apply these changes to {user.config_path}? [y/N] ")
+            answer = deps.get("ask", input)(f"Apply these changes to {user.config_path}? [y/N] ")
         except EOFError:
             answer = ""
         apply = answer.strip().lower() in ("y", "yes")
@@ -160,7 +176,7 @@ def main(args: argparse.Namespace, *, config: SousConfig | None = None, **deps) 
     backup = report_mod.apply_changes(user.config_path, new_text, run.run_id)
     out(f"applied; backup at {backup}" if backup else "applied")
     note = report_mod.restart_note(
-        choice.changes, managed=deps.get("managed", _managed)(), label="com.sous.daemon"
+        choice.changes, managed=deps.get("managed", _managed)(), label=_label()
     )
     if note:
         out(note)

@@ -8,6 +8,7 @@ from sous.tune.candidates import Candidate, Table
 from sous.tune.candidates import describe as real_describe
 from sous.tune.daemon import Readiness
 from sous.tune.hardware import Hardware
+from sous.tune.rundir import RunDir
 from tests import tune_fixtures as fx
 
 M = "mlx-community/Qwen3.8-27B-4bit"
@@ -53,11 +54,17 @@ def _configs():
         M: fx.qwen_27b(),
         D: fx.dflash2_27b(),
         "mlx-community/Qwen3.5-9B-MLX-4bit": fx.qwen_9b(),
+        "z-lab/Qwen3.5-9B-DFlash": fx.dflash_9b(),
     }
 
 
 def _sizes():
-    return {M: 16_100_000_000, D: 3_850_000_000, "mlx-community/Qwen3.5-9B-MLX-4bit": 6 * 10**9}
+    return {
+        M: 16_100_000_000,
+        D: 3_850_000_000,
+        "mlx-community/Qwen3.5-9B-MLX-4bit": 6 * 10**9,
+        "z-lab/Qwen3.5-9B-DFlash": 2_600_000_000,
+    }
 
 
 def _bench(scores):
@@ -100,7 +107,7 @@ def _deps(tmp_path, *, scores, cached=(), answers=(), ready=None, isatty=True):
         is_cached=lambda rid: rid in cached,
         size=lambda rid: sizes[rid],
         download=downloaded.append,
-        ask=lambda prompt: next(it, "n"),
+        ask=lambda prompt: (print(prompt, end=""), next(it, "n"))[1],
         isatty=lambda: isatty,
         managed=lambda: False,
         out=print,
@@ -198,3 +205,49 @@ def test_a_full_run_is_refused_in_this_version(tmp_path, capsys):
     deps, _ = _deps(tmp_path, scores={})
     assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 2
     assert "--quick" in capsys.readouterr().out
+
+
+def test_models_naming_the_configured_model_outside_the_table_keeps_its_drafter(tmp_path, capsys):
+    model_id = "mlx-community/Qwen3.5-9B-MLX-4bit"
+    drafter_id = "z-lab/Qwen3.5-9B-DFlash"
+    deps, _ = _deps(tmp_path, scores={}, cached=(model_id, drafter_id))
+    # This id is deliberately absent here (unlike the shared _table(), where
+    # it already sits as a drafterless "9b" candidate): --models must fall to
+    # the manual-candidate default the fix carries the user's drafter onto.
+    deps["load_table"] = lambda: Table(
+        checked=date.today(),
+        validated_with="x",
+        trusted_orgs=("mlx-community",),
+        publishers=("Qwen",),
+        candidates=(Candidate(M, "27b-dense", (D,)),),
+    )
+    cfg = _cfg(tmp_path, model_id=model_id, speculative_draft_id=drafter_id)
+    code = main(_args(models=[model_id]), config=cfg, **deps)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Qwen3.5-9B-MLX-4bit + Qwen3.5-9B-DFlash @3" in out.split("## Throughput")[1]
+    assert "Apply these changes" not in out and "speculative_draft_id" not in out
+
+
+def test_a_mistyped_resume_is_refused_not_a_traceback(tmp_path, capsys):
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, "mlx-community/Qwen3.5-9B-MLX-4bit"))
+    assert main(_args(resume="nope"), config=_cfg(tmp_path), **deps) == 2
+    assert "nope" in capsys.readouterr().out
+
+
+def test_a_bench_that_raises_is_exit_1_and_keeps_finished_rows(tmp_path, capsys):
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, "mlx-community/Qwen3.5-9B-MLX-4bit"))
+    real = deps["bench"]
+    seen = []
+
+    def bench(arm, **kw):
+        seen.append(arm)
+        if len(seen) == 2:
+            raise RuntimeError("boom")
+        return real(arm, **kw)
+
+    deps["bench"] = bench
+    assert main(_args(), config=_cfg(tmp_path), **deps) == 1
+    assert "boom" in capsys.readouterr().out
+    run_id = next(p.name for p in (tmp_path / "tune").iterdir())
+    assert len(RunDir.existing(tmp_path / "tune", run_id).rows("bench")) == 1
