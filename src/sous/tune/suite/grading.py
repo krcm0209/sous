@@ -8,13 +8,10 @@ import importlib.util
 import json
 import subprocess
 import sys
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from sous.tune.suite import SuiteTask
-
-TestRunner = Callable[..., tuple[int, int, str]]
 
 
 @dataclass(frozen=True)
@@ -70,8 +67,9 @@ def grade_task(
     """The task's score over the worker's finished project, in [0, 1]. With
     a grade.py the task decides — it gets the project and a test runner
     whose default test directory is the hidden one — else the hidden
-    modules' pass fraction. A grader that raises scores zero and says so:
-    the run is a result either way, and the suite goes on."""
+    modules' pass fraction. A grader that raises or returns something that
+    is not a (score, detail) pair scores zero and says so: the run is a
+    result either way, and the suite goes on."""
 
     def tests(cwd: Path, tests_dir: Path | None = None) -> tuple[int, int, str]:
         return run_tests(
@@ -88,6 +86,7 @@ def grade_task(
         else:
             passed, total, detail = tests(project)
             score = passed / total if total else 0.0
+        grade = Grade(min(1.0, max(0.0, float(score))), str(detail))
     except Exception as e:  # noqa: BLE001 — a grader bug is a zero, named, not a dead run
         return Grade(0.0, f"grader failed: {type(e).__name__}: {e}")
-    return Grade(min(1.0, max(0.0, float(score))), str(detail))
+    return grade

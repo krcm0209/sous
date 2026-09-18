@@ -215,6 +215,12 @@ def test_a_grader_that_raises_is_a_zero_with_the_error(tmp_path):
     assert g.score == 0.0 and "grader failed: KeyError" in g.detail
 
 
+def test_a_grader_that_returns_garbage_is_a_zero_with_the_error(tmp_path):
+    task = _suite_task(tmp_path, "def grade(project, tests):\n    return None, 'looks fine'\n")
+    g = grade_task(task, _project(tmp_path), timeout=60)
+    assert g.score == 0.0 and "grader failed: TypeError" in g.detail
+
+
 @pytest.mark.parametrize("task", load_tasks(), ids=lambda t: t.name)
 def test_every_shipped_grader_scores_the_solution_one_and_the_fixture_zero(task, tmp_path):
     solved = tmp_path / "solved"
