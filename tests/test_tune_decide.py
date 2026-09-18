@@ -491,7 +491,19 @@ def test_a_reference_with_no_completed_run_is_said_so(tmp_path):
     user = _user(tmp_path)
     cur = _arm(user, "27 @3", current=True)
     nine = _arm(user, "9", drafter="", block=0, model=M9)
-    runs = _runs(cur, [0.0, 0.0], seconds=100.0, state="failed") + _runs(nine, [1.0], seconds=50.0)
+    runs = _runs(cur, [0.6, 0.6], seconds=100.0, state="failed") + _runs(nine, [1.0], seconds=50.0)
     choice = full_decision(user, [cur, nine], runs, [], runs_per_task=1)
     assert choice is not None and choice.label == "9"
     assert any("note: the reference completed no run" in r for r in choice.reasons)
+
+
+def test_a_graded_but_failed_reference_still_constrains_the_grade(tmp_path):
+    user = _user(tmp_path)
+    cur = _arm(user, "27 @3", current=True)
+    nine = _arm(user, "9", drafter="", block=0, model=M9)
+    runs = _runs(cur, [0.6, 0.6], seconds=100.0, state="failed") + _runs(nine, [0.5], seconds=10.0)
+    choice = full_decision(user, [cur, nine], runs, [], runs_per_task=1)
+    assert choice is not None and choice.label == "27 @3"
+    assert any("note: the reference completed no run" in r for r in choice.reasons)
+    line = next(r for r in choice.reasons if r.startswith("9:"))
+    assert line.endswith("not eligible: grade 0.50 < 0.55")

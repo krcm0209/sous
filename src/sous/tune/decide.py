@@ -272,8 +272,8 @@ def full_decision(
     ]
     if ref_sum.completed == 0:
         reasons.append(
-            "note: the reference completed no run, so the quality margin "
-            "constrains nothing; the winner is the fastest arm"
+            "note: the reference completed no run, so the completed-runs floor "
+            "constrains nothing; its grade and repetition terms still apply"
         )
     reasons.append(
         "winner: the eligible arm with the lowest suite wall time; "
