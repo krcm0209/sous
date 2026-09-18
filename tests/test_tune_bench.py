@@ -421,3 +421,29 @@ def test_a_cold_retry_voids_the_deltas_timing_but_keeps_the_count():
         session.join(5.0)
     assert result.produced == 2
     assert result.first_delta_seconds is None and result.last_delta_seconds is None
+
+
+def test_the_detokenizers_flush_delta_is_not_a_retry():
+    """The VLM backend's last delta is the detokenizer's flush: empty text
+    with the previous count repeated. A repeat is not a fall, and voiding
+    the timings on it would leave every VLM turn without a TTFT."""
+
+    class Flushing(FakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            self.on_deltas_seen.append(on_delta)
+            text = self._take(messages, tools, max_tokens)
+            assert on_delta is not None
+            on_delta(bench.Delta("a", 1, None))
+            on_delta(bench.Delta("b", 2, None))
+            on_delta(bench.Delta("", 2, "length"))  # the flush repeats the count
+            return text
+
+    engine = ManagedEngine(Flushing(["x"]))
+    session = engine.session()
+    try:
+        result = bench._Turn(engine, session, 5.0).run([{"role": "user", "content": "x"}], 8)
+    finally:
+        session.close()
+        session.join(5.0)
+    assert result.produced == 2
+    assert result.first_delta_seconds is not None and result.last_delta_seconds is not None

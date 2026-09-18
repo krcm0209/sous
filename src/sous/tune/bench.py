@@ -169,11 +169,12 @@ class _Turn:
 
         def on_delta(d: Delta) -> None:
             now = time.monotonic() - started
-            # output_tokens counts from 1 and only grows within one attempt;
-            # a count that fell back is the prompt cache's cold retry starting
-            # over, whose start this clock never saw — its timings are void,
-            # the gauges (reset per attempt) still stand.
-            if d.output_tokens <= tokens[0]:
+            # output_tokens counts from 1 and never falls within one attempt
+            # (the detokenizer's final flush repeats the last count, so equal
+            # is not a fall); a count that fell is the prompt cache's cold
+            # retry starting over, whose start this clock never saw — its
+            # timings are void, the gauges (reset per attempt) still stand.
+            if d.output_tokens < tokens[0]:
                 retried[0] = True
             if not first:
                 first.append(now)
