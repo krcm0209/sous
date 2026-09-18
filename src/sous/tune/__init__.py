@@ -1,4 +1,5 @@
-"""`sous tune`: benchmark this machine, pick the settings, show the diff."""
+"""`sous tune`: benchmark this machine, grade the candidates, pick the
+settings, show the diff. `--quick` stops after the throughput stage."""
 
 from __future__ import annotations
 
@@ -15,8 +16,18 @@ from sous.tune import daemon as daemon_mod
 from sous.tune import hardware as hw_mod
 from sous.tune import hub as hub_mod
 from sous.tune import report as report_mod
-from sous.tune.decide import quick_decision
+from sous.tune import suite as suite_mod
+from sous.tune.decide import (
+    ArmSummary,
+    FullChoice,
+    QuickChoice,
+    full_decision,
+    model_stage,
+    quick_decision,
+    summarize,
+)
 from sous.tune.rundir import RunDir
+from sous.tune.suite import runner as runner_mod
 
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED = 0, 1, 2
 _GIB = 1 << 30
@@ -59,6 +70,122 @@ def _manual_candidate(model_id: str, user: SousConfig) -> cand_mod.Candidate:
     return cand_mod.Candidate(model_id, "manual", drafters)
 
 
+def _suite_stage(
+    stage: list[arms_mod.Arm],
+    tasks: list[suite_mod.SuiteTask],
+    runs_per_task: int,
+    run: RunDir,
+    suite_runs: list[runner_mod.SuiteRun],
+    *,
+    suite: Callable[..., runner_mod.SuiteOutcome],
+    ready: Callable[[int], daemon_mod.Readiness],
+    user: SousConfig,
+    out: Callable[..., None],
+) -> str | None:
+    """Every arm's (task, run) not already in the run's rows, one arm at a
+    time. Returns the text of what must stop the run — a daemon that is no
+    longer free, or weights left resident — else None."""
+    for arm in stage:
+        done = {
+            (r.task, r.index)
+            for r in suite_runs
+            if r.key == arm.suite_key and r.window == arm.window
+        }
+        if len(done) >= len(tasks) * runs_per_task:
+            continue
+        # Minutes to hours have passed since the last check: a session or a
+        # task that arrived since would load beside the suite's engine.
+        readiness = ready(user.server_port)
+        if not readiness.ready:
+            return f"daemon: {readiness.reason}"
+        out(f"  {arm.label}: suite ...")
+
+        def record(r: runner_mod.SuiteRun) -> None:
+            run.append("suite", r.as_dict())
+            suite_runs.append(r)
+
+        outcome = suite(
+            arm,
+            tasks,
+            runs=runs_per_task,
+            done=done,
+            record=record,
+            scratch=run.path / "suite",
+            out=out,
+        )
+        if outcome.error:
+            out(f"  {arm.label}: {outcome.error}")
+        if not outcome.released:
+            return (
+                f"the model could not be released ({outcome.error}); restart the daemon or "
+                f"this process and re-run with --resume {run.run_id}"
+            )
+    return None
+
+
+def _full_stages(
+    user: SousConfig,
+    hardware: hw_mod.Hardware,
+    checkpoints: dict[str, cand_mod.Checkpoint],
+    arms: list[arms_mod.Arm],
+    rows: list[bench_mod.BenchRow],
+    tasks: list[suite_mod.SuiteTask],
+    runs_per_task: int,
+    run: RunDir,
+    *,
+    suite: Callable[..., runner_mod.SuiteOutcome],
+    ready: Callable[[int], daemon_mod.Readiness],
+    out: Callable[..., None],
+) -> tuple[FullChoice | None, list[ArmSummary], str | None]:
+    """The model stage, then the winner stage on its choice. Returns the
+    choice, the summaries the report shows, and the text of a failure that
+    stops the run."""
+    stage = model_stage(arms, rows)
+    eta = runner_mod.estimate_seconds(stage, rows, tasks=len(tasks), runs=runs_per_task)
+    line = f"suite: {len(tasks)} tasks x {runs_per_task} runs on {len(stage)} arm(s)"
+    if eta is not None:
+        line += f"; roughly {eta / 60:.0f} min from the measured speeds"
+    out(line)
+    suite_runs = [runner_mod.SuiteRun.from_dict(r) for r in run.rows("suite")]
+    stop = _suite_stage(
+        stage, tasks, runs_per_task, run, suite_runs, suite=suite, ready=ready, user=user, out=out
+    )
+    if stop is not None:
+        return None, [], stop
+    choice = full_decision(user, stage, suite_runs, rows, runs_per_task=runs_per_task)
+    extra: list[arms_mod.Arm] = []
+    if choice is not None:
+        winner = choice.arm
+        extra = arms_mod.winner_stage_arms(
+            winner, nax=hardware.nax, checkpoint=checkpoints[winner.model_id]
+        )
+        if extra:
+            out(f"winner stage on {winner.label}: " + ", ".join(a.label for a in extra))
+            stop = _suite_stage(
+                extra,
+                tasks,
+                runs_per_task,
+                run,
+                suite_runs,
+                suite=suite,
+                ready=ready,
+                user=user,
+                out=out,
+            )
+            if stop is not None:
+                return None, [], stop
+            choice = full_decision(
+                user,
+                [winner, *extra],
+                suite_runs,
+                rows,
+                runs_per_task=runs_per_task,
+                reference=winner,
+            )
+    summaries = [s for a in [*stage, *extra] if (s := summarize(a, suite_runs, rows)) is not None]
+    return choice, summaries, None
+
+
 def main(
     args: argparse.Namespace,
     *,
@@ -73,15 +200,15 @@ def main(
     download: Callable[[str], object] | None = None,
     ask: Callable[[str], str] = input,
     bench: Callable[..., bench_mod.BenchRow] = bench_mod.bench_arm,
+    suite: Callable[..., runner_mod.SuiteOutcome] = runner_mod.run_suite,
+    load_tasks: Callable[[], list[suite_mod.SuiteTask]] = suite_mod.load_tasks,
     isatty: Callable[[], bool] | None = None,
     managed: Callable[[], bool] = _managed,
 ) -> int:
     """Every collaborator is a keyword parameter with the real one as its
     default, so a test's injection is checked at the call and a misspelt
     one is an error rather than a run against the live daemon or the Hub."""
-    if not getattr(args, "quick", False):
-        out("sous tune: only the quick stage exists in this version; run `sous tune --quick`")
-        return EXIT_REFUSED
+    quick = bool(getattr(args, "quick", False))
     user = config or load_config()
     hardware = detect()
     table = load_table()
@@ -199,7 +326,30 @@ def main(
         out(f"sous tune: failed while measuring: {type(e).__name__}: {e}")
         return EXIT_FAILED
 
-    choice = quick_decision(user, arms, rows)
+    choice: QuickChoice | FullChoice | None
+    summaries: list[ArmSummary] = []
+    tasks: list[suite_mod.SuiteTask] = []
+    runs_per_task = getattr(args, "runs", 2)
+    if quick or released_failure:
+        choice = quick_decision(user, arms, rows) if quick else None
+    else:
+        tasks = load_tasks()
+        choice, summaries, stop = _full_stages(
+            user,
+            hardware,
+            checkpoints,
+            arms,
+            rows,
+            tasks,
+            runs_per_task,
+            run,
+            suite=suite,
+            ready=ready,
+            out=out,
+        )
+        if stop is not None:
+            out(f"sous tune: {stop}")
+            released_failure = True
     text = report_mod.render_report(
         hardware=hardware,
         table_age_days=(date.today() - table.checked).days,
@@ -208,6 +358,10 @@ def main(
         rows=rows,
         choice=choice,
         current_model=user.model_id,
+        quick=quick,
+        suite=summaries,
+        tasks=len(tasks),
+        runs=runs_per_task,
     )
     run.write_text("report.md", text)
     out(text)

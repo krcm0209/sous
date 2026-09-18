@@ -1811,9 +1811,12 @@ def test_tune_subcommand_dispatches_with_its_flags(monkeypatch):
     seen = {}
     monkeypatch.setattr(sous.tune, "main", lambda args, **k: seen.update(vars(args)) or 0)
     with pytest.raises(SystemExit) as e:
-        cli.main(["tune", "--quick", "--repeat", "3", "--models", "a/b", "c/d", "--yes"])
+        cli.main(
+            ["tune", "--quick", "--repeat", "3", "--runs", "3", "--models", "a/b", "c/d", "--yes"]
+        )
     assert e.value.code == 0
     assert seen["quick"] is True and seen["repeat"] == 3
+    assert seen["runs"] == 3
     assert seen["models"] == ["a/b", "c/d"] and seen["yes"] is True and seen["apply"] is False
 
 

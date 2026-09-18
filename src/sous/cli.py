@@ -928,13 +928,16 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("uninstall-launchd", help="remove the start-at-login LaunchAgent")
     tune = sub.add_parser(
         "tune",
-        help="measure this machine and propose [model] settings "
-        "(quick stage: drafter, block size, window)",
+        help="measure this machine, grade the candidates and propose [model] settings "
+        "(--quick: throughput only — drafter, block size, window)",
     )
-    tune.add_argument("--quick", action="store_true", help="the throughput stage only")
+    tune.add_argument(
+        "--quick", action="store_true", help="the throughput stage only; never changes the model"
+    )
     tune.add_argument(
         "--models", nargs="+", metavar="ID", help="candidate ids instead of the table"
     )
+    tune.add_argument("--runs", type=int, default=2, help="suite runs per task (full run)")
     tune.add_argument("--repeat", type=int, default=2, help="attempts per measurement (best wins)")
     tune.add_argument("--resume", metavar="RUN_ID", help="continue a run under ~/.sous/tune")
     tune.add_argument("--yes", action="store_true", help="approve every download and apply")
