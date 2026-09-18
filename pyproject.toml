@@ -132,3 +132,9 @@ select = [
 
 [tool.ty.environment]
 python-version = "3.14"
+
+[tool.ty.src]
+# The suite's fixture projects import each other by bare name (`from rpn
+# import evaluate`) and resolve only inside a copied project; the shipped
+# graders prove them in CI instead.
+exclude = ["src/sous/tune/suite/tasks"]
