@@ -12,7 +12,7 @@ from sous.tune.bench import (
     bench_arm,
     build_prompt,
 )
-from tests.fake_engine import FakeEngine
+from tests.fake_engine import ChunkedFakeEngine, FakeEngine
 
 
 def _count(messages, tools):
@@ -237,3 +237,32 @@ def test_the_best_repeat_wins_and_the_gauges_are_read_per_owner(tmp_path):
     assert len(owners) >= 2
     assert len(set(owners)) == 1
     assert owners[0] is not None
+
+
+def test_without_gauges_the_rates_come_from_the_deltas(tmp_path):
+    # Simulates the text-only mlx-lm backend once every layer's cache is
+    # trimmable: prefill and decode fuse into one hooks.decode() call, so
+    # prefill_seconds/prefilled_tokens never move off 0 and decode_seconds
+    # covers the whole turn, not just decode.
+    script: list[str] = ["|".join(["w " * 64] * 4)] * 8
+
+    def factory(model_id):
+        e = ChunkedFakeEngine(script, delay=0.01)
+        e.stats = {"prefill_seconds": 0.0, "prefilled_tokens": 0, "decode_seconds": 0.5}
+        return e
+
+    row = bench_arm(
+        _arm(tmp_path),
+        factory=factory,
+        repeat=1,
+        peak_memory=lambda: 0,
+        reset_peak=lambda: None,
+        active_memory=lambda: 0,
+        out=lambda *a, **k: None,
+    )
+    assert row.ok, row.error
+    assert row.prefill_tps_2k is not None and row.prefill_tps_2k > 0
+    assert row.decode_tps_1k is not None and row.decode_tps_1k > 0
+    # The fused gauge (decode_seconds alone, covering prefill too) must not
+    # be the source of a decode-only rate.
+    assert row.decode_tps_1k != DECODE_TOKENS / 0.5

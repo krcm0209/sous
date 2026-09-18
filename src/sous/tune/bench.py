@@ -89,33 +89,74 @@ def build_prompt(
     return render()
 
 
+@dataclass(frozen=True)
+class TurnResult:
+    text: str
+    gauges: dict
+    produced: int
+    first_delta_seconds: float | None
+    last_delta_seconds: float | None
+
+
 class _Turn:
     """One generate() through a session, with the gauges read on that
     session's thread right after — they are per-turn readings, never
-    counter differences."""
+    counter differences. Also times the first and last delta relative to
+    generate()'s own entry, for _prefill_rate/_decode_rate's fallback."""
 
     def __init__(self, engine, session, timeout: float):
         self.engine, self.session, self.timeout = engine, session, timeout
 
-    def run(self, messages: list[dict], max_tokens: int) -> tuple[str, dict, int, float | None]:
+    def run(self, messages: list[dict], max_tokens: int) -> TurnResult:
         first: list[float] = []
+        last: list[float] = [0.0]
         tokens: list[int] = [0]
         started = time.monotonic()
 
         def on_delta(d: Delta) -> None:
+            now = time.monotonic() - started
             if not first:
-                first.append(time.monotonic() - started)
+                first.append(now)
+            last[0] = now
             tokens[0] = d.output_tokens
 
         text = self.session.generate(messages, WORKER_TOOLS, max_tokens, self.timeout, on_delta)
         gauges = self.engine.prompt_cache_stats(owner=self.session.thread)
-        return text, gauges, tokens[0], (first[0] if first else None)
+        return TurnResult(
+            text=text,
+            gauges=gauges,
+            produced=tokens[0],
+            first_delta_seconds=first[0] if first else None,
+            last_delta_seconds=last[0] if first else None,
+        )
 
 
 def _rate(tokens: float | None, seconds: float | None) -> float | None:
     if not tokens or not seconds or seconds <= 0:
         return None
     return tokens / seconds
+
+
+# On the text-only mlx-lm backend, once every layer's cache is trimmable,
+# PrefixCache._run fuses the rest of prefill into its one decode call and
+# never times the phases apart — prefill_seconds/prefilled_tokens stay 0 and
+# decode_seconds covers both. The VLM backend (the default model) always
+# splits them, so the gauges are used whenever they are actually populated;
+# otherwise the deltas' own wall-clock timing is the only witness left.
+def _prefill_rate(gauges: dict, prompt_tokens: int, first_delta: float | None) -> float | None:
+    if gauges.get("prefilled_tokens") and gauges.get("prefill_seconds"):
+        return _rate(gauges["prefilled_tokens"], gauges["prefill_seconds"])
+    return _rate(prompt_tokens, first_delta)  # cold turn: the whole prompt was prefilled
+
+
+def _decode_rate(
+    produced: int, gauges: dict, first_delta: float | None, last_delta: float | None
+) -> float | None:
+    if gauges.get("decode_seconds") and gauges.get("prefill_seconds"):
+        return _rate(produced, gauges["decode_seconds"])
+    if first_delta is None or last_delta is None:
+        return None
+    return _rate(produced - 1, last_delta - first_delta)
 
 
 def _measure(
@@ -135,32 +176,47 @@ def _measure(
         decode_1k: list[float] = []
         ttfts: list[float] = []
         for _ in range(max(1, repeat)):
-            text, gauges, produced, _ = turn.run(short, DECODE_TOKENS)
-            rate = _rate(produced, gauges.get("decode_seconds"))
+            result = turn.run(short, DECODE_TOKENS)
+            rate = _decode_rate(
+                result.produced,
+                result.gauges,
+                result.first_delta_seconds,
+                result.last_delta_seconds,
+            )
             if rate is not None:
                 decode_1k.append(rate)
             warm = [
                 *short,
-                {"role": "assistant", "content": text},
+                {"role": "assistant", "content": result.text},
                 {"role": "user", "content": "Continue with the next function."},
             ]
-            _, _, _, ttft = turn.run(warm, 8)
+            ttft = turn.run(warm, 8).first_delta_seconds
             if ttft is not None:
                 ttfts.append(ttft)
-        _, gauges, _, _ = turn.run(build_prompt(count, PREFILL_CONTEXT, seed=1), 1)
-        prefill_2k = _rate(gauges.get("prefilled_tokens"), gauges.get("prefill_seconds"))
+        prefill_prompt = build_prompt(count, PREFILL_CONTEXT, seed=1)
+        result = turn.run(prefill_prompt, 1)
+        prefill_2k = _prefill_rate(
+            result.gauges, count(prefill_prompt, WORKER_TOOLS), result.first_delta_seconds
+        )
         prefill_16k = decode_16k = None
         if arm.window >= LONG_CONTEXT + _LONG_HEADROOM:
             long = build_prompt(count, LONG_CONTEXT, seed=2)
-            text, gauges, _, _ = turn.run(long, 1)
-            prefill_16k = _rate(gauges.get("prefilled_tokens"), gauges.get("prefill_seconds"))
+            result = turn.run(long, 1)
+            prefill_16k = _prefill_rate(
+                result.gauges, count(long, WORKER_TOOLS), result.first_delta_seconds
+            )
             warm = [
                 *long,
-                {"role": "assistant", "content": text},
+                {"role": "assistant", "content": result.text},
                 {"role": "user", "content": "Continue with the next function."},
             ]
-            _, gauges, produced, _ = turn.run(warm, DECODE_TOKENS)
-            decode_16k = _rate(produced, gauges.get("decode_seconds"))
+            result = turn.run(warm, DECODE_TOKENS)
+            decode_16k = _decode_rate(
+                result.produced,
+                result.gauges,
+                result.first_delta_seconds,
+                result.last_delta_seconds,
+            )
         spread = None
         # One repeat has nothing to compare against — 0.0 would read as
         # "perfectly stable" rather than "unmeasured".
