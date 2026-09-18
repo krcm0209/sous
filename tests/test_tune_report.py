@@ -1,0 +1,141 @@
+import os
+
+from sous.config import load_config
+from sous.engine.int8prefill import Availability
+from sous.tune.arms import Refusal
+from sous.tune.bench import BenchRow
+from sous.tune.candidates import describe
+from sous.tune.decide import QuickChoice
+from sous.tune.hardware import detect
+from sous.tune.report import apply_changes, config_diff, render_report, restart_note
+from tests import tune_fixtures as fx
+
+M = "mlx-community/Qwen3.8-27B-4bit"
+
+
+def _hardware(tmp_path):
+    return detect(
+        device_info=lambda: {
+            "device_name": "Apple M5 Pro",
+            "memory_size": 64 * 2**30,
+            "max_recommended_working_set_size": fx.M5_PRO_WORKING_SET,
+            "architecture": "applegpu_g17s",
+        },
+        mac_ver=lambda: ("26.6.2", ("", "", ""), "arm64"),
+        disk_usage=lambda p: (1, 2, 400 * 2**30),
+        availability=lambda: Availability(True),
+        version=lambda n: "1.0",
+        hub_cache=str(tmp_path),
+    )
+
+
+def _row(label, model=M, ok=True):
+    return BenchRow(
+        label=label,
+        model_id=model,
+        drafter_id="d",
+        block_size=3,
+        window=131072,
+        ok=ok,
+        error=None if ok else "RuntimeError: boom",
+        load_seconds=5.2,
+        prefill_tps_2k=479.4,
+        prefill_tps_16k=401.0,
+        decode_tps_1k=25.6,
+        decode_tps_16k=18.3,
+        ttft_seconds=1.1,
+        peak_memory_bytes=20 * 2**30,
+        spread=0.03,
+    )
+
+
+def test_the_report_has_every_section_and_labels_other_models_quality_untested(tmp_path):
+    cps = {
+        M: describe(M, config_fn=lambda m: fx.qwen_27b(), size_fn=lambda m: 16_100_000_000),
+        "o/9b": describe("o/9b", config_fn=lambda m: fx.qwen_9b(), size_fn=lambda m: 6 * 10**9),
+    }
+    choice = QuickChoice(
+        label="cur",
+        model_id=M,
+        drafter_id="d",
+        block_size=3,
+        window=131072,
+        gateway_window=None,
+        changes={},
+        reasons=["the current arm is already the fastest measured"],
+    )
+    text = render_report(
+        hardware=_hardware(tmp_path),
+        table_age_days=3,
+        checkpoints=cps,
+        refusals=[Refusal("o/big", "", "weights 30.0 GB ... below the floor")],
+        rows=[_row("cur"), _row("nine", model="o/9b"), _row("bad", ok=False)],
+        choice=choice,
+        current_model=M,
+    )
+    for heading in ("Hardware", "Candidates", "Throughput", "Choice"):
+        assert heading in text
+    assert "Apple M5 Pro" in text and "51.8 GiB" in text
+    assert "16.1 GB" in text and "64 KiB/token" in text
+    assert "o/big" in text and "below the floor" in text
+    assert "479" in text and "18.3" in text and "RuntimeError: boom" in text
+    assert "quality untested" in text.split("nine")[1].splitlines()[0]
+    assert "already the fastest" in text
+    assert "stale" not in text
+
+
+def test_a_stale_table_and_a_missing_choice_are_said_plainly(tmp_path):
+    text = render_report(
+        hardware=_hardware(tmp_path),
+        table_age_days=120,
+        checkpoints={},
+        refusals=[],
+        rows=[],
+        choice=None,
+        current_model=M,
+    )
+    assert "stale" in text and "--discover" in text
+    assert "cannot recommend" in text and M in text
+
+
+def test_config_diff_preserves_comments_and_untouched_keys(tmp_path):
+    p = tmp_path / "config.toml"
+    original = (
+        '# mine\n[model]\nid = "x/y"   # keep\nspeculative_block_size = 3\n'
+        "\n[gateway]\nenabled = true\n"
+    )
+    p.write_text(original)
+    new, diff = config_diff(
+        p, {"model": {"speculative_block_size": 2}, "gateway": {"max_context_tokens": 65536}}
+    )
+    assert "# mine" in new and 'id = "x/y"   # keep' in new
+    assert "speculative_block_size = 2" in new and "max_context_tokens = 65536" in new
+    assert "-speculative_block_size = 3" in diff and "+speculative_block_size = 2" in diff
+    assert "+max_context_tokens = 65536" in diff
+    assert load_config(p).speculative_block_size == 3  # nothing written yet
+
+
+def test_config_diff_starts_from_an_empty_document_when_the_file_is_absent(tmp_path):
+    p = tmp_path / "config.toml"
+    new, diff = config_diff(p, {"model": {"speculative_draft_id": ""}})
+    assert 'speculative_draft_id = ""' in new and diff.startswith("---")
+
+
+def test_apply_writes_a_backup_then_the_new_text(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nspeculative_block_size = 3\n")
+    new, _ = config_diff(p, {"model": {"speculative_block_size": 2}})
+    backup = apply_changes(p, new, "20260917-101500")
+    assert backup is not None
+    assert backup == tmp_path / "config.toml.bak-tune-20260917-101500"
+    assert backup.read_text() == "[model]\nspeculative_block_size = 3\n"
+    assert load_config(p).speculative_block_size == 2
+    assert apply_changes(tmp_path / "fresh.toml", new, "x") is None
+
+
+def test_restart_note_only_for_keys_the_daemon_reads_at_load():
+    assert restart_note({"model": {"speculative_block_size": 2}}, managed=False, label="l") is None
+    unmanaged = restart_note({"model": {"id": "o/9b"}}, managed=False, label="com.sous.daemon")
+    assert unmanaged and "sous stop" in unmanaged and "sous serve" in unmanaged
+    managed = restart_note({"model": {"int8_prefill": True}}, managed=True, label="com.sous.daemon")
+    assert managed and f"launchctl kickstart -k gui/{os.getuid()}/com.sous.daemon" in managed
