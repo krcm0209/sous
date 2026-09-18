@@ -3,7 +3,7 @@ import dataclasses
 import pytest
 
 from sous.config import SousConfig
-from sous.engine.base import ManagedEngine, ReplaySafe
+from sous.engine.base import EngineManager, ManagedEngine, ReplaySafe
 from sous.protocol import WORKER_TOOLS
 from sous.tune import bench
 from sous.tune.arms import Arm
@@ -14,6 +14,7 @@ from sous.tune.bench import (
     BenchRow,
     bench_arm,
     build_prompt,
+    release,
 )
 from tests.fake_engine import ChunkedFakeEngine, FakeEngine
 
@@ -447,3 +448,48 @@ def test_the_detokenizers_flush_delta_is_not_a_retry():
         session.join(5.0)
     assert result.produced == 2
     assert result.first_delta_seconds is not None and result.last_delta_seconds is not None
+
+
+def test_release_frees_the_engine_and_returns_none(tmp_path):
+    engine = FakeEngine([])
+    manager = EngineManager(_arm(tmp_path).config, engine_factory=lambda mid: engine)
+    managed = manager.get()
+    session = managed.session()
+    lines = []
+    error = release(
+        manager, session, baseline=0, active_memory=lambda: 0, label="m", out=lines.append
+    )
+    assert error is None
+    assert engine.unloaded
+    assert manager.status()["loaded"] is False
+    assert lines == []
+
+
+def test_release_reports_a_refused_unload_without_waiting(tmp_path, monkeypatch):
+    engine = FakeEngine([])
+    manager = EngineManager(_arm(tmp_path).config, engine_factory=lambda mid: engine)
+    manager.get()
+    monkeypatch.setattr(bench, "_UNLOAD_WAIT_SECONDS", 30.0)
+    with manager.lease():
+        error = release(
+            manager, None, baseline=0, active_memory=lambda: 0, label="m", out=lambda *a: None
+        )
+    assert error == "unload refused: the engine is leased by a turn"
+    assert not engine.unloaded
+
+
+def test_release_reports_memory_that_never_comes_back(tmp_path, monkeypatch):
+    engine = FakeEngine([])
+    manager = EngineManager(_arm(tmp_path).config, engine_factory=lambda mid: engine)
+    manager.get()
+    monkeypatch.setattr(bench, "_UNLOAD_WAIT_SECONDS", 0.0)
+    error = release(
+        manager,
+        None,
+        baseline=0,
+        active_memory=lambda: 3 * 2**30,
+        label="m",
+        out=lambda *a: None,
+    )
+    assert error == "memory not released: 3.0 GiB still resident"
+    assert engine.unloaded

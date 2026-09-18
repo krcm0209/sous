@@ -1743,3 +1743,55 @@ def test_unload_now_names_a_load_or_an_unload_in_progress():
     release.set()
     unloader.join(5.0)
     assert mgr.unload_now() == {"unloaded": False, "reason": "nothing loaded"}
+
+
+def test_default_engine_factory_maps_every_model_value_onto_the_backend(monkeypatch, tmp_path):
+    from sous.engine import base
+
+    seen = {}
+
+    def fake(model_id, *args, **kwargs):
+        seen["model_id"] = model_id
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(base, "_default_factory", fake)
+    cfg = SousConfig(
+        data_dir=tmp_path,
+        config_path=tmp_path / "c.toml",
+        model_id="org/m",
+        temperature=0.0,
+        top_p=0.9,
+        top_k=5,
+        prompt_cache=False,
+        speculative_draft_id="z/d",
+        speculative_block_size=2,
+        prompt_cache_gb=1.5,
+        max_context_tokens=4096,
+        gateway_enabled=True,
+        gateway_max_context_tokens=65536,
+        int8_prefill=True,
+    )
+    base.default_engine_factory(cfg)("org/m")
+    assert seen["model_id"] == "org/m"
+    assert seen["args"] == (0.0, 0.9, 5, False)
+    assert seen["kwargs"] == {
+        "draft_id": "z/d",
+        "draft_block_size": 2,
+        "cache_budget": int(1.5 * (1 << 30)),
+        "reserve_tokens": 65536,
+        "int8_prefill": True,
+    }
+
+
+def test_engine_manager_without_a_factory_uses_the_default_one(monkeypatch, tmp_path):
+    from sous.engine import base
+
+    calls = []
+    monkeypatch.setattr(
+        base, "default_engine_factory", lambda cfg: lambda mid: calls.append((cfg.model_id, mid))
+    )
+    cfg = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", model_id="org/m")
+    base.EngineManager(cfg)._factory("org/m")
+    assert calls == [("org/m", "org/m")]
