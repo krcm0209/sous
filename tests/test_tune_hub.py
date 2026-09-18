@@ -1,6 +1,16 @@
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
-from sous.tune.hub import Download, ask_consent, fetch, is_cached, plan_downloads, snapshot_bytes
+from sous.tune.hub import (
+    Download,
+    _cached_path,
+    ask_consent,
+    fetch,
+    is_cached,
+    plan_downloads,
+    snapshot_bytes,
+)
 
 
 class _Api:
@@ -103,3 +113,84 @@ def test_fetch_downloads_each_approved_snapshot_once(capsys):
     fetch(["a/b", "c/d", "a/b"], download=lambda rid: seen.append(rid))
     assert seen == ["a/b", "c/d"]
     assert "a/b" in capsys.readouterr().out
+
+
+def _cache_snapshot(
+    cache_dir: Path, repo_id: str, files: dict[str, bytes], sha: str = "a" * 40
+) -> Path:
+    """A slice of a real Hugging Face cache layout for repo_id at sha: a
+    refs/main file holding the commit sha as plain text, and the given files
+    under snapshots/<sha>/ — what try_to_load_from_cache actually reads."""
+    org, name = repo_id.split("/")
+    repo_dir = cache_dir / f"models--{org}--{name}"
+    (repo_dir / "refs").mkdir(parents=True)
+    (repo_dir / "refs" / "main").write_text(sha)
+    snapshot = repo_dir / "snapshots" / sha
+    snapshot.mkdir(parents=True)
+    for name_, content in files.items():
+        (snapshot / name_).write_bytes(content)
+    return snapshot
+
+
+def _index(*shard_names: str) -> bytes:
+    weight_map = {f"tensor.{i}": name for i, name in enumerate(shard_names)}
+    return json.dumps({"weight_map": weight_map}).encode()
+
+
+def test_cached_path_is_none_for_a_metadata_only_snapshot(tmp_path):
+    # candidates.describe() fetches config.json alone to size a candidate;
+    # that lookup must never itself read back as a cached, loadable model.
+    _cache_snapshot(tmp_path, "org/model", {"config.json": b"{}"})
+    assert _cached_path("org/model", cache_dir=tmp_path) is None
+
+
+def test_cached_path_finds_a_single_file_checkpoint(tmp_path):
+    snapshot = _cache_snapshot(
+        tmp_path, "org/model", {"config.json": b"{}", "model.safetensors": b"x" * 10}
+    )
+    assert _cached_path("org/model", cache_dir=tmp_path) == snapshot
+
+
+def test_cached_path_is_none_when_an_indexed_shard_is_missing(tmp_path):
+    shards = (
+        "model-00001-of-00003.safetensors",
+        "model-00002-of-00003.safetensors",
+        "model-00003-of-00003.safetensors",
+    )
+    _cache_snapshot(
+        tmp_path,
+        "org/model",
+        {
+            "config.json": b"{}",
+            "model.safetensors.index.json": _index(*shards),
+            shards[0]: b"x",
+            shards[1]: b"x",
+            # shards[2] is never written: the shard list names it, disk lacks it.
+        },
+    )
+    assert _cached_path("org/model", cache_dir=tmp_path) is None
+
+
+def test_cached_path_finds_a_sharded_checkpoint_with_no_readme(tmp_path):
+    # mlx-vlm downloads with allow_patterns, so a fully usable snapshot it
+    # produced never has a README.md; the Hub's own completeness check
+    # disagrees and this must not.
+    shards = (
+        "model-00001-of-00003.safetensors",
+        "model-00002-of-00003.safetensors",
+        "model-00003-of-00003.safetensors",
+    )
+    snapshot = _cache_snapshot(
+        tmp_path,
+        "org/model",
+        {
+            "config.json": b"{}",
+            "model.safetensors.index.json": _index(*shards),
+            **{name: b"x" for name in shards},
+        },
+    )
+    assert _cached_path("org/model", cache_dir=tmp_path) == snapshot
+
+
+def test_cached_path_is_none_for_an_absent_repo(tmp_path):
+    assert _cached_path("org/nope", cache_dir=tmp_path) is None

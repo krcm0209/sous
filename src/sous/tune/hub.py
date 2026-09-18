@@ -3,6 +3,7 @@ download plan, consent for each snapshot, and the downloads themselves."""
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -12,16 +13,38 @@ _GB = 10**9
 _GIB = 1 << 30
 
 
-def _cached_path(repo_id: str) -> Path | None:
+def _cached_path(repo_id: str, *, cache_dir: str | Path | None = None) -> Path | None:
     """The local snapshot directory, or None: a lookup that never touches the
-    network, so an absent snapshot is a plain answer rather than a download."""
-    from huggingface_hub import snapshot_download
-    from huggingface_hub.errors import LocalEntryNotFoundError
+    network, so an absent snapshot is a plain answer rather than a download.
 
-    try:
-        return Path(snapshot_download(repo_id, local_files_only=True))
-    except LocalEntryNotFoundError, OSError, ValueError:
+    Answered from the cache's own files rather than the Hub's own
+    completeness check (`snapshot_download(..., local_files_only=True)`):
+    that check counts non-weight files an mlx-vlm download never fetches
+    (a cached model reads as missing) and is satisfied by a snapshot that
+    holds only a config.json fetched for metadata, with no weights on disk
+    at all (an uncached model reads as ready to load, for free)."""
+    from huggingface_hub import try_to_load_from_cache
+
+    config = try_to_load_from_cache(repo_id, "config.json", cache_dir=cache_dir)
+    if not isinstance(config, str):  # None (absent) or the _CACHED_NO_EXIST sentinel
         return None
+    snapshot = Path(config).parent
+    return snapshot if _weights_complete(snapshot) else None
+
+
+def _weights_complete(snapshot: Path) -> bool:
+    """Whether every weight shard the checkpoint names is present: the
+    Hub's own completeness check counts README-style files a model loader
+    never fetches, and a metadata-only entry (config.json fetched for the
+    fit arithmetic) has a snapshot directory with no weights at all."""
+    index = snapshot / "model.safetensors.index.json"
+    if index.is_file():
+        try:
+            names = set(json.loads(index.read_text()).get("weight_map", {}).values())
+        except ValueError, OSError:
+            return False
+        return bool(names) and all((snapshot / name).is_file() for name in names)
+    return any(snapshot.glob("*.safetensors"))
 
 
 def is_cached(repo_id: str, *, cached_path: Callable[[str], Path | None] | None = None) -> bool:
