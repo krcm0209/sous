@@ -459,3 +459,39 @@ def test_a_full_choice_over_another_model_writes_its_drafter_block_and_fit_windo
         "model": {"id": M9, "speculative_draft_id": "z/9d", "speculative_block_size": 2},
         "gateway": {"max_context_tokens": 65536},
     }
+
+
+def test_an_arm_exactly_at_the_margin_is_eligible(tmp_path):
+    user = _user(tmp_path)
+    cur = _arm(user, "27 @3", current=True)
+    nine = _arm(user, "9", drafter="", block=0, model=M9)
+    runs = _runs(cur, [0.75] * 3, seconds=100.0) + _runs(nine, [0.70] * 3, seconds=50.0)
+    choice = full_decision(user, [cur, nine], runs, [], runs_per_task=1)
+    assert choice is not None and choice.label == "9"
+    assert not any("not eligible" in r for r in choice.reasons)
+
+
+def test_completed_runs_at_the_floor_and_equal_repetitions_are_eligible(tmp_path):
+    user = _user(tmp_path)
+    cur = _arm(user, "27 @3", current=True)
+    nine = _arm(user, "9", drafter="", block=0, model=M9)
+    runs = _runs(cur, [1.0] * 4, seconds=100.0, repetitions=1) + [
+        _run(nine, "t0", grade=1.0, seconds=10.0, repetitions=1),
+        _run(nine, "t1", grade=1.0, seconds=10.0, repetitions=1),
+        _run(nine, "t2", grade=1.0, seconds=10.0, repetitions=1, state="failed"),
+        _run(nine, "t3", grade=1.0, seconds=10.0, repetitions=1, state="failed"),
+    ]
+    choice = full_decision(user, [cur, nine], runs, [], runs_per_task=2)
+    assert choice is not None and choice.label == "9"
+    line = next(r for r in choice.reasons if r.startswith("9:"))
+    assert line.endswith("-> eligible")
+
+
+def test_a_reference_with_no_completed_run_is_said_so(tmp_path):
+    user = _user(tmp_path)
+    cur = _arm(user, "27 @3", current=True)
+    nine = _arm(user, "9", drafter="", block=0, model=M9)
+    runs = _runs(cur, [0.0, 0.0], seconds=100.0, state="failed") + _runs(nine, [1.0], seconds=50.0)
+    choice = full_decision(user, [cur, nine], runs, [], runs_per_task=1)
+    assert choice is not None and choice.label == "9"
+    assert any("note: the reference completed no run" in r for r in choice.reasons)

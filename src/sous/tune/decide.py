@@ -14,6 +14,12 @@ from sous.tune.hardware import gib
 from sous.tune.suite.runner import SuiteRun
 
 MARGIN = 0.05
+# The floor and every mean grade are float arithmetic over pass fractions
+# (thirds, sevenths, ...): compared raw, an arm sitting exactly at the
+# margin is rejected on rounding noise the printed reason (rounded to two
+# decimals) can't show, so the line reads as a self-contradiction. The
+# boundary decided here must be the one the reasons print.
+_GRADE_EPSILON = 1e-9
 
 
 @dataclass(frozen=True)
@@ -263,13 +269,20 @@ def full_decision(
         f"eligible: mean grade >= {grade_floor:.2f} ({ref_sum.mean_grade:.2f} - {MARGIN:.2f}), "
         f"completed runs >= {completed_floor} ({ref_sum.completed} - {runs_per_task} per task), "
         f"repetition incidents <= {ref_sum.repetitions}",
-        "winner: the eligible arm with the lowest suite wall time; "
-        "a tie goes to the smaller peak memory",
     ]
+    if ref_sum.completed == 0:
+        reasons.append(
+            "note: the reference completed no run, so the quality margin "
+            "constrains nothing; the winner is the fastest arm"
+        )
+    reasons.append(
+        "winner: the eligible arm with the lowest suite wall time; "
+        "a tie goes to the smaller peak memory"
+    )
     eligible: list[tuple[Arm, ArmSummary]] = []
     for arm, s in summaries:
         problems = []
-        if s.mean_grade < grade_floor:
+        if s.mean_grade + _GRADE_EPSILON < grade_floor:
             problems.append(f"grade {s.mean_grade:.2f} < {grade_floor:.2f}")
         if s.completed < completed_floor:
             problems.append(f"completed {s.completed} < {completed_floor}")
