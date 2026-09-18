@@ -362,18 +362,29 @@ def run_one(
     )
 
 
-def _check_int8(arm: Arm, engine: ManagedEngine) -> None:
+def _check_int8(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> None:
     """Like the drafter check: the engine refuses INT8 prefill with a status
-    rather than an error, and a run under the int8 label over the stock
-    path would put that setting in the config on stock numbers."""
+    rather than an error. The winner stage's own int8 arm exists to
+    *measure* int8 prefill, so the engine refusing it must fail that arm —
+    a run under the int8 label over the stock path would put that setting
+    in the config on stock numbers. Every other arm only inherited
+    int8_prefill from the user's config; the daemon would run it stock with
+    one warning rather than refuse it, so this prints a notice instead and
+    lets the arm run."""
     if not arm.int8_prefill:
         return
     status = engine.int8_prefill_status or {}
-    if status.get("state") != "active":
-        reason = status.get("reason") or "no status"
+    if status.get("state") == "active":
+        return
+    reason = status.get("reason") or "no status"
+    if arm.int8_under_test:
         raise RuntimeError(
             f"int8 prefill requested, engine reports {status.get('state', 'nothing')}: {reason}"
         )
+    out(
+        f"  {arm.label}: int8 prefill unavailable here ({reason}); "
+        "the engine runs stock, as the daemon would"
+    )
 
 
 def _slug(label: str) -> str:
@@ -416,7 +427,7 @@ def _run_suite(
     try:
         try:
             _check_drafter(arm, engine)
-            _check_int8(arm, engine)
+            _check_int8(arm, engine, out)
         except RuntimeError as e:
             check_error = str(e)
         if check_error is None:

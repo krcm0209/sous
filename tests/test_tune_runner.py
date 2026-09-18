@@ -292,8 +292,15 @@ def test_an_arm_whose_drafter_or_int8_did_not_load_runs_nothing(tmp_path):
     )
     assert outcome.runs == [] and outcome.released
     assert outcome.error == "drafter z/d requested, engine runs with none"
+    # int8_under_test=True: the winner stage's own int8 arm, which exists to
+    # measure int8 prefill — the engine refusing it must fail the arm.
     int8 = Arm(
-        **{**vars(arm), "int8_prefill": True, "label": "m + int8 prefill"}  # ty: ignore[invalid-argument-type]
+        **{
+            **vars(arm),
+            "int8_prefill": True,
+            "int8_under_test": True,
+            "label": "m + int8 prefill",
+        }  # ty: ignore[invalid-argument-type]
     )
     outcome = run_suite(
         int8,
@@ -309,6 +316,45 @@ def test_an_arm_whose_drafter_or_int8_did_not_load_runs_nothing(tmp_path):
     )
     assert outcome.runs == []
     assert outcome.error == "int8 prefill requested, engine reports unavailable: no tensor units"
+
+
+def test_an_arm_that_merely_inherits_int8_runs_when_the_engine_cannot_route_it(tmp_path):
+    """int8_prefill=True but int8_under_test=False: the arm only inherited
+    the setting from the user's config (quick_arms mirrors it onto every
+    arm), so an engine that cannot route int8 here must not refuse the
+    arm — the daemon would run it on the stock path with a warning, and the
+    suite must do the same rather than treat an inherited setting as a hard
+    requirement."""
+
+    class Engine(FakeEngine):
+        drafter = ""
+        int8_prefill_status = {"state": "unavailable", "reason": "no tensor units", "routed": 0}
+
+    arm = _arm(tmp_path)
+    inherited = Arm(
+        **{
+            **vars(arm),
+            "int8_prefill": True,
+            "int8_under_test": False,
+            "label": "m + int8 (inherited)",
+        }  # ty: ignore[invalid-argument-type]
+    )
+    lines = []
+    outcome = run_suite(
+        inherited,
+        [_task()],
+        runs=1,
+        done=set(),
+        record=lambda r: None,
+        scratch=tmp_path / "c",
+        out=lines.append,
+        factory=lambda mid: Engine([FINISH]),
+        python=PYTHON,
+        active_memory=lambda: 0,
+    )
+    assert len(outcome.runs) == 1
+    assert outcome.error is None
+    assert any("runs stock" in line for line in lines)
 
 
 def test_memory_is_judged_against_the_baseline_taken_before_the_load(tmp_path, monkeypatch):

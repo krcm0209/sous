@@ -288,6 +288,10 @@ def test_on_nax_a_routable_checkpoint_gets_an_int8_arm_and_a_sampled_winner_a_gr
     assert int8.suite_key == (*int8.key, True, False)
     assert greedy.suite_key == (*greedy.key, False, True)
     assert all(not a.current and a.fit_window == 131072 for a in arms)
+    # Only the winner stage's own int8 arm is under test: the engine
+    # refusing it must fail the arm, unlike an arm that merely inherited
+    # int8_prefill from the user's config.
+    assert int8.int8_under_test and not greedy.int8_under_test
 
 
 def test_without_nax_only_the_greedy_arm_is_offered(tmp_path):
@@ -337,6 +341,8 @@ def test_quick_arms_mirror_the_users_int8_and_greedy_settings(tmp_path):
     for arm in arms:
         assert arm.int8_prefill is True
         assert arm.greedy is True
+        # Inherited, not proposed: quick_arms never puts an arm under test.
+        assert arm.int8_under_test is False
         assert arm.suite_key == (*arm.key, True, True)
         cp = _checkpoints()[arm.model_id]
         extra_arms = winner_stage_arms(arm, nax=True, checkpoint=cp)

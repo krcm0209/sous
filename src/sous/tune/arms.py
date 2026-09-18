@@ -37,6 +37,14 @@ class Arm:
     # from `config` so a row can be keyed without reading the config back.
     int8_prefill: bool = False
     greedy: bool = False
+    # True only for the winner stage's own int8 arm, built to *measure*
+    # INT8 prefill: the engine refusing it must fail that arm. Every other
+    # arm's int8_prefill is merely inherited from the user's config (every
+    # quick_arms arm mirrors it) — the daemon would run that arm's
+    # checkpoint on the stock path with one warning rather than refuse it,
+    # so the suite runner must do the same instead of treating an inherited
+    # setting as a hard requirement.
+    int8_under_test: bool = False
 
     @property
     def key(self) -> tuple[str, str, int]:
@@ -254,6 +262,7 @@ def winner_stage_arms(winner: Arm, *, nax: bool, checkpoint: Checkpoint) -> list
                 config=dataclasses.replace(winner.config, int8_prefill=True),
                 current=False,
                 int8_prefill=True,
+                int8_under_test=True,
             )
         )
     if not winner.greedy:
