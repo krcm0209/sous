@@ -155,6 +155,17 @@ async def _hold_body(request: Request) -> tuple[int, float]:
     return pid, float(create_time)
 
 
+async def _require_empty_body(request: Request) -> None:
+    """`/sous/unload` takes no body: one that carries something is a request
+    for a different route, refused the way a malformed hold is."""
+    try:
+        async for chunk in request.stream():
+            if chunk:
+                raise _invalid("unload takes no body")
+    except ClientDisconnect:
+        raise _invalid("client disconnected mid-body") from None
+
+
 async def _served(route: str, fn: Callable[..., dict], *args: object) -> Response:
     """`fn` on a worker thread, its dict as the reply. A failure is a 500 in
     the error vocabulary every other route speaks, not Starlette's bare
@@ -173,14 +184,14 @@ def mount_monitor(
     status: Callable[[], dict],
     version: Callable[[], object],
 ) -> None:
-    """Register GET /sous/status, GET /sous/events, POST /sous/hold and a
-    404 for every other /sous/ path. `status` builds the full status
-    document (recent turns and tasks included); `version` is what the event
-    stream polls — a value that differs from the last one whenever the
-    document would. The status and hold handlers hand their work to a
-    thread — status() reads the task store and hold() takes the engine
-    manager's lock, and neither belongs on the event loop — and the event
-    stream builds each of its documents the same way."""
+    """Register GET /sous/status, GET /sous/events, POST /sous/hold,
+    POST /sous/unload and a 404 for every other /sous/ path. `status` builds
+    the full status document (recent turns and tasks included); `version` is
+    what the event stream polls — a value that differs from the last one
+    whenever the document would. The status, hold and unload handlers hand
+    their work to a thread — status() reads the task store, hold() and
+    unload() take the engine manager's lock, and neither belongs on the event
+    loop — and the event stream builds each of its documents the same way."""
     # sse-starlette logs every frame it sends at DEBUG — the status document,
     # verbatim, up to ten times a second — and the gateway's own pin of this
     # logger only runs when the gateway is mounted. /sous/events is mounted
@@ -214,6 +225,22 @@ def mount_monitor(
             return _refused(e)
         return await _served("POST /sous/hold", engines.hold, pid, create_time)
 
+    async def sous_unload(request: Request) -> Response:
+        try:
+            check_loopback(request)
+            await _require_empty_body(request)
+        except RequestError as e:
+            return _refused(e)
+        reply = await _served("POST /sous/unload", engines.unload_now)
+        if reply.status_code != 200:
+            return reply
+        body = json.loads(bytes(reply.body))
+        if body.get("unloaded"):
+            return reply
+        # The engine is busy or empty: a state the caller must wait out or
+        # respect, not an error in its request.
+        return _refused(RequestError(409, "conflict_error", body["reason"]))
+
     async def sous_unknown(request: Request) -> Response:
         try:
             check_loopback(request)
@@ -224,6 +251,7 @@ def mount_monitor(
     mcp.custom_route("/sous/status", methods=["GET"])(sous_status)
     mcp.custom_route("/sous/events", methods=["GET"])(sous_events)
     mcp.custom_route("/sous/hold", methods=["POST"])(sous_hold)
+    mcp.custom_route("/sous/unload", methods=["POST"])(sous_unload)
     # Registered after the real routes and before the gateway mounts its
     # catch-all (the SDK keeps registration order), so no path under /sous
     # can reach the upstream with the gateway on. The bare /sous needs its

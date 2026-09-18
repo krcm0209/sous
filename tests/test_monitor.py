@@ -770,3 +770,41 @@ def test_mounting_the_monitor_pins_sse_starlette_above_debug(tmp_path: Path, mon
     monkeypatch.setattr(logger, "level", logging.NOTSET)
     _app(tmp_path, gateway_enabled=False)
     assert logger.level == logging.INFO
+
+
+# --- /sous/unload -------------------------------------------------------------------
+
+
+def test_unload_frees_a_loaded_idle_engine(tmp_path: Path):
+    app, engines = _app(tmp_path)
+    engines.get()
+    r = _request(app, "POST", "/sous/unload", b"")
+    assert r.status_code == 200
+    assert r.json() == {"unloaded": True, "reason": None}
+    assert engines.status()["loaded"] is False
+
+
+def test_unload_is_a_409_with_the_reason_while_a_session_holds_the_model(tmp_path: Path):
+    app, engines = _app(tmp_path)
+    engines.get()
+    engines.hold(os.getpid(), 1.0)
+    r = _request(app, "POST", "/sous/unload", b"")
+    assert r.status_code == 409
+    assert r.json()["error"] == {"type": "conflict_error", "message": "held by 1 session(s)"}
+    assert engines.status()["loaded"] is True
+
+
+def test_unload_with_nothing_loaded_is_a_409_too(tmp_path: Path):
+    app, _ = _app(tmp_path)
+    r = _request(app, "POST", "/sous/unload", b"")
+    assert r.status_code == 409
+    assert r.json()["error"]["message"] == "nothing loaded"
+
+
+def test_unload_refuses_a_body_and_a_cross_site_caller_like_hold(tmp_path: Path):
+    app, _ = _app(tmp_path)
+    r = _request(app, "POST", "/sous/unload", {"pid": 1})
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"
+    r = _request(app, "POST", "/sous/unload", b"", headers={"sec-fetch-site": "cross-site"})
+    assert r.status_code == 403
