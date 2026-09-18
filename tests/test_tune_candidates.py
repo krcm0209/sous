@@ -143,3 +143,42 @@ def test_fit_refuses_when_the_drafters_size_is_unknown():
 
 def test_fit_floor_for_the_gateway_is_claude_codes_minimum():
     assert GATEWAY_MIN_CONTEXT_TOKENS == 48 * 1024
+
+
+def test_drafter_compatibility_refuses_a_vocabulary_mismatch():
+    """mlx-vlm's own validation compares vocabularies too, and the engine
+    survives a drafter that fails it by running undrafted — a bench row
+    would then carry a drafter it never had."""
+    target = describe(
+        "t",
+        config_fn=lambda m: {
+            **fx.qwen_27b(),
+            "text_config": {**fx.qwen_27b()["text_config"], "vocab_size": 248320},
+        },
+        size_fn=lambda m: 1,
+    )
+    good = describe(
+        "d", config_fn=lambda m: {**fx.dflash2_27b(), "vocab_size": 248320}, size_fn=lambda m: 1
+    )
+    wrong = describe(
+        "w", config_fn=lambda m: {**fx.dflash2_27b(), "vocab_size": 151936}, size_fn=lambda m: 1
+    )
+    assert target.vocab_size == 248320 and good.vocab_size == 248320
+    assert drafter_compatible(target, good) == (True, "")
+    ok, why = drafter_compatible(target, wrong)
+    assert ok is False and "vocabulary" in why
+    # Unknown on either side is not a mismatch.
+    assert drafter_compatible(
+        target, describe("u", config_fn=lambda m: fx.dflash2_27b(), size_fn=lambda m: 1)
+    ) == (True, "")
+
+
+def test_a_lowered_window_says_what_it_costs_the_prompt_cache():
+    f = fit(
+        _cp(6_000_000_000, kv=32768),
+        None,
+        window=131072,
+        floor=8192,
+        working_set_bytes=fx.M2_AIR_WORKING_SET,
+    )
+    assert f.fits and "prompt-cache" in f.detail

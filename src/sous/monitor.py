@@ -167,11 +167,14 @@ async def _require_empty_body(request: Request) -> None:
 
 
 async def _served(route: str, fn: Callable[..., dict], *args: object) -> Response:
-    """`fn` on a worker thread, its dict as the reply. A failure is a 500 in
-    the error vocabulary every other route speaks, not Starlette's bare
-    text one — which `sous claude` reads as no daemon at all."""
+    """`fn` on a worker thread, its dict as the reply. A `RequestError` it
+    raises is that refusal, verbatim; any other failure is a 500 in the
+    error vocabulary every other route speaks, not Starlette's bare text
+    one — which `sous claude` reads as no daemon at all."""
     try:
         return JSONResponse(await run_sync(fn, *args))
+    except RequestError as e:
+        return _refused(e)
     except Exception as e:  # noqa: BLE001 — every failure becomes an error body
         # The type only: an error's message can name a path.
         _logger.error(f"{route} failed ({type(e).__name__})")
@@ -200,12 +203,17 @@ def mount_monitor(
 
     def _unload() -> dict:
         try:
-            return engines.unload_now()
+            reply = engines.unload_now()
         finally:
             # The pool thread that ran the unload freed mlx arrays; anyio
             # retires idle workers, and a thread that exits with live mlx state
             # takes the daemon down (ml-explore/mlx#4327).
             release_mlx_thread_state()
+        if not reply["unloaded"]:
+            # The engine is busy or empty: a state the caller must wait out or
+            # respect, not an error in its request.
+            raise RequestError(409, "conflict_error", reply["reason"] or "refused")
+        return reply
 
     async def sous_status(request: Request) -> Response:
         try:
@@ -240,15 +248,7 @@ def mount_monitor(
             await _require_empty_body(request)
         except RequestError as e:
             return _refused(e)
-        reply = await _served("POST /sous/unload", _unload)
-        if reply.status_code != 200:
-            return reply
-        body = json.loads(bytes(reply.body))
-        if body.get("unloaded"):
-            return reply
-        # The engine is busy or empty: a state the caller must wait out or
-        # respect, not an error in its request.
-        return _refused(RequestError(409, "conflict_error", body.get("reason") or "refused"))
+        return await _served("POST /sous/unload", _unload)
 
     async def sous_unknown(request: Request) -> Response:
         try:

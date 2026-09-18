@@ -21,11 +21,32 @@ class Arm:
     model_id: str
     drafter_id: str
     block_size: int
+    # The model's measurement window, shared by every arm of the model and
+    # lowered for its heaviest drafter, so no block size is measured at a
+    # window another block size could not run at.
     window: int
     gateway_window: int | None
     tier: str
     current: bool
-    unvetted: bool = False
+    # The window this arm alone fits at — its own drafter or none — which is
+    # what a proposal writes: the drafterless arm must not carry the
+    # reservation made for a drafter its configuration never loads.
+    fit_window: int | None = None
+    fit_gateway_window: int | None = None
+
+    @property
+    def key(self) -> tuple[str, str, int]:
+        """What identifies an arm across a run, its rows and a resume. The
+        label is for people: two orgs' checkpoints with one repo basename
+        share it."""
+        return (self.model_id, self.drafter_id, self.block_size)
+
+    @property
+    def serving_window(self) -> int:
+        """The longest context the daemon would serve with this configuration
+        — what the engine reserves KV for, and what a long-context
+        measurement must fit in."""
+        return max(self.window, self.gateway_window or 0)
 
 
 @dataclass(frozen=True)
@@ -47,10 +68,24 @@ def label_for(model_id: str, drafter_id: str, block_size: int) -> str:
 
 
 def _with_current(user: SousConfig, candidates: list[Candidate]) -> list[Candidate]:
-    if any(c.id == user.model_id for c in candidates):
-        return list(candidates)
-    drafters = (user.speculative_draft_id,) if user.speculative_draft_id else ()
-    return [Candidate(user.model_id, "current", drafters, "the configured model"), *candidates]
+    """The user's own model and drafter always among the candidates: a model
+    the table lacks is added as a candidate of its own, and a model the
+    table lists gains the user's drafter when the table pairs it with
+    others — otherwise the configured arm is never measured and there is no
+    baseline to propose against."""
+    mine = user.speculative_draft_id
+    out: list[Candidate] = []
+    found = False
+    for cand in candidates:
+        if cand.id == user.model_id:
+            found = True
+            if mine and mine not in cand.drafters:
+                cand = dataclasses.replace(cand, drafters=(*cand.drafters, mine))
+        out.append(cand)
+    if not found:
+        drafters = (mine,) if mine else ()
+        out.insert(0, Candidate(user.model_id, "current", drafters, "the configured model"))
+    return out
 
 
 def _arm(
@@ -60,6 +95,9 @@ def _arm(
     block: int,
     f: Fit,
     gateway_window: int | None,
+    own: Fit,
+    *,
+    current: bool | None = None,
 ) -> Arm:
     config = dataclasses.replace(
         user,
@@ -71,11 +109,12 @@ def _arm(
             gateway_window if gateway_window is not None else user.gateway_max_context_tokens
         ),
     )
-    current = (
-        cand.id == user.model_id
-        and drafter_id == user.speculative_draft_id
-        and (not drafter_id or block == user.speculative_block_size)
-    )
+    if current is None:
+        current = (
+            cand.id == user.model_id
+            and drafter_id == user.speculative_draft_id
+            and (not drafter_id or block == user.speculative_block_size)
+        )
     return Arm(
         label=label_for(cand.id, drafter_id, block),
         config=config,
@@ -86,6 +125,10 @@ def _arm(
         gateway_window=gateway_window,
         tier=cand.tier,
         current=current,
+        fit_window=min(user.max_context_tokens, own.window),
+        fit_gateway_window=(
+            min(user.gateway_max_context_tokens, own.window) if user.gateway_enabled else None
+        ),
     )
 
 
@@ -113,6 +156,10 @@ def quick_arms(
             refusals.append(Refusal(cand.id, "", "checkpoint unknown (offline?)"))
             continue
         drafters: list[Checkpoint] = []
+        # The configured drafter refused as unusable with this model: the
+        # daemon runs the model undrafted (the engine degrades rather than
+        # fails), so the no-drafter arm is the configuration in use.
+        users_drafter_unusable = False
         for drafter_id in cand.drafters:
             drafter = checkpoints.get(drafter_id)
             if drafter is None:
@@ -123,11 +170,18 @@ def quick_arms(
                 # it would refuse the whole model, drafterless arm included.
                 refusals.append(Refusal(cand.id, drafter_id, "drafter size unknown (offline?)"))
                 continue
-            ok, why = drafter_compatible(target, drafter)
+            if target.backend != "vlm":
+                # Speculative decoding is an mlx-vlm feature; the factory
+                # drops the drafter for the text-only backend without a word.
+                ok, why = False, "the text-only backend has no speculative decoding"
+            else:
+                ok, why = drafter_compatible(target, drafter)
             if ok:
                 drafters.append(drafter)
-            else:
-                refusals.append(Refusal(cand.id, drafter_id, why))
+                continue
+            refusals.append(Refusal(cand.id, drafter_id, why))
+            if cand.id == user.model_id and drafter_id == user.speculative_draft_id:
+                users_drafter_unusable = True
         heaviest = max(drafters, key=lambda d: d.bytes or 0, default=None)
         f = fit(target, heaviest, window=window, floor=floor, working_set_bytes=working_set_bytes)
         if not f.fits:
@@ -136,8 +190,23 @@ def quick_arms(
         gateway_window = None
         if user.gateway_enabled:
             gateway_window = min(user.gateway_max_context_tokens, f.window)
-        arms.append(_arm(user, cand, "", 0, f, gateway_window))
+        own = fit(target, None, window=window, floor=floor, working_set_bytes=working_set_bytes)
+        arms.append(
+            _arm(
+                user,
+                cand,
+                "",
+                0,
+                f,
+                gateway_window,
+                own,
+                current=True if users_drafter_unusable else None,
+            )
+        )
         for drafter in drafters:
+            own = fit(
+                target, drafter, window=window, floor=floor, working_set_bytes=working_set_bytes
+            )
             is_users_own_pair = cand.id == user.model_id and drafter.id == user.speculative_draft_id
             # The user's own block size may sit outside the curated set (0 is
             # the drafter's adaptive policy; anything else they set by hand),
@@ -149,5 +218,5 @@ def quick_arms(
                 else BLOCK_SIZES
             )
             for block in blocks:
-                arms.append(_arm(user, cand, drafter.id, block, f, gateway_window))
+                arms.append(_arm(user, cand, drafter.id, block, f, gateway_window, own))
     return arms, refusals

@@ -1708,3 +1708,38 @@ def test_unload_now_bumps_the_version_and_clears_the_idle_clock():
     mgr.unload_now()
     assert mgr.version > before
     assert mgr.status()["idle_seconds"] is None
+
+
+def test_unload_now_names_a_load_or_an_unload_in_progress():
+    """`_engine` is None during both, and "nothing loaded" would send the
+    caller waiting for the memory back the wrong way."""
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowUnload(FakeEngine):
+        def unload(self) -> None:
+            started.set()
+            release.wait(5.0)
+            super().unload()
+
+    def factory(model_id: str):
+        started.set()
+        release.wait(5.0)
+        return SlowUnload([])
+
+    mgr = EngineManager(SousConfig(), engine_factory=factory)
+    loader = threading.Thread(target=mgr.get, daemon=True)
+    loader.start()
+    assert started.wait(5.0)
+    assert mgr.unload_now() == {"unloaded": False, "reason": "a model load is in progress"}
+    release.set()
+    loader.join(5.0)
+    started.clear()
+    release.clear()
+    unloader = threading.Thread(target=mgr.unload_now, daemon=True)
+    unloader.start()
+    assert started.wait(5.0)
+    assert mgr.unload_now() == {"unloaded": False, "reason": "an unload is in progress"}
+    release.set()
+    unloader.join(5.0)
+    assert mgr.unload_now() == {"unloaded": False, "reason": "nothing loaded"}

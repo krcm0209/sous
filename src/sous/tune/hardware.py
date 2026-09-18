@@ -50,7 +50,9 @@ def _availability() -> Availability:
     return int8prefill.availability()
 
 
-def _hub_cache() -> str:
+def hub_cache_dir() -> str:
+    """Where the Hub keeps snapshots on this machine; the one lookup the
+    tune's modules share."""
     from huggingface_hub import constants
 
     return str(constants.HF_HUB_CACHE)
@@ -82,7 +84,7 @@ def detect(
     call is a device query, not an op, so it is safe on any thread."""
     info = (device_info or _device_info)()
     release = (mac_ver or platform.mac_ver)()[0]
-    cache = hub_cache if hub_cache is not None else _hub_cache()
+    cache = hub_cache if hub_cache is not None else hub_cache_dir()
     free = int((disk_usage or shutil.disk_usage)(_nearest_existing(cache))[2])
     nax = (availability or _availability)()
     read = version or dist_version

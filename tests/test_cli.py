@@ -1815,3 +1815,10 @@ def test_tune_subcommand_dispatches_with_its_flags(monkeypatch):
     assert e.value.code == 0
     assert seen["quick"] is True and seen["repeat"] == 3
     assert seen["models"] == ["a/b", "c/d"] and seen["yes"] is True and seen["apply"] is False
+
+
+def test_restart_hint_names_launchds_kickstart_or_the_two_commands():
+    from sous.cli import restart_hint
+
+    assert restart_hint(managed=False) == "sous stop, then sous serve"
+    assert restart_hint(managed=True) == f"launchctl kickstart -k gui/{os.getuid()}/{LABEL}"

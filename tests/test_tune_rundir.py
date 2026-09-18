@@ -36,3 +36,25 @@ def test_json_and_text_files_land_in_the_run_dir(tmp_path):
     p = rd.write_json("hardware.json", {"chip": "M2"})
     assert json.loads(p.read_text()) == {"chip": "M2"}
     assert rd.write_text("report.md", "# hi\n").read_text() == "# hi\n"
+
+
+def test_a_torn_last_line_is_a_row_that_never_landed(tmp_path):
+    """A full disk cuts a line short; --resume must measure that arm again,
+    not fail on the file it exists to read."""
+    rd = RunDir.new(tmp_path / "tune")
+    rd.append("bench", {"label": "a"})
+    with rd.results.open("a") as f:
+        f.write('{"kind": "bench", "label": "b", "decode_tps_1k": 2')
+    assert rd.rows("bench") == [{"label": "a"}]
+    with rd.results.open("a") as f:
+        f.write("\n[1, 2]\n")
+    assert rd.rows("bench") == [{"label": "a"}]
+
+
+def test_two_runs_in_one_second_get_their_own_directories(tmp_path):
+    a = RunDir.new(tmp_path / "tune", clock=lambda: 1_800_000_000.0)
+    b = RunDir.new(tmp_path / "tune", clock=lambda: 1_800_000_000.0)
+    assert a.path != b.path and b.path.is_dir()
+    assert b.run_id.startswith(a.run_id)
+    a.append("bench", {"label": "a"})
+    assert b.rows("bench") == []

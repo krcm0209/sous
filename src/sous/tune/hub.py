@@ -3,14 +3,31 @@ download plan, consent for each snapshot, and the downloads themselves."""
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from sous.tune.hardware import hub_cache_dir
+
 _GB = 10**9
 _GIB = 1 << 30
+# What mlx-vlm's loader fetches from a repo (mlx_vlm.utils.get_model_path):
+# the weights and the files that read them. The size a consent prompt quotes
+# is the safetensors total, so the download must not reach past it to
+# formats no loader here opens.
+LOADER_PATTERNS = (
+    "*.json",
+    "*.jsonl",
+    "*.safetensors",
+    "*.py",
+    "*.model",
+    "*.tiktoken",
+    "*.txt",
+    "*.jinja",
+)
 
 
 def _cached_path(repo_id: str, *, cache_dir: str | Path | None = None) -> Path | None:
@@ -101,9 +118,11 @@ def plan_downloads(
     plan: list[Download] = []
     seen: set[str] = set()
     for repo_id, role, removes in items:
-        if repo_id in seen or cached(repo_id):
+        if repo_id in seen:
             continue
         seen.add(repo_id)
+        if cached(repo_id):
+            continue
         plan.append(Download(repo_id, size(repo_id), role, removes))
     return plan
 
@@ -112,10 +131,13 @@ def _size(n: int | None) -> str:
     return "size unknown" if n is None else f"{n / _GB:.1f} GB"
 
 
-def _default_hub_cache() -> str:
-    from huggingface_hub import constants
-
-    return str(constants.HF_HUB_CACHE)
+def confirm(prompt: str, ask: Callable[[str], str] = input) -> bool:
+    """One yes/no question; EOF and anything but a yes are a no."""
+    try:
+        answer = ask(prompt)
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
 
 
 def ask_consent(
@@ -130,18 +152,13 @@ def ask_consent(
     each download knowing everything the run wants and what a no costs."""
     if not plan:
         return set()
-    hub = hub_cache if hub_cache is not None else _default_hub_cache()
+    hub = hub_cache if hub_cache is not None else hub_cache_dir()
     out(f"Downloads needed (free disk {free_bytes / _GIB:.1f} GiB at {hub}):")
     for n, d in enumerate(plan, start=1):
         out(f"  {n}. {d.repo_id:45s} {_size(d.bytes):>13s}   {d.role}; refusing: {d.removes}")
     approved: set[str] = set()
     for n, d in enumerate(plan, start=1):
-        prompt = f"Download #{n} ({d.repo_id}, {_size(d.bytes)})? [y/N] "
-        try:
-            answer = ask(prompt)
-        except EOFError:
-            answer = ""
-        if answer.strip().lower() in ("y", "yes"):
+        if confirm(f"Download #{n} ({d.repo_id}, {_size(d.bytes)})? [y/N] ", ask):
             approved.add(d.repo_id)
     return approved
 
@@ -157,7 +174,7 @@ def fetch(
     if download is None:
         from huggingface_hub import snapshot_download
 
-        download = snapshot_download
+        download = functools.partial(snapshot_download, allow_patterns=list(LOADER_PATTERNS))
     done: set[str] = set()
     for repo_id in repo_ids:
         if repo_id in done:

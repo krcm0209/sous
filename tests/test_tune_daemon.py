@@ -93,3 +93,61 @@ def test_a_daemon_that_predates_unload_names_the_restart():
     assert r.ready is False
     assert "predates /sous/unload" in r.reason
     assert "sous stop" in r.reason and "sous serve" in r.reason
+    assert "com.sous.daemon" in r.reason
+
+
+def test_a_transport_error_is_a_refusal_not_a_traceback():
+    """`_sous_request` raises httpx errors by design (a 15 s deadline, a
+    daemon gone between the port probe and the request); the tune must
+    print a reason like every other refusal."""
+    import httpx
+
+    def dying(port, method, path, json=None):
+        raise httpx.ConnectError("refused")
+
+    r = ready_for_tune(8383, request=dying, port_open=lambda p: True)
+    assert r.ready is False and "ConnectError" in r.reason
+
+    request, calls = _request(_status(loaded=True))
+
+    def dying_unload(port, method, path, json=None):
+        if path == "/sous/unload":
+            raise httpx.ReadTimeout("slow")
+        return request(port, method, path, json)
+
+    r = ready_for_tune(8383, request=dying_unload, port_open=lambda p: True)
+    assert r.ready is False and "ReadTimeout" in r.reason
+
+
+def test_a_daemon_mid_unload_is_not_ready():
+    """`loaded` is already false while the weights come off the GPU; a tune
+    that started then would load its own model beside them."""
+    request, calls = _request(_status(unloading=True))
+    r = ready_for_tune(8383, request=request, port_open=lambda p: True)
+    assert r.ready is False and "unloading" in r.reason
+    assert calls == [("GET", "/sous/status")]
+
+
+def test_a_queued_task_counts_as_busy():
+    request, calls = _request({**_status(), "queue": {"queued": 2, "running": 0}})
+    r = ready_for_tune(8383, request=request, port_open=lambda p: True)
+    assert r.ready is False and "2 queued" in r.reason
+    assert calls == [("GET", "/sous/status")]
+
+
+def test_a_model_that_left_between_the_two_calls_is_the_state_asked_for():
+    request, _ = _request(
+        _status(loaded=True),
+        unload=(
+            409,
+            {"type": "error", "error": {"type": "conflict_error", "message": "nothing loaded"}},
+        ),
+    )
+    r = ready_for_tune(8383, request=request, port_open=lambda p: True)
+    assert r.ready is True and "no model" in r.reason
+
+
+def test_a_409_whose_error_is_not_a_dict_is_still_a_refusal():
+    request, _ = _request(_status(loaded=True), unload=(409, {"error": "busy"}))
+    r = ready_for_tune(8383, request=request, port_open=lambda p: True)
+    assert r.ready is False and "refused" in r.reason

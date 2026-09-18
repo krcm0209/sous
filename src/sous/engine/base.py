@@ -321,6 +321,16 @@ class ManagedEngine:
         # has no such attribute.
         return getattr(self._inner, "positions", None)
 
+    @property
+    def drafter(self) -> str | None:
+        """The speculative drafter the engine actually runs with: its id, ""
+        for none, or None from a backend that has no notion of one (the LM
+        backend, fakes). A VLM engine survives a drafter that fails to load
+        by running without it, so a caller that must know the difference —
+        the bench, whose row would otherwise carry a drafter's label over
+        undrafted numbers — reads this rather than its own request."""
+        return getattr(self._inner, "drafter", None)
+
     def generate(
         self,
         messages: list[dict],
@@ -735,26 +745,42 @@ class EngineManager:
         if gone and not self._holders and self._last_used is not None:
             self._last_used = self._clock()
 
-    def unload_if_idle(self) -> bool:
-        with self._changed:
-            self._prune_holders()
-            # _engine is None while a load or an unload is in progress too,
-            # so both are refused here without a second check.
-            if self._engine is None or self._last_used is None:
-                return False
-            if self._engine.generation_in_flight() or self._leases:
-                # Never free the model weights under an active (possibly
-                # abandoned-as-stalled) generation, nor under a caller that is
-                # holding this engine across calls that take no _gen_lock.
-                return False
-            if self._holders:
-                return False
-            idle = self._clock() - self._last_used
-            if idle <= self._config.idle_unload_minutes * 60:
-                return False
-            engine, self._engine = self._engine, None
-            self._unloading = True
-            self._bump()
+    def _refusal(self) -> str | None:
+        """Why the weights cannot be freed right now, or None. Lock held by
+        the caller, holders already pruned. The one list the idle sweep and a
+        requested unload both consult, so a new pin refuses on both paths.
+        A load or an unload in progress is named as such: `_engine` is None
+        during both, and "nothing loaded" would send a caller waiting for
+        the memory back the wrong way."""
+        if self._loading:
+            return "a model load is in progress"
+        if self._unloading:
+            return "an unload is in progress"
+        if self._engine is None:
+            return "nothing loaded"
+        if self._engine.generation_in_flight():
+            # Never free the model weights under an active (possibly
+            # abandoned-as-stalled) generation.
+            return "a generation is in flight"
+        if self._leases:
+            # Nor under a caller holding this engine across calls that take
+            # no _gen_lock.
+            return "the engine is leased by a turn"
+        if self._holders:
+            return f"held by {len(self._holders)} session(s)"
+        return None
+
+    def _take(self) -> ManagedEngine:
+        """Lock held by the caller, `_refusal()` just answered None: detach
+        the engine and mark the unload under way."""
+        engine, self._engine = self._engine, None
+        assert engine is not None
+        self._unloading = True
+        self._bump()
+        return engine
+
+    def _free(self, engine: ManagedEngine) -> None:
+        """Outside the lock — the weights come off the GPU over seconds."""
         try:
             engine.unload()
         finally:
@@ -762,6 +788,17 @@ class EngineManager:
                 self._unloading = False
                 self._bump()
                 self._changed.notify_all()
+
+    def unload_if_idle(self) -> bool:
+        with self._changed:
+            self._prune_holders()
+            if self._refusal() is not None or self._last_used is None:
+                return False
+            idle = self._clock() - self._last_used
+            if idle <= self._config.idle_unload_minutes * 60:
+                return False
+            engine = self._take()
+        self._free(engine)
         return True
 
     def unload_now(self) -> dict:
@@ -775,25 +812,12 @@ class EngineManager:
         the clock the sweep would have kept running."""
         with self._changed:
             self._prune_holders()
-            if self._engine is None:
-                return {"unloaded": False, "reason": "nothing loaded"}
-            if self._engine.generation_in_flight():
-                return {"unloaded": False, "reason": "a generation is in flight"}
-            if self._leases:
-                return {"unloaded": False, "reason": "the engine is leased by a turn"}
-            if self._holders:
-                return {"unloaded": False, "reason": f"held by {len(self._holders)} session(s)"}
-            engine, self._engine = self._engine, None
+            reason = self._refusal()
+            if reason is not None:
+                return {"unloaded": False, "reason": reason}
+            engine = self._take()
             self._last_used = None
-            self._unloading = True
-            self._bump()
-        try:
-            engine.unload()
-        finally:
-            with self._changed:
-                self._unloading = False
-                self._bump()
-                self._changed.notify_all()
+        self._free(engine)
         return {"unloaded": True, "reason": None}
 
     def status(self) -> dict:

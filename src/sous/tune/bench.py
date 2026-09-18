@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from sous.engine.base import Delta, EngineManager, release_mlx_thread_state
+from sous.engine.base import Delta, EngineManager, ReplaySafe, release_mlx_thread_state
 from sous.protocol import WORKER_TOOLS
 from sous.tune.arms import Arm
 
@@ -23,6 +23,8 @@ DECODE_TOKENS = 256
 _LONG_HEADROOM = 1024
 _UNLOAD_WAIT_SECONDS = 30.0
 _UNLOAD_SLACK_BYTES = 1 << 30
+_GIB = 1 << 30
+_CONTINUE = "Continue with the next function."
 # build_prompt's rough per-function token cost: each round adds enough
 # functions to close the gap to target_tokens in one step, so the final
 # overshoot is at most one function's worth rather than a doubling.
@@ -58,6 +60,11 @@ class BenchRow:
     # existed still reads as "released" on --resume.
     released: bool = True
 
+    @property
+    def key(self) -> tuple[str, str, int]:
+        """The arm this row measured — `Arm.key`, never the label."""
+        return (self.model_id, self.drafter_id, self.block_size)
+
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
 
@@ -66,6 +73,35 @@ class BenchRow:
         kwargs = {f.name: d[f.name] for f in dataclasses.fields(cls) if f.name != "released"}
         kwargs["released"] = d.get("released", True)
         return cls(**kwargs)
+
+    @classmethod
+    def failed(cls, arm: Arm, error: str) -> BenchRow:
+        return cls(
+            label=arm.label,
+            model_id=arm.model_id,
+            drafter_id=arm.drafter_id,
+            block_size=arm.block_size,
+            window=arm.window,
+            ok=False,
+            error=error,
+            load_seconds=None,
+            prefill_tps_2k=None,
+            prefill_tps_16k=None,
+            decode_tps_1k=None,
+            decode_tps_16k=None,
+            ttft_seconds=None,
+            peak_memory_bytes=None,
+            spread=None,
+        )
+
+    def with_teardown_error(self, suffix: str) -> BenchRow:
+        """The row of a finished measurement whose teardown left the weights
+        resident: `ok` stays what the measurement made it, `released` is
+        False so the run stops rather than measure a second arm beside
+        them, and the report names why."""
+        return dataclasses.replace(
+            self, error=suffix if self.ok else f"{self.error}; {suffix}", released=False
+        )
 
 
 def _code_lines(rng: random.Random, n: int, start: int) -> list[str]:
@@ -128,23 +164,35 @@ class _Turn:
         first: list[float] = []
         last: list[float] = [0.0]
         tokens: list[int] = [0]
+        retried = [False]
         started = time.monotonic()
 
         def on_delta(d: Delta) -> None:
             now = time.monotonic() - started
+            # output_tokens counts from 1 and only grows within one attempt;
+            # a count that fell back is the prompt cache's cold retry starting
+            # over, whose start this clock never saw — its timings are void,
+            # the gauges (reset per attempt) still stand.
+            if d.output_tokens <= tokens[0]:
+                retried[0] = True
             if not first:
                 first.append(now)
             last[0] = now
             tokens[0] = d.output_tokens
 
-        text = self.session.generate(messages, WORKER_TOOLS, max_tokens, self.timeout, on_delta)
+        # Accounting only — nothing this callback sees leaves the process —
+        # so a warm attempt that fails may still be retried cold.
+        text = self.session.generate(
+            messages, WORKER_TOOLS, max_tokens, self.timeout, ReplaySafe(on_delta)
+        )
         gauges = self.engine.prompt_cache_stats(owner=self.session.thread)
+        timed = bool(first) and not retried[0]
         return TurnResult(
             text=text,
             gauges=gauges,
             produced=tokens[0],
-            first_delta_seconds=first[0] if first else None,
-            last_delta_seconds=last[0] if first else None,
+            first_delta_seconds=first[0] if timed else None,
+            last_delta_seconds=last[0] if timed else None,
         )
 
 
@@ -156,10 +204,14 @@ def _rate(tokens: float | None, seconds: float | None) -> float | None:
 
 # On the text-only mlx-lm backend, once every layer's cache is trimmable,
 # PrefixCache._run fuses the rest of prefill into its one decode call and
-# never times the phases apart — prefill_seconds/prefilled_tokens stay 0 and
-# decode_seconds covers both. The VLM backend (the default model) always
-# splits them, so the gauges are used whenever they are actually populated;
-# otherwise the deltas' own wall-clock timing is the only witness left.
+# never times the phases apart — prefill_seconds stays 0 (prefilled_tokens
+# is still counted) and decode_seconds covers both. The VLM backend (the
+# default model) always splits them, so the gauges are used whenever the
+# phase timer actually ran; otherwise the deltas' own wall-clock timing is
+# the only witness left. That clock starts before the request is handed to
+# the session thread, so its prefill figure also carries the render and the
+# tokenization the gauge excludes — a bench prompt's, at most a few percent
+# of a multi-second prefill, but not the same basis.
 def _prefill_rate(gauges: dict, prompt_tokens: int, first_delta: float | None) -> float | None:
     if gauges.get("prefilled_tokens") and gauges.get("prefill_seconds"):
         return _rate(gauges["prefilled_tokens"], gauges["prefill_seconds"])
@@ -173,7 +225,32 @@ def _decode_rate(
         return _rate(produced, gauges["decode_seconds"])
     if first_delta is None or last_delta is None:
         return None
+    if produced <= 1:
+        # One token has no decode interval, but the turn did run: a
+        # measured, degenerate rate that ranks last — not an absent one that
+        # would drop the arm (and with it the baseline) from the decision.
+        return 0.0
     return _rate(produced - 1, last_delta - first_delta)
+
+
+def _continue(conversation: list[dict], answer: str) -> list[dict]:
+    return [
+        *conversation,
+        {"role": "assistant", "content": answer},
+        {"role": "user", "content": _CONTINUE},
+    ]
+
+
+def _check_drafter(arm: Arm, engine) -> None:
+    """The engine survives a drafter that fails to load by running without
+    it, which a measurement cannot: the row would carry the drafter's label
+    over undrafted numbers, and the decision could write that drafter into
+    the config. A backend that reports no drafter at all is not checked."""
+    loaded = engine.drafter
+    if loaded is not None and loaded != arm.drafter_id:
+        raise RuntimeError(
+            f"drafter {arm.drafter_id or 'none'} requested, engine runs with {loaded or 'none'}"
+        )
 
 
 def _measure(
@@ -185,14 +262,19 @@ def _measure(
     loading = time.monotonic()
     engine = manager.get()
     load_seconds = time.monotonic() - loading
-    session = engine.session()
-    turn = _Turn(engine, session, timeout)
-    count = engine.count_tokens
+    # From here the weights are resident: everything that can fail runs
+    # inside the try so the teardown below always gets to free them.
+    session = None
+    repeats = max(1, repeat)
     try:
+        _check_drafter(arm, engine)
+        session = engine.session()
+        turn = _Turn(engine, session, timeout)
+        count = engine.count_tokens
         short = build_prompt(count, SHORT_CONTEXT)
         decode_1k: list[float] = []
         ttfts: list[float] = []
-        for _ in range(max(1, repeat)):
+        for _ in range(repeats):
             result = turn.run(short, DECODE_TOKENS)
             rate = _decode_rate(
                 result.produced,
@@ -202,42 +284,44 @@ def _measure(
             )
             if rate is not None:
                 decode_1k.append(rate)
-            warm = [
-                *short,
-                {"role": "assistant", "content": result.text},
-                {"role": "user", "content": "Continue with the next function."},
-            ]
-            ttft = turn.run(warm, 8).first_delta_seconds
+            ttft = turn.run(_continue(short, result.text), 8).first_delta_seconds
             if ttft is not None:
                 ttfts.append(ttft)
         prefill_prompt = build_prompt(count, PREFILL_CONTEXT, seed=1)
-        result = turn.run(prefill_prompt, 1)
-        prefill_2k = _prefill_rate(
-            result.gauges, count(prefill_prompt, WORKER_TOOLS), result.first_delta_seconds
-        )
+        prefill_tokens = count(prefill_prompt, WORKER_TOOLS)
+        prefill_2k_samples: list[float] = []
+        for _ in range(repeats):
+            result = turn.run(prefill_prompt, 1)
+            rate = _prefill_rate(result.gauges, prefill_tokens, result.first_delta_seconds)
+            if rate is not None:
+                prefill_2k_samples.append(rate)
         long = build_prompt(count, LONG_CONTEXT, seed=2)
         long_tokens = count(long, WORKER_TOOLS)
-        prefill_16k = decode_16k = None
-        if long_tokens + DECODE_TOKENS + _LONG_HEADROOM <= arm.window:
+        prefill_16k = None
+        decode_16k: list[float] = []
+        # The 16K decode is what the decision ranks on, so it gets every
+        # repeat too; the one 16K prefill is the prefix it continues from.
+        if long_tokens + DECODE_TOKENS + _LONG_HEADROOM <= arm.serving_window:
             result = turn.run(long, 1)
             prefill_16k = _prefill_rate(result.gauges, long_tokens, result.first_delta_seconds)
-            warm = [
-                *long,
-                {"role": "assistant", "content": result.text},
-                {"role": "user", "content": "Continue with the next function."},
-            ]
-            result = turn.run(warm, DECODE_TOKENS)
-            decode_16k = _decode_rate(
-                result.produced,
-                result.gauges,
-                result.first_delta_seconds,
-                result.last_delta_seconds,
-            )
+            warm = _continue(long, result.text)
+            for _ in range(repeats):
+                result = turn.run(warm, DECODE_TOKENS)
+                rate = _decode_rate(
+                    result.produced,
+                    result.gauges,
+                    result.first_delta_seconds,
+                    result.last_delta_seconds,
+                )
+                if rate is not None:
+                    decode_16k.append(rate)
         spread = None
-        # One repeat has nothing to compare against — 0.0 would read as
+        # The spread describes the measurement the decision ranks on. One
+        # repeat has nothing to compare against — 0.0 would read as
         # "perfectly stable" rather than "unmeasured".
-        if len(decode_1k) >= 2:
-            spread = (max(decode_1k) - min(decode_1k)) / max(decode_1k)
+        deciding = decode_16k or decode_1k
+        if len(deciding) >= 2 and max(deciding) > 0:
+            spread = (max(deciding) - min(deciding)) / max(deciding)
         row = BenchRow(
             label=arm.label,
             model_id=arm.model_id,
@@ -247,32 +331,16 @@ def _measure(
             ok=True,
             error=None,
             load_seconds=load_seconds,
-            prefill_tps_2k=prefill_2k,
+            prefill_tps_2k=max(prefill_2k_samples) if prefill_2k_samples else None,
             prefill_tps_16k=prefill_16k,
             decode_tps_1k=max(decode_1k) if decode_1k else None,
-            decode_tps_16k=decode_16k,
+            decode_tps_16k=max(decode_16k) if decode_16k else None,
             ttft_seconds=min(ttfts) if ttfts else None,
             peak_memory_bytes=int(peak_memory()),
             spread=spread,
         )
     except BaseException as e:  # noqa: BLE001 — becomes the row's error
-        row = BenchRow(
-            label=arm.label,
-            model_id=arm.model_id,
-            drafter_id=arm.drafter_id,
-            block_size=arm.block_size,
-            window=arm.window,
-            ok=False,
-            error=f"{type(e).__name__}: {e}",
-            load_seconds=None,
-            prefill_tps_2k=None,
-            prefill_tps_16k=None,
-            decode_tps_1k=None,
-            decode_tps_16k=None,
-            ttft_seconds=None,
-            peak_memory_bytes=None,
-            spread=None,
-        )
+        row = BenchRow.failed(arm, f"{type(e).__name__}: {e}")
 
     # Teardown always runs, over whatever the try/except above produced: a
     # row already built in `row` can no longer be discarded by a teardown
@@ -280,31 +348,36 @@ def _measure(
     # neither can a teardown step itself raising, caught below so the row
     # survives that too.
     try:
-        session.close()
-        # A wedged generation never dequeues _CLOSE, so this can't wait for
-        # one; it only gives a healthy thread time to release its mlx state.
-        session.join(5.0)
+        if session is not None:
+            session.close()
+            # A wedged generation never dequeues _CLOSE, so this can't wait
+            # for one; it only gives a healthy thread time to release its
+            # mlx state.
+            session.join(5.0)
         released = manager.unload_now()
         if released["unloaded"]:
             deadline = time.monotonic() + _UNLOAD_WAIT_SECONDS
             while active_memory() > baseline + _UNLOAD_SLACK_BYTES and time.monotonic() < deadline:
                 time.sleep(0.2)
+            resident = active_memory() - baseline
+            if resident > _UNLOAD_SLACK_BYTES:
+                # The unload ran but the memory never came back: the same
+                # dirty machine as a refused unload, and the run must stop
+                # the same way rather than read it as clean.
+                out(f"  {arm.label}: {resident / _GIB:.1f} GiB still resident after the unload")
+                row = row.with_teardown_error(
+                    f"memory not released: {resident / _GIB:.1f} GiB still resident"
+                )
         else:
             # The weights are still resident — say so, and don't wait for
             # memory that cannot come back; the next arm's peak reading will
             # be too, and the caller must stop rather than measure a second
             # arm with two models loaded.
             out(f"  {arm.label}: model not released ({released['reason']})")
-            suffix = f"unload refused: {released['reason']}"
-            row = dataclasses.replace(
-                row, error=suffix if row.ok else f"{row.error}; {suffix}", released=False
-            )
+            row = row.with_teardown_error(f"unload refused: {released['reason']}")
     except Exception as e:  # noqa: BLE001 — the row survives; only teardown failed
         out(f"  {arm.label}: teardown failed ({type(e).__name__}: {e})")
-        suffix = f"teardown failed: {type(e).__name__}: {e}"
-        row = dataclasses.replace(
-            row, error=suffix if row.ok else f"{row.error}; {suffix}", released=False
-        )
+        row = row.with_teardown_error(f"teardown failed: {type(e).__name__}: {e}")
 
     out(f"  {arm.label}: {'done' if row.ok else 'failed'}")
     return row
@@ -368,21 +441,7 @@ def bench_arm(
     worker.join()
     result = outcome[0]
     if isinstance(result, BaseException):
-        return BenchRow(
-            label=arm.label,
-            model_id=arm.model_id,
-            drafter_id=arm.drafter_id,
-            block_size=arm.block_size,
-            window=arm.window,
-            ok=False,
-            error=f"{type(result).__name__}: {result}",
-            load_seconds=None,
-            prefill_tps_2k=None,
-            prefill_tps_16k=None,
-            decode_tps_1k=None,
-            decode_tps_16k=None,
-            ttft_seconds=None,
-            peak_memory_bytes=None,
-            spread=None,
-        )
+        # Only a failure before the load finished reaches here (_measure
+        # turns everything after it into a row), so nothing is resident.
+        return BenchRow.failed(arm, f"{type(result).__name__}: {result}")
     return result

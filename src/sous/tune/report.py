@@ -69,13 +69,19 @@ def _row_line(row: BenchRow, current_model: str) -> str:
     if not row.ok:
         return f"  {row.label:45s} failed: {row.error}{tag}"
     peak = "-" if row.peak_memory_bytes is None else gib(row.peak_memory_bytes)
-    return (
+    line = (
         f"  {row.label:45s} prefill {_fmt(row.prefill_tps_2k)}/{_fmt(row.prefill_tps_16k)} tok/s"
         f"  decode {_fmt(row.decode_tps_1k)}/{_fmt(row.decode_tps_16k)} tok/s"
         f"  ttft {_fmt(row.ttft_seconds, ' s')}  peak {peak}"
         f"  spread {_fmt(None if row.spread is None else row.spread * 100, '%', 0)}"
         f"  load {_fmt(row.load_seconds, ' s')}{tag}"
     )
+    if row.error:
+        # A finished measurement whose teardown was refused or failed: the
+        # weights stayed resident, and every arm measured after it says so
+        # here, not only on the console of the run that hit it.
+        line += f"\n      {row.error}"
+    return line
 
 
 def render_report(
@@ -105,7 +111,7 @@ def render_report(
     if table_age_days > STALE_AFTER_DAYS:
         out.append(
             f"  the candidate table is {table_age_days} days old and may be stale; "
-            "`sous tune --discover` can look for newer checkpoints"
+            "a newer sous release may list newer checkpoints, and --models measures ids of your own"
         )
     out += ["", "## Candidates", ""]
     for cp in checkpoints.values():
@@ -157,30 +163,34 @@ def config_diff(config_path: Path, changes: dict[str, dict[str, object]]) -> tup
 
 def apply_changes(config_path: Path, new_text: str, run_id: str) -> Path | None:
     backup = None
-    if config_path.is_file():
+    exists = config_path.is_file()
+    if exists:
         backup = config_path.with_name(f"{config_path.name}.bak-tune-{run_id}")
-        shutil.copyfile(config_path, backup)
+        # copy2, not copyfile: a config the user made private stays private
+        # in its backup.
+        shutil.copy2(config_path, backup)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     # Written to a temporary file first and swapped in with os.replace, which
     # is atomic on the same filesystem: a crash mid-write leaves the temp
-    # file half-written, never the real config truncated.
+    # file half-written, never the real config truncated. The swap installs
+    # a new inode, so the old file's mode is copied over first.
     tmp = config_path.with_name(f"{config_path.name}.tmp-{run_id}")
     tmp.write_text(new_text)
+    if exists:
+        shutil.copymode(config_path, tmp)
     os.replace(tmp, config_path)
     return backup
 
 
-def restart_note(changes: dict[str, dict[str, object]], *, managed: bool, label: str) -> str | None:
+def restart_note(changes: dict[str, dict[str, object]], *, managed: bool) -> str | None:
     """`server.py` reads the config once at startup and builds one
     EngineManager closed over every [model]/[gateway] value; only the
     allowlist is re-read at runtime. So every key `sous tune --quick` can
     write — not just the model id or int8_prefill — needs a restart before
     the daemon acts on it."""
+    from sous.cli import restart_hint
+
     keys = [key for section in changes.values() for key in section]
     if not keys:
         return None
-    named = ", ".join(keys)
-    if managed:
-        kickstart = f"launchctl kickstart -k gui/{os.getuid()}/{label}"
-        return f"restart the daemon to apply {named}: {kickstart}"
-    return f"restart the daemon to apply {named}: sous stop, then sous serve"
+    return f"restart the daemon to apply {', '.join(keys)}: {restart_hint(managed=managed)}"

@@ -3,9 +3,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from sous.tune.hub import (
+    LOADER_PATTERNS,
     Download,
     _cached_path,
     ask_consent,
+    confirm,
     fetch,
     is_cached,
     plan_downloads,
@@ -194,3 +196,38 @@ def test_cached_path_finds_a_sharded_checkpoint_with_no_readme(tmp_path):
 
 def test_cached_path_is_none_for_an_absent_repo(tmp_path):
     assert _cached_path("org/nope", cache_dir=tmp_path) is None
+
+
+def test_plan_asks_whether_a_repo_is_cached_once_however_many_arms_name_it():
+    asked = []
+    plan_downloads(
+        [("org/m", "candidate", "its arms")] * 4 + [("org/d", "drafter for org/m", "x")] * 3,
+        cached=lambda rid: asked.append(rid) or rid == "org/m",
+        size=lambda rid: 1,
+    )
+    assert asked == ["org/m", "org/d"]
+
+
+def test_confirm_takes_a_yes_and_nothing_else():
+    assert confirm("? ", lambda p: "y") is True
+    assert confirm("? ", lambda p: " Yes ") is True
+    assert confirm("? ", lambda p: "") is False
+
+    def eof(prompt):
+        raise EOFError
+
+    assert confirm("? ", eof) is False
+
+
+def test_fetch_downloads_only_what_the_loader_reads(monkeypatch):
+    """The consent prompt quoted the safetensors total; a repo that also
+    ships other weight formats must not cost more than that."""
+    import huggingface_hub
+
+    seen = []
+    monkeypatch.setattr(
+        huggingface_hub, "snapshot_download", lambda rid, **kw: seen.append((rid, kw))
+    )
+    fetch(["a/b"], out=lambda *a, **k: None)
+    assert seen == [("a/b", {"allow_patterns": list(LOADER_PATTERNS)})]
+    assert "*.safetensors" in LOADER_PATTERNS and "*.bin" not in LOADER_PATTERNS

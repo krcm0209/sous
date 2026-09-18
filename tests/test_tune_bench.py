@@ -3,6 +3,7 @@ import dataclasses
 import pytest
 
 from sous.config import SousConfig
+from sous.engine.base import ManagedEngine, ReplaySafe
 from sous.protocol import WORKER_TOOLS
 from sous.tune import bench
 from sous.tune.arms import Arm
@@ -37,7 +38,7 @@ def test_build_prompt_overshoots_by_less_than_ten_percent(target):
     assert counted < target * 1.1
 
 
-def _arm(tmp_path, window=131072):
+def _arm(tmp_path, window=131072, gateway_window=None):
     cfg = SousConfig(
         data_dir=tmp_path / "d",
         config_path=tmp_path / "c.toml",
@@ -52,7 +53,7 @@ def _arm(tmp_path, window=131072):
         drafter_id="z/draft",
         block_size=3,
         window=window,
-        gateway_window=None,
+        gateway_window=gateway_window,
         tier="t",
         current=True,
     )
@@ -97,6 +98,10 @@ def test_bench_arm_reads_throughput_from_the_engines_gauges(tmp_path):
     assert engines[0].unloaded is True
     # Every turn ran on the one session thread the prompt cache is scoped to.
     assert len({t for t in engines[0].generate_threads}) == 1
+    # Accounting-only callbacks, so a warm attempt that fails is retried cold.
+    assert all(isinstance(cb, ReplaySafe) for cb in engines[0].on_deltas_seen)
+    # Every repeat measures the decode the decision ranks on, the 16K one.
+    assert engines[0].max_tokens_seen.count(DECODE_TOKENS) == 4
 
 
 def test_a_small_window_skips_the_long_context_measurements(tmp_path):
@@ -281,8 +286,8 @@ def test_the_best_repeat_wins_and_the_gauges_are_read_per_owner(tmp_path):
 def test_without_gauges_the_rates_come_from_the_deltas(tmp_path):
     # Simulates the text-only mlx-lm backend once every layer's cache is
     # trimmable: prefill and decode fuse into one hooks.decode() call, so
-    # prefill_seconds/prefilled_tokens never move off 0 and decode_seconds
-    # covers the whole turn, not just decode.
+    # prefill_seconds never moves off 0 and decode_seconds covers the whole
+    # turn, not just decode.
     script: list[str] = ["|".join(["w " * 64] * 4)] * 8
 
     def factory(model_id):
@@ -305,3 +310,114 @@ def test_without_gauges_the_rates_come_from_the_deltas(tmp_path):
     # The fused gauge (decode_seconds alone, covering prefill too) must not
     # be the source of a decode-only rate.
     assert row.decode_tps_1k != DECODE_TOKENS / 0.5
+
+
+def test_a_failure_after_the_load_still_frees_the_model(tmp_path, monkeypatch):
+    """Starting the session thread can fail with the weights resident; the
+    row must say the model was not released, or the next arm loads a second
+    one beside it."""
+
+    def no_thread(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(ManagedEngine, "session", no_thread)
+    factory, engines = _fake()
+    row = bench_arm(
+        _arm(tmp_path),
+        factory=factory,
+        peak_memory=lambda: 0,
+        reset_peak=lambda: None,
+        active_memory=lambda: 0,
+        out=lambda *a, **k: None,
+    )
+    assert row.ok is False and "can't start new thread" in (row.error or "")
+    assert engines[0].unloaded is True and row.released is True
+
+
+def test_an_arm_whose_drafter_the_engine_did_not_load_fails_instead_of_mislabelling(tmp_path):
+    class Undrafted(FakeEngine):
+        drafter = ""  # the engine survived a bad drafter by running without it
+
+    engines = []
+
+    def factory(model_id):
+        e = Undrafted(["w " * DECODE_TOKENS] * 12)
+        engines.append(e)
+        return e
+
+    row = bench_arm(
+        _arm(tmp_path),
+        factory=factory,
+        peak_memory=lambda: 0,
+        reset_peak=lambda: None,
+        active_memory=lambda: 0,
+        out=lambda *a, **k: None,
+    )
+    assert row.ok is False and "drafter z/draft" in (row.error or "")
+    assert engines[0].calls == [] and engines[0].unloaded is True
+
+
+def test_the_long_context_is_measured_when_only_the_gateway_window_holds_it(tmp_path):
+    factory, engines = _fake()
+    row = bench_arm(
+        _arm(tmp_path, window=8192, gateway_window=131072),
+        factory=factory,
+        repeat=1,
+        peak_memory=lambda: 1,
+        reset_peak=lambda: None,
+        active_memory=lambda: 0,
+        out=lambda *a, **k: None,
+    )
+    assert row.ok and row.decode_tps_16k == DECODE_TOKENS / 4.0
+
+
+def test_memory_that_never_comes_back_after_the_unload_stops_the_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench, "_UNLOAD_WAIT_SECONDS", 0.0)
+    factory, _ = _fake()
+    readings = iter([0, *([3 * 2**30] * 10)])
+    lines = []
+    row = bench_arm(
+        _arm(tmp_path),
+        factory=factory,
+        repeat=1,
+        peak_memory=lambda: 0,
+        reset_peak=lambda: None,
+        active_memory=lambda: next(readings),
+        out=lambda *a, **k: lines.append(" ".join(str(x) for x in a)),
+    )
+    assert row.ok is True and row.released is False
+    assert row.error is not None and "still resident" in row.error
+    assert any("still resident" in line for line in lines)
+
+
+def test_a_turn_that_stops_after_one_token_is_a_measured_zero_not_unmeasured():
+    assert bench._decode_rate(1, {}, 0.5, 0.5) == 0.0
+    assert bench._decode_rate(0, {}, 0.5, 0.5) == 0.0
+    assert bench._decode_rate(1, {}, None, None) is None
+    assert bench._decode_rate(5, {}, 0.5, 1.5) == 4.0
+
+
+def test_a_cold_retry_voids_the_deltas_timing_but_keeps_the_count():
+    """A retried attempt's deltas count from 1 again; its start was never
+    clocked, so the fallback rates must not straddle the failed attempt."""
+
+    class Retrying(FakeEngine):
+        def generate(self, messages, tools, max_tokens, on_delta=None):
+            self.on_deltas_seen.append(on_delta)
+            text = self._take(messages, tools, max_tokens)
+            assert on_delta is not None
+            on_delta(bench.Delta("a", 1, None))
+            on_delta(bench.Delta("b", 2, None))
+            on_delta(bench.Delta("a", 1, None))  # the cold retry starts over
+            on_delta(bench.Delta("b", 2, "stop"))
+            return text
+
+    engine = ManagedEngine(Retrying(["x"]))
+    session = engine.session()
+    try:
+        result = bench._Turn(engine, session, 5.0).run([{"role": "user", "content": "x"}], 8)
+    finally:
+        session.close()
+        session.join(5.0)
+    assert result.produced == 2
+    assert result.first_delta_seconds is None and result.last_delta_seconds is None

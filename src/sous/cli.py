@@ -655,6 +655,16 @@ def _lock_is_held(data_dir: Path) -> bool:
     return False
 
 
+def restart_hint(*, managed: bool) -> str:
+    """The command that restarts the daemon — launchd's kickstart when it
+    manages the daemon, `sous stop` then `sous serve` otherwise. One spelling
+    for `sous stop`, `sous tune` and the docs: the label and the launchd
+    domain live here, not in every message that names them."""
+    if managed:
+        return f"launchctl kickstart -k gui/{os.getuid()}/{LABEL}"
+    return "sous stop, then sous serve"
+
+
 def _cmd_stop() -> None:
     config = load_config()
     # launchd first, deliberately. A KeepAlive job can be loaded while its
@@ -663,7 +673,7 @@ def _cmd_stop() -> None:
     if _launchd_loaded(LABEL):
         print("sous daemon: managed by launchd, which would restart it immediately")
         print("  remove it:  sous uninstall-launchd")
-        print(f"  restart it: launchctl kickstart -k gui/{os.getuid()}/{LABEL}")
+        print(f"  restart it: {restart_hint(managed=True)}")
         raise SystemExit(1)
     if not _port_open(config.server_port):
         print(f"sous daemon: not running (port {config.server_port})")

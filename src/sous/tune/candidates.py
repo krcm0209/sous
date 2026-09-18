@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 
-from sous.context import kv_bytes_per_token, native_max_tokens
+from sous.context import TOKEN_STEP, kv_bytes_per_token, native_max_tokens
 from sous.engine.base import fetch_model_config, select_backend
 
 # A drafter ships bf16 and sous quantizes it to 4-bit at load: 4 bits of
@@ -19,8 +19,8 @@ DRAFTER_QUANT_DIVISOR = 3.5
 # Working memory a turn needs beyond weights and KV: activations, the
 # drafter's captured hidden states, the allocator's slack.
 SLACK_BYTES = 2 * 2**30
-# mlx grows KV buffers in 256-token steps; a window is a multiple of it.
-WINDOW_STEP = 256
+# A window is a multiple of the step mlx grows KV buffers in.
+WINDOW_STEP = TOKEN_STEP
 _GIB = 1 << 30
 _GB = 10**9
 _FAST_VERIFIER_BITS = (4, 5, 8)
@@ -121,6 +121,7 @@ class Checkpoint:
     num_layers: int | None
     num_target_layers: int | None
     quant: QuantSummary
+    vocab_size: int | None = None
 
 
 def _text(config: dict) -> dict:
@@ -155,13 +156,17 @@ def describe(
         num_layers=text.get("num_hidden_layers"),
         num_target_layers=config.get("num_target_layers"),
         quant=summarize_quantization(config),
+        vocab_size=text.get("vocab_size"),
     )
 
 
 def drafter_compatible(target: Checkpoint, drafter: Checkpoint) -> tuple[bool, str]:
-    """The checks mlx-vlm's validate_drafter_compatibility makes, made here
-    before any download: a drafter reads the target's hidden states, so the
-    widths must agree and its declared target depth must be the target's."""
+    """The shape checks mlx-vlm's drafter validation makes, made here before
+    any download: a drafter reads the target's hidden states and emits its
+    tokens, so the widths and vocabularies must agree and its declared
+    target depth must be the target's. The engine survives a drafter that
+    fails the real check by running without it, which a measurement cannot
+    afford (see bench), so the refusal has to come first."""
     if drafter.hidden_size != target.hidden_size:
         return False, (
             f"hidden size {drafter.hidden_size} does not match the target's {target.hidden_size}"
@@ -170,6 +175,14 @@ def drafter_compatible(target: Checkpoint, drafter: Checkpoint) -> tuple[bool, s
         return False, (
             f"declares {drafter.num_target_layers} target layers; the target has "
             f"{target.num_layers}"
+        )
+    if (
+        drafter.vocab_size is not None
+        and target.vocab_size is not None
+        and drafter.vocab_size != target.vocab_size
+    ):
+        return False, (
+            f"vocabulary of {drafter.vocab_size} does not match the target's {target.vocab_size}"
         )
     return True, ""
 
@@ -222,7 +235,14 @@ def fit(
         f"weights {target.bytes / _GB:.1f} GB ({target.bytes / _GIB:.1f} GiB){drafter_note}"
         f" + KV {kv} B/token x {chosen} + {SLACK_BYTES / _GIB:.0f} GiB slack"
         f" = {needed / _GIB:.1f} GiB vs working set {working_set_bytes / _GIB:.1f} GiB"
-        + ("" if chosen == window else f" (window lowered from {window})")
+        # A lowered window sits within one step of the working set, and the
+        # daemon's own prompt-cache budget is the same arithmetic — what is
+        # left at that window is not enough for a fork slot.
+        + (
+            ""
+            if chosen == window
+            else f" (window lowered from {window}; little or nothing left for prompt-cache forks)"
+        )
         + ("" if fits else f"; below the {floor}-token floor")
     )
     return Fit(fits, chosen, needed, working_set_bytes, detail)

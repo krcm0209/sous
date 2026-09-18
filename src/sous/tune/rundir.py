@@ -3,6 +3,7 @@ data dir, results appended as they land so an interrupted run can resume."""
 
 from __future__ import annotations
 
+import itertools
 import json
 import time
 from collections.abc import Callable
@@ -16,10 +17,18 @@ class RunDir:
 
     @classmethod
     def new(cls, base: Path, *, clock: Callable[[], float] = time.time) -> RunDir:
-        run_id = time.strftime("%Y%m%d-%H%M%S", time.localtime(clock()))
-        path = base / run_id
-        path.mkdir(parents=True, exist_ok=True)
-        return cls(path)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(clock()))
+        # The stamp has one-second resolution and nothing serialises tune
+        # processes: two started in the same second must not share a
+        # directory, or one reads the other's rows as its own.
+        for n in itertools.count(1):
+            path = base / (stamp if n == 1 else f"{stamp}-{n}")
+            try:
+                path.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                continue
+            return cls(path)
+        raise AssertionError("unreachable")
 
     @classmethod
     def existing(cls, base: Path, run_id: str) -> RunDir:
@@ -45,8 +54,14 @@ class RunDir:
         for line in self.results.read_text().splitlines():
             if not line.strip():
                 continue
-            row = json.loads(line)
-            if row.pop("kind", None) == kind:
+            # A line a full disk or a kill cut short is a result that never
+            # landed: --resume measures that arm again rather than failing
+            # on the file it exists to read.
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.pop("kind", None) == kind:
                 out.append(row)
         return out
 

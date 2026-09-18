@@ -32,7 +32,7 @@ def _hardware(tmp_path):
     )
 
 
-def _row(label, model=M, ok=True):
+def _row(label, model=M, ok=True, error=None, released=True):
     return BenchRow(
         label=label,
         model_id=model,
@@ -40,7 +40,7 @@ def _row(label, model=M, ok=True):
         block_size=3,
         window=131072,
         ok=ok,
-        error=None if ok else "RuntimeError: boom",
+        error=error if ok else "RuntimeError: boom",
         load_seconds=5.2,
         prefill_tps_2k=479.4,
         prefill_tps_16k=401.0,
@@ -49,6 +49,7 @@ def _row(label, model=M, ok=True):
         ttft_seconds=1.1,
         peak_memory_bytes=20 * 2**30,
         spread=0.03,
+        released=released,
     )
 
 
@@ -183,7 +184,7 @@ def test_a_stale_table_and_a_missing_choice_are_said_plainly(tmp_path):
         choice=None,
         current_model=M,
     )
-    assert "stale" in text and "--discover" in text
+    assert "stale" in text and "--models" in text and "--discover" not in text
     assert "cannot recommend" in text and M in text
 
 
@@ -241,18 +242,43 @@ def test_apply_leaves_the_original_untouched_if_the_write_crashes_mid_way(tmp_pa
 
 
 def test_restart_note_fires_for_any_change_and_names_the_keys():
-    assert restart_note({}, managed=False, label="l") is None
+    assert restart_note({}, managed=False) is None
     unmanaged = restart_note(
-        {"model": {"speculative_block_size": 2, "max_context_tokens": 65536}},
-        managed=False,
-        label="com.sous.daemon",
+        {"model": {"speculative_block_size": 2, "max_context_tokens": 65536}}, managed=False
     )
     assert unmanaged is not None
     assert "speculative_block_size" in unmanaged and "max_context_tokens" in unmanaged
     assert "sous stop" in unmanaged and "sous serve" in unmanaged
-    managed = restart_note(
-        {"model": {"speculative_draft_id": ""}}, managed=True, label="com.sous.daemon"
-    )
+    managed = restart_note({"model": {"speculative_draft_id": ""}}, managed=True)
     assert managed is not None
     assert "speculative_draft_id" in managed
     assert f"launchctl kickstart -k gui/{os.getuid()}/com.sous.daemon" in managed
+
+
+def test_a_finished_row_whose_weights_stayed_resident_says_so_in_the_report(tmp_path):
+    """The bench leaves `ok` True on a measurement that finished and only
+    the teardown of which failed; the report must still carry the reason,
+    or a resumed run reads the row as clean."""
+    text = render_report(
+        hardware=_hardware(tmp_path),
+        table_age_days=1,
+        checkpoints={},
+        refusals=[],
+        rows=[_row("cur", error="unload refused: a generation is in flight", released=False)],
+        choice=None,
+        current_model=M,
+    )
+    line = text.split("## Throughput")[1]
+    assert "18.3" in line and "unload refused: a generation is in flight" in line
+
+
+def test_apply_keeps_the_configs_mode_on_the_file_and_its_backup(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nspeculative_block_size = 3\n")
+    p.chmod(0o600)
+    new, _ = config_diff(p, {"model": {"speculative_block_size": 2}})
+    backup = apply_changes(p, new, "20260918-x")
+    assert backup is not None
+    assert oct(p.stat().st_mode & 0o777) == "0o600"
+    assert oct(backup.stat().st_mode & 0o777) == "0o600"
+    assert load_config(p).speculative_block_size == 2

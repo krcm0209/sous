@@ -2,6 +2,8 @@ import argparse
 import dataclasses
 from datetime import date
 
+import pytest
+
 from sous.config import SousConfig, load_config
 from sous.tune import main
 from sous.tune.bench import BenchRow
@@ -276,3 +278,77 @@ def test_a_bench_that_raises_is_exit_1_and_keeps_finished_rows(tmp_path, capsys)
     assert "boom" in capsys.readouterr().out
     run_id = next(p.name for p in (tmp_path / "tune").iterdir())
     assert len(RunDir.existing(tmp_path / "tune", run_id).rows("bench")) == 1
+
+
+def test_a_failed_download_ends_the_run_with_a_message_not_a_traceback(tmp_path, capsys):
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D), answers=("y",))
+
+    def failing(rid):
+        raise OSError(28, "No space left on device")
+
+    deps["download"] = failing
+    assert main(_args(), config=_cfg(tmp_path), **deps) == 1
+    out = capsys.readouterr().out
+    assert "download failed" in out and "No space left" in out
+
+
+def test_a_drafter_approved_for_a_refused_model_is_not_downloaded(tmp_path, capsys):
+    """The prompts are independent, so a user may decline the 27B and accept
+    its drafter; nothing left to measure names the drafter then."""
+    deps, downloaded = _deps(tmp_path, scores={}, cached=(), answers=("n", "y", "y"))
+    code = main(_args(), config=_cfg(tmp_path), **deps)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Download #1" in out and "Download #2" in out and "Download #3" in out
+    assert downloaded == ["mlx-community/Qwen3.5-9B-MLX-4bit"]
+
+
+def test_downloads_that_exceed_the_free_disk_are_refused_before_fetching(tmp_path, capsys):
+    deps, downloaded = _deps(tmp_path, scores={}, cached=(M, D), answers=("y",))
+    hw = _hardware(tmp_path)
+    deps["detect"] = lambda: dataclasses.replace(hw, disk_free_bytes=10**9)
+    assert main(_args(), config=_cfg(tmp_path), **deps) == 2
+    assert "GiB is free" in capsys.readouterr().out and downloaded == []
+
+
+def test_the_daemon_is_asked_again_right_before_the_first_load(tmp_path, capsys):
+    """Consent and downloads take minutes; a session or a task that arrived
+    since would load beside the bench."""
+    answers = iter([Readiness(True, "no daemon"), Readiness(False, "a sous claude session holds")])
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, "mlx-community/Qwen3.5-9B-MLX-4bit"))
+    deps["ready"] = lambda port: next(answers)
+    called = []
+    deps["bench"] = lambda arm, **kw: called.append(arm)
+    assert main(_args(), config=_cfg(tmp_path), **deps) == 2
+    assert "sous claude" in capsys.readouterr().out and called == []
+
+
+def test_resume_measures_an_arm_again_when_its_window_changed(tmp_path, capsys):
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, "mlx-community/Qwen3.5-9B-MLX-4bit"))
+    seen = []
+    real = deps["bench"]
+    deps["bench"] = lambda arm, **kw: (seen.append(arm.label), real(arm, **kw))[1]
+    assert main(_args(), config=_cfg(tmp_path), **deps) == 0
+    first = list(seen)
+    run_id = sorted(p.name for p in (tmp_path / "tune").iterdir())[-1]
+    seen.clear()
+    smaller = _cfg(tmp_path, max_context_tokens=16384)
+    assert main(_args(resume=run_id), config=smaller, **deps) == 0
+    assert seen == first
+
+
+def test_resume_survives_a_torn_results_line(tmp_path, capsys):
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, "mlx-community/Qwen3.5-9B-MLX-4bit"))
+    assert main(_args(), config=_cfg(tmp_path), **deps) == 0
+    run_id = sorted(p.name for p in (tmp_path / "tune").iterdir())[-1]
+    results = tmp_path / "tune" / run_id / "results.jsonl"
+    with results.open("a") as f:
+        f.write('{"kind": "bench", "label": "torn')
+    assert main(_args(resume=run_id), config=_cfg(tmp_path), **deps) == 0
+
+
+def test_a_misspelt_collaborator_is_an_error_not_a_run_against_the_real_daemon(tmp_path):
+    deps, _ = _deps(tmp_path, scores={})
+    deps["raedy"] = deps.pop("ready")
+    with pytest.raises(TypeError):
+        main(_args(), config=_cfg(tmp_path), **deps)

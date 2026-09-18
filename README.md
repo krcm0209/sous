@@ -731,8 +731,10 @@ set and whether the GPU has tensor units, fits every curated candidate to
 memory (and prints the arithmetic for each one it refuses), lists every
 download it would need and asks about each one separately, then measures
 prefill and decode throughput of every arm through sous's own engine
-(`--repeat` sets how many attempts each arm gets, default 2 — the best
-attempt wins) — the numbers a delegated task or a gateway turn would see. It
+(`--repeat` sets how many attempts each decode and short-prefill measurement
+gets, default 2 — the best attempt wins; the one 16K prefill is the prefix
+its decode continues from) — the numbers a delegated task or a gateway turn
+would see. It
 ends with a report, a diff of `~/.sous/config.toml`, and a question:
 
 ```
@@ -743,8 +745,10 @@ Nothing is written before that yes; `--apply` applies the diff without
 asking (downloads are still asked about individually unless `--yes`, which
 answers every prompt for scripted use). A backup is kept beside the config
 file. The daemon is asked to release the model first (`POST /sous/unload`)
-and refuses while a `sous claude` session holds it or a task is running —
-the tune waits for neither, it tells you. Applied changes take effect only
+and refuses while a `sous claude` session holds it, a task is running or
+queued, or a load or unload is under way — the tune waits for none of them,
+it tells you, and it asks once more right before its first model loads.
+Applied changes take effect only
 when the daemon next starts — `sous stop`, then `sous serve` (or
 `launchctl kickstart -k gui/<uid>/<label>` for a managed one) — and the tune
 prints that exact command when a change needs it. Results and the report
