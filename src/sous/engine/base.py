@@ -764,6 +764,35 @@ class EngineManager:
                 self._changed.notify_all()
         return True
 
+    def unload_now(self) -> dict:
+        """Free the weights on request — `sous tune` needs the memory — with
+        every refusal the idle sweep makes and none of its clock: a session
+        holding the model, a leased engine or an in-flight generation each
+        keep it, and the caller learns which. `idle_seconds` reads None
+        afterwards, as after any unload."""
+        with self._changed:
+            self._prune_holders()
+            if self._engine is None:
+                return {"unloaded": False, "reason": "nothing loaded"}
+            if self._engine.generation_in_flight():
+                return {"unloaded": False, "reason": "a generation is in flight"}
+            if self._leases:
+                return {"unloaded": False, "reason": "the engine is leased by a turn"}
+            if self._holders:
+                return {"unloaded": False, "reason": f"held by {len(self._holders)} session(s)"}
+            engine, self._engine = self._engine, None
+            self._last_used = None
+            self._unloading = True
+            self._bump()
+        try:
+            engine.unload()
+        finally:
+            with self._changed:
+                self._unloading = False
+                self._bump()
+                self._changed.notify_all()
+        return {"unloaded": True, "reason": None}
+
     def status(self) -> dict:
         with self._lock:
             self._prune_holders()
