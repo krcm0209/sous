@@ -655,6 +655,16 @@ def _lock_is_held(data_dir: Path) -> bool:
     return False
 
 
+def restart_hint(*, managed: bool) -> str:
+    """The command that restarts the daemon — launchd's kickstart when it
+    manages the daemon, `sous stop` then `sous serve` otherwise. One spelling
+    for `sous stop`, `sous tune` and the docs: the label and the launchd
+    domain live here, not in every message that names them."""
+    if managed:
+        return f"launchctl kickstart -k gui/{os.getuid()}/{LABEL}"
+    return "sous stop, then sous serve"
+
+
 def _cmd_stop() -> None:
     config = load_config()
     # launchd first, deliberately. A KeepAlive job can be loaded while its
@@ -663,7 +673,7 @@ def _cmd_stop() -> None:
     if _launchd_loaded(LABEL):
         print("sous daemon: managed by launchd, which would restart it immediately")
         print("  remove it:  sous uninstall-launchd")
-        print(f"  restart it: launchctl kickstart -k gui/{os.getuid()}/{LABEL}")
+        print(f"  restart it: {restart_hint(managed=True)}")
         raise SystemExit(1)
     if not _port_open(config.server_port):
         print(f"sous daemon: not running (port {config.server_port})")
@@ -916,6 +926,19 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("mcp", help="bridge stdio to the daemon (for stdio-only MCP clients)")
     sub.add_parser("install-launchd", help="install start-at-login LaunchAgent")
     sub.add_parser("uninstall-launchd", help="remove the start-at-login LaunchAgent")
+    tune = sub.add_parser(
+        "tune",
+        help="measure this machine and propose [model] settings "
+        "(quick stage: drafter, block size, window)",
+    )
+    tune.add_argument("--quick", action="store_true", help="the throughput stage only")
+    tune.add_argument(
+        "--models", nargs="+", metavar="ID", help="candidate ids instead of the table"
+    )
+    tune.add_argument("--repeat", type=int, default=2, help="attempts per measurement (best wins)")
+    tune.add_argument("--resume", metavar="RUN_ID", help="continue a run under ~/.sous/tune")
+    tune.add_argument("--yes", action="store_true", help="approve every download and apply")
+    tune.add_argument("--apply", action="store_true", help="apply the diff without asking")
     # Registered for `sous --help` only: the verb is dispatched at the top of
     # main(), before argparse ever sees it, so there is no `claude` branch below.
     sub.add_parser(
@@ -948,3 +971,7 @@ def main(argv: list[str] | None = None) -> None:
         _cmd_install_launchd()
     elif args.command == "uninstall-launchd":
         _cmd_uninstall_launchd()
+    elif args.command == "tune":
+        from sous.tune import main as tune_main
+
+        raise SystemExit(tune_main(args))
