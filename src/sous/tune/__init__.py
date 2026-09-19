@@ -34,6 +34,13 @@ EXIT_OK, EXIT_FAILED, EXIT_REFUSED = 0, 1, 2
 _GIB = 1 << 30
 
 
+def _print_now(*args, **kwargs) -> None:
+    """The tune's progress lines must reach a redirected stdout as they
+    happen: a suite runs for hours, and a block-buffered file would show
+    nothing until the process exits."""
+    print(*args, **kwargs, flush=True)
+
+
 def _managed() -> bool:
     from sous.cli import LABEL, _launchd_loaded
 
@@ -212,7 +219,7 @@ def main(
     args: argparse.Namespace,
     *,
     config: SousConfig | None = None,
-    out: Callable[..., None] = print,
+    out: Callable[..., None] = _print_now,
     detect: Callable[[], hw_mod.Hardware] = hw_mod.detect,
     load_table: Callable[[], cand_mod.Table] = cand_mod.load_table,
     ready: Callable[[int], daemon_mod.Readiness] = daemon_mod.ready_for_tune,

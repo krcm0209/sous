@@ -631,3 +631,16 @@ def test_a_daemon_that_gets_busy_mid_suite_stops_with_the_resume_hint(tmp_path, 
     out = capsys.readouterr().out
     assert "held by 1 session(s)" in out
     assert "--resume" in out
+
+
+def test_progress_lines_are_flushed_as_they_are_printed(monkeypatch):
+    from sous.tune import _print_now
+
+    recorded = []
+
+    def recording_print(*args, **kwargs):
+        recorded.append(kwargs)
+
+    monkeypatch.setattr("builtins.print", recording_print)
+    _print_now("x")
+    assert recorded == [{"flush": True}]
