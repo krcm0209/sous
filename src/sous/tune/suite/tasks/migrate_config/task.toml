@@ -1,8 +1,9 @@
 title = "Migrate the INI configs to JSON"
 category = "mechanical-sweep"
-instructions = """Migrate the configuration files from INI to JSON. For each configs/<name>.ini \
-write configs/<name>.json holding the same sections and keys — each section an object, every \
-value the string configparser reads (port "8080" stays a string) — then delete the .ini file. \
-Change settings.load to read configs/<name>.json instead, returning the same nested dict it \
-returns today. There are three files: alpha, beta and gamma."""
+instructions = """Migrate the configuration files from INI to JSON. For each configs/<name>.ini write \
+configs/<name>.json holding the same sections and keys — each section an object, every \
+value the string configparser reads (port "8080" stays a string). Change settings.load to \
+read configs/<name>.json instead of the .ini file, returning the same nested dict it returns \
+today, and stop importing configparser. Leave the .ini files in place. There are three \
+files: alpha, beta and gamma."""
 context_files = ["settings.py", "configs/alpha.ini"]

@@ -30,6 +30,9 @@ Rules the loader and CI enforce (`tests/test_tune_suite.py`):
 - Standard library only, in the fixture, the grader and the solution: an end
   user's machine has nothing else, and the worker's allowlist is the shipped
   one plus `python -m unittest`.
+- A task must never require deleting, moving or renaming a file: the worker's tools
+  read, write and edit files and run allowlisted commands, and neither `rm` nor `mv`
+  is allowlisted. Ask for a rewrite, or say "leave the old file in place".
 - Allowlisting `python -m unittest` runs the worker's own code on your
   machine, like every other test runner in the shipped allowlist; the
   sandbox confines the worker's file tools, not what its tests execute.
