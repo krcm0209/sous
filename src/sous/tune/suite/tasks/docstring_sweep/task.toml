@@ -1,0 +1,6 @@
+title = "Docstring sweep over shapes.py"
+category = "mechanical-sweep"
+instructions = """Add a one-line docstring to every public function in shapes.py that has none. \
+Leave the functions that already have a docstring, the private helper, every signature and \
+every line of behaviour exactly as they are. Do not add or remove any other file."""
+context_files = ["shapes.py"]

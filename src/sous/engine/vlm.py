@@ -62,7 +62,6 @@ class VLMEngine:
         int8_prefill: bool = False,
     ):
         from mlx_vlm import load
-        from mlx_vlm.sample_utils import make_sampler
 
         from sous.engine import int8prefill
         from sous.engine.base import measure_cache_budget
@@ -77,7 +76,7 @@ class VLMEngine:
         # Before the drafter loads (so it is never tagged) and before the cache
         # budget is measured (so warm-up temporaries are already released).
         self.int8_prefill_status = int8prefill.enable(self._model, enabled=int8_prefill)
-        self._sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
+        self._sampler = self._make_sampler(temperature=temperature, top_p=top_p, top_k=top_k)
         self._memo = PromptMemo()
         self._tokenize_lock = threading.Lock()
         self._draft = None
@@ -102,6 +101,18 @@ class VLMEngine:
         self._cache = PrefixCache(
             self, enabled=prompt_cache, max_bytes=cache_budget, reserve_bytes=reserve_bytes
         )
+
+    @staticmethod
+    def _make_sampler(*, temperature: float, top_p: float, top_k: int):
+        """None at temperature 0: mlx-vlm's generate_step treats no sampler
+        plus temperature 0 as greedy, and only then does the speculative walk
+        take its exact-match verify; an argmax sampler is a callable like any
+        other and gets the sampled path (#87)."""
+        if temperature == 0:
+            return None
+        from mlx_vlm.sample_utils import make_sampler
+
+        return make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
 
     @property
     def positions(self) -> str:
@@ -299,6 +310,14 @@ class VLMEngine:
         tokenizer = getattr(processor, "tokenizer", processor)
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
         chunks: list[str] = []
+        # No sampler means greedy to generate_step only together with an
+        # explicit temperature of 0; the configured sampler needs no
+        # temperature at all.
+        sampling = (
+            {"sampler": None, "temperature": 0}
+            if self._sampler is None
+            else {"sampler": self._sampler}
+        )
         # prompt_cache plus input_ids, not prompt_cache_state: sous owns the
         # cache outright rather than driving mlx-vlm's reuse path, and so
         # also owns the positions the suffix is encoded at (_positions).
@@ -307,11 +326,11 @@ class VLMEngine:
             processor,
             "",
             max_tokens=max_tokens,
-            sampler=self._sampler,
             verbose=False,
             prompt_cache=cache,
             input_ids=mx.array(token_ids)[None],
             **self._positions(cache, len(token_ids)),
+            **sampling,
             **draft_kwargs,
         ):
             # Draft rows are the speculator's proposals, not accepted output;

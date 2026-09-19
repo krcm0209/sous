@@ -23,6 +23,14 @@ DECODE_TOKENS = 256
 _LONG_HEADROOM = 1024
 _UNLOAD_WAIT_SECONDS = 30.0
 _UNLOAD_SLACK_BYTES = 1 << 30
+# A budget-exhausted run abandons its generation, but MLX generation is
+# synchronous and uninterruptible (ManagedEngine._gen_lock): the engine's
+# session thread keeps decoding until it reaches its token cap, minutes on a
+# slow model. The weights cannot be freed before that ends, and stopping the
+# whole tune run over one arm's last, still-running generation would discard
+# hours of already-measured results — so release() waits it out instead.
+_INFLIGHT_WAIT_SECONDS = 900.0
+_INFLIGHT_POLL_SECONDS = 2.0
 _GIB = 1 << 30
 _CONTINUE = "Continue with the next function."
 # build_prompt's rough per-function token cost: each round adds enough
@@ -254,6 +262,61 @@ def _check_drafter(arm: Arm, engine) -> None:
         )
 
 
+def release(
+    manager: EngineManager,
+    session,
+    *,
+    baseline: int,
+    active_memory: Callable[[], int],
+    label: str,
+    out: Callable[..., None],
+) -> str | None:
+    """Free one arm's engine: the text of what went wrong when the weights
+    stayed resident (a refused unload, memory that never came back, a
+    teardown step that raised), None when they were freed. Never raises —
+    the caller's measurement must survive its own teardown — and the run
+    must stop on any text, because the next arm's peak-memory reading would
+    be two models' worth."""
+    try:
+        if session is not None:
+            session.close()
+            # A wedged generation never dequeues _CLOSE, so this can't wait
+            # for one; it only gives a healthy thread time to release its
+            # mlx state.
+            session.join(5.0)
+        released = manager.unload_now()
+        inflight_deadline = time.monotonic() + _INFLIGHT_WAIT_SECONDS
+        waited = False
+        while (
+            not released["unloaded"]
+            and released["reason"] == "a generation is in flight"
+            and time.monotonic() < inflight_deadline
+        ):
+            if not waited:
+                out(f"  {label}: waiting for an abandoned generation to end before the unload")
+                waited = True
+            time.sleep(_INFLIGHT_POLL_SECONDS)
+            released = manager.unload_now()
+        if not released["unloaded"]:
+            # The weights are still resident — say so, and don't wait for
+            # memory that cannot come back.
+            out(f"  {label}: model not released ({released['reason']})")
+            return f"unload refused: {released['reason']}"
+        deadline = time.monotonic() + _UNLOAD_WAIT_SECONDS
+        while active_memory() > baseline + _UNLOAD_SLACK_BYTES and time.monotonic() < deadline:
+            time.sleep(0.2)
+        resident = active_memory() - baseline
+        if resident > _UNLOAD_SLACK_BYTES:
+            # The unload ran but the memory never came back: the same dirty
+            # machine as a refused unload.
+            out(f"  {label}: {resident / _GIB:.1f} GiB still resident after the unload")
+            return f"memory not released: {resident / _GIB:.1f} GiB still resident"
+        return None
+    except Exception as e:  # noqa: BLE001 — the caller's row survives; only teardown failed
+        out(f"  {label}: teardown failed ({type(e).__name__}: {e})")
+        return f"teardown failed: {type(e).__name__}: {e}"
+
+
 def _measure(
     arm: Arm, repeat: int, factory, timeout: float, peak_memory, reset_peak, active_memory, out
 ) -> BenchRow:
@@ -345,40 +408,12 @@ def _measure(
 
     # Teardown always runs, over whatever the try/except above produced: a
     # row already built in `row` can no longer be discarded by a teardown
-    # problem the way a bare `finally` that returned from `try` could — and
-    # neither can a teardown step itself raising, caught below so the row
-    # survives that too.
-    try:
-        if session is not None:
-            session.close()
-            # A wedged generation never dequeues _CLOSE, so this can't wait
-            # for one; it only gives a healthy thread time to release its
-            # mlx state.
-            session.join(5.0)
-        released = manager.unload_now()
-        if released["unloaded"]:
-            deadline = time.monotonic() + _UNLOAD_WAIT_SECONDS
-            while active_memory() > baseline + _UNLOAD_SLACK_BYTES and time.monotonic() < deadline:
-                time.sleep(0.2)
-            resident = active_memory() - baseline
-            if resident > _UNLOAD_SLACK_BYTES:
-                # The unload ran but the memory never came back: the same
-                # dirty machine as a refused unload, and the run must stop
-                # the same way rather than read it as clean.
-                out(f"  {arm.label}: {resident / _GIB:.1f} GiB still resident after the unload")
-                row = row.with_teardown_error(
-                    f"memory not released: {resident / _GIB:.1f} GiB still resident"
-                )
-        else:
-            # The weights are still resident — say so, and don't wait for
-            # memory that cannot come back; the next arm's peak reading will
-            # be too, and the caller must stop rather than measure a second
-            # arm with two models loaded.
-            out(f"  {arm.label}: model not released ({released['reason']})")
-            row = row.with_teardown_error(f"unload refused: {released['reason']}")
-    except Exception as e:  # noqa: BLE001 — the row survives; only teardown failed
-        out(f"  {arm.label}: teardown failed ({type(e).__name__}: {e})")
-        row = row.with_teardown_error(f"teardown failed: {type(e).__name__}: {e}")
+    # problem the way a bare `finally` that returned from `try` could.
+    error = release(
+        manager, session, baseline=baseline, active_memory=active_memory, label=arm.label, out=out
+    )
+    if error is not None:
+        row = row.with_teardown_error(error)
 
     out(f"  {arm.label}: {'done' if row.ok else 'failed'}")
     return row

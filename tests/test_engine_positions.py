@@ -63,7 +63,7 @@ def _engine(model: _Model, positional: bool = True) -> VLMEngine:
     engine._processor = types.SimpleNamespace(  # ty: ignore[invalid-assignment]
         tokenizer=types.SimpleNamespace(stopping_criteria=stopping)
     )
-    engine._sampler = object()  # ty: ignore[invalid-assignment]
+    engine._sampler = object()
     engine._positional = positional
     engine._memo = PromptMemo()
     engine._tokenize_lock = threading.Lock()

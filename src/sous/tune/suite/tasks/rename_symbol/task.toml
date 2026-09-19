@@ -1,0 +1,8 @@
+title = "Rename ItemStore to InventoryStore"
+category = "cross-file-refactor"
+instructions = """Rename the class ItemStore to InventoryStore everywhere in this project: its \
+definition in store.py, and every import and use in report.py, cli.py and tests/test_store.py. \
+Change nothing else — no behaviour, no other names. Run `python -m unittest discover -s tests` \
+and make sure it passes before you finish."""
+context_files = ["store.py"]
+verify_commands = ["python -m unittest discover -s tests"]

@@ -1,0 +1,9 @@
+{
+  "server": {
+    "host": "gamma.local",
+    "port": "9000"
+  },
+  "limits": {
+    "retries": "1"
+  }
+}

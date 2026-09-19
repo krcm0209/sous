@@ -1,0 +1,9 @@
+title = "A dataclass from a JSON schema"
+category = "codegen"
+instructions = """Write record.py: a dataclass named Record generated from schema.json. One field \
+per property, in the schema's order, with the matching Python type (integer -> int, string -> str, \
+boolean -> bool, an array of strings -> list[str], number -> float). Required properties have no \
+default; an optional one defaults to the schema's default when it gives one, else to None. Add a \
+classmethod from_dict(data) that raises ValueError when a required key is missing, and a method \
+to_dict() returning a plain dict that from_dict accepts back unchanged. Standard library only."""
+context_files = ["schema.json"]

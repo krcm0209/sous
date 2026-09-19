@@ -114,7 +114,8 @@ sous wait <task-id>     # block until a task finishes or needs approval
 sous claude             # Claude Code with local subagents (gateway mode, below)
 sous stop               # stop it (see below)
 sous uninstall-launchd  # stop it starting at login, and remove the agent
-sous tune --quick       # measure this machine and propose settings (see Tuning)
+sous tune               # grade the candidates on this machine and propose settings (see Tuning)
+sous tune --quick       # the throughput stage only, in about 15 minutes
 ```
 
 `sous stop` deliberately refuses when launchd is managing the daemon, because
@@ -553,7 +554,8 @@ speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
 speculative_block_size = 3
 # `sous tune --quick` may rewrite speculative_draft_id, speculative_block_size
 # and max_context_tokens (and [gateway].max_context_tokens) after showing you
-# the diff; it never changes id or int8_prefill.
+# the diff; the full `sous tune` may also rewrite id, int8_prefill and
+# temperature, each only when its suite run earned it.
 
 # INT8-activation prefill on the M5 tensor units (M5-family or newer, macOS
 # 26.2+; warns once and prefills stock elsewhere). ~1.4x prefill on the default
@@ -723,46 +725,78 @@ still argmaxes to the same wrong output every time.
 
 ## Tuning
 
-`sous tune` runs its quick stage only in this version — pass `--quick`, or it
-refuses and says so. It measures this machine and proposes the `[model]`
-settings that cannot change what the model says: the drafter, its block
-size, and a context window that fits. It detects the chip, the Metal working
-set and whether the GPU has tensor units, fits every curated candidate to
-memory (and prints the arithmetic for each one it refuses), lists every
-download it would need and asks about each one separately, then measures
-prefill and decode throughput of every arm through sous's own engine
-(`--repeat` sets how many attempts each decode and short-prefill measurement
-gets, default 2 — the best attempt wins; the one 16K prefill is the prefix
-its decode continues from) — the numbers a delegated task or a gateway turn
-would see. It
-ends with a report, a diff of `~/.sous/config.toml`, and a question:
+`sous tune` chooses the model and the `[model]` settings for the machine it
+runs on, so you never read a tok/s table or a quantization format. It ends
+with a report, a unified diff of `~/.sous/config.toml`, and a question:
 
 ```
 Apply these changes to ~/.sous/config.toml? [y/N]
 ```
 
-Nothing is written before that yes; `--apply` applies the diff without
-asking (downloads are still asked about individually unless `--yes`, which
-answers every prompt for scripted use). A backup is kept beside the config
-file. The daemon is asked to release the model first (`POST /sous/unload`)
-and refuses while a `sous claude` session holds it, a task is running or
-queued, or a load or unload is under way — the tune waits for none of them,
-it tells you, and it asks once more right before its first model loads.
-Applied changes take effect only
-when the daemon next starts — `sous stop`, then `sous serve` (or
-`launchctl kickstart -k gui/<uid>/<label>` for a managed one) — and the tune
-prints that exact command when a change needs it. Results and the report
-land under `~/.sous/tune/<run-id>/`; `--resume <run-id>` continues an
-interrupted run, `--models ID ...` measures ids of your own. Other models
-than the configured one are measured and reported with a "quality untested"
-label; only the full run (a later release) may propose a model change.
+Nothing is written before that yes; a backup is kept beside the config file,
+and the tune prints the daemon-restart command every applied change needs
+(`sous stop`, then `sous serve`, or `launchctl kickstart -k gui/<uid>/<label>`
+for a managed daemon — the daemon reads `[model]` once at startup).
+
+**`sous tune --quick`** (about 15 minutes on an M5 Pro for three fitting
+candidates) detects the chip, the Metal working set and whether the GPU has
+tensor units, fits every curated candidate to memory (printing the
+arithmetic for each one it refuses), asks about every download it would need
+one by one, then measures prefill and decode throughput of every arm — a
+model, a drafter or none, a block size — through sous's own engine
+(`--repeat` sets the attempts per measurement, default 2; the best wins and
+the spread is printed). It proposes only the settings that cannot change
+what the model says: the drafter, its block size, and a window that fits.
+Other models are measured and reported with a "quality untested" label; a
+quick run never changes the model.
+
+**`sous tune`** (about three hours on an M5 Pro for three fitting models; the
+estimate is printed after the quick stage from the measured speeds and covers
+the model stage; the winner stage adds up to two arms of the same size) does
+all of the above, then grades the candidates: for each model's fastest
+quality-neutral arm, and for your current configuration, it runs a suite of
+eight mechanical coding tasks — implement a module from its spec, write
+tests for one, a docstring sweep, a cross-file rename, a bug fix, a dataclass
+from a JSON schema, a CLI flag, a config-format migration — through the real
+worker loop, under the real sandbox with the shipped allowlist plus
+`python -m unittest`, denying every approval request. Each run is scored by a
+hidden grader (`--runs` sets the runs per task, default 2). The rule, printed
+in full with every number:
+
+- the **reference** is your current configuration when it fits this machine,
+  else the fastest arm of the largest tier that does;
+- an arm is **eligible** when its mean grade is within 0.05 of the
+  reference's, it completed at least as many runs as the reference minus one
+  task's worth, and it looped on a tool no more often;
+- the **winner** is the eligible arm with the lowest total suite wall time
+  (a tie goes to the smaller memory footprint).
+
+On the winner, the same rule then judges one extra arm per quality-affecting
+setting: INT8 prefill (where the tensor units and the checkpoint allow it)
+and greedy sampling (`temperature = 0`, which also lets the drafter's
+exact-match verify run). A setting lands in the diff only when its own
+measured arm is eligible and faster — that is why there is no `--greedy`
+flag to understand. The full run may therefore change `[model].id`, the
+drafter and block size, the windows, `int8_prefill` and `temperature`.
+
+The daemon is asked to release the model first (`POST /sous/unload`) and
+refuses while a `sous claude` session holds it, a task is running or queued, or
+a load or unload is under way — the tune waits for none of them, it tells you,
+and it asks again right before its first bench load and before every model the
+suite loads. Results (`results.jsonl` with every bench row and suite run,
+`hardware.json`, `report.md`, and each suite run's project and transcript under
+`suite/`) land in `~/.sous/tune/<run-id>/`; `--resume <run-id>` continues an
+interrupted run from the rows it already has; `--models ID ...` measures ids of
+your own; `--yes` answers every prompt for scripted use, `--apply` skips only
+the final one. Adding a suite task or a curated candidate is described in
+[docs/tuning.md](docs/tuning.md).
 
 ## Smaller machines
 
-`sous tune --quick` tells you what fits and how fast it runs here; the table
-below is the fallback for a machine that cannot reach the Hub. The
-alternative shares the default's `qwen3_5` architecture, so it loads
-through the exact same mlx-vlm path — edit `[model].id` in
+`sous tune` tells you what fits and grades it here (`--quick` measures
+throughput only); the table below is the fallback for a machine that cannot
+reach the Hub. The alternative shares the default's `qwen3_5` architecture,
+so it loads through the exact same mlx-vlm path — edit `[model].id` in
 `~/.sous/config.toml` and the next delegation downloads and uses it.
 
 | Unified memory | `[model].id` | Weights |

@@ -33,6 +33,18 @@ class Arm:
     # reservation made for a drafter its configuration never loads.
     fit_window: int | None = None
     fit_gateway_window: int | None = None
+    # The quality-affecting dimensions the winner stage measures, mirrored
+    # from `config` so a row can be keyed without reading the config back.
+    int8_prefill: bool = False
+    greedy: bool = False
+    # True only for the winner stage's own int8 arm, built to *measure*
+    # INT8 prefill: the engine refusing it must fail that arm. Every other
+    # arm's int8_prefill is merely inherited from the user's config (every
+    # quick_arms arm mirrors it) — the daemon would run that arm's
+    # checkpoint on the stock path with one warning rather than refuse it,
+    # so the suite runner must do the same instead of treating an inherited
+    # setting as a hard requirement.
+    int8_under_test: bool = False
 
     @property
     def key(self) -> tuple[str, str, int]:
@@ -40,6 +52,12 @@ class Arm:
         label is for people: two orgs' checkpoints with one repo basename
         share it."""
         return (self.model_id, self.drafter_id, self.block_size)
+
+    @property
+    def suite_key(self) -> tuple[str, str, int, bool, bool]:
+        """What identifies an arm across suite runs and a resume: the bench
+        key plus the two settings only the suite may change."""
+        return (*self.key, self.int8_prefill, self.greedy)
 
     @property
     def serving_window(self) -> int:
@@ -129,6 +147,8 @@ def _arm(
         fit_gateway_window=(
             min(user.gateway_max_context_tokens, own.window) if user.gateway_enabled else None
         ),
+        int8_prefill=user.int8_prefill,
+        greedy=user.temperature == 0,
     )
 
 
@@ -220,3 +240,39 @@ def quick_arms(
             for block in blocks:
                 arms.append(_arm(user, cand, drafter.id, block, f, gateway_window, own))
     return arms, refusals
+
+
+def winner_stage_arms(winner: Arm, *, nax: bool, checkpoint: Checkpoint) -> list[Arm]:
+    """One extra arm per quality-affecting setting the winner does not have
+    yet: INT8 prefill where the tensor units and the checkpoint's quantization
+    allow it (the engine refuses anything else with a status, and the arm
+    would measure the stock path under the int8 label), and greedy sampling
+    for a winner that samples. Each is judged on its own against the winner."""
+    from sous.engine.int8prefill import SUPPORTED_MODEL_TYPES
+
+    arms: list[Arm] = []
+    routable = (
+        nax and checkpoint.model_type in SUPPORTED_MODEL_TYPES and checkpoint.quant.int8_routable
+    )
+    if routable and not winner.int8_prefill:
+        arms.append(
+            dataclasses.replace(
+                winner,
+                label=f"{winner.label} + int8 prefill",
+                config=dataclasses.replace(winner.config, int8_prefill=True),
+                current=False,
+                int8_prefill=True,
+                int8_under_test=True,
+            )
+        )
+    if not winner.greedy:
+        arms.append(
+            dataclasses.replace(
+                winner,
+                label=f"{winner.label} greedy",
+                config=dataclasses.replace(winner.config, temperature=0.0),
+                current=False,
+                greedy=True,
+            )
+        )
+    return arms
