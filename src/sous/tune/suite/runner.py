@@ -31,7 +31,13 @@ from sous.engine.base import (
 )
 from sous.tasks import TaskState, TaskStore
 from sous.tune.arms import Arm
-from sous.tune.bench import BenchRow, _active_memory, _check_drafter, release
+from sous.tune.bench import (
+    _INFLIGHT_WAIT_SECONDS,
+    BenchRow,
+    _active_memory,
+    _check_drafter,
+    release,
+)
 from sous.tune.suite import SuiteTask
 from sous.tune.suite.grading import grade_task
 from sous.worker import run_task
@@ -392,6 +398,32 @@ def _slug(label: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in label)
 
 
+_DRAIN_POLL_SECONDS = 1.0
+
+
+def _drain(
+    engine: ManagedEngine,
+    *,
+    label: str,
+    out: Callable[..., None],
+    wait: float = _INFLIGHT_WAIT_SECONDS,
+) -> None:
+    """Wait out this run's own abandoned generation before the next run's
+    budget clock starts. run_task can give up on a stalled generation at its
+    wall-clock deadline (recorded budget-exhausted) while the engine's
+    session thread keeps decoding under ManagedEngine._gen_lock until it
+    reaches its token cap — minutes on a slow model. Left alone, the next
+    run's first generate() would block on that lock for free, spending its
+    own budget waiting rather than doing anything."""
+    deadline = time.monotonic() + wait
+    waited = False
+    while engine.generation_in_flight() and time.monotonic() < deadline:
+        if not waited:
+            out(f"  {label}: waiting for an abandoned generation to end before the next run")
+            waited = True
+        time.sleep(_DRAIN_POLL_SECONDS)
+
+
 def _run_suite(
     arm: Arm,
     tasks: list[SuiteTask],
@@ -456,6 +488,10 @@ def _run_suite(
                         )
                     except Exception as e:  # noqa: BLE001 — one run's failure, recorded; goes on
                         result = _error_run(task, index, arm, f"{type(e).__name__}: {e}")
+                    # Before record(): a budget-exhausted run's generation can
+                    # still be decoding under the engine's lock, and the next
+                    # run's own budget clock must not start against it.
+                    _drain(engine, label=arm.label, out=out)
                     # Appended before record() runs, so a run already
                     # finished is kept even when the callback itself raises.
                     results.append(result)

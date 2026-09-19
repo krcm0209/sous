@@ -1,4 +1,5 @@
 import dataclasses
+import threading
 
 import pytest
 
@@ -165,6 +166,10 @@ def test_a_refused_unload_is_recorded_and_skips_the_settle_wait(tmp_path, monkey
         "unload_now",
         lambda self: {"unloaded": False, "reason": "a generation is in flight"},
     )
+    # This refusal never clears, so without a bound release() would retry it
+    # for the full _INFLIGHT_WAIT_SECONDS instead of the settle-wait this
+    # test is about.
+    monkeypatch.setattr(bench, "_INFLIGHT_WAIT_SECONDS", 0.0)
     factory, _ = _fake()
     memory_calls = []
 
@@ -493,3 +498,41 @@ def test_release_reports_memory_that_never_comes_back(tmp_path, monkeypatch):
     )
     assert error == "memory not released: 3.0 GiB still resident"
     assert engine.unloaded
+
+
+def test_release_waits_for_an_in_flight_generation_then_unloads(tmp_path, monkeypatch):
+    """A budget-exhausted run's generation keeps decoding under _gen_lock
+    after run_task gives up on it (MLX generation is synchronous and
+    uninterruptible). release() must wait that out rather than stop the
+    whole tune run over a model that would have freed itself a moment
+    later."""
+    engine = FakeEngine([])
+    manager = EngineManager(_arm(tmp_path).config, engine_factory=lambda mid: engine)
+    managed = manager.get()
+    managed._gen_lock.acquire()
+    threading.Timer(0.1, managed._gen_lock.release).start()
+    monkeypatch.setattr(bench, "_INFLIGHT_WAIT_SECONDS", 5.0)
+    monkeypatch.setattr(bench, "_INFLIGHT_POLL_SECONDS", 0.02)
+    lines = []
+    error = release(manager, None, baseline=0, active_memory=lambda: 0, label="m", out=lines.append)
+    assert error is None
+    assert engine.unloaded
+    assert manager.status()["loaded"] is False
+    waiting = [line for line in lines if "waiting for an abandoned generation" in line]
+    assert waiting == ["  m: waiting for an abandoned generation to end before the unload"]
+
+
+def test_release_gives_up_on_a_generation_that_never_ends(tmp_path, monkeypatch):
+    engine = FakeEngine([])
+    manager = EngineManager(_arm(tmp_path).config, engine_factory=lambda mid: engine)
+    managed = manager.get()
+    managed._gen_lock.acquire()
+    monkeypatch.setattr(bench, "_INFLIGHT_WAIT_SECONDS", 0.0)
+    try:
+        error = release(
+            manager, None, baseline=0, active_memory=lambda: 0, label="m", out=lambda *a: None
+        )
+    finally:
+        managed._gen_lock.release()
+    assert error == "unload refused: a generation is in flight"
+    assert not engine.unloaded

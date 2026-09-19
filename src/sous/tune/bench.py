@@ -23,6 +23,14 @@ DECODE_TOKENS = 256
 _LONG_HEADROOM = 1024
 _UNLOAD_WAIT_SECONDS = 30.0
 _UNLOAD_SLACK_BYTES = 1 << 30
+# A budget-exhausted run abandons its generation, but MLX generation is
+# synchronous and uninterruptible (ManagedEngine._gen_lock): the engine's
+# session thread keeps decoding until it reaches its token cap, minutes on a
+# slow model. The weights cannot be freed before that ends, and stopping the
+# whole tune run over one arm's last, still-running generation would discard
+# hours of already-measured results — so release() waits it out instead.
+_INFLIGHT_WAIT_SECONDS = 900.0
+_INFLIGHT_POLL_SECONDS = 2.0
 _GIB = 1 << 30
 _CONTINUE = "Continue with the next function."
 # build_prompt's rough per-function token cost: each round adds enough
@@ -277,6 +285,18 @@ def release(
             # mlx state.
             session.join(5.0)
         released = manager.unload_now()
+        inflight_deadline = time.monotonic() + _INFLIGHT_WAIT_SECONDS
+        waited = False
+        while (
+            not released["unloaded"]
+            and released["reason"] == "a generation is in flight"
+            and time.monotonic() < inflight_deadline
+        ):
+            if not waited:
+                out(f"  {label}: waiting for an abandoned generation to end before the unload")
+                waited = True
+            time.sleep(_INFLIGHT_POLL_SECONDS)
+            released = manager.unload_now()
         if not released["unloaded"]:
             # The weights are still resident — say so, and don't wait for
             # memory that cannot come back.

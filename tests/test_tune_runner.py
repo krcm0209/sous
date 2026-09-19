@@ -228,6 +228,48 @@ def test_run_suite_loads_once_runs_what_is_not_done_records_in_order_and_release
     assert (tmp_path / "scratch" / "m" / "implement_rpn-3" / "project" / "rpn.py").is_file()
 
 
+def test_the_next_run_waits_for_an_abandoned_generation(tmp_path, monkeypatch):
+    """run_task can give up on a stalled generation (budget-exhausted) at
+    its own wall-clock deadline while the engine's session thread keeps
+    decoding under ManagedEngine._gen_lock until it hits its token cap. The
+    next run's own budget clock must not start against a locked engine."""
+    from sous.tune.suite import runner
+
+    task = _task()
+    inner = FakeEngine([FINISH, FINISH])
+    real_run_one = runner.run_one
+
+    def run_one_then_hold(task, index, arm, engine, counting, scratch, **kwargs):
+        result = real_run_one(task, index, arm, engine, counting, scratch, **kwargs)
+        if index == 0:
+            # run_one has already returned (as run_task does on budget
+            # exhaustion), but the engine's session thread is simulated as
+            # still decoding underneath, holding the lock a while longer.
+            engine._gen_lock.acquire()
+            threading.Timer(0.1, engine._gen_lock.release).start()
+        return result
+
+    monkeypatch.setattr(runner, "run_one", run_one_then_hold)
+    monkeypatch.setattr(runner, "_DRAIN_POLL_SECONDS", 0.02)
+    lines = []
+    outcome = run_suite(
+        _arm(tmp_path),
+        [task],
+        runs=2,
+        done=set(),
+        record=lambda r: None,
+        scratch=tmp_path / "scratch",
+        out=lines.append,
+        factory=lambda mid: inner,
+        python=PYTHON,
+        active_memory=lambda: 0,
+    )
+    assert [r.state for r in outcome.runs] == ["done", "done"]
+    assert outcome.released and outcome.error is None
+    waiting = [line for line in lines if "waiting for an abandoned generation" in line]
+    assert waiting == ["  m: waiting for an abandoned generation to end before the next run"]
+
+
 def test_run_suite_runs_on_a_thread_of_its_own(tmp_path):
     task = _task()
     names = []
