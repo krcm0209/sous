@@ -76,6 +76,7 @@ recommends is cost without benefit.
 | `SousConfig.gateway_*` fields | `local_models`, `max_context_tokens`, `generation_timeout_minutes`, `upstream_url`; `gateway_enabled` deleted |
 | `tests/test_gateway_*.py` | `tests/test_api_*.py` |
 | `scripts/e2e_smoke.py` | `scripts/api_smoke.py` (rewritten, see Scripts) |
+| `protocol.py: WORKER_TOOLS`, `worker.py: SYSTEM_TEMPLATE` | `tune/payload.py` (see Tune) |
 
 ### Untouched
 
@@ -191,10 +192,12 @@ about tasks. Only the `sous` console script remains in `pyproject.toml`.
 PR #107 (`sous tune` full mode) merges before this work starts; this branch
 is cut from `main` afterwards. Changes:
 
-- `tune/bench.py` gets its synthetic tool array from a new `tune/payload.py`
-  instead of the worker's `WORKER_TOOLS`; the payload is a fixed array of
-  eight tool schemas whose rendered token count a test pins, so bench numbers
-  stay comparable across runs.
+- `tune/payload.py` takes over the worker's eight-tool schema
+  (`protocol.WORKER_TOOLS`) and its system prompt (`worker.SYSTEM_TEMPLATE`)
+  as tune's fixtures. `tune/bench.py` reads the schema from there; a test
+  pins the schema's rendered token count so bench numbers stay comparable
+  across runs, and the suite's grades stay comparable with the ones #107
+  recorded because the prompt and tools the model sees do not change.
 - `kv_bytes_per_token`, `native_max_tokens` and `TOKEN_STEP` move from
   `context.py` to `engine/window.py`; `tune/candidates.py` imports them from
   there.
@@ -205,6 +208,45 @@ is cut from `main` afterwards. Changes:
   `engine.holders` is empty, instead of reading `queue`.
 - `protocol.py` keeps `ToolSet`, `parse_tool_calls` and `ParseError` (the
   endpoint uses them) and drops `WORKER_TOOLS` and `WORKER_TOOLSET`.
+
+### Suite runner
+
+`tune/suite/runner.py` grades a candidate by running each suite task through
+the worker loop today: it enqueues into a scratch `TaskStore`, calls
+`run_task` with the full `ToolExecutor`, auto-denies approvals from a thread,
+then reads the store's final state and the worker's `transcript.jsonl`. With
+the worker gone, the suite gets a loop and an executor of its own, sized for
+a throwaway scratch project rather than for security:
+
+- `tune/suite/loop.py: run_loop(task, engine, window, *, python, transcript)`
+  runs one task on one generation thread: `engine.generate` with the payload
+  schema and system prompt, `protocol.parse_tool_calls`, tool calls executed
+  through `tools.py`, results appended, until the model calls `finish` or the
+  budget ends. Budget: the turn and wall-clock limits the scratch config
+  carries today, as `Budget(turns, minutes, tokens_per_generation)`.
+  Outcomes: `completed`, `failed`, `budget-exhausted`. It writes the same
+  `transcript.jsonl` event shapes into the scratch dir the worker wrote, so
+  `metrics_from_transcript` is unchanged, and returns turns used, outcome and
+  error for the report.
+- `tune/suite/tools.py: ScratchTools(root, verify_commands)` implements the
+  eight tools over the scratch project: paths resolve under `root` and
+  anything that escapes is a tool error, `run_command` accepts only the
+  task's verify commands and the suite's fixed `python -m unittest` and
+  `python -m pytest` forms (today's `SUITE_ALLOWLIST` role) and runs them
+  with `subprocess.run(timeout=...)` under the interpreter the runner
+  selects, and `finish` ends the loop. No approvals, audit, environment
+  scrubbing, process groups or queue: a denied command is a tool error, as
+  the denier made it today.
+- The runner drops `TaskStore`, `run_task`, `ContextDecision`, the denier
+  thread, `SUITE_ALLOWLIST`, `DEFAULT_ALLOWLIST` and the scratch config's
+  allowlist and budget keys, passes `arm.window` as an integer, and reads
+  turns and outcome from the loop's result instead of the store and the
+  report's budget block. `SuiteRun`'s fields and the grading step are
+  unchanged.
+
+About 350 lines added under `tune/`, against about 1,600 deleted from the
+worker path. None of it is a boundary: it runs only inside `sous tune`, on
+copies of the suite's synthetic projects, in a scratch directory.
 
 ## Tests
 
@@ -231,6 +273,12 @@ Added, each failing before its change:
   under the new name).
 - `scripts/api_smoke.py`'s request builder produces a body the endpoint routes
   locally (pure function, no model).
+- `ScratchTools` refuses a path that escapes the scratch root and a command
+  outside the accepted forms, and runs an accepted verify command; `run_loop`
+  returns each of the three outcomes against a fake engine and writes the
+  transcript events `metrics_from_transcript` reads. `test_tune_runner.py`
+  and `test_tune_suite.py` are adapted to the loop, not rewritten; the
+  payload's rendered token count is pinned.
 
 The `model`-marked tests keep their markers and stay local-only; CI runs
 `uv run pytest -m "not model"`, `uv run ty check`, ruff and `uv lock --check`
