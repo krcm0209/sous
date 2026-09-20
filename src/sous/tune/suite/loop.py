@@ -21,6 +21,7 @@ FORMAT_REMINDER = (
     "the tool-call format specified in your instructions."
 )
 NUDGE = "You must call a tool to make progress. Call finish when done."
+ELIDED = "<tool_result>[elided: re-read the file if needed]</tool_result>"
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class LoopResult:
     error: str | None
     summary: str
     concerns: str
+    elisions: int
 
 
 class Transcript:
@@ -88,6 +90,31 @@ def _execute(call: ToolCall, tools: ScratchTools, deadline: float, command_timeo
         return f"error: {e}"
 
 
+def _elide_if_needed(messages: list[dict], engine: ManagedEngine, window: int) -> tuple[int, int]:
+    """Rewrite the oldest verbatim tool results until the prompt is back under
+    the window, returning the final count and how many were rewritten. The
+    caller must still check the count: with nothing elidable left it can be
+    over, and an oversized prompt must never be sent.
+
+    A task whose early reads have scrolled out of the window is not a failed
+    task — the model can read that file again, and dropping the text is far
+    cheaper than dropping the run a dozen turns in."""
+    elisions = 0
+    while (count := engine.count_tokens(messages, TOOLS)) > window:
+        for m in messages:
+            if (
+                m["role"] == "user"
+                and m["content"].startswith("<tool_result")
+                and "[elided" not in m["content"]
+            ):
+                m["content"] = ELIDED
+                elisions += 1
+                break
+        else:
+            return count, elisions  # nothing left to elide; still over the window
+    return count, elisions
+
+
 def run_loop(
     *,
     instructions: str,
@@ -115,7 +142,7 @@ def run_loop(
 
         started = time.monotonic()
         deadline = started + budget.minutes * 60
-        turns = malformed = 0
+        turns = malformed = elisions = 0
         summary = concerns = ""
         outcome, error = "budget-exhausted", None
 
@@ -124,13 +151,23 @@ def run_loop(
             outcome, error = "failed", reason
 
         while turns < budget.turns and time.monotonic() < deadline:
-            token_count = engine.count_tokens(messages, TOOLS)
+            token_count, elided = _elide_if_needed(messages, engine, window)
+            elisions += elided
+            if token_count > window:
+                reason = (
+                    f"context overflow: {token_count} tokens exceeds the "
+                    f"{window}-token window with nothing left to elide"
+                )
+                transcript.log(event="context_overflow", error=reason)
+                fail(reason)
+                break
+            # The window bounds prompt PLUS output, so a prompt that lands
+            # exactly on it has nowhere to generate.
             output_room = window - token_count
             if output_room <= 0:
-                # No elision here: a suite task that fills its window is a
-                # failed run, which is what the worker reported once it had
-                # nothing left to elide.
-                reason = f"context overflow: {token_count} tokens fill the {window}-token window"
+                reason = (
+                    f"context overflow: prompt fills the {window}-token window; no room to generate"
+                )
                 transcript.log(event="context_overflow", error=reason)
                 fail(reason)
                 break
@@ -183,7 +220,10 @@ def run_loop(
                     if raw_summary is None or not str(raw_summary).strip():
                         result = "error: finish requires a non-empty summary"
                         transcript.log(
-                            event="tool", name=call.name, arguments=call.arguments, result=result
+                            event="tool",
+                            name=call.name,
+                            arguments=call.arguments,
+                            result=result[:2000],
                         )
                         messages.append(_tool_result_message(call.name, result))
                         continue
@@ -200,7 +240,9 @@ def run_loop(
                 break
 
         transcript.log(event="finished", outcome=outcome)
-        return LoopResult(outcome, turns, time.monotonic() - started, error, summary, concerns)
+        return LoopResult(
+            outcome, turns, time.monotonic() - started, error, summary, concerns, elisions
+        )
     finally:
         session.close()
         engine.reset_prompt_cache(owner=session.thread)

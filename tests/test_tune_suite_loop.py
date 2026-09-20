@@ -10,17 +10,23 @@ from tests.fake_engine import FakeEngine
 CALL = '<tool_call>{{"name": "{name}", "arguments": {args}}}</tool_call>'
 FINISH = CALL.format(name="finish", args='{"summary": "done", "concerns": ""}')
 WRITE = CALL.format(name="write_file", args='{"path": "hello.txt", "content": "hi"}')
+WINDOW = 8192
+ELIDED = "<tool_result>[elided: re-read the file if needed]</tool_result>"
 
 
 def _run(
     tmp_path: Path,
     script: list[str],
     budget: Budget = Budget(turns=8, minutes=5),  # noqa: B008 — frozen; sharing it is harmless
+    engine: FakeEngine | None = None,
 ):
+    """`engine` replaces the default scripted one: a test that scripts token
+    counts needs to hold on to the instance the loop ran against."""
     root = tmp_path / "project"
     root.mkdir()
     cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
-    mgr = EngineManager(cfg, engine_factory=lambda _mid: FakeEngine(script))
+    fake = engine if engine is not None else FakeEngine(script)
+    mgr = EngineManager(cfg, engine_factory=lambda _mid: fake)
     transcript = Transcript(tmp_path / "transcript.jsonl")
     try:
         result = run_loop(
@@ -28,7 +34,7 @@ def _run(
             context_files=(),
             root=root,
             engine=mgr.get(),
-            window=8192,
+            window=WINDOW,
             budget=budget,
             tools=ScratchTools(root),
             transcript=transcript,
@@ -90,3 +96,43 @@ def test_finish_without_a_summary_is_a_tool_error_and_the_loop_goes_on(tmp_path:
         "arguments": {"summary": ""},
         "result": "error: finish requires a non-empty summary",
     }
+
+
+class _ElidingEngine(FakeEngine):
+    """Over the window while any tool result is still verbatim in the
+    messages, under it once they have all been elided."""
+
+    def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
+        verbatim = any(
+            m["role"] == "user" and m["content"].startswith("<tool_result name=") for m in messages
+        )
+        return 10_000 if verbatim else 100
+
+
+class _FullEngine(FakeEngine):
+    """No elision brings this prompt under the window."""
+
+    def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
+        return WINDOW + 1
+
+
+def test_old_tool_results_are_elided_so_a_long_task_keeps_going(tmp_path: Path):
+    script: list[str] = [WRITE, WRITE, FINISH]
+    engine = _ElidingEngine(script)
+    result, events, _ = _run(tmp_path, script, engine=engine)
+    assert result.outcome == "completed"
+    assert result.error is None
+    assert result.elisions >= 1
+    assert not any(e["event"] == "context_overflow" for e in events)
+    results_sent = [m for m in engine.calls[-1] if m["content"].startswith("<tool_result")]
+    assert results_sent and all(m["content"] == ELIDED for m in results_sent)
+
+
+def test_a_prompt_with_nothing_left_to_elide_fails_the_run(tmp_path: Path):
+    script: list[str] = [WRITE, FINISH]
+    result, events, _ = _run(tmp_path, script, engine=_FullEngine(script))
+    assert result.outcome == "failed"
+    assert result.turns == 0
+    assert result.elisions == 0
+    assert result.error is not None and result.error.startswith("context overflow:")
+    assert events[0] == {"event": "context_overflow", "error": result.error}
