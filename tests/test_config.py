@@ -351,10 +351,47 @@ def test_upstream_rejects_anything_that_is_not_a_bare_origin(tmp_path: Path):
         assert any("upstream_url" in str(w.message) for w in caught), raw
 
 
+@pytest.mark.parametrize(
+    ("section", "key", "bad", "default"),
+    [
+        ("server", "port", "70000", 8383),
+        ("server", "port", "0", 8383),
+        ("server", "port", '"abc"', 8383),
+        ("server", "port", "true", 8383),
+        ("model", "idle_unload_minutes", "-5", 30),
+        ("model", "idle_unload_minutes", "1.5", 30),
+        ("model", "idle_unload_minutes", "false", 30),
+    ],
+)
+def test_a_bad_port_or_idle_span_warns_and_uses_the_default(
+    tmp_path: Path, section: str, key: str, bad: str, default: int
+):
+    """A bad port would take the daemon down at bind (launchd restart-loops
+    it); a negative idle span would unload on every sweep tick."""
+    path = tmp_path / "config.toml"
+    path.write_text(f"[{section}]\n{key} = {bad}\n")
+    with pytest.warns(UserWarning, match=rf"\[{section}\]\.{key}"):
+        cfg = load_config(path)
+    field = "server_port" if key == "port" else key
+    assert getattr(cfg, field) == default
+
+
+def test_an_idle_span_of_zero_is_a_setting_not_a_typo(tmp_path: Path):
+    path = tmp_path / "config.toml"
+    path.write_text("[model]\nidle_unload_minutes = 0\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert load_config(path).idle_unload_minutes == 0
+
+
 def test_settings_from_0_6_are_ignored_with_one_warning_naming_their_new_homes(tmp_path: Path):
     path = tmp_path / "config.toml"
+    # The obsolete window differs from the served one, so the note can only
+    # pass by naming the value in effect.
     path.write_text(
-        '[gateway]\nenabled = true\nlocal_models = ["sous-local"]\nmax_context_tokens = 131072\n\n'
+        '[gateway]\nenabled = true\nlocal_models = ["sous-local"]\nmax_context_tokens = 262144\n'
+        'upstream_url = "https://api.anthropic.com"\ngeneration_timeout_minutes = 10\n\n'
+        "[model]\nmax_context_tokens = 131072\n\n"
         '[budgets]\nmax_turns = 3\n\n[commands]\nallowlist = ["pytest"]\n\n'
         '[context]\nmode = "auto"\n\n[tasks]\nretention = 5\n'
     )
@@ -367,6 +404,8 @@ def test_settings_from_0_6_are_ignored_with_one_warning_naming_their_new_homes(t
     for note in (
         "[gateway].enabled (removed: the endpoint is always on)",
         "[gateway].local_models (now [server].local_models)",
+        "[gateway].upstream_url (now [server].upstream_url)",
+        "[gateway].generation_timeout_minutes (now [server].generation_timeout_minutes)",
         "[gateway].max_context_tokens "
         "(now [model].max_context_tokens; the served window is 131072)",
         "[budgets] (removed with the worker path)",

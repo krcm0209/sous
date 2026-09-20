@@ -231,6 +231,36 @@ def _server_values(server: dict) -> tuple[tuple[str, ...], int]:
     return tuple(models), timeout
 
 
+def _server_port(server: dict) -> int:
+    """[server].port: an integer from 1 to 65535, degrading to 8383 with a
+    warning. 0 is refused too: the daemon would bind a port the OS picked
+    while every other sous command, reading the same file, looks for 0."""
+    value = server.get("port", 8383)
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+        warnings.warn(
+            f"sous config: [server].port {value!r} must be an integer from 1 to 65535; using 8383",
+            stacklevel=3,
+        )
+        return 8383
+    return value
+
+
+def _idle_unload_minutes(model: dict) -> int:
+    """[model].idle_unload_minutes: a whole number of minutes, 0 included
+    (the sweep then unloads on its first tick past a turn), degrading to 30
+    with a warning. A negative value reads as "never" and would do the
+    opposite: unload on every tick."""
+    value = model.get("idle_unload_minutes", 30)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        warnings.warn(
+            f"sous config: [model].idle_unload_minutes {value!r} must be a non-negative "
+            "integer; using 30",
+            stacklevel=3,
+        )
+        return 30
+    return value
+
+
 def _model_window(model: dict) -> int:
     """[model].max_context_tokens, clamped UP to the Claude Code floor rather
     than defaulted: a smaller value can only be a misjudged floor, and the
@@ -411,12 +441,12 @@ def load_config(config_path: Path | None = None) -> SousConfig:
     _warn_obsolete(raw, window)
     local_models, generation_timeout = _server_values(server)
     return SousConfig(
-        server_port=server.get("port", 8383),
+        server_port=_server_port(server),
         upstream_url=_upstream_url(server),
         local_models=local_models,
         generation_timeout_minutes=generation_timeout,
         model_id=model.get("id", "mlx-community/Qwen3.8-27B-4bit"),
-        idle_unload_minutes=model.get("idle_unload_minutes", 30),
+        idle_unload_minutes=_idle_unload_minutes(model),
         max_context_tokens=window,
         temperature=model.get("temperature", 0.7),
         top_p=model.get("top_p", 0.8),
