@@ -895,6 +895,16 @@ def _arg_timeout(text: str) -> float:
     return value
 
 
+def _positive_int(text: str) -> int:
+    """0 or fewer suite runs per task would measure nothing while still
+    reporting a clean exit: reject it as a usage error before the suite
+    starts rather than silently produce an empty comparison."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv: list[str] | None = None) -> None:
     raw = sys.argv[1:] if argv is None else argv
     if raw[:1] == ["claude"]:
@@ -928,12 +938,17 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("uninstall-launchd", help="remove the start-at-login LaunchAgent")
     tune = sub.add_parser(
         "tune",
-        help="measure this machine and propose [model] settings "
-        "(quick stage: drafter, block size, window)",
+        help="measure this machine, grade the candidates and propose [model] settings "
+        "(--quick: throughput only — drafter, block size, window)",
     )
-    tune.add_argument("--quick", action="store_true", help="the throughput stage only")
+    tune.add_argument(
+        "--quick", action="store_true", help="the throughput stage only; never changes the model"
+    )
     tune.add_argument(
         "--models", nargs="+", metavar="ID", help="candidate ids instead of the table"
+    )
+    tune.add_argument(
+        "--runs", type=_positive_int, default=2, help="suite runs per task (full run)"
     )
     tune.add_argument("--repeat", type=int, default=2, help="attempts per measurement (best wins)")
     tune.add_argument("--resume", metavar="RUN_ID", help="continue a run under ~/.sous/tune")

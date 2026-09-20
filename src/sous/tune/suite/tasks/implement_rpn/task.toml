@@ -1,0 +1,8 @@
+title = "Implement the RPN calculator"
+category = "implement-from-spec"
+instructions = """rpn.py documents two functions in its module docstring and leaves both \
+unimplemented (they raise NotImplementedError). Implement tokenize and evaluate exactly as \
+the docstring describes, keeping the docstring and both signatures as they are. Do not add \
+any other file."""
+context_files = ["rpn.py"]
+max_turns = 12

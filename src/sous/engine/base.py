@@ -292,6 +292,32 @@ def _default_factory(
     )
 
 
+def default_engine_factory(config: SousConfig) -> Callable[[str], Engine]:
+    """The factory EngineManager builds when given none: every [model] value
+    mapped onto the backend. Public so a process that must wrap the real
+    engine (the tune's suite runner counts its deltas) builds the same one
+    rather than a second copy of this mapping."""
+    return lambda model_id: _default_factory(
+        model_id,
+        config.temperature,
+        config.top_p,
+        config.top_k,
+        config.prompt_cache,
+        draft_id=config.speculative_draft_id,
+        draft_block_size=config.speculative_block_size,
+        cache_budget=(
+            None if config.prompt_cache_gb is None else int(config.prompt_cache_gb * (1 << 30))
+        ),
+        # The largest cache one turn can build on this daemon: the
+        # gateway's window when it is on, else the worker's.
+        reserve_tokens=max(
+            config.max_context_tokens,
+            config.gateway_max_context_tokens if config.gateway_enabled else 0,
+        ),
+        int8_prefill=config.int8_prefill,
+    )
+
+
 class ManagedEngine:
     """Serializes generations on one engine instance. MLX generation is
     synchronous and uninterruptible: on a stall the worker abandons its
@@ -512,29 +538,7 @@ class EngineManager:
         clock: Callable[[], float] = time.monotonic,
     ):
         self._config = config
-        self._factory = engine_factory or (
-            lambda model_id: _default_factory(
-                model_id,
-                config.temperature,
-                config.top_p,
-                config.top_k,
-                config.prompt_cache,
-                draft_id=config.speculative_draft_id,
-                draft_block_size=config.speculative_block_size,
-                cache_budget=(
-                    None
-                    if config.prompt_cache_gb is None
-                    else int(config.prompt_cache_gb * (1 << 30))
-                ),
-                # The largest cache one turn can build on this daemon: the
-                # gateway's window when it is on, else the worker's.
-                reserve_tokens=max(
-                    config.max_context_tokens,
-                    config.gateway_max_context_tokens if config.gateway_enabled else 0,
-                ),
-                int8_prefill=config.int8_prefill,
-            )
-        )
+        self._factory = engine_factory or default_engine_factory(config)
         self._lock = threading.Lock()
         # A load or an unload is never done under _lock (minutes for a 27B):
         # get() and unload_if_idle() mark which is in progress and wait on

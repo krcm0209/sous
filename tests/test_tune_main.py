@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import json
 from datetime import date
 
 import pytest
@@ -12,6 +13,8 @@ from sous.tune.candidates import describe as real_describe
 from sous.tune.daemon import Readiness
 from sous.tune.hardware import Hardware
 from sous.tune.rundir import RunDir
+from sous.tune.suite import SuiteTask
+from sous.tune.suite.runner import SuiteOutcome, SuiteRun
 from tests import tune_fixtures as fx
 
 M = "mlx-community/Qwen3.8-27B-4bit"
@@ -19,7 +22,7 @@ D = "z-lab/Qwen3.8-27B-DFlash2"
 
 
 def _args(**over):
-    base = dict(quick=True, models=None, repeat=1, resume=None, yes=False, apply=False)
+    base = dict(quick=True, models=None, repeat=1, runs=2, resume=None, yes=False, apply=False)
     base.update(over)
     return argparse.Namespace(**base)
 
@@ -94,7 +97,73 @@ def _bench(scores):
     return bench
 
 
-def _deps(tmp_path, *, scores, cached=(), answers=(), ready=None, isatty=True):
+def _tasks(tmp_path):
+    return [
+        SuiteTask(
+            name=n,
+            path=tmp_path,
+            title=n,
+            category="bug-fix",
+            instructions="x",
+            context_files=(),
+            verify_commands=(),
+            max_turns=1,
+            max_minutes=1,
+        )
+        for n in ("a", "b")
+    ]
+
+
+def _suite(grades, seconds, seen):
+    def suite(arm, tasks, *, runs, done, record, scratch, out, **kw):
+        seen.append((arm.label, sorted(done)))
+        results = []
+        for task in tasks:
+            for i in range(runs):
+                if (task.name, i) in done:
+                    continue
+                r = SuiteRun(
+                    task=task.name,
+                    index=i,
+                    label=arm.label,
+                    model_id=arm.model_id,
+                    drafter_id=arm.drafter_id,
+                    block_size=arm.block_size,
+                    int8_prefill=arm.int8_prefill,
+                    greedy=arm.greedy,
+                    window=arm.window,
+                    state="done",
+                    outcome="completed",
+                    turns=3,
+                    seconds=(seconds or {}).get(arm.label, 10.0),
+                    output_tokens=100,
+                    malformed=0,
+                    repetitions=0,
+                    approvals_denied=0,
+                    grade=(grades or {}).get(arm.label, 1.0),
+                    grade_detail="",
+                    error=None,
+                    transcript_path=None,
+                )
+                record(r)
+                results.append(r)
+        return SuiteOutcome(results, True, None)
+
+    return suite
+
+
+def _deps(
+    tmp_path,
+    *,
+    scores,
+    cached=(),
+    answers=(),
+    ready=None,
+    isatty=True,
+    grades=None,
+    seconds=None,
+    seen=None,
+):
     ready = ready if ready is not None else Readiness(True, "no daemon")
     configs, sizes = _configs(), _sizes()
     it = iter(answers)
@@ -113,6 +182,8 @@ def _deps(tmp_path, *, scores, cached=(), answers=(), ready=None, isatty=True):
         ask=lambda prompt: (print(prompt, end=""), next(it, "n"))[1],
         isatty=lambda: isatty,
         managed=lambda: False,
+        suite=_suite(grades, seconds, seen if seen is not None else []),
+        load_tasks=lambda: _tasks(tmp_path),
         out=print,
     ), downloaded
 
@@ -202,12 +273,6 @@ def test_resume_skips_arms_already_in_the_run(tmp_path, capsys):
     seen.clear()
     assert main(_args(resume=run_id), config=_cfg(tmp_path), **deps) == 0
     assert seen == [] and first
-
-
-def test_a_full_run_is_refused_in_this_version(tmp_path, capsys):
-    deps, _ = _deps(tmp_path, scores={})
-    assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 2
-    assert "--quick" in capsys.readouterr().out
 
 
 def test_models_naming_the_configured_model_outside_the_table_keeps_its_drafter(tmp_path, capsys):
@@ -352,3 +417,230 @@ def test_a_misspelt_collaborator_is_an_error_not_a_run_against_the_real_daemon(t
     deps["raedy"] = deps.pop("ready")
     with pytest.raises(TypeError):
         main(_args(), config=_cfg(tmp_path), **deps)
+
+
+N = "mlx-community/Qwen3.5-9B-MLX-4bit"
+NINE = "Qwen3.5-9B-MLX-4bit"
+CUR = "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @3"
+
+
+def test_a_full_run_grades_each_models_fastest_arm_and_can_change_the_model(tmp_path, capsys):
+    seen = []
+    deps, _ = _deps(
+        tmp_path,
+        scores={CUR: 30.0, "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @5": 28.0, NINE: 45.0},
+        cached=(M, D, N),
+        grades={NINE: 0.9, CUR: 0.92},
+        seconds={NINE: 5.0, CUR: 20.0},
+        seen=seen,
+    )
+    assert main(_args(quick=False, yes=True), config=_cfg(tmp_path), **deps) == 0
+    out = capsys.readouterr().out
+    # The model stage: each model's fastest arm, the current one among them.
+    assert [label for label, _ in seen[:2]] == [CUR, NINE]
+    # The winner stage on the 9B: nax is on and the fixture is affine 4-bit gs64.
+    assert [label for label, _ in seen[2:]] == [f"{NINE} + int8 prefill", f"{NINE} greedy"]
+    assert "## Suite" in out and "suite: 2 tasks x 2 runs on 2 arm(s)" in out
+    assert "roughly" in out and "min from the measured speeds" in out
+    assert f'+id = "{N}"' in out
+    assert "restart the daemon to apply id, speculative_draft_id" in out
+    assert f'id = "{N}"' in (tmp_path / "config.toml").read_text()
+
+
+def test_the_winner_stage_offers_only_what_the_hardware_allows(tmp_path, capsys):
+    seen = []
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N), seen=seen)
+    no_nax = dataclasses.replace(_hardware(tmp_path), nax=False, nax_reason="pre-M5")
+    deps["detect"] = lambda: no_nax
+    assert main(_args(quick=False, yes=True), config=_cfg(tmp_path), **deps) == 0
+    assert [label for label, _ in seen if "int8" in label] == []
+    assert [label for label, _ in seen if label.endswith(" greedy")]
+
+
+def test_a_greedy_arm_that_wins_writes_temperature_zero(tmp_path, capsys):
+    deps, _ = _deps(
+        tmp_path,
+        scores={CUR: 30.0, NINE: 20.0},
+        cached=(M, D, N),
+        seconds={f"{CUR} greedy": 5.0},
+    )
+    assert main(_args(quick=False, yes=True), config=_cfg(tmp_path), **deps) == 0
+    out = capsys.readouterr().out
+    assert "+temperature = 0.0" in out and "+id" not in out
+
+
+def test_resume_skips_suite_runs_already_recorded(tmp_path, capsys):
+    seen = []
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N), seen=seen)
+    assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 0
+    first = list(seen)
+    run_id = sorted(p.name for p in (tmp_path / "tune").iterdir())[-1]
+    seen.clear()
+    assert main(_args(quick=False, resume=run_id), config=_cfg(tmp_path), **deps) == 0
+    assert first and seen == []  # every (task, run) of every arm is already on disk
+    results = (tmp_path / "tune" / run_id / "results.jsonl").read_text().splitlines()
+    rows = [json.loads(line) for line in results]
+    assert {r["kind"] for r in rows} == {"bench", "suite"}
+
+
+def test_resume_retries_a_run_the_runner_recorded_as_an_error(tmp_path, capsys):
+    """_error_run and the denier-failure relabel both leave a state="error"
+    row in results.jsonl — a row is appended, never rewritten — so a stale
+    error for a (task, index) sits beside its later retry. --resume must
+    still retry that pair rather than count the runner's own error as a
+    permanently done result."""
+    seen = []
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N), seen=seen)
+    assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 0
+    run_id = sorted(p.name for p in (tmp_path / "tune").iterdir())[-1]
+    run = RunDir.existing(tmp_path / "tune", run_id)
+    original = next(
+        SuiteRun.from_dict(r)
+        for r in run.rows("suite")
+        if r["label"] == CUR and r["task"] == "a" and r["index"] == 0
+    )
+    error_row = dataclasses.replace(original, state="error", outcome=None, error="disk full")
+    run.append("suite", error_row.as_dict())
+    seen.clear()
+    assert main(_args(quick=False, resume=run_id), config=_cfg(tmp_path), **deps) == 0
+    done_for_cur = next(done for label, done in seen if label == CUR)
+    assert ("a", 0) not in done_for_cur
+
+
+def test_a_suite_arm_whose_weights_stay_resident_stops_the_run(tmp_path, capsys):
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N))
+    stuck = "unload refused: held by 1 session(s)"
+    deps["suite"] = lambda arm, tasks, **kw: SuiteOutcome([], False, stuck)
+    assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 1
+    out = capsys.readouterr().out
+    assert "could not be released (unload refused: held by 1 session(s))" in out
+    assert "--resume" in out
+
+
+def test_the_daemon_is_asked_again_before_every_suite_arm(tmp_path, capsys):
+    calls = []
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N))
+    real = deps["ready"]
+    deps["ready"] = lambda port: (calls.append(port), real(port))[1]
+    assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 0
+    # once up front, once before the first bench load, once per suite arm
+    # (two models, then two winner-stage arms)
+    assert len(calls) == 2 + 4
+
+
+def test_a_quick_run_never_touches_the_suite(tmp_path, capsys):
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N))
+
+    def never(*a, **k):
+        raise AssertionError("the suite ran in a quick run")
+
+    deps["suite"] = never
+    deps["load_tasks"] = never
+    assert main(_args(quick=True), config=_cfg(tmp_path), **deps) == 0
+    assert "## Suite" not in capsys.readouterr().out
+
+
+def test_a_stopped_suite_still_reports_the_runs_it_recorded(tmp_path, capsys):
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N))
+
+    def suite(arm, tasks, *, runs, done, record, scratch, out, **kw):
+        r = SuiteRun(
+            task=tasks[0].name,
+            index=0,
+            label=arm.label,
+            model_id=arm.model_id,
+            drafter_id=arm.drafter_id,
+            block_size=arm.block_size,
+            int8_prefill=arm.int8_prefill,
+            greedy=arm.greedy,
+            window=arm.window,
+            state="done",
+            outcome="completed",
+            turns=3,
+            seconds=10.0,
+            output_tokens=100,
+            malformed=0,
+            repetitions=0,
+            approvals_denied=0,
+            grade=1.0,
+            grade_detail="",
+            error=None,
+            transcript_path=None,
+        )
+        record(r)
+        return SuiteOutcome([r], False, "unload refused: held by 1 session(s)")
+
+    deps["suite"] = suite
+    assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 1
+    out = capsys.readouterr().out
+    assert "## Suite" in out
+    suite_section = out.split("## Suite", 1)[1]
+    assert CUR in suite_section and "completed 1/1" in suite_section
+    assert "(no suite runs)" not in out
+
+
+def test_a_stop_in_the_winner_stage_keeps_the_model_stages_choice(tmp_path, capsys):
+    """The winner stage measures extra settings (int8, greedy) on top of an
+    already-decided model-stage winner. A stop there must not discard that
+    decision — the report should still recommend what the model stage
+    chose, with a note that the winner-stage settings were left unmeasured
+    — and main must still exit 1 before applying anything."""
+    calls = []
+    deps, _ = _deps(
+        tmp_path,
+        scores={CUR: 30.0, "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @5": 28.0, NINE: 45.0},
+        cached=(M, D, N),
+        grades={NINE: 0.9, CUR: 0.92},
+        seconds={NINE: 5.0, CUR: 20.0},
+    )
+    real_suite = deps["suite"]
+    stuck = "unload refused: held by 1 session(s)"
+
+    def suite(arm, tasks, **kw):
+        calls.append(arm.label)
+        if len(calls) == 3:  # the winner stage's first arm: "NINE + int8 prefill"
+            return SuiteOutcome([], False, stuck)
+        return real_suite(arm, tasks, **kw)
+
+    deps["suite"] = suite
+    assert main(_args(quick=False, yes=True), config=_cfg(tmp_path), **deps) == 1
+    out = capsys.readouterr().out
+    assert calls == [CUR, NINE, f"{NINE} + int8 prefill"]
+    assert f"could not be released ({stuck})" in out
+    assert "## Choice" in out
+    choice_section = out.split("## Choice", 1)[1]
+    assert f"  {NINE}" in choice_section.splitlines()
+    assert "winner stage incomplete: the model could not be released" in choice_section
+    assert stuck in choice_section
+    assert "Apply these changes" not in out
+
+
+def test_a_daemon_that_gets_busy_mid_suite_stops_with_the_resume_hint(tmp_path, capsys):
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N))
+    real = deps["ready"]
+    calls = []
+
+    def ready(port):
+        calls.append(port)
+        # ready: up front, before the first bench load, before the first
+        # suite arm; busy from the second suite arm on.
+        return real(port) if len(calls) <= 3 else Readiness(False, "held by 1 session(s)")
+
+    deps["ready"] = ready
+    assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 1
+    out = capsys.readouterr().out
+    assert "held by 1 session(s)" in out
+    assert "--resume" in out
+
+
+def test_progress_lines_are_flushed_as_they_are_printed(monkeypatch):
+    from sous.tune import _print_now
+
+    recorded = []
+
+    def recording_print(*args, **kwargs):
+        recorded.append(kwargs)
+
+    monkeypatch.setattr("builtins.print", recording_print)
+    _print_now("x")
+    assert recorded == [{"flush": True}]

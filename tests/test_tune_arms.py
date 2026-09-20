@@ -1,7 +1,7 @@
 import dataclasses
 
 from sous.config import SousConfig
-from sous.tune.arms import BLOCK_SIZES, quick_arms
+from sous.tune.arms import BLOCK_SIZES, Arm, quick_arms, winner_stage_arms
 from sous.tune.candidates import Candidate, describe
 from tests import tune_fixtures as fx
 
@@ -247,3 +247,103 @@ def test_a_text_only_model_gets_no_drafter_arms(tmp_path):
     arms, refusals = quick_arms(user, cands, cps, working_set_bytes=fx.M5_PRO_WORKING_SET)
     assert [a.drafter_id for a in arms if a.model_id == "o/text"] == [""]
     assert any("text-only" in r.reason for r in refusals)
+
+
+def _winner(tmp_path, temperature=0.7, int8=False):
+    cfg = SousConfig(
+        data_dir=tmp_path / "d",
+        config_path=tmp_path / "c.toml",
+        temperature=temperature,
+        int8_prefill=int8,
+    )
+    return Arm(
+        label="27B + DFlash2 @3",
+        config=cfg,
+        model_id="mlx-community/Qwen3.8-27B-4bit",
+        drafter_id="z-lab/Qwen3.8-27B-DFlash2",
+        block_size=3,
+        window=131072,
+        gateway_window=None,
+        tier="27b-dense",
+        current=True,
+        fit_window=131072,
+        int8_prefill=int8,
+        greedy=temperature == 0,
+    )
+
+
+def test_the_suite_key_extends_the_bench_key_with_the_quality_dimensions(tmp_path):
+    arm = _winner(tmp_path)
+    assert arm.key == ("mlx-community/Qwen3.8-27B-4bit", "z-lab/Qwen3.8-27B-DFlash2", 3)
+    assert arm.suite_key == (*arm.key, False, False)
+
+
+def test_on_nax_a_routable_checkpoint_gets_an_int8_arm_and_a_sampled_winner_a_greedy_arm(tmp_path):
+    cp = _checkpoints()["mlx-community/Qwen3.8-27B-4bit"]
+    arms = winner_stage_arms(_winner(tmp_path), nax=True, checkpoint=cp)
+    assert [a.label for a in arms] == ["27B + DFlash2 @3 + int8 prefill", "27B + DFlash2 @3 greedy"]
+    int8, greedy = arms
+    assert int8.int8_prefill and int8.config.int8_prefill and not int8.greedy
+    assert greedy.greedy and greedy.config.temperature == 0 and not greedy.int8_prefill
+    assert int8.suite_key == (*int8.key, True, False)
+    assert greedy.suite_key == (*greedy.key, False, True)
+    assert all(not a.current and a.fit_window == 131072 for a in arms)
+    # Only the winner stage's own int8 arm is under test: the engine
+    # refusing it must fail the arm, unlike an arm that merely inherited
+    # int8_prefill from the user's config.
+    assert int8.int8_under_test and not greedy.int8_under_test
+
+
+def test_without_nax_only_the_greedy_arm_is_offered(tmp_path):
+    cp = _checkpoints()["mlx-community/Qwen3.8-27B-4bit"]
+    assert [a.label for a in winner_stage_arms(_winner(tmp_path), nax=False, checkpoint=cp)] == [
+        "27B + DFlash2 @3 greedy"
+    ]
+
+
+def test_a_checkpoint_int8_cannot_route_gets_no_int8_arm(tmp_path):
+    cp = describe(
+        "mlx-community/Qwen3.8-27B-mxfp4",
+        config_fn=lambda m: fx.qwen_27b({"group_size": 32, "bits": 4, "mode": "mxfp4"}),
+        size_fn=lambda m: 15_000_000_000,
+    )
+    arms = winner_stage_arms(_winner(tmp_path), nax=True, checkpoint=cp)
+    assert [a.greedy for a in arms] == [True]
+
+
+def test_a_winner_already_greedy_and_int8_gets_no_extra_arms(tmp_path):
+    cp = _checkpoints()["mlx-community/Qwen3.8-27B-4bit"]
+    arms = winner_stage_arms(_winner(tmp_path, temperature=0, int8=True), nax=True, checkpoint=cp)
+    assert arms == []
+
+
+def test_a_moe_checkpoint_gets_no_int8_arm(tmp_path):
+    cp = describe(
+        "mlx-community/Qwen3.5-35B-A3B-4bit",
+        config_fn=lambda m: fx.qwen_27b(model_type="qwen3_5_moe"),
+        size_fn=lambda m: 20_000_000_000,
+    )
+    arms = winner_stage_arms(_winner(tmp_path), nax=True, checkpoint=cp)
+    assert [a.greedy for a in arms] == [True]
+
+
+def test_quick_arms_mirror_the_users_int8_and_greedy_settings(tmp_path):
+    user = SousConfig(
+        data_dir=tmp_path / "d",
+        config_path=tmp_path / "c.toml",
+        int8_prefill=True,
+        temperature=0.0,
+    )
+    arms, refusals = quick_arms(
+        user, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
+    )
+    assert refusals == []
+    for arm in arms:
+        assert arm.int8_prefill is True
+        assert arm.greedy is True
+        # Inherited, not proposed: quick_arms never puts an arm under test.
+        assert arm.int8_under_test is False
+        assert arm.suite_key == (*arm.key, True, True)
+        cp = _checkpoints()[arm.model_id]
+        extra_arms = winner_stage_arms(arm, nax=True, checkpoint=cp)
+        assert extra_arms == []

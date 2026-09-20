@@ -1,0 +1,7 @@
+title = "Add --lines to wc.py"
+category = "feature-slice"
+instructions = """Add a --lines flag to wc.py. With it, the tool counts lines (as str.splitlines \
+counts them) instead of words; the output format, the per-file lines and the total line stay \
+exactly as they are. Give the flag a one-line help text so it shows up in --help. Change nothing \
+else."""
+context_files = ["wc.py"]
