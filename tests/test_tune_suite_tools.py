@@ -57,3 +57,29 @@ def test_a_command_past_its_timeout_is_reported_not_raised(tmp_path: Path):
     sleep = f"{sys.executable} -c 'import time; time.sleep(5)'"
     t = _tools(tmp_path, verify_commands=(sleep,))
     assert t.run_command(sleep, timeout=0.2) == f"command timed out after 0.2s: {sleep}"
+
+
+def test_command_output_keeps_the_verdict_by_capping_head_and_tail(tmp_path: Path):
+    # A verify command whose stdout is long keeps both head (for context) and
+    # tail (for verdict): "3 failed" or similar is at the end.
+    verdict = f"{sys.executable} -c \"print('x' * 40000); print('VERDICT')\""
+    t = _tools(tmp_path, verify_commands=(verdict,))
+    result = t.run_command(verdict)
+    assert result.startswith("exit code 0")
+    assert "[... " in result and " bytes elided ...]" in result
+    assert "VERDICT" in result and result.rstrip().endswith("VERDICT")
+    # Capped size: two halves + marker + newlines
+    from sous.tune.suite.tools import MAX_TOOL_OUTPUT
+
+    assert len(result) <= MAX_TOOL_OUTPUT + 100  # marker + newlines
+
+
+def test_command_with_odd_bytes_does_not_raise(tmp_path: Path):
+    # A verify command that writes bytes the locale codec cannot decode
+    # should not raise UnicodeDecodeError; instead, it should return a
+    # tool result with the decodable parts and replacement characters.
+    odd = f"{sys.executable} -c \"import sys; sys.stdout.buffer.write(b'\\xff\\xfe ok\\n')\""
+    t = _tools(tmp_path, verify_commands=(odd,))
+    result = t.run_command(odd)
+    assert result.startswith("exit code 0")
+    assert "ok" in result

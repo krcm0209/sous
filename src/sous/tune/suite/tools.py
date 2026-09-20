@@ -25,6 +25,7 @@ ACCEPTED_RUNNERS = (
     "python3 -m pytest",
     "pytest",
 )
+_CAP_HALF = MAX_TOOL_OUTPUT // 2
 
 
 class ToolError(Exception):
@@ -35,6 +36,18 @@ def _truncate(text: str) -> str:
     if len(text) > MAX_TOOL_OUTPUT:
         return text[:MAX_TOOL_OUTPUT] + "\n[truncated]"
     return text
+
+
+def _capped_command_output(text: str) -> str:
+    # Command output keeps the head and tail: a verify command's verdict
+    # ("3 failed", traceback, summary) is at the end, which head-only
+    # truncation would hide. Keep both halves with an elision marker.
+    if len(text) <= MAX_TOOL_OUTPUT:
+        return text
+    head = text[:_CAP_HALF]
+    tail = text[-_CAP_HALF:]
+    elided = len(text) - 2 * _CAP_HALF
+    return f"{head}\n[... {elided} bytes elided ...]\n{tail}"
 
 
 class ScratchTools:
@@ -133,11 +146,17 @@ class ScratchTools:
         budget = self._command_timeout if timeout is None else timeout
         try:
             proc = subprocess.run(
-                argv, cwd=self.root, capture_output=True, text=True, timeout=budget, check=False
+                argv,
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=budget,
+                check=False,
             )
         except FileNotFoundError:
             return f"command not found: {argv[0]}"
         except subprocess.TimeoutExpired:
             return f"command timed out after {budget}s: {command}"
         body = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
-        return _truncate(f"exit code {proc.returncode}\n{body}")
+        return _capped_command_output(f"exit code {proc.returncode}\n{body}")
