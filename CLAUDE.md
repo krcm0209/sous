@@ -14,6 +14,7 @@ Claude Code use stretches further — evaluate features against that goal.
 - `uv run ty check` — type check (ty, NOT mypy; covers tests and scripts too).
 - `uv run ruff check . && uv run ruff format --check .` — lint/format.
 - `uv lock --check` — lockfile sync. CI runs exactly these four jobs.
+- `uv run python scripts/api_smoke.py` — one served turn against a tiny real model; run it after any dependency change, since CI cannot load a model.
 
 ## Gotchas
 
