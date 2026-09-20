@@ -126,6 +126,20 @@ def _events(text: str) -> list[tuple[str, dict]]:
 # --- probes and routing -------------------------------------------------------------
 
 
+def test_mcp_is_answered_locally_not_forwarded(tmp_path: Path):
+    """0.6 served the MCP transport at /mcp. A Claude Code that still has the
+    `claude mcp add sous` entry sends JSON-RPC there, and that body must never
+    reach the upstream."""
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
+    body = b'{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}'
+    for path in ("/mcp", "/mcp/", "/mcp/anything"):
+        r = _request(app, "POST", path, body=body)
+        assert r.status_code == 404
+        assert "claude mcp remove sous" in r.json()["error"]["message"]
+    assert fake.requests == []
+
+
 def test_hello_is_forwarded_upstream(tmp_path: Path):
     """Claude Code probes /api/hello at startup (gate 1, O3). Phase 1 answered
     it locally; with routing in place the real API answers, through sous."""

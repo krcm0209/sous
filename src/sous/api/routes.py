@@ -475,10 +475,28 @@ class Endpoint:
         return [
             Route("/v1/messages", self.messages, methods=["POST"]),
             Route("/v1/messages/count_tokens", self.count_tokens, methods=["POST"]),
+            # 0.6 served the MCP transport here. A Claude Code still holding
+            # that `claude mcp add` entry must be told so, not have its
+            # JSON-RPC bodies forwarded to the upstream by the catch-all.
+            Route("/mcp", self.mcp_removed, methods=list(ALL_METHODS)),
+            Route("/mcp/{path:path}", self.mcp_removed, methods=list(ALL_METHODS)),
             # Matched last: a method the two routes above do not take
             # (GET /v1/messages) falls through to the upstream's own answer.
             Route("/{path:path}", self.passthrough, methods=list(ALL_METHODS)),
         ]
+
+    async def mcp_removed(self, request: Request) -> Response:
+        try:
+            check_loopback(request)
+        except RequestError as e:
+            return JSONResponse(e.body(), status_code=e.status)
+        _log("refused a request to /mcp: the MCP server went in 0.7.0 (claude mcp remove sous)")
+        e = RequestError(
+            404,
+            "not_found_error",
+            "sous no longer serves an MCP server; run `claude mcp remove sous`",
+        )
+        return JSONResponse(e.body(), status_code=e.status)
 
     async def passthrough(self, request: Request) -> Response:
         """Everything the endpoint has no route of its own for — /api/hello,
@@ -904,8 +922,8 @@ def mount_endpoint(
     # sse-starlette logs every frame it sends at DEBUG — the model's reply,
     # verbatim. The daemon runs at INFO, but the no-bodies-in-logs rule must not
     # depend on that: pin the library's logger above DEBUG where the frames are
-    # made. Here rather than at import, because server.py imports this module
-    # unconditionally and a disabled endpoint must not reconfigure a logger.
+    # made. Here rather than at import: importing this module (the CLI, a
+    # test) must not reconfigure a logger; building the endpoint may.
     logging.getLogger("sse_starlette").setLevel(logging.INFO)
     # Same rule, one layer down: httpx logs "HTTP Request: <method> <full URL>"
     # at INFO — the upstream URL including its query string — and httpcore
