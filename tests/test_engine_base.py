@@ -1794,6 +1794,7 @@ def test_engine_manager_without_a_factory_uses_the_default_one(monkeypatch, tmp_
     )
     cfg = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", model_id="org/m")
     base.EngineManager(cfg)._factory("org/m")
+    assert calls == [("org/m", "org/m")]
 
 
 def _wait_until(predicate, timeout: float = 2.0) -> bool:
