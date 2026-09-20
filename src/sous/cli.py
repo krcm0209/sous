@@ -181,21 +181,28 @@ def _daemon_status(port: int, data_dir: Path) -> dict | None:
         # The type only: an httpx message can carry the URL it was building.
         _no_status_answer(port, type(exc).__name__)
         return None
-    if status == 404:
-        if _lock_is_held(data_dir):
-            print(_PREDATES_MESSAGE, file=sys.stderr)
-        else:
-            print(
-                f"sous claude: 127.0.0.1:{port} is not a sous daemon (nothing holds "
-                f"{data_dir / 'daemon.lock'}); stop what listens there, or change [server].port",
-                file=sys.stderr,
-            )
-        raise SystemExit(1)
     body = _json_object(raw) if status == 200 else None
-    if body is None:
-        _no_status_answer(port, f"status {status}")
-        return None
-    return body
+    if body is not None and not isinstance(body.get("config"), dict):
+        # Someone else's JSON object: read as the document it would be a
+        # traceback at the first field.
+        body = None
+    if body is not None:
+        return body
+    # Whatever the answer was, the lock says whether a daemon is there at
+    # all: nothing holding it means the port is another service's, and a
+    # restart would only collide with it.
+    if not _lock_is_held(data_dir):
+        print(
+            f"sous claude: 127.0.0.1:{port} is not a sous daemon (nothing holds "
+            f"{data_dir / 'daemon.lock'}); stop what listens there, or change [server].port",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if status == 404:
+        print(_PREDATES_MESSAGE, file=sys.stderr)
+        raise SystemExit(1)
+    _no_status_answer(port, f"status {status}" if status != 200 else "not the status document")
+    return None
 
 
 def _hold_warning(why: str) -> None:
@@ -383,7 +390,7 @@ def status_lines(document: dict, now: float) -> list[str]:
         f"holders {engine.get('holders') or 0}",
     ]
     idle = engine.get("idle_seconds")
-    if state == "loaded" and idle is not None:
+    if state == "loaded" and isinstance(idle, int | float):
         engine_parts.append(f"idle {_span(idle)}")
     lines = [
         f"sous daemon: listening on 127.0.0.1:{config.get('port', '?')}",
@@ -395,7 +402,7 @@ def status_lines(document: dict, now: float) -> list[str]:
     if inflight:
         for turn in inflight:
             since = turn.get("started_at")
-            age = f" {_clock(now - since)}" if since is not None else ""
+            age = f" {_clock(now - since)}" if isinstance(since, int | float) else ""
             lines.append(
                 f"  turn {turn.get('id', '?')} {turn.get('model', '?')} "
                 f"{turn.get('phase', 'queued')}{age}"
@@ -403,7 +410,7 @@ def status_lines(document: dict, now: float) -> list[str]:
     else:
         lines.append("  turns in flight: none")
     # The ring is newest first already.
-    recent = [s for s in _entries(document.get("recent_turns"))[:5] if isinstance(s, dict)]
+    recent = [s for s in _entries(document.get("recent_turns")) if isinstance(s, dict)][:5]
     if recent:
         lines.append("  recent turns:")
         lines.extend("    " + _recent_turn_text(s) for s in recent)

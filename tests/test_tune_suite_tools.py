@@ -86,6 +86,8 @@ def test_the_cd_idiom_runs_its_command_where_it_asked(tmp_path: Path):
     assert t.run_command(f"cd {t.root} && {where} && echo x").startswith(guidance)
     assert t.run_command(f"{where} | cat").startswith(guidance)
     assert t.run_command(f"{where} > out.txt").startswith(guidance)
+    assert t.run_command(f"{where} >out.txt").startswith(guidance)
+    assert t.run_command(f"{where} 2>err.txt").startswith(guidance)
     assert not (t.root / "out.txt").exists()
     assert t.run_command(f"cd .. && {where}") == (
         "command rejected: cd target .. is outside the project"

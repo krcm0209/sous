@@ -7,9 +7,9 @@ its stdin is closed (a child that reads it must see EOF, not the operator's
 terminal), and it is stopped past a wall clock or a size cap: the spool sits on
 the boot volume, and a test printing in a loop fills that faster than a
 two-minute clock notices. Either stop kills the command's whole process group,
-so nothing it started outlives it, holding the spool's blocks or writing into
-the project while the project is graded. None of this confines the command;
-it keeps a runaway from taking the tune, or the machine, with it."""
+so nothing in that group outlives it, holding the spool's blocks or writing
+into the project while the project is graded. None of this confines the
+command; it keeps a runaway from taking the tune, or the machine, with it."""
 
 from __future__ import annotations
 
@@ -26,7 +26,8 @@ from typing import IO
 
 # Far above what any reader keeps — the tools cap a result at 16 000
 # characters, the grader reads one line of each stream — and about ten
-# milliseconds of a runaway, so the stop lands within one poll.
+# milliseconds of a runaway, so the stop lands within one poll; what that
+# poll let through on top is the real ceiling.
 MAX_SPOOL_BYTES = 16 * 1024 * 1024
 _POLL_SECONDS = 0.1
 
@@ -62,8 +63,15 @@ def bounded(
             stderr=err,
             start_new_session=True,
         )
-        stopped = _watch(proc, (out,) if merged else (out, err), timeout)
-        yield Spawned(proc.returncode, stopped, out, err)
+        try:
+            stopped = _watch(proc, (out,) if merged else (out, err), timeout)
+            yield Spawned(proc.returncode, stopped, out, err)
+        finally:
+            # An interrupt unwinding through the watch must not leave the
+            # command running: its own session keeps the terminal's Ctrl-C
+            # from it, so the tune would exit and the command play on.
+            if proc.poll() is None:
+                _kill_group(proc)
 
 
 def _watch(proc: subprocess.Popen, spools: tuple[IO[bytes], ...], timeout: float) -> str | None:

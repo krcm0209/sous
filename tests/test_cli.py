@@ -1028,15 +1028,42 @@ def test_daemon_status_names_a_404_from_something_that_is_not_sous(tmp_path, cap
 
 
 def test_daemon_status_reports_a_listener_that_does_not_answer(tmp_path, capsys):
+    """A 500 from the daemon holding the lock is a daemon that did not
+    answer; the same 500 with nothing holding the lock is another service
+    on the port, and the advice is the port's, not a restart."""
     from sous import cli
 
     fake = _FakeSousHTTP(None, status_code=500)
+    lock = _held_daemon_lock(tmp_path)
     try:
         assert cli._daemon_status(fake.port, tmp_path) is None
+        err = capsys.readouterr().err
+        assert "did not answer /sous/status" in err and "500" in err
+        lock.close()
+        with pytest.raises(SystemExit) as exc:
+            cli._daemon_status(fake.port, tmp_path)
     finally:
         fake.close()
-    err = capsys.readouterr().err
-    assert "did not answer /sous/status" in err and "500" in err
+    assert exc.value.code == 1
+    assert "not a sous daemon" in capsys.readouterr().err
+
+
+def test_daemon_status_treats_someone_elses_json_as_no_answer(tmp_path, capsys):
+    """A 200 JSON object without the config block is not the document:
+    read as one it would be a traceback at the first field."""
+    from sous import cli
+
+    fake = _FakeSousHTTP(None, raw=b'{"config": 5}')
+    lock = _held_daemon_lock(tmp_path)
+    try:
+        assert cli._daemon_status(fake.port, tmp_path) is None
+        assert "not the status document" in capsys.readouterr().err
+        lock.close()
+        with pytest.raises(SystemExit):
+            cli._daemon_status(fake.port, tmp_path)
+    finally:
+        fake.close()
+    assert "not a sous daemon" in capsys.readouterr().err
 
 
 def test_daemon_status_is_none_when_nothing_listens(tmp_path):
@@ -1046,15 +1073,22 @@ def test_daemon_status_is_none_when_nothing_listens(tmp_path):
 
 
 def test_a_status_that_is_not_json_is_a_daemon_that_does_not_answer(tmp_path, capsys):
-    """Something else on the port — a 200 that is not the document."""
+    """A 200 that is not the document: from the daemon holding the lock, a
+    daemon that did not answer; from a port nothing holds the lock for,
+    something else entirely, and the advice is the port's."""
     from sous import cli
 
     fake = _FakeSousHTTP(None, raw=b"<html>nope</html>")
+    lock = _held_daemon_lock(tmp_path)
     try:
         assert cli._daemon_status(fake.port, tmp_path) is None
+        assert "did not answer /sous/status" in capsys.readouterr().err
+        lock.close()
+        with pytest.raises(SystemExit):
+            cli._daemon_status(fake.port, tmp_path)
     finally:
         fake.close()
-    assert "did not answer /sous/status" in capsys.readouterr().err
+    assert "not a sous daemon" in capsys.readouterr().err
 
 
 def test_a_reply_past_the_size_cap_is_a_daemon_that_does_not_answer(tmp_path, capsys):
@@ -1830,6 +1864,15 @@ def test_status_lines_skip_entries_that_are_not_the_documents_shape():
     assert lines[0] == "sous daemon: listening on 127.0.0.1:?"
     assert "  turns in flight: none" in lines
     assert lines[-1].startswith("    msg_a")
+    # Dict blocks with the wrong field types: skipped field by field.
+    document = {
+        "engine": {"loaded": True, "idle_seconds": "x"},
+        "config": {"port": 8383},
+        "inflight": [{"id": "msg_b", "started_at": "nope"}],
+    }
+    lines = status_lines(document, now=0.0)
+    assert "idle" not in lines[1]
+    assert lines[2] == "  turn msg_b ? queued"
 
 
 def json_dumps(doc: dict) -> bytes:

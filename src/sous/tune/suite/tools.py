@@ -37,6 +37,9 @@ _CAP_HALF = MAX_TOOL_OUTPUT // 2
 # would send the model down a wrong path; a `>` inside a quoted argument is
 # not one.
 _SHELL_OPERATORS = frozenset({"&&", "||", ";", "&", "|", "|&", "<", ">", ">>", "2>", "2>&1", "&>"})
+# ...and a token glued to one (`>out.txt`, `2>err`, `cmd;`), which would
+# reach the command as an argument too.
+_GLUED_OPERATOR = re.compile(r"^\d?[<>|&;]|[<>|&;]$")
 CD_GUIDANCE = (
     "run a single command from the project root, or after one `cd <dir> &&`; "
     "no pipes, redirection or second command"
@@ -168,7 +171,7 @@ class ScratchTools:
                 raise ToolError(f"command rejected: {CD_GUIDANCE}")
             cwd = self._cd_target(argv[1])
             argv = argv[3:]
-        if any(token in _SHELL_OPERATORS for token in argv):
+        if any(token in _SHELL_OPERATORS or _GLUED_OPERATOR.search(token) for token in argv):
             raise ToolError(f"command rejected: {CD_GUIDANCE}")
         return argv, cwd
 
