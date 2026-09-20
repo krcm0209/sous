@@ -1,13 +1,12 @@
 import json
 
-from sous.tune.daemon import ready_for_tune
+from sous.tune.daemon import Readiness, ready_for_tune
 
 
 def _status(**engine):
     doc = {
         "engine": {"loaded": False, "loading": False, "holders": 0, **engine},
         "inflight": [],
-        "queue": {"queued": 0, "running": 0},
     }
     return doc
 
@@ -43,10 +42,9 @@ def test_a_loaded_idle_daemon_is_asked_to_unload():
     assert calls == [("GET", "/sous/status"), ("POST", "/sous/unload")]
 
 
-def test_a_held_model_a_running_task_and_a_turn_each_refuse_without_unloading():
+def test_a_held_model_and_a_turn_each_refuse_without_unloading():
     for doc, word in (
         (_status(loaded=True, holders=1), "sous claude"),
-        ({**_status(loaded=True), "queue": {"queued": 0, "running": 1}}, "busy"),
         ({**_status(loaded=True), "inflight": [{"id": "msg_1"}]}, "busy"),
     ):
         request, calls = _request(doc)
@@ -128,11 +126,11 @@ def test_a_daemon_mid_unload_is_not_ready():
     assert calls == [("GET", "/sous/status")]
 
 
-def test_a_queued_task_counts_as_busy():
-    request, calls = _request({**_status(), "queue": {"queued": 2, "running": 0}})
-    r = ready_for_tune(8383, request=request, port_open=lambda p: True)
-    assert r.ready is False and "2 queued" in r.reason
-    assert calls == [("GET", "/sous/status")]
+def test_a_turn_in_flight_makes_the_daemon_busy():
+    doc = {"engine": {"loaded": True, "holders": 0}, "inflight": [{"id": "msg_1"}]}
+    request = lambda port, method, path: (200, json.dumps(doc).encode())  # noqa: E731
+    r = ready_for_tune(8383, request=request, port_open=lambda port: True)
+    assert r == Readiness(False, "the daemon is busy: 1 turn(s) in flight")
 
 
 def test_a_model_that_left_between_the_two_calls_is_the_state_asked_for():

@@ -57,16 +57,8 @@ EVENT_IDLE_TICK_SECONDS = 0.5
 
 
 def _busy(document: dict) -> bool:
-    # A delegated task counts: the worker never writes the registry, and
-    # `running` includes a task awaiting approval, whose clock runs too.
     engine = document.get("engine") or {}
-    queue = document.get("queue") or {}
-    return bool(
-        document.get("inflight")
-        or queue.get("running")
-        or engine.get("loading")
-        or engine.get("unloading")
-    )
+    return bool(document.get("inflight") or engine.get("loading") or engine.get("unloading"))
 
 
 async def _status_events(

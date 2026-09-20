@@ -21,7 +21,6 @@ from sous.inflight import Inflight
 from sous.monitor import HOLD_BODY_LIMIT
 from sous.monitor import _hold_body as _parse_hold_body
 from sous.server import create_server
-from sous.tasks import TaskStore
 from tests.fake_engine import FakeEngine
 from tests.fake_upstream import FakeUpstream
 
@@ -34,7 +33,6 @@ def _app(
     alive=None,
     inflight=None,
     factory=None,
-    store=None,
     idle_minutes=None,
 ):
     cfg = SousConfig(
@@ -48,11 +46,8 @@ def _app(
         engine_factory=factory or (lambda mid: FakeEngine([])),
         holder_alive=alive or (lambda pid, ct: True),
     )
-    # The version counter is per instance, so a test that writes to the store
-    # must write through the app's own, the way `inflight=` hands in a registry.
-    store = store or TaskStore(tmp_path / "tasks.db")
     upstream = upstream or FakeUpstream().upstream()
-    server = create_server(store, engines, cfg, upstream=upstream, inflight=inflight)
+    server = create_server(engines, cfg, upstream=upstream, inflight=inflight)
     return server.streamable_http_app(), engines
 
 
@@ -98,14 +93,14 @@ def test_status_is_the_full_status_document(tmp_path: Path):
     assert doc["engine"]["loading"] is False
     assert doc["engine"]["holders"] == 0
     assert "memory_gb" in doc["engine"]
-    assert doc["inflight"] == [] and doc["recent_turns"] == [] and doc["recent_tasks"] == []
+    assert doc["inflight"] == [] and doc["recent_turns"] == []
     assert doc["config"]["gateway"] == {
         "enabled": False,
         "local_models": ["sous-local"],
         "max_context_tokens": 131072,
         "upstream_url": "https://api.anthropic.com",
     }
-    assert set(doc) == {"engine", "inflight", "queue", "config", "recent_turns", "recent_tasks"}
+    assert set(doc) == {"engine", "inflight", "config", "recent_turns"}
 
 
 def test_hold_registers_the_caller_and_preloads(tmp_path: Path):
@@ -268,9 +263,7 @@ def test_status_carries_the_recent_ring_the_gateway_writes(tmp_path: Path):
         data_dir=tmp_path / "data", config_path=tmp_path / "config.toml", gateway_enabled=True
     )
     engines = EngineManager(cfg, engine_factory=lambda mid: _Fake(["reply"]))
-    app = create_server(
-        TaskStore(tmp_path / "tasks.db"), engines, cfg, upstream=FakeUpstream().upstream()
-    ).streamable_http_app()
+    app = create_server(engines, cfg, upstream=FakeUpstream().upstream()).streamable_http_app()
     body = {
         "model": "sous-local",
         "max_tokens": 16,
@@ -375,7 +368,7 @@ def test_events_start_with_the_full_document(tmp_path: Path):
     assert status == [200]
     event, doc = frames[0]
     assert event == "status"
-    assert set(doc) == {"engine", "inflight", "queue", "config", "recent_turns", "recent_tasks"}
+    assert set(doc) == {"engine", "inflight", "config", "recent_turns"}
     assert doc["engine"]["loaded"] is False
 
 
@@ -434,12 +427,11 @@ def test_an_idle_stream_polls_on_the_idle_tick_and_a_busy_one_on_the_fast_tick(
         return await real_sleep(delay, *args, **kwargs)
 
     monkeypatch.setattr(monitor.asyncio, "sleep", recording_sleep)
-    store = TaskStore(tmp_path / "tasks.db")
     registry = Inflight()
-    app, _ = _app(tmp_path, store=store, inflight=registry)
+    app, engines = _app(tmp_path, inflight=registry)
 
     def change() -> None:
-        store.enqueue("t", "do it", str(tmp_path), [], [])
+        engines.touch()
 
     _collect_events(app, want=2, during=change)
     assert 0.6 in delays and 0.01 not in delays, delays
@@ -460,22 +452,6 @@ def test_events_beat_once_a_second_while_a_turn_is_in_flight(tmp_path: Path, mon
     started = time.monotonic()
     _, frames = _collect_events(app, want=3)
     assert len([e for e, _ in frames if e == "status"]) >= 3
-    assert time.monotonic() - started < 2.0
-
-
-def test_events_beat_while_a_delegated_task_is_running(tmp_path: Path, monkeypatch):
-    """The worker writes the store once per tool call, but the task's own
-    clock and the cache counters it moves are in the document: a running
-    task keeps the heartbeat the way a gateway turn does."""
-    monkeypatch.setattr(monitor, "EVENT_HEARTBEAT_SECONDS", 0.2)
-    store = TaskStore(tmp_path / "tasks.db")
-    app, _ = _app(tmp_path, store=store)
-    store.enqueue("t", "do it", str(tmp_path), [], [])
-    assert store.claim_next() is not None
-    started = time.monotonic()
-    _, frames = _collect_events(app, want=3)
-    statuses = [d for e, d in frames if e == "status"]
-    assert len(statuses) >= 3 and all(d["queue"]["running"] == 1 for d in statuses)
     assert time.monotonic() - started < 2.0
 
 
@@ -560,17 +536,12 @@ def test_events_beat_while_an_unload_is_under_way(tmp_path: Path, monkeypatch):
     assert all(s["unloading"] and not s["loaded"] and not s["loading"] for s in statuses[:2])
 
 
-def test_a_load_a_hold_a_release_a_task_change_and_an_unload_each_reach_the_client(
-    tmp_path: Path, monkeypatch
-):
+def test_a_load_a_hold_a_release_and_an_unload_each_reach_the_client(tmp_path: Path, monkeypatch):
     """None of these is a registry change; each used to ride the heartbeat."""
     monkeypatch.setattr(monitor, "EVENT_HEARTBEAT_SECONDS", 60.0)
     monkeypatch.setattr(monitor, "EVENT_IDLE_TICK_SECONDS", 0.05)
     alive = {"ok": True}
-    store = TaskStore(tmp_path / "tasks.db")
-    app, engines = _app(
-        tmp_path, alive=lambda pid, started: alive["ok"], store=store, idle_minutes=0
-    )
+    app, engines = _app(tmp_path, alive=lambda pid, started: alive["ok"], idle_minutes=0)
 
     def load() -> None:
         engines.get()
@@ -593,11 +564,6 @@ def test_a_load_a_hold_a_release_a_task_change_and_an_unload_each_reach_the_clie
 
     _, frames = _collect_events(app, want=2, during=release)
     assert [d["engine"]["holders"] for e, d in frames if e == "status"][-1] == 0
-
-    _, frames = _collect_events(
-        app, want=2, during=lambda: store.enqueue("t", "do it", str(tmp_path), [], [])
-    )
-    assert [d["queue"]["queued"] for e, d in frames if e == "status"] == [0, 1]
 
     time.sleep(0.01)  # idle_unload_minutes=0 still needs the clock to have moved
     _, frames = _collect_events(app, want=2, during=engines.unload_if_idle)

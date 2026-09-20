@@ -25,7 +25,6 @@ from sous.engine.base import EngineManager
 from sous.gateway.routes import MAX_BODY_DEPTH, Gateway, mount_gateway
 from sous.gateway.turn import TurnAbandoned
 from sous.server import create_server
-from sous.tasks import TaskStore
 from tests.fake_engine import ChunkedFakeEngine, FakeEngine
 from tests.fake_upstream import FakeUpstream
 
@@ -50,10 +49,9 @@ def _app(tmp_path: Path, engine, upstream=None, **overrides):
         config_path=tmp_path / "config.toml",
         **overrides,
     )
-    store = TaskStore(tmp_path / "tasks.db")
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
     upstream = upstream or FakeUpstream().upstream()
-    return create_server(store, engines, cfg, upstream=upstream).streamable_http_app()
+    return create_server(engines, cfg, upstream=upstream).streamable_http_app()
 
 
 def _gateway_app(tmp_path: Path, engine, upstream=None, **overrides) -> tuple[Gateway, object]:

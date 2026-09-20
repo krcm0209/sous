@@ -1,4 +1,5 @@
-"""MCP layer: six tools wrapping SousService, plus daemon main()."""
+"""SousService and the daemon's MCP server: no tools of its own, just the
+monitor and gateway routes mounted on it, plus daemon main()."""
 
 from __future__ import annotations
 
@@ -9,13 +10,11 @@ import logging
 import os
 import pwd
 import re
-import shlex
 import signal
 import subprocess
 import sys
 import threading
-import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import IO
 
@@ -23,21 +22,14 @@ import anyio
 import uvicorn
 from mcp.server import MCPServer
 
-from sous.config import SousConfig, current_allowlist, load_config, persist_allowlist_entry
+from sous.config import SousConfig, load_config
 from sous.engine.base import EngineManager, release_mlx_thread_state
 from sous.gateway.routes import Gateway, mount_gateway
 from sous.gateway.upstream import Upstream
 from sous.inflight import Inflight
 from sous.logs import configure_daemon_logging, enable_warning_capture, format_line
 from sous.monitor import mount_monitor
-from sous.tasks import FINISHED_STATES, Task, TaskState, TaskStore
-from sous.toolexec import (
-    _is_within,
-    canonical_command_for_allowlist,
-    command_allowed,
-    terminate_active_commands,
-)
-from sous.worker import run_worker_loop
+from sous.toolexec import terminate_active_commands
 
 _logger = logging.getLogger("sous.server")
 
@@ -56,266 +48,45 @@ def _mlx_memory_gb() -> float | None:
         release_mlx_thread_state()
 
 
-class _Memo[K, V]:
-    """One value keyed on one stamp: `get` refetches when the key it was
-    stored under is not the one asked for. The slot is replaced whole, so a
-    reader on another thread sees the old pair or the new one, never half of
-    either; two readers that both miss both fetch, and a stale key stored
-    over a newer one costs the next reader a fetch, never a stale value."""
-
-    def __init__(self) -> None:
-        self._slot: tuple[K, V] | None = None
-
-    def get(self, key: K, fetch: Callable[[], V]) -> V:
-        slot = self._slot
-        if slot is None or slot[0] != key:
-            slot = (key, fetch())
-            self._slot = slot
-        return slot[1]
-
-
 class SousService:
     def __init__(
         self,
-        store: TaskStore,
         engines: EngineManager,
         config: SousConfig,
         inflight: Inflight | None = None,
     ):
-        self.store = store
         self.engines = engines
         self.config = config
         # The gateway's turns report here; create_server hands the same
         # registry to both, so the status document sees what the gateway does.
         self.inflight = inflight or Inflight()
-        # The status document is built up to ten times a second during a
-        # turn, and the task counts, the recent listing and the allowlist
-        # change only when a task or the config file does: each is read
-        # once per change and served from here in between. Two task slots,
-        # not one: the narrow build (the MCP tool) never pays for a listing
-        # it does not show.
-        self._counts: _Memo[int, dict[str, int]] = _Memo()
-        self._recent: _Memo[int, list[Task]] = _Memo()
-        self._allowlist: _Memo[tuple[int, int], list[list[str]]] = _Memo()
-
-    def delegate_task(
-        self,
-        title: str,
-        instructions: str,
-        project_root: str,
-        context_files: list[str] | None = None,
-        verify_commands: list[str] | None = None,
-    ) -> dict:
-        root = Path(project_root)
-        if not root.is_absolute():
-            return {"error": f"project_root must be an absolute path: {project_root}"}
-        if not root.is_dir():
-            return {"error": f"project_root does not exist: {project_root}"}
-        if _is_within(self.config.data_dir.resolve(), root.resolve()):
-            return {
-                "error": f"project_root contains the sous data dir "
-                f"({self.config.data_dir}); a task rooted there "
-                f"could rewrite sous's own allowlist, task db, "
-                f"and audit transcripts"
-            }
-        allowlist = current_allowlist(self.config.config_path)
-        bad = []
-        for c in verify_commands or []:
-            try:
-                argv = shlex.split(c)
-            except ValueError:
-                # Client-supplied string with e.g. an unmatched quote — a
-                # structured error, never a ValueError out of the service.
-                bad.append(c)
-                continue
-            if not command_allowed(argv, allowlist):
-                bad.append(c)
-        if bad:
-            return {"error": "verify_commands not allowlisted (or unparseable): " + ", ".join(bad)}
-        task = self.store.enqueue(
-            title=title,
-            instructions=instructions,
-            project_root=str(root),
-            context_files=context_files or [],
-            verify_commands=verify_commands or [],
-        )
-        return {"task_id": task.id, "queue_position": self.store.queue_position(task.id) or 0}
-
-    def _status_entry(self, t: Task) -> dict:
-        end = t.finished_at or time.time()
-        elapsed = (end - t.started_at) if t.started_at else None
-        return {
-            "id": t.id,
-            "title": t.title,
-            "state": t.state,
-            "outcome": t.outcome,
-            "queue_position": self.store.queue_position(t.id),
-            "turns_used": t.turns_used,
-            "elapsed_seconds": round(elapsed) if elapsed else None,
-            "last_activity": t.last_activity,
-            "pending_command": t.pending_command,
-        }
-
-    def task_status(self, task_id: str | None = None) -> dict:
-        if task_id is not None:
-            t = self.store.get(task_id)
-            if t is None:
-                return {"error": f"unknown task: {task_id}"}
-            return self._status_entry(t)
-        return {"tasks": [self._status_entry(t) for t in self.store.list_recent()]}
-
-    def task_result(self, task_id: str, include_diff: bool = False) -> dict:
-        t = self.store.get(task_id)
-        if t is None:
-            return {"error": f"unknown task: {task_id}"}
-        if t.state not in FINISHED_STATES:
-            return {"error": f"task is {t.state}; result not ready"}
-        out = {"task_id": t.id, "state": t.state, "outcome": t.outcome, "report": t.report}
-        if include_diff:
-            out["diff"] = self._diff(t)
-        return out
-
-    def _diff(self, t: Task) -> str | None:
-        files = [f["path"] for f in (t.report or {}).get("files_changed", [])]
-        if not files or not self._is_git_repo(t.project_root):
-            return None
-        # `git diff` cannot show untracked files, and file CREATION is the
-        # single most common worker action — so split the reported paths into
-        # tracked (regular diff) and untracked (an add-style --no-index diff
-        # against /dev/null each). Strictly read-only: no `git add`, no index
-        # writes — this is a reporting path over the user's repository.
-        ls = subprocess.run(
-            ["git", "ls-files", "-z", "--", *files],
-            cwd=t.project_root,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        tracked = set(ls.stdout.split("\0")) - {""}
-        parts: list[str] = []
-        if tracked_files := [f for f in files if f in tracked]:
-            proc = subprocess.run(
-                ["git", "diff", "--", *tracked_files],
-                cwd=t.project_root,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            parts.append(proc.stdout)
-        for f in files:
-            if f in tracked:
-                continue
-            # --no-index exits 1 when the files differ — for a newly created
-            # file that IS the expected outcome, not an error.
-            proc = subprocess.run(
-                ["git", "diff", "--no-index", "--", "/dev/null", f],
-                cwd=t.project_root,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            parts.append(proc.stdout)
-        combined = "".join(parts)
-        return combined[-30_000:] if combined else None
-
-    @staticmethod
-    def _is_git_repo(project_root: str) -> bool:
-        """Authoritative repo check: a `.git`-is-a-directory probe misses git
-        worktrees and submodules, where `.git` is a FILE pointing at the real
-        gitdir, and it also misses project_root being a subdirectory of a
-        repo. `git rev-parse --is-inside-work-tree` handles all three."""
-        check = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return check.returncode == 0 and check.stdout.strip() == "true"
-
-    def cancel_task(self, task_id: str) -> dict:
-        if self.store.get(task_id) is None:
-            return {"error": f"unknown task: {task_id}"}
-        return {"cancelled": self.store.cancel(task_id)}
-
-    def respond_to_command_request(
-        self, task_id: str, approve: bool, persist_to_allowlist: bool = False
-    ) -> dict:
-        t = self.store.get(task_id)
-        if t is None:
-            return {"error": f"unknown task: {task_id}"}
-        if t.state != TaskState.AWAITING_APPROVAL:
-            return {"error": f"task is {t.state}, not awaiting approval"}
-        ok = self.store.respond_approval(task_id, approve)
-        # Persist only after the approval actually landed — a timeout-deny
-        # racing this call must not leave the command allowlisted forever.
-        # Persist the canonical form the allowlist actually matches: run_command
-        # strips a `cd <dir> &&` prefix before checking, so persisting the raw
-        # `cd ... && ...` would write an entry no future request can ever match,
-        # and the "remembered" approval would keep prompting.
-        if ok and approve and persist_to_allowlist and t.pending_command:
-            persist_allowlist_entry(
-                canonical_command_for_allowlist(t.pending_command), self.config.config_path
-            )
-        return {"ok": ok}
-
-    def _task_summary(self, t: Task) -> dict:
-        end = t.finished_at or time.time()
-        return {
-            "id": t.id,
-            "state": t.state,
-            "title": t.title,
-            "seconds": round(end - t.started_at) if t.started_at else 0,
-        }
 
     def _config_stamp(self) -> tuple[int, int]:
         """The config file's mtime_ns and size, (-1, -1) when there is no
-        file: what the allowlist memo and the status version key on. The
-        size is there for a write that keeps the mtime and changes the
-        length — a `cp -p`, a backup restore — which the memo would
-        otherwise never see; one that keeps both is still invisible."""
+        file: what the status version keys on. The size is there for a
+        write that keeps the mtime and changes the length — a `cp -p`, a
+        backup restore — which the stamp would otherwise never see; one
+        that keeps both is still invisible."""
         try:
             st = self.config.config_path.stat()
         except OSError:
             return (-1, -1)
         return (st.st_mtime_ns, st.st_size)
 
-    def status_version(self) -> tuple[int, int, int, tuple[int, int]]:
+    def status_version(self) -> tuple[int, int, tuple[int, int]]:
         """What the event stream polls between documents: the in-flight
-        registry's version, the engine manager's, the task store's and the
-        config file's stamp. Four cheap reads and no lock; a change to any
-        of them is a document worth sending, and nothing else is."""
-        return (
-            self.inflight.version,
-            self.engines.version,
-            self.store.version,
-            self._config_stamp(),
-        )
-
-    def _task_reads(self, *, recent: bool) -> tuple[dict, list[Task]]:
-        # The version is read once, before the queries, so a write that
-        # lands while they run is a newer number next time, never masked.
-        version = self.store.version
-        counts = self._counts.get(version, self.store.count_by_state)
-        if not recent:
-            return counts, []
-        return counts, self._recent.get(version, lambda: self.store.list_recent(limit=10))
-
-    def _allowlist_now(self) -> list[list[str]]:
-        # No file stamps as (-1, -1): the defaults, which current_allowlist knows.
-        return self._allowlist.get(
-            self._config_stamp(), lambda: current_allowlist(self.config.config_path)
-        )
+        registry's version, the engine manager's, and the config file's
+        stamp. Three cheap reads and no lock; a change to any of them is a
+        document worth sending, and nothing else is."""
+        return (self.inflight.version, self.engines.version, self._config_stamp())
 
     def status_document(self, *, recent: bool) -> dict:
         """The one document every status surface serves. `recent` adds the
-        last fifty turns and the last ten tasks — for the HTTP routes and
-        the terminal, not for the MCP tool, where a frontier model pays for
-        every key it reads. Runs on a worker thread: the task store is
-        SQLite, the engine's status takes its lock, and the registry's
-        snapshot may call into the prompt cache."""
+        last fifty turns — for the HTTP routes and the terminal, not for a
+        narrower caller, where a frontier model pays for every key it reads.
+        Runs on a worker thread: the engine's status takes its lock, and the
+        registry's snapshot may call into the prompt cache."""
         try:
-            counts, tasks = self._task_reads(recent=recent)
             engine = self.engines.status()
             live = self.inflight.snapshot()
             # Last of all: the read releases this thread's mlx state, and the
@@ -332,26 +103,10 @@ class SousService:
         document = {
             "engine": engine,
             "inflight": live["inflight"],
-            "queue": {
-                "queued": counts.get(TaskState.QUEUED, 0),
-                "running": counts.get(TaskState.RUNNING, 0)
-                + counts.get(TaskState.AWAITING_APPROVAL, 0),
-            },
             "config": {
                 "model_id": self.config.model_id,
                 "idle_unload_minutes": self.config.idle_unload_minutes,
                 "port": self.config.server_port,
-                "max_turns": self.config.max_turns,
-                "max_minutes": self.config.max_minutes,
-                "allowlist": self._allowlist_now(),
-                "context": {
-                    "mode": self.config.context_mode,
-                    "fraction": self.config.context_fraction,
-                    "min_tokens": self.config.context_min_tokens,
-                    # Fixed mode's operative value — without it a client sees
-                    # THAT the policy is fixed but not what it's fixed to.
-                    "max_context_tokens": self.config.max_context_tokens,
-                },
                 "gateway": {
                     "enabled": self.config.gateway_enabled,
                     "local_models": list(self.config.gateway_local_models),
@@ -362,70 +117,21 @@ class SousService:
         }
         if recent:
             document["recent_turns"] = live["recent_turns"]
-            document["recent_tasks"] = [self._task_summary(t) for t in tasks]
         return document
-
-    def server_status(self) -> dict:
-        return self.status_document(recent=False)
-
-
-# Clients surface server instructions to the model unconditionally, even on
-# surfaces that defer tool schemas out of context (Claude Code shows only tool
-# NAMES until an explicit fetch) — so this text is what makes sous discoverable
-# at decision time, and it must stand alone: when to delegate, why it beats
-# working inline, then mechanics. Claude Code truncates instructions at 2KB
-# with no marker, so the ending is the first thing an overrun loses; a test
-# pins the size.
-_INSTRUCTIONS = """\
-sous runs a local MLX model on this Mac that executes self-contained coding
-tasks in a sandboxed, queued tool loop. Every line the local worker generates
-is output the user's Claude plan did not pay for — so when a task qualifies,
-delegate it instead of generating the output inline.
-
-Delegate mechanical, repetitive, low-risk work: boilerplate, test
-scaffolding, bulk renames or migrations, docstring/comment sweeps, lint-fix
-sweeps, fixture generation. Do NOT delegate architecture, subtle debugging,
-security-sensitive code, API design, or anything needing this conversation's
-context or taste. Delegation pays only when a short spec yields a large diff;
-if you must author the content in the spec, work inline instead.
-
-To delegate, call delegate_to_local_model with self-contained instructions —
-the worker sees nothing of this chat — stating the goal, scope limits, and
-acceptance criteria, plus project_root (absolute path). Trust the worker
-with the how: point context_files at convention docs instead of restating
-them, let allowlisted verify_commands catch what a linter would — worker
-attempts are free, your prompt is not. It returns a task_id at once. If
-your next step needs the result, block on `sous wait <task_id>`; otherwise
-keep working and check task_status between steps.
-
-If task_status shows awaiting_approval, the worker wants to run the command
-in pending_command: relay it to the human verbatim (approve once / allowlist
-/ deny), answer via respond_to_command_request — unanswered requests
-auto-deny. Don't edit files the running task is touching.
-
-Collect with task_result (include_diff=true) and review the diff like a PR
-from an eager junior. A clean diff earns a brief acceptance — don't
-re-narrate good work. On a miss, re-delegate a narrower self-contained task
-scoped to just the flaws (the worker keeps nothing between tasks), and say
-only that you're re-instructing it. budget-exhausted is partial
-work: review, then finish or re-delegate narrower. The worker's output is a
-draft, never a merge.
-"""
 
 
 def create_server(
-    store: TaskStore,
     engines: EngineManager,
     config: SousConfig,
     *,
     upstream: Upstream | None = None,
     inflight: Inflight | None = None,
 ) -> MCPServer:
-    # One registry: the gateway's turns write it, the status routes and the
-    # MCP tool read it. A caller may pass its own (a test that writes to it
-    # while driving the app).
+    # One registry: the gateway's turns write it, and the status routes
+    # read it. A caller may pass its own (a test that writes to it while
+    # driving the app).
     inflight = inflight or Inflight()
-    svc = SousService(store, engines, config, inflight)
+    svc = SousService(engines, config, inflight)
     # mount_gateway (below) runs after MCPServer(...) is constructed, so the
     # lifespan closure below needs a late-bound holder for whatever it
     # mounts — empty when the gateway is disabled, since there is then
@@ -434,9 +140,13 @@ def create_server(
 
     @contextlib.asynccontextmanager
     async def _lifespan(_: MCPServer) -> AsyncIterator[None]:
+        # Nothing else loops unload_if_idle() any more: the lifespan is the
+        # one span that matches the served app's lifetime exactly.
+        engines.start_idle_sweep()
         try:
             yield None
         finally:
+            engines.stop_idle_sweep()
             # Fires on every path that drives the app's ASGI lifespan:
             # uvicorn's graceful shutdown and its SIGTERM path alike
             # (capture_signals re-raises SIGTERM only after Server.shutdown()
@@ -448,80 +158,13 @@ def create_server(
             for gateway in mounted_gateway:
                 await gateway.aclose()
 
-    mcp = MCPServer("sous", instructions=_INSTRUCTIONS, lifespan=_lifespan)
+    mcp = MCPServer("sous", lifespan=_lifespan)
 
     # MCPServer.__init__ just ran the SDK's configure_logging("INFO"), which
     # basicConfig's a RichHandler onto the root logger — every record wrapped
     # at 80 columns. Replace it with the daemon's one-line shape now, before
     # the first line anyone cares about is written.
     configure_daemon_logging()
-
-    # The MCP-facing name deliberately differs from SousService.delegate_task:
-    # on surfaces that defer tool schemas, the name is the only signal the
-    # model has at decision time, so it must carry its own trigger (mechanical
-    # work -> a local model). Clients already namespace by server — Claude
-    # sees mcp__sous__delegate_to_local_model — so no sous_ prefix.
-    @mcp.tool()
-    def delegate_to_local_model(
-        title: str,
-        instructions: str,
-        project_root: str,
-        context_files: list[str] | None = None,
-        verify_commands: list[str] | None = None,
-    ) -> dict:
-        """Delegate a mechanical, self-contained coding task to the local model.
-
-        Every line the local worker generates is output the user's Claude plan
-        did not pay for — prefer delegating qualifying work over generating it
-        inline. It pays when a short spec yields a large diff; if you would be
-        authoring the content in the spec, work inline instead. Use for
-        volume-heavy, low-risk work (boilerplate, test scaffolding, bulk
-        renames, docstrings, lint fixes) — NOT for architecture, tricky
-        debugging, or security-sensitive code. The worker has NO conversation
-        context: instructions must be self-contained (goal, scope limits,
-        acceptance criteria) but lean — trust the worker with the how and
-        re-delegate narrower on a miss. Returns immediately with a task_id;
-        poll with task_status and ALWAYS review the result diff before
-        accepting.
-        """
-        return svc.delegate_task(title, instructions, project_root, context_files, verify_commands)
-
-    @mcp.tool()
-    def task_status(task_id: str | None = None) -> dict:
-        """Check delegated task progress. Omit task_id to list all recent tasks.
-
-        A task in state awaiting_approval wants to run the command shown in
-        pending_command — ask the human, then call respond_to_command_request.
-        """
-        return svc.task_status(task_id)
-
-    @mcp.tool()
-    def task_result(task_id: str, include_diff: bool = False) -> dict:
-        """Fetch a finished task's report (summary, files changed, verify output,
-        transcript path). Set include_diff=true for a unified diff (git repos).
-        Treat the output as a draft: review it before accepting."""
-        return svc.task_result(task_id, include_diff)
-
-    @mcp.tool()
-    def cancel_task(task_id: str) -> dict:
-        """Cancel a queued task immediately, or stop a running task at its next
-        tool boundary."""
-        return svc.cancel_task(task_id)
-
-    @mcp.tool()
-    def respond_to_command_request(
-        task_id: str, approve: bool, persist_to_allowlist: bool = False
-    ) -> dict:
-        """Resolve an awaiting_approval task. Only call after asking the human.
-        approve=true runs the pending command once; persist_to_allowlist=true
-        additionally adds it to the config allowlist for all future tasks."""
-        return svc.respond_to_command_request(task_id, approve, persist_to_allowlist)
-
-    @mcp.tool()
-    def server_status() -> dict:
-        """Daemon health: model load state, memory, the turn in flight, queue
-        depth, active config."""
-        return svc.server_status()
 
     # The daemon's own routes go on before the gateway's: the gateway ends
     # with a catch-all that forwards upstream, and a /sous/ path must never
@@ -695,10 +338,10 @@ def main() -> None:
     # terminal). Fallback on failure: whatever PATH we inherited.
     if login_path := _login_shell_path():
         os.environ["PATH"] = login_path
-    # Before ANY queue access: recover_interrupted() below would fail a running
-    # daemon's in-flight task, and the worker would load a second copy of the
-    # model. The port bind at the end of this function is far too late to be
-    # the guard. `_lock` is unused by design — it must stay open to hold it.
+    # Before anything else claims the port or the data dir: the port bind at
+    # the end of this function is far too late to be the guard against a
+    # second daemon starting. `_lock` is unused by design — it must stay
+    # open to hold it.
     _lock = _acquire_singleton_lock(config.data_dir)
     # Only the daemon entry point silences huggingface_hub's tqdm bars —
     # terminal animation that lands in a log file as garbage (`Fetching 13
@@ -711,20 +354,10 @@ def main() -> None:
     # stderr is None when fd 2 was closed at exec (`sous serve 2>&-`).
     if sys.stderr is None or not sys.stderr.isatty():
         disable_progress_bars()
-    store = TaskStore(config.data_dir / "tasks.db")
-    interrupted = store.recover_interrupted(config.data_dir)
-    if interrupted:
-        _logger.warning(f"marked {interrupted} interrupted task(s) as failed")
     engines = EngineManager(config)
     stop = threading.Event()
     _install_shutdown_handler(stop)
-    worker = threading.Thread(
-        target=run_worker_loop,
-        args=(store, engines, config, stop),
-        daemon=True,
-    )
-    worker.start()
-    mcp = create_server(store, engines, config)
+    mcp = create_server(engines, config)
     if config.gateway_enabled:
         _logger.info(
             f"gateway (experimental) serving {', '.join(config.gateway_local_models)} "

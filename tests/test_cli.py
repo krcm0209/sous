@@ -1411,7 +1411,6 @@ def test_daemon_status_reads_the_real_daemons_gateway_config(tmp_path):
     from sous.config import SousConfig
     from sous.engine.base import EngineManager
     from sous.server import create_server, uvicorn_config
-    from sous.tasks import TaskStore
     from tests.fake_engine import FakeEngine
 
     @contextlib.contextmanager
@@ -1433,7 +1432,7 @@ def test_daemon_status_reads_the_real_daemons_gateway_config(tmp_path):
         data_dir=tmp_path / "data", config_path=tmp_path / "c.toml", gateway_enabled=True
     )
     engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
-    app = create_server(TaskStore(tmp_path / "tasks.db"), engines, cfg).streamable_http_app()
+    app = create_server(engines, cfg).streamable_http_app()
     port = _free_cli_port()
     with serve(app, port):
         status = _daemon_status(port, tmp_path)

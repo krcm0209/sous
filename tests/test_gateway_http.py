@@ -27,7 +27,6 @@ from sous.engine.base import EngineManager
 from sous.gateway.routes import Gateway, mount_gateway
 from sous.gateway.upstream import Upstream
 from sous.server import GRACEFUL_SHUTDOWN_SECONDS, create_server, uvicorn_config
-from sous.tasks import TaskStore
 from tests.fake_engine import ChunkedFakeEngine
 from tests.fake_upstream import FakeUpstream
 
@@ -59,9 +58,7 @@ def _app(
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
     if upstream_url is None and upstream is None:
         upstream = FakeUpstream().upstream()
-    return create_server(
-        TaskStore(tmp_path / "tasks.db"), engines, cfg, upstream=upstream
-    ).streamable_http_app()
+    return create_server(engines, cfg, upstream=upstream).streamable_http_app()
 
 
 def _gateway_app(tmp_path: Path, engine) -> tuple[Gateway, object]:
