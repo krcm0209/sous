@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from sous.cli import _BOOTOUT_NOT_LOADED, LABEL, launchd_plist
+from sous.cli import _BOOTOUT_NOT_LOADED, LABEL, launchd_plist, status_lines
+from sous.config import SousConfig
 
 
 def _free_cli_port() -> int:
@@ -64,25 +65,6 @@ def test_status_reports_not_running(tmp_path, capsys, monkeypatch):
     cli.main(["status"])
     out = capsys.readouterr().out
     assert "not running" in out
-
-
-def test_mcp_subcommand_dispatches_to_the_proxy(monkeypatch):
-    """`sous mcp` must reach the proxy and propagate its exit code, so a failed
-    cold start surfaces to the launching client instead of exiting 0."""
-    import sous.proxy
-    from sous.cli import main
-
-    called = {}
-
-    def fake_run():
-        called["ran"] = True
-        return 1
-
-    monkeypatch.setattr(sous.proxy, "run", fake_run)
-    with pytest.raises(SystemExit) as exc:
-        main(["mcp"])
-    assert called.get("ran") is True
-    assert exc.value.code == 1
 
 
 # --- stop / uninstall-launchd -------------------------------------------------
@@ -242,38 +224,6 @@ def test_stop_refuses_a_stale_pid_file(tmp_path, capsys, monkeypatch):
             cli.main(["stop"])
         assert exc.value.code != 0
         assert daemon.poll() is None, "signalled despite a stale lock"
-    finally:
-        daemon.kill()
-
-
-def test_stop_warns_about_all_active_tasks(tmp_path, capsys, monkeypatch):
-    """The warning must cover every state recover_interrupted() will fail.
-
-    list_recent() caps at 20 rows, so a long-running task drops off the list
-    once 20 newer ones are queued, and AWAITING_APPROVAL was missed entirely.
-    """
-    from sous import cli
-    from sous.tasks import TaskStore
-
-    port = _free_cli_port()
-    daemon = _fake_daemon(tmp_path, port)
-    try:
-        store = TaskStore(tmp_path / "tasks.db")
-        old = store.enqueue("long-runner", "x", "/tmp", [], [])
-        store.claim_next()
-        approving = store.enqueue("needs-approval", "x", "/tmp", [], [])
-        store.claim_next()
-        store.request_approval(approving.id, "pytest")
-        for i in range(25):  # push the running task off list_recent()
-            store.enqueue(f"filler{i}", "x", "/tmp", [], [])
-        still_running = store.get(old.id)
-        assert still_running is not None and still_running.state == "running"
-
-        monkeypatch.setattr(cli, "load_config", lambda: _cfg(tmp_path, port))
-        monkeypatch.setattr(cli, "_launchd_loaded", lambda label: False)
-        cli.main(["stop"])
-        out = capsys.readouterr().out
-        assert "running" in out and "awaiting_approval" in out
     finally:
         daemon.kill()
 
@@ -681,146 +631,6 @@ def test_install_launchd_exits_nonzero_when_bootstrap_fails(tmp_path, capsys, mo
     assert exc.value.code == 1
     assert "run manually" in capsys.readouterr().out
     assert plist.exists()  # the plist itself is still written; only the load failed
-
-
-# --- wait ----------------------------------------------------------------------
-
-
-def _wait_store(tmp_path, monkeypatch):
-    from sous import cli
-    from sous.config import SousConfig
-    from sous.tasks import TaskStore
-
-    cfg = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
-    monkeypatch.setattr(cli, "load_config", lambda: cfg)
-    return TaskStore(tmp_path / "tasks.db")
-
-
-def _enqueue(store):
-    return store.enqueue(
-        title="t", instructions="x", project_root="/", context_files=[], verify_commands=[]
-    )
-
-
-def test_wait_returns_immediately_for_a_finished_task(tmp_path, capsys, monkeypatch):
-    from sous import cli
-
-    store = _wait_store(tmp_path, monkeypatch)
-    t = _enqueue(store)
-    store.claim_next()
-    store.finish(t.id, "completed", {"summary": "s"})
-    cli.main(["wait", t.id])
-    out = capsys.readouterr().out
-    assert "done" in out and "completed" in out
-
-
-def test_wait_blocks_until_approval_is_requested(tmp_path, capsys, monkeypatch):
-    """The point of `wait`: agents park it in a background shell instead of
-    tight-polling task_status or reading tasks.db by hand — so it must wake on
-    awaiting_approval (a human is needed NOW), not only on terminal states."""
-    from sous import cli
-
-    store = _wait_store(tmp_path, monkeypatch)
-    t = _enqueue(store)
-    store.claim_next()
-
-    def approve_later():
-        time.sleep(0.3)
-        store.request_approval(t.id, "git diff")
-
-    flipper = threading.Thread(target=approve_later)
-    started = time.monotonic()
-    flipper.start()
-    try:
-        cli.main(["wait", t.id, "--interval", "0.05"])
-    finally:
-        flipper.join()
-    elapsed = time.monotonic() - started
-    out = capsys.readouterr().out
-    assert "awaiting_approval" in out
-    assert "git diff" in out, "the pending command is the thing the human must see"
-    assert elapsed >= 0.3, f"returned in {elapsed:.2f}s — never actually waited"
-
-
-def test_wait_unknown_task_exits_2(tmp_path, capsys, monkeypatch):
-    from sous import cli
-
-    _wait_store(tmp_path, monkeypatch)
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["wait", "nope"])
-    assert exc.value.code == 2
-
-
-def test_wait_timeout_exits_1(tmp_path, capsys, monkeypatch):
-    """A queued task that never advances must not hang the caller forever when
-    a timeout was asked for — and the timeout must be exit 1, distinct from
-    unknown-task (2), so scripts can tell 'still running' from 'gone'."""
-    from sous import cli
-
-    store = _wait_store(tmp_path, monkeypatch)
-    t = _enqueue(store)  # stays queued: nothing ever claims it
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["wait", t.id, "--timeout", "0.3", "--interval", "0.05"])
-    assert exc.value.code == 1
-    assert "queued" in capsys.readouterr().out
-
-
-def test_wait_timeout_is_not_quantized_by_interval(tmp_path, capsys, monkeypatch):
-    """A 0.3s timeout must expire near 0.3s even with the default 2s interval —
-    each sleep has to be capped to the remaining budget, or the deadline check
-    only runs on interval boundaries (and a task finishing inside the overrun
-    would be reported as success AFTER the caller's deadline)."""
-    from sous import cli
-
-    store = _wait_store(tmp_path, monkeypatch)
-    t = _enqueue(store)  # stays queued
-    started = time.monotonic()
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["wait", t.id, "--timeout", "0.3"])  # interval left at default
-    elapsed = time.monotonic() - started
-    assert exc.value.code == 1
-    assert elapsed < 1.0, f"timed out after {elapsed:.2f}s — quantized to the interval"
-
-
-def test_wait_rejects_degenerate_intervals_and_timeouts(tmp_path, capsys, monkeypatch):
-    """--interval 0 recreates the tight-polling this command exists to prevent,
-    a negative interval raises out of time.sleep, and a NaN timeout never
-    expires — all three must be argparse usage errors (exit 2), not runtime
-    misbehavior."""
-    from sous import cli
-
-    store = _wait_store(tmp_path, monkeypatch)
-    t = _enqueue(store)
-    store.claim_next()
-    store.finish(t.id, "completed", {"summary": "s"})  # even a done task: reject first
-    for argv in (
-        ["wait", t.id, "--interval", "0", "--timeout", "0.2"],
-        ["wait", t.id, "--interval", "-1", "--timeout", "0.2"],
-        ["wait", t.id, "--timeout", "nan"],
-        ["wait", t.id, "--interval", "nan", "--timeout", "0.2"],
-        ["wait", t.id, "--timeout", "-5"],
-    ):
-        with pytest.raises(SystemExit) as exc:
-            cli.main(argv)
-        assert exc.value.code == 2, argv
-
-
-def test_wait_timeout_zero_is_an_immediate_probe(tmp_path, capsys, monkeypatch):
-    """--timeout 0 is the defined non-blocking form: one state check, then
-    report — exit 0 if the task already needs attention, exit 1 otherwise."""
-    from sous import cli
-
-    store = _wait_store(tmp_path, monkeypatch)
-    pending = _enqueue(store)
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["wait", pending.id, "--timeout", "0"])
-    assert exc.value.code == 1
-    done = _enqueue(store)
-    store.claim_next()  # claims `pending`... order: claim_next takes oldest queued
-    store.claim_next()
-    store.finish(done.id, "completed", {"summary": "s"})
-    cli.main(["wait", done.id, "--timeout", "0"])
-    assert "done" in capsys.readouterr().out
 
 
 # --- sous claude ---------------------------------------------------------------------
@@ -1516,7 +1326,6 @@ def _document(**overrides) -> dict:
     doc = {
         "engine": {"loaded": True, "loading": False, "holders": 0, "prompt_cache": {"slots": 5}},
         "inflight": [],
-        "queue": {"queued": 0, "running": 0},
         "config": {},
         "recent_turns": [],
         "recent_tasks": [],
@@ -1833,3 +1642,100 @@ def test_restart_hint_names_launchds_kickstart_or_the_two_commands():
 
     assert restart_hint(managed=False) == "sous stop, then sous serve"
     assert restart_hint(managed=True) == f"launchctl kickstart -k gui/{os.getuid()}/{LABEL}"
+
+
+def test_status_lines_show_the_engine_the_turn_and_the_recent_ring():
+    doc = {
+        "engine": {
+            "loaded": True,
+            "loading": False,
+            "unloading": False,
+            "model_id": "org/m",
+            "idle_seconds": 12.0,
+            "holders": 1,
+        },
+        "inflight": [
+            {"id": "msg_1", "model": "sous-local", "phase": "decode", "started_at": 100.0}
+        ],
+        "config": {"port": 8383},
+        "recent_turns": [
+            {
+                "id": "msg_0",
+                "model": "sous-local",
+                "status": 200,
+                "stop_reason": "tool_use",
+                "cache": "hit",
+                "input_tokens": 66262,
+                "output_tokens": 50,
+                "seconds": 4.9,
+            }
+        ],
+    }
+    lines = status_lines(doc, now=130.0)
+    assert lines[0] == "sous daemon: listening on 127.0.0.1:8383"
+    assert lines[1].startswith("  engine: org/m loaded · holders 1 · idle ")
+    assert lines[2].startswith("  turn msg_1 sous-local decode ")
+    assert lines[3] == "  recent turns:"
+    assert (
+        lines[4] == "    msg_0 sous-local status=200 stop=tool_use cache=hit in=66262 out=50 4.9s"
+    )
+
+
+def test_status_lines_for_an_idle_unloaded_daemon():
+    doc = {
+        "engine": {
+            "loaded": False,
+            "loading": False,
+            "unloading": False,
+            "model_id": "org/m",
+            "idle_seconds": None,
+            "holders": 0,
+        },
+        "inflight": [],
+        "config": {"port": 8383},
+        "recent_turns": [],
+    }
+    assert status_lines(doc, now=0.0) == [
+        "sous daemon: listening on 127.0.0.1:8383",
+        "  engine: org/m unloaded · holders 0",
+        "  turns in flight: none",
+    ]
+
+
+def test_status_prints_the_document_when_the_daemon_answers(monkeypatch, capsys, tmp_path):
+    from sous import cli
+
+    doc = {
+        "engine": {"loaded": False, "model_id": "org/m", "holders": 0},
+        "inflight": [],
+        "config": {"port": 8383},
+        "recent_turns": [],
+    }
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: SousConfig(
+            server_port=8383, data_dir=tmp_path, config_path=tmp_path / "config.toml"
+        ),
+    )
+    monkeypatch.setattr(cli, "_port_open", lambda port: True)
+    monkeypatch.setattr(
+        cli, "_sous_request", lambda port, method, path, json=None: (200, json_dumps(doc))
+    )
+    cli.main(["status"])
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "sous daemon: listening on 127.0.0.1:8383"
+    assert out[1] == "  engine: org/m unloaded · holders 0"
+
+
+def json_dumps(doc: dict) -> bytes:
+    return json.dumps(doc).encode()
+
+
+def test_wait_and_mcp_are_no_longer_commands(capsys):
+    from sous import cli
+
+    for verb in ("wait", "mcp"):
+        with pytest.raises(SystemExit):
+            cli.main([verb])
+        assert "invalid choice" in capsys.readouterr().err

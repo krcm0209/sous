@@ -1,4 +1,4 @@
-"""sous CLI: serve / status / top / statusline / wait / stop / mcp / claude / install- and
+"""sous CLI: serve / status / top / statusline / stop / claude / install- and
 uninstall-launchd."""
 
 from __future__ import annotations
@@ -7,7 +7,6 @@ import argparse
 import contextlib
 import fcntl
 import json
-import math
 import os
 import plistlib
 import shutil
@@ -50,9 +49,9 @@ _LSP_OFF = ["--disallowedTools", "LSP"]
 _NO_HOLD_FLAGS = ("--help", "-h", "--version", "-v")
 # Model load plus a long prefill: minutes, not the SDK's default.
 _API_TIMEOUT_MS = "3000000"
-# Nothing about /sous/status or /sous/hold is slow: one reads the task
-# store, the engine's counters and the turn registry (a millisecond), the
-# other registers a pid; neither waits for the model.
+# Nothing about /sous/status or /sous/hold is slow: one reads the engine's
+# counters and the turn registry (a millisecond), the other registers a
+# pid; neither waits for the model.
 _STATUS_TIMEOUT_SECONDS = 15.0
 # The status document is tens of KB with its ring of recent turns and a hold
 # reply is three fields; a reply past this is not the daemon's.
@@ -372,20 +371,80 @@ def launchd_plist(sous_executable: str, log_dir: Path) -> str:
     ).decode()
 
 
+def status_lines(document: dict, now: float) -> list[str]:
+    """`sous status` from the status document: the engine, the turns in
+    flight and the last five served, newest first. `now` is only for a
+    turn's elapsed time, like statusline_text."""
+    engine = document.get("engine") or {}
+    config = document.get("config") or {}
+    if engine.get("loading"):
+        state = "loading"
+    elif engine.get("unloading"):
+        state = "unloading"
+    elif engine.get("loaded"):
+        state = "loaded"
+    else:
+        state = "unloaded"
+    engine_parts = [
+        f"engine: {engine.get('model_id', '?')} {state}",
+        f"holders {engine.get('holders') or 0}",
+    ]
+    idle = engine.get("idle_seconds")
+    if state == "loaded" and idle is not None:
+        engine_parts.append(f"idle {_clock(idle)}")
+    lines = [
+        f"sous daemon: listening on 127.0.0.1:{config.get('port', '?')}",
+        "  " + " · ".join(engine_parts),
+    ]
+    inflight = document.get("inflight") or []
+    if inflight:
+        for turn in inflight:
+            since = turn.get("started_at")
+            age = f" {_clock(now - since)}" if since is not None else ""
+            lines.append(
+                f"  turn {turn.get('id', '?')} {turn.get('model', '?')} "
+                f"{turn.get('phase', 'queued')}{age}"
+            )
+    else:
+        lines.append("  turns in flight: none")
+    recent = list(document.get("recent_turns") or [])[-5:]
+    if recent:
+        lines.append("  recent turns:")
+        for s in reversed(recent):
+            lines.append(
+                f"    {s.get('id', '?')} {s.get('model', '?')} status={s.get('status', '?')} "
+                f"stop={s.get('stop_reason') or '-'} cache={s.get('cache') or '-'} "
+                f"in={s.get('input_tokens', '-')} out={s.get('output_tokens', '-')} "
+                f"{s.get('seconds', '-')}s"
+            )
+    return lines
+
+
 def _cmd_status() -> None:
     config = load_config()
-    try:
-        with socket.create_connection(("127.0.0.1", config.server_port), timeout=1):
-            print(f"sous daemon: listening on 127.0.0.1:{config.server_port}")
-    except OSError:
+    if not _port_open(config.server_port):
         print(f"sous daemon: not running (port {config.server_port})")
         print("start it with: sous serve   (or: sous install-launchd)")
         return
-    from sous.tasks import TaskStore
+    import httpx
 
-    store = TaskStore(config.data_dir / "tasks.db")
-    for t in store.list_recent(limit=10):
-        print(f"  {t.id}  {t.state:<18} {t.title}")
+    try:
+        status, raw = _sous_request(config.server_port, "GET", "/sous/status")
+    except httpx.HTTPError as e:
+        print(
+            f"sous daemon: port {config.server_port} did not answer /sous/status "
+            f"({type(e).__name__}); is it sous?"
+        )
+        raise SystemExit(1) from None
+    document = _json_object(raw) if status == 200 else None
+    if document is None:
+        print(
+            f"sous daemon: port {config.server_port} answered {status} to /sous/status; "
+            f"restart it ({restart_hint(managed=False)})"
+        )
+        raise SystemExit(1)
+    for line in status_lines(document, now=time.time()):
+        print(line)
 
 
 def _clock(seconds: float) -> str:
@@ -498,45 +557,6 @@ def _cmd_top() -> None:
     from sous.tui import run_top
 
     raise SystemExit(run_top(config.server_port))
-
-
-def _cmd_wait(task_id: str, timeout: float | None, interval: float) -> None:
-    """Block until the task needs attention, so agents can park this in a
-    background shell instead of tight-polling task_status — or, worse, reading
-    tasks.db by hand (observed in the wild; the schema is not a contract).
-
-    Wakes on awaiting_approval as well as the terminal states: an approval
-    request needs a human NOW, and a wait that slept through it would let the
-    request time out into an auto-deny.
-    """
-    config = load_config()
-    from sous.tasks import FINISHED_STATES, TaskState, TaskStore
-
-    store = TaskStore(config.data_dir / "tasks.db")
-    deadline = (time.monotonic() + timeout) if timeout is not None else None
-    while True:
-        t = store.get(task_id)
-        if t is None:
-            print(f"sous: unknown task {task_id}")
-            raise SystemExit(2)
-        if t.state in FINISHED_STATES or t.state == TaskState.AWAITING_APPROVAL:
-            line = f"state={t.state}"
-            if t.outcome:
-                line += f" outcome={t.outcome}"
-            if t.state == TaskState.AWAITING_APPROVAL and t.pending_command:
-                line += f" pending_command={t.pending_command}"
-            print(line)
-            return
-        # Cap each sleep to the remaining budget: sleeping a full interval and
-        # only then checking would quantize the deadline to interval boundaries
-        # — and a task finishing inside that overrun would be reported as a
-        # success AFTER the caller's timeout. (--timeout 0 thereby becomes the
-        # non-blocking probe: one state check, then report.)
-        remaining = None if deadline is None else deadline - time.monotonic()
-        if remaining is not None and remaining <= 0:
-            print(f"state={t.state} (timeout)")
-            raise SystemExit(1)
-        time.sleep(interval if remaining is None else min(interval, remaining))
 
 
 def _plist_path() -> Path:
@@ -688,20 +708,6 @@ def _cmd_stop() -> None:
         print(f"  something else is on port {config.server_port}; not signalling a stale pid")
         raise SystemExit(1)
 
-    from sous.tasks import TaskState, TaskStore
-
-    # count_by_state aggregates every row; list_recent() caps at 20 and would
-    # miss a long-running task once newer ones are queued past it.
-    counts = TaskStore(config.data_dir / "tasks.db").count_by_state()
-    interrupted = {
-        state: n
-        for state, n in counts.items()
-        if state in (TaskState.RUNNING, TaskState.AWAITING_APPROVAL) and n
-    }
-    if interrupted:
-        summary = ", ".join(f"{n} {state}" for state, n in sorted(interrupted.items()))
-        print(f"sous: {summary}; these will be reported failed when the daemon restarts")
-
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -714,7 +720,6 @@ def _cmd_stop() -> None:
         print(f"sous daemon: sent SIGTERM to {pid} but port {config.server_port} is still open")
         raise SystemExit(1)
     print(f"sous daemon: stopped (pid {pid})")
-    print("any running `sous mcp` bridges will exit on their own")
 
 
 def _cmd_uninstall_launchd() -> None:
@@ -875,26 +880,6 @@ def _cmd_install_launchd() -> None:
         raise SystemExit(1) from None
 
 
-def _arg_interval(text: str) -> float:
-    """A zero interval recreates the tight-polling `wait` exists to prevent, a
-    negative one raises out of time.sleep, and NaN poisons the sleep math —
-    reject all three as usage errors instead of misbehaving at runtime."""
-    value = float(text)
-    if not math.isfinite(value) or value <= 0:
-        raise argparse.ArgumentTypeError("interval must be a positive finite number of seconds")
-    return value
-
-
-def _arg_timeout(text: str) -> float:
-    """NaN never compares past the deadline (the wait would ignore an explicit
-    timeout and block forever); negatives are nonsense. Zero is allowed and
-    defined: an immediate, non-blocking probe."""
-    value = float(text)
-    if not math.isfinite(value) or value < 0:
-        raise argparse.ArgumentTypeError("timeout must be a non-negative finite number of seconds")
-    return value
-
-
 def _positive_int(text: str) -> int:
     """0 or fewer suite runs per task would measure nothing while still
     reporting a clean exit: reject it as a usage error before the suite
@@ -915,25 +900,15 @@ def main(argv: list[str] | None = None) -> None:
         return
     parser = argparse.ArgumentParser(prog="sous", description="local MLX sous-chef for Claude")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("serve", help="run the daemon (MCP over HTTP on 127.0.0.1)")
-    status = sub.add_parser("status", help="check the daemon and recent tasks")
+    sub.add_parser("serve", help="run the daemon (the endpoint on 127.0.0.1)")
+    status = sub.add_parser("status", help="the daemon, its engine and the recent turns")
     status.add_argument("--watch", action="store_true", help="the live terminal (sous top)")
     sub.add_parser(
         "statusline",
         help="one line for Claude Code's statusLine setting (reads and ignores its stdin JSON)",
     )
     sub.add_parser("top", help="watch the pass live: the order on it, the line, the recent orders")
-    wait = sub.add_parser("wait", help="block until a task finishes or requests a command approval")
-    wait.add_argument("task_id")
-    wait.add_argument(
-        "--timeout",
-        type=_arg_timeout,
-        default=None,
-        help="give up after N seconds, exit 1 (0 = non-blocking probe)",
-    )
-    wait.add_argument("--interval", type=_arg_interval, default=2.0, help="poll every N seconds")
     sub.add_parser("stop", help="stop the daemon (unmanaged daemons only)")
-    sub.add_parser("mcp", help="bridge stdio to the daemon (for stdio-only MCP clients)")
     sub.add_parser("install-launchd", help="install start-at-login LaunchAgent")
     sub.add_parser("uninstall-launchd", help="remove the start-at-login LaunchAgent")
     tune = sub.add_parser(
@@ -966,20 +941,12 @@ def main(argv: list[str] | None = None) -> None:
         from sous.server import main as serve_main
 
         serve_main()
-    elif args.command == "mcp":
-        # Attribute lookup, not `from ... import run`: the exit code has to
-        # reach the launching client, and this stays patchable for tests.
-        import sous.proxy
-
-        raise SystemExit(sous.proxy.run())
     elif args.command == "status":
         _cmd_top() if args.watch else _cmd_status()
     elif args.command == "top":
         _cmd_top()
     elif args.command == "statusline":
         _cmd_statusline()
-    elif args.command == "wait":
-        _cmd_wait(args.task_id, args.timeout, args.interval)
     elif args.command == "stop":
         _cmd_stop()
     elif args.command == "install-launchd":
