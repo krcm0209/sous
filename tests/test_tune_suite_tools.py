@@ -1,9 +1,10 @@
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from sous.tune.suite.tools import ScratchTools, ToolError
+from sous.tune.suite.tools import MAX_TOOL_OUTPUT, ScratchTools, ToolError
 
 
 def _tools(tmp_path: Path, **kw) -> ScratchTools:
@@ -68,21 +69,28 @@ def test_a_blank_verify_command_accepts_nothing(tmp_path: Path):
     assert t.denied == 1
 
 
-def test_the_cd_idiom_runs_its_command_from_the_root(tmp_path: Path):
+def test_the_cd_idiom_runs_its_command_where_it_asked(tmp_path: Path):
     """Local models write `cd <project> && <cmd>` whatever the prompt says;
-    the cd is dropped, never a cwd, and anything past one command is refused."""
-    verify = f"{sys.executable} -c 'print(7)'"
-    t = _tools(tmp_path, verify_commands=(verify,))
+    the command runs in the directory named, as a shell would run it, and
+    anything past one command is refused with guidance. The quoted argument
+    holds a `;` on purpose: shlex unquotes before the operator check, so a
+    substring test refused this command with the cd and ran it without."""
+    where = f"{sys.executable} -c 'import os; print(os.path.basename(os.getcwd()))'"
+    t = _tools(tmp_path, verify_commands=(where,))
     t.write_file("pkg/__init__.py", "")
-    assert t.run_command(f"cd {t.root} && {verify}") == "exit code 0\n7\n"
-    assert t.run_command(f"cd pkg && {verify}") == "exit code 0\n7\n"
+    assert t.run_command(where) == "exit code 0\nproject\n"
+    assert t.run_command(f"cd {t.root} && {where}") == "exit code 0\nproject\n"
+    assert t.run_command(f"cd pkg && {where}") == "exit code 0\npkg\n"
     guidance = "command rejected: run a single command from the project root"
     assert t.run_command("cd").startswith(guidance)
-    assert t.run_command(f"cd {t.root} && {verify} && echo x").startswith(guidance)
-    assert t.run_command(f"cd .. && {verify}") == (
+    assert t.run_command(f"cd {t.root} && {where} && echo x").startswith(guidance)
+    assert t.run_command(f"{where} | cat").startswith(guidance)
+    assert t.run_command(f"{where} > out.txt").startswith(guidance)
+    assert not (t.root / "out.txt").exists()
+    assert t.run_command(f"cd .. && {where}") == (
         "command rejected: cd target .. is outside the project"
     )
-    assert t.run_command(f"cd missing && {verify}") == (
+    assert t.run_command(f"cd missing && {where}") == (
         "command rejected: cd target missing is not a directory in the project"
     )
     assert t.run_command(f"cd {t.root} && rm -rf .").startswith("command denied")
@@ -108,12 +116,40 @@ def test_command_output_keeps_the_verdict_by_capping_head_and_tail(tmp_path: Pat
     t = _tools(tmp_path, verify_commands=(verdict,))
     result = t.run_command(verdict)
     assert result.startswith("exit code 0")
-    assert "[... " in result and " characters elided ...]" in result
+    assert "[... " in result and " bytes elided ...]" in result
     assert "VERDICT" in result and result.rstrip().endswith("VERDICT")
     # Capped size: two halves + marker + newlines
-    from sous.tune.suite.tools import MAX_TOOL_OUTPUT
-
     assert len(result) <= MAX_TOOL_OUTPUT + 100  # marker + newlines
+
+
+def test_a_runaway_command_is_stopped_at_the_output_cap_not_the_clock(tmp_path: Path):
+    """A test printing in a loop fills the spool — on the boot volume — far
+    faster than a wall clock notices; the size cap stops it within a poll and
+    the model still reads a capped head and tail."""
+    flood = f"{sys.executable} -c \"while True: print('x' * 4096)\""
+    t = _tools(tmp_path, verify_commands=(flood,))
+    started = time.monotonic()
+    result = t.run_command(flood, timeout=30)
+    assert time.monotonic() - started < 10
+    assert result.startswith("command stopped: more than")
+    assert " bytes elided ...]" in result
+    assert len(result) <= MAX_TOOL_OUTPUT + 200
+
+
+@pytest.mark.slow
+def test_a_timed_out_command_takes_its_children_with_it(tmp_path: Path):
+    """The whole process group dies with the command, so a child it started
+    cannot keep writing into the project while the project is graded."""
+    script = tmp_path / "child.py"
+    script.write_text("import time\ntime.sleep(1.5)\nopen('late.txt', 'w').write('late')\n")
+    parent = (
+        f'{sys.executable} -c "import subprocess, sys, time; '
+        f"subprocess.Popen([sys.executable, '{script}']); time.sleep(5)\""
+    )
+    t = _tools(tmp_path, verify_commands=(parent,))
+    assert t.run_command(parent, timeout=0.3) == f"command timed out after 0.3s: {parent}"
+    time.sleep(2.0)
+    assert not (t.root / "late.txt").exists()
 
 
 def test_command_with_odd_bytes_does_not_raise(tmp_path: Path):

@@ -2,19 +2,20 @@
 
 Not a boundary: the project is a throwaway copy under a temp dir, the only
 commands accepted are the task's own verify commands and the suite's test
-runners, and nothing here audits, scrubs or kills process groups. The output
-shapes are fixed, so every arm the suite grades reads its results the same
-way. `approvals_denied` in a suite run counts the commands refused against
-this set, which is narrower than the 0.6 allowlist."""
+runners, and nothing here audits or scrubs. The bounds a command runs under
+(`spawn`) keep a runaway candidate from taking the tune with it; they confine
+nothing. The output shapes are fixed, so every arm the suite grades reads its
+results the same way. `approvals_denied` in a suite run counts the commands
+refused against this set, which is narrower than the 0.6 allowlist."""
 
 from __future__ import annotations
 
 import os
 import re
 import shlex
-import subprocess
-import tempfile
 from pathlib import Path
+
+from sous.tune.suite import spawn
 
 MAX_TOOL_OUTPUT = 16_000
 MAX_GREP_HITS = 200
@@ -31,8 +32,15 @@ ACCEPTED_RUNNERS = (
     "pytest",
 )
 _CAP_HALF = MAX_TOOL_OUTPUT // 2
-_SHELL_OPERATORS = ("&&", "||", ";", "|", "<", ">")
-CD_GUIDANCE = "run a single command from the project root, without cd, &&, pipes or redirection"
+# Whole tokens, matched after shlex has unquoted: no shell runs here, so
+# an operator would reach the command as a literal argument and its complaint
+# would send the model down a wrong path; a `>` inside a quoted argument is
+# not one.
+_SHELL_OPERATORS = frozenset({"&&", "||", ";", "&", "|", "|&", "<", ">", ">>", "2>", "2>&1", "&>"})
+CD_GUIDANCE = (
+    "run a single command from the project root, or after one `cd <dir> &&`; "
+    "no pipes, redirection or second command"
+)
 
 
 class ToolError(Exception):
@@ -58,7 +66,7 @@ def _spooled(f) -> str:
     head = f.read(_CAP_HALF).decode(errors="replace")
     f.seek(size - _CAP_HALF)
     tail = f.read().decode(errors="replace")
-    return f"{head}\n[... {size - 2 * _CAP_HALF} characters elided ...]\n{tail}"
+    return f"{head}\n[... {size - 2 * _CAP_HALF} bytes elided ...]\n{tail}"
 
 
 class ScratchTools:
@@ -144,34 +152,38 @@ class ScratchTools:
                 continue
         return _truncate("\n".join(out) or "(no matches)")
 
-    def _strip_cd(self, argv: list[str]) -> list[str]:
-        """`cd <dir> && <command>` down to `<command>`: every command already
-        runs at the project root, and local models emit the idiom whatever the
-        prompt says. `<dir>` must be a directory inside the project (a failed
-        cd short-circuits the && in a real shell), the remainder one command
-        with no further shell operator, and cwd is never taken from it."""
-        if not argv or argv[0] != "cd":
-            return argv
-        if len(argv) < 4 or argv[2] != "&&":
+    def _parse(self, command: str) -> tuple[list[str], Path]:
+        """The argv and the directory to run it in. `cd <dir> && <command>`
+        runs <command> in <dir>, as a shell would: local models emit the idiom
+        whatever the prompt says, and one that named a directory expects its
+        relative paths resolved there — run at the root instead, its "file not
+        found" contradicts the listing it just read. <dir> must be a directory
+        inside the project (a failed cd short-circuits the && in a real shell).
+        Anything else shell-shaped is refused with guidance rather than run
+        as literal arguments."""
+        argv = shlex.split(command)
+        cwd = self.root
+        if argv and argv[0] == "cd":
+            if len(argv) < 4 or argv[2] != "&&":
+                raise ToolError(f"command rejected: {CD_GUIDANCE}")
+            cwd = self._cd_target(argv[1])
+            argv = argv[3:]
+        if any(token in _SHELL_OPERATORS for token in argv):
             raise ToolError(f"command rejected: {CD_GUIDANCE}")
-        rest = argv[3:]
-        if any(op in token for token in rest for op in _SHELL_OPERATORS):
-            raise ToolError(f"command rejected: {CD_GUIDANCE}")
+        return argv, cwd
+
+    def _cd_target(self, arg: str) -> Path:
         try:
-            target = self._confined(argv[1])
+            target = self._confined(arg)
         except ToolError:
-            raise ToolError(
-                f"command rejected: cd target {argv[1]} is outside the project"
-            ) from None
+            raise ToolError(f"command rejected: cd target {arg} is outside the project") from None
         if not target.is_dir():
-            raise ToolError(
-                f"command rejected: cd target {argv[1]} is not a directory in the project"
-            )
-        return rest
+            raise ToolError(f"command rejected: cd target {arg} is not a directory in the project")
+        return target
 
     def run_command(self, command: str, timeout: float | None = None) -> str:
         try:
-            argv = self._strip_cd(shlex.split(command))
+            argv, cwd = self._parse(command)
         except ValueError as e:
             return f"command rejected: unparseable ({e})"
         except ToolError as e:
@@ -182,25 +194,14 @@ class ScratchTools:
             self.denied += 1
             return f"command denied (not allowlisted): {command}"
         budget = COMMAND_TIMEOUT if timeout is None else timeout
-        # Spooled to one unlinked temp file, not pipes: capture_output would
-        # hold a runaway test's whole output in this process, beside the
-        # resident weights, before the cap could apply. Both streams in write
-        # order, as a terminal would show them. stdin is closed: a child that
-        # reads it must see EOF, not the operator's terminal.
-        with tempfile.TemporaryFile() as spool:
-            try:
-                proc = subprocess.run(
-                    argv,
-                    cwd=self.root,
-                    stdin=subprocess.DEVNULL,
-                    stdout=spool,
-                    stderr=spool,
-                    timeout=budget,
-                    check=False,
-                )
-            except FileNotFoundError:
-                return f"command not found: {argv[0]}"
-            except subprocess.TimeoutExpired:
-                return f"command timed out after {budget}s: {command}"
-            body = _spooled(spool)
-        return f"exit code {proc.returncode}\n{body}"
+        try:
+            with spawn.bounded(argv, cwd=cwd, timeout=budget) as run:
+                if run.stopped == "timeout":
+                    return f"command timed out after {budget}s: {command}"
+                body = _spooled(run.stdout)
+                if run.stopped == "output":
+                    stopped = f"command stopped: more than {spawn.MAX_SPOOL_BYTES} bytes of output"
+                    return f"{stopped}\n{body}"
+                return f"exit code {run.returncode}\n{body}"
+        except FileNotFoundError:
+            return f"command not found: {argv[0]}"

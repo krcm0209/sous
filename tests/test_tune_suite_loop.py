@@ -5,11 +5,12 @@ import sous.tune.suite.loop as loop_module
 from sous.config import SousConfig
 from sous.engine.base import EngineManager, GenerationStalled
 from sous.tune.suite.loop import Budget, Transcript, run_loop
-from sous.tune.suite.tools import ScratchTools
+from sous.tune.suite.tools import COMMAND_TIMEOUT, ScratchTools
 from tests.fake_engine import FakeEngine
 
 CALL = '<tool_call>{{"name": "{name}", "arguments": {args}}}</tool_call>'
 FINISH = CALL.format(name="finish", args='{"summary": "done", "concerns": ""}')
+RUN = CALL.format(name="run_command", args='{"command": "pytest"}')
 WRITE = CALL.format(name="write_file", args='{"path": "hello.txt", "content": "hi"}')
 LIST_DIR = CALL.format(name="list_dir", args="{}")
 BAD = "<tool_call>{not json}</tool_call>"
@@ -22,11 +23,13 @@ def _run(
     script: list[str],
     budget: Budget = Budget(turns=8, minutes=5),  # noqa: B008 — frozen; sharing it is harmless
     engine: FakeEngine | None = None,
+    tools: ScratchTools | None = None,
 ):
     """`engine` replaces the default scripted one: a test that scripts token
-    counts needs to hold on to the instance the loop ran against."""
-    root = tmp_path / "project"
-    root.mkdir()
+    counts needs to hold on to the instance the loop ran against; `tools`
+    likewise, and its root is the project."""
+    root = tools.root if tools is not None else tmp_path / "project"
+    root.mkdir(exist_ok=True)
     cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     fake = engine if engine is not None else FakeEngine(script)
     mgr = EngineManager(cfg, engine_factory=lambda _mid: fake)
@@ -39,7 +42,7 @@ def _run(
             engine=mgr.get(),
             window=WINDOW,
             budget=budget,
-            tools=ScratchTools(root),
+            tools=tools if tools is not None else ScratchTools(root),
             transcript=transcript,
         )
     finally:
@@ -128,6 +131,55 @@ class _StallingEngine(FakeEngine):
     def generate(self, messages, tools, max_tokens, on_delta=None):
         self.clock.now = self.at
         raise GenerationStalled("generation stalled")
+
+
+class _TickingEngine(FakeEngine):
+    """Moves the loop's clock to the next of `at` before each generation."""
+
+    def __init__(self, clock: _Clock, script: list[str], at: list[float]):
+        super().__init__(script)
+        self.clock, self.at = clock, iter(at)
+
+    def generate(self, messages, tools, max_tokens, on_delta=None):
+        self.clock.now = next(self.at)
+        return super().generate(messages, tools, max_tokens, on_delta)
+
+
+class _RecordingTools(ScratchTools):
+    """Records the timeout each command was handed instead of running it."""
+
+    def __init__(self, root: Path):
+        super().__init__(root)
+        self.timeouts: list[float | None] = []
+
+    def run_command(self, command: str, timeout: float | None = None) -> str:
+        self.timeouts.append(timeout)
+        return "exit code 0\n"
+
+
+def test_a_commands_timeout_is_its_own_or_the_tasks_remaining_budget(tmp_path: Path, monkeypatch):
+    """One command may not run past the task's own deadline, and never gets
+    less than a second: a non-positive timeout expires before it starts."""
+    clock = _Clock()
+    monkeypatch.setattr(loop_module.time, "monotonic", clock)
+    root = tmp_path / "project"
+    root.mkdir()
+    tools = _RecordingTools(root)
+    engine = _TickingEngine(clock, [RUN, RUN, RUN, FINISH], at=[0.0, 30.0, 59.5, 59.5])
+    result, _, _ = _run(tmp_path, [], Budget(turns=8, minutes=1), engine=engine, tools=tools)
+    assert result.outcome == "completed"
+    assert tools.timeouts == [60.0, 30.0, 1]
+
+
+def test_a_commands_timeout_is_the_commands_own_when_the_budget_is_far(tmp_path: Path, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(loop_module.time, "monotonic", clock)
+    root = tmp_path / "project"
+    root.mkdir()
+    tools = _RecordingTools(root)
+    engine = _TickingEngine(clock, [RUN, FINISH], at=[0.0, 0.0])
+    _run(tmp_path, [], Budget(turns=8, minutes=5), engine=engine, tools=tools)
+    assert tools.timeouts == [COMMAND_TIMEOUT]
 
 
 def test_a_stall_past_the_deadline_is_budget_exhausted_not_failed(tmp_path: Path, monkeypatch):

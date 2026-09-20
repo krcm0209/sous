@@ -366,8 +366,10 @@ def status_lines(document: dict, now: float) -> list[str]:
     """`sous status` from the status document: the engine, the turns in
     flight and the last five served, newest first. `now` is only for a
     turn's elapsed time, like statusline_text."""
-    engine = document.get("engine") or {}
-    config = document.get("config") or {}
+    engine = document.get("engine")
+    engine = engine if isinstance(engine, dict) else {}
+    config = document.get("config")
+    config = config if isinstance(config, dict) else {}
     if engine.get("loading"):
         state = "loading"
     elif engine.get("unloading"):
@@ -387,7 +389,9 @@ def status_lines(document: dict, now: float) -> list[str]:
         f"sous daemon: listening on 127.0.0.1:{config.get('port', '?')}",
         "  " + " · ".join(engine_parts),
     ]
-    inflight = document.get("inflight") or []
+    # Shape-checked entry by entry: whatever answered on the port is read
+    # here, and a wrong element must not become a traceback.
+    inflight = [t for t in _entries(document.get("inflight")) if isinstance(t, dict)]
     if inflight:
         for turn in inflight:
             since = turn.get("started_at")
@@ -399,11 +403,15 @@ def status_lines(document: dict, now: float) -> list[str]:
     else:
         lines.append("  turns in flight: none")
     # The ring is newest first already.
-    recent = list(document.get("recent_turns") or [])[:5]
+    recent = [s for s in _entries(document.get("recent_turns"))[:5] if isinstance(s, dict)]
     if recent:
         lines.append("  recent turns:")
         lines.extend("    " + _recent_turn_text(s) for s in recent)
     return lines
+
+
+def _entries(value: object) -> list:
+    return value if isinstance(value, list) else []
 
 
 def _recent_turn_text(s: dict) -> str:
@@ -437,25 +445,32 @@ def _cmd_status() -> None:
         )
         raise SystemExit(1) from None
     document = _json_object(raw) if status == 200 else None
-    if document is not None and not ("engine" in document and "config" in document):
+    if document is not None and not (
+        isinstance(document.get("engine"), dict) and isinstance(document.get("config"), dict)
+    ):
         # A JSON object without the engine block is some other service on the
         # port; read as a document it would print a confident report about a
         # daemon that isn't there.
-        print(
-            f"sous daemon: port {config.server_port} answered /sous/status with something "
-            "that is not the status document; is it sous?"
-        )
-        raise SystemExit(1)
+        document = None
     if document is None:
-        if status == 404 and not _lock_is_held(config.data_dir):
+        # Whatever the answer was — a 404, a 503, HTML, someone else's JSON —
+        # the lock says whether there is a daemon to restart: nothing holding
+        # it means the port is another service's, and a restart would only
+        # collide with it.
+        if not _lock_is_held(config.data_dir):
             print(
                 f"sous daemon: 127.0.0.1:{config.server_port} is not a sous daemon (nothing "
                 f"holds {config.data_dir / 'daemon.lock'}); stop what listens there, or "
                 "change [server].port"
             )
             raise SystemExit(1)
+        answer = (
+            "/sous/status with something that is not the status document"
+            if status == 200
+            else f"{status} to /sous/status"
+        )
         print(
-            f"sous daemon: port {config.server_port} answered {status} to /sous/status; "
+            f"sous daemon: port {config.server_port} answered {answer}; "
             f"restart it ({restart_hint(managed=_launchd_loaded(LABEL))})"
         )
         raise SystemExit(1)

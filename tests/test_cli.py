@@ -1745,15 +1745,26 @@ def test_status_refuses_a_200_that_is_not_the_status_document(monkeypatch, capsy
         ),
     )
     monkeypatch.setattr(cli, "_port_open", lambda port: True)
-    monkeypatch.setattr(
-        cli, "_sous_request", lambda port, method, path, json=None: (200, b'{"ok": true}')
-    )
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["status"])
-    assert exc.value.code == 1
-    out = capsys.readouterr().out
-    assert "not the status document" in out
-    assert "restart" not in out
+    monkeypatch.setattr(cli, "_launchd_loaded", lambda _label: False)
+    # Someone else's JSON, a JSON array, HTML, an object with the right keys
+    # but not their shape: none is the document, and which advice follows
+    # depends only on whether a daemon holds the lock.
+    for raw in (b'{"ok": true}', b"[1, 2]", b"<html>hi</html>", b'{"engine": 5, "config": 5}'):
+        monkeypatch.setattr(
+            cli, "_sous_request", lambda port, method, path, json=None, r=raw: (200, r)
+        )
+        monkeypatch.setattr(cli, "_lock_is_held", lambda _data_dir: False)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["status"])
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "is not a sous daemon" in out and "[server].port" in out
+        assert "restart" not in out
+        monkeypatch.setattr(cli, "_lock_is_held", lambda _data_dir: True)
+        with pytest.raises(SystemExit):
+            cli.main(["status"])
+        out = capsys.readouterr().out
+        assert "not the status document" in out and "restart it" in out
 
 
 def test_status_tells_a_foreign_listener_from_a_daemon_that_predates_the_route(
@@ -1796,11 +1807,29 @@ def test_status_names_launchds_restart_when_launchd_manages_the_daemon(
     )
     monkeypatch.setattr(cli, "_port_open", lambda port: True)
     monkeypatch.setattr(cli, "_sous_request", lambda port, method, path, json=None: (503, b""))
+    monkeypatch.setattr(cli, "_lock_is_held", lambda _data_dir: True)
     for managed in (True, False):
         monkeypatch.setattr(cli, "_launchd_loaded", lambda _label, m=managed: m)
         with pytest.raises(SystemExit):
             cli.main(["status"])
         assert cli.restart_hint(managed=managed) in capsys.readouterr().out
+
+
+def test_status_lines_skip_entries_that_are_not_the_documents_shape():
+    """A squatter on the port can answer anything; a wrong element in the
+    rings is skipped, not a traceback."""
+    from sous.cli import status_lines
+
+    document = {
+        "engine": 5,
+        "config": "no",
+        "inflight": 3,
+        "recent_turns": [1, {"id": "msg_a", "status": 200, "seconds": 1.0, "error": None}],
+    }
+    lines = status_lines(document, now=0.0)
+    assert lines[0] == "sous daemon: listening on 127.0.0.1:?"
+    assert "  turns in flight: none" in lines
+    assert lines[-1].startswith("    msg_a")
 
 
 def json_dumps(doc: dict) -> bytes:
