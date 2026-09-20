@@ -70,14 +70,16 @@ class StderrHandler(logging.StreamHandler):
 def configure_daemon_logging() -> None:
     """Install the daemon's handler on the root logger, once.
 
-    Idempotent, so `create_server` can call it every time it assembles the
-    app (tests build many). Removes any earlier copy of this handler and the
-    SDK's RichHandler (matched by class name: rich is a transitive dependency
-    and this module must not import it). Sets the root level to INFO when it
-    is unset or higher — the SDK sets INFO too, but this must not depend on
-    call order. Library logger *levels* are untouched: the gateway pins
-    sse-starlette/httpx/httpcore above where they log bodies and URLs, and
-    a handler swap must never loosen that."""
+    Idempotent: `main()` calls it exactly once, before anything else logs,
+    but one pytest process runs many tests that each need it installed —
+    some by calling `main()`, some through an autouse fixture that calls
+    this directly — so a second call must replace the existing handler,
+    never stack another one beside it. Removes any earlier copy of this
+    handler and any stray `RichHandler` (matched by class name: rich is a
+    transitive dependency and this module must not import it). Sets the
+    root level to INFO when it is unset or higher. Library logger *levels*
+    are untouched: the gateway pins sse-starlette/httpx/httpcore above where
+    they log bodies and URLs, and a handler swap must never loosen that."""
     root = logging.getLogger()
     for handler in list(root.handlers):
         if handler.get_name() == SOUS_HANDLER_NAME or type(handler).__name__ == "RichHandler":

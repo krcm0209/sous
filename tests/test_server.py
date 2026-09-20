@@ -129,14 +129,24 @@ def test_lock_file_records_the_holder_pid(tmp_path: Path):
 def test_main_installs_the_shutdown_handler_before_serving(tmp_path: Path, monkeypatch):
     """The handler is useless if main() never installs it, and its body is
     untestable in-process (it ends in os._exit) — so pinning this one-line
-    link is the only coverage the wiring gets.
+    link is the only coverage the wiring gets. The same is true of the
+    daemon's log handler: nothing but main() installs it any more (the
+    gateway test files' autouse fixtures call configure_daemon_logging()
+    themselves, so they would stay green even if main() stopped calling it),
+    so this test removes any copy left by an earlier test before asserting
+    that main() is what put one back.
     """
     import sous.server as server
+    from sous.logs import SOUS_HANDLER_NAME
 
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        if h.name == SOUS_HANDLER_NAME:
+            root.removeHandler(h)
     data = tmp_path / "data"
     data.mkdir()
     installed = []
-    with socket.socket() as occupied:  # make mcp.run() fail fast instead of serving
+    with socket.socket() as occupied:  # make serve() fail fast instead of serving
         occupied.bind(("127.0.0.1", 0))
         occupied.listen(1)
         cfg = SousConfig(
@@ -152,6 +162,7 @@ def test_main_installs_the_shutdown_handler_before_serving(tmp_path: Path, monke
         with pytest.raises(SystemExit):
             server.main()
     assert installed, "main() served without installing the shutdown handler"
+    assert sum(1 for h in root.handlers if h.name == SOUS_HANDLER_NAME) == 1
 
 
 def test_main_routes_config_load_warnings_through_the_daemon_shape(
@@ -173,7 +184,7 @@ def test_main_routes_config_load_warnings_through_the_daemon_shape(
     config_path = tmp_path / "config.toml"
     config_path.write_text("[nonsense]\n")  # unknown section: load_config warns
 
-    with socket.socket() as occupied:  # make mcp.run() fail fast instead of serving
+    with socket.socket() as occupied:  # make serve() fail fast instead of serving
         occupied.bind(("127.0.0.1", 0))
         occupied.listen(1)
 
