@@ -131,7 +131,7 @@ def measure_cache_budget(reserve_bytes: int) -> int:
     Runs inside both engine constructors, so it must never raise: an mlx API
     change here would otherwise brick every model load on the shipped
     default. Every other reader of these numbers degrades instead
-    (decide_context, live_headroom), and so does this one — to a single slot.
+    (live_headroom), and so does this one — to a single slot.
     """
     try:
         import mlx.core as mx
@@ -815,7 +815,7 @@ class EngineManager:
         `sous-idle-sweep`, calls unload_if_idle() every `interval_s` seconds
         until stop_idle_sweep(). A second start while one runs is a no-op."""
         with self._lock:
-            if self._sweep is not None:
+            if self._sweep is not None and self._sweep.is_alive():
                 return
             stop = threading.Event()
             thread = threading.Thread(
@@ -824,17 +824,30 @@ class EngineManager:
                 name="sous-idle-sweep",
                 daemon=True,
             )
+            try:
+                thread.start()
+            except RuntimeError as e:
+                # The OS refused a thread. Publishing it anyway would make
+                # every later start a no-op and the stop a join on a thread
+                # that never ran; the daemon just goes without the sweep.
+                _logger.warning(f"idle sweep not started ({e}); idle models stay loaded")
+                return
             self._sweep, self._sweep_stop = thread, stop
-            thread.start()
 
     def stop_idle_sweep(self, timeout: float = 5.0) -> None:
         with self._lock:
             thread, stop = self._sweep, self._sweep_stop
-            self._sweep, self._sweep_stop = None, None
         if thread is None or stop is None:
             return
         stop.set()
         thread.join(timeout)
+        with self._lock:
+            if thread.is_alive():
+                # Mid-unload past the bound: left to finish on its own, and
+                # kept on the books so a start meanwhile stays a no-op.
+                _logger.warning(f"idle sweep still unloading after {timeout:.0f}s; not waited for")
+            elif self._sweep is thread:
+                self._sweep, self._sweep_stop = None, None
 
     def _run_idle_sweep(self, interval_s: float, stop: threading.Event) -> None:
         # An unload frees mlx arrays on this thread, and a thread that touched
