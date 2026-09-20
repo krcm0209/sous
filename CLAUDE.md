@@ -1,9 +1,11 @@
 # CLAUDE.md
 
-sous is an MCP daemon that delegates mechanical coding tasks from Claude
-Code to a sandboxed local MLX worker. macOS / Apple silicon only. The goal
-is plan economics: volume output is generated locally for free so heavy
-Claude Code use stretches further — evaluate features against that goal.
+sous is a local daemon that serves Claude Code's subagents from a local MLX
+model and forwards everything else upstream unchanged; Claude Code executes
+every tool under its own permission system. macOS / Apple silicon only. The
+goal is plan economics: subagent output is generated locally for free so
+heavy Claude Code use stretches further — evaluate features against that
+goal.
 
 ## Commands
 
@@ -28,23 +30,20 @@ Claude Code use stretches further — evaluate features against that goal.
   `engine.base.release_mlx_thread_state()` before it exits — mlx >= 0.32.1
   (ml-explore/mlx#4327) segfaults the whole daemon in the exiting thread's
   TLS teardown otherwise. CI cannot catch this (model tests are local-only);
-  after dependency changes, verify with one real delegated task. After the
+  after dependency changes, verify with one real served turn. After the
   release that thread cannot run another mlx op that needs a stream — any
   array op, `mx.eval`, a model load — with "There is no Stream(gpu, 0) in
   current thread"; device and allocator calls (`device_info`,
   `get_active_memory`, `get_cache_memory`, `clear_cache`) and the freeing of
   arrays made earlier still work, which is what `server._mlx_memory_gb` and
   `context._live_memory` rely on from threads that are reused. So a thread
-  that releases before each unit of work ends — a gateway pool thread, which
-  releases after every turn — may keep querying and freeing, but must never
-  run a load: a load runs on a `sous-model-load` thread of its own
+  that releases before each unit of work ends — an endpoint pool thread,
+  which releases after every turn — may keep querying and freeing, but must
+  never run a load: a load runs on a `sous-model-load` thread of its own
   (`EngineManager._load`). Before it had one, a load on a pool thread made
   every later cold start on that thread fail. A thread that controls its own
-  exit, like the worker loop, touches mlx freely and releases once on the
-  way out.
-- e2e_smoke.py often ends `failed` or `budget-exhausted` even when it worked —
-  the 0.6B model can't reliably emit `finish`. Judge by hello.txt content.
-- Budget exhaustion is `done` with outcome `budget-exhausted`, never `failed`.
+  exit, like the endpoint's session thread, touches mlx freely and releases
+  once on the way out.
 - Tests must never touch the real `~/.sous` — always pass tmp_path-based
   config_path/data_dir.
 - `docs/superpowers/**` are point-in-time design/plan records: never edit,
@@ -59,9 +58,9 @@ Claude Code use stretches further — evaluate features against that goal.
   failure — nothing was sent that a re-run would send twice.
 - Prompt-cache slots (`engine/promptcache.py`) are owned by the thread that
   built them (#34) and looked up only by that thread. `reset_prompt_cache`
-  and `prompt_cache_stats` take an `owner`: the worker retires its session's
-  thread (`session.thread`) at task end and never calls the bare `reset()`,
-  which drops the gateway's slots too. A `fork` slot is a *copy* taken while
+  and `prompt_cache_stats` take an `owner`: the turn runner retires a
+  stalled session's thread (`session.thread`) and never calls the bare
+  `reset()`, which drops every other owner's slots too. A `fork` slot is a *copy* taken while
   a turn prefills past a boundary (`fork_point`, 4096-token floor). There are
   two: the *tools* boundary — Qwen3.5/3.8 render `# Tools` *before* the
   client's system text, so sessions and projects presenting the same tool
@@ -84,7 +83,7 @@ Claude Code use stretches further — evaluate features against that goal.
   heals on the next take. Inline `role:"system"` messages after the first user message
   render as `<system-reminder>` blocks in the preceding user turn (after its
   tool results), or as a user turn of their own after an assistant turn
-  (`gateway/convert._place_inline_system`), never hoisted into the system
+  (`api/convert._place_inline_system`), never hoisted into the system
   block: the hoist moved the header boundary and killed every prefix behind
   it on the turn an attachment arrived.
   Never rewind a cache to make a slot — a hybrid model's recurrent layers
@@ -149,11 +148,10 @@ Claude Code use stretches further — evaluate features against that goal.
   `after` snapshot in `TurnRunner.run` — never as `after − before`. Counters
   (`forks`, `evictions`, `pressure_evictions`, `reused_tokens`) are deltas.
   Timers read `promptcache._clock` so tests can drive them; `Slot.last_used`
-  keeps the real clock. The gauges exist for the gateway's turn line only:
-  every MCP-facing `prompt_cache` block (a task report, `server_status` via
-  `EngineManager.status`) goes through `without_turn_gauges`, because there a
-  gauge is a task's last `generate()` beside task-long counters, or a max
-  over every owner ever seen — tokens the frontier model pays to read nothing.
+  keeps the real clock. The gauges exist for the endpoint's turn line only:
+  the status document's `prompt_cache` block (`EngineManager.status`) goes
+  through `without_turn_gauges`, because there a gauge is a max over every
+  owner ever seen beside daemon-long counters — a number no reader can use.
 - `EngineManager` never holds its lock across a model load or unload
   (`_loading`/`_unloading` on a `Condition`): `status()`, `hold()` and the
   idle sweep must answer during either, and `/sous/status` reports
@@ -162,26 +160,26 @@ Claude Code use stretches further — evaluate features against that goal.
   (pid gone, a zombie, or start time off by more than a second = reused
   pid), and whichever prunes the last one restarts the idle clock; the
   preload thread `hold()` may start calls `get()` and then
-  `release_mlx_thread_state()` like every mlx-touching thread. A gateway
+  `release_mlx_thread_state()` like every mlx-touching thread. An endpoint
   turn re-checks `abandoned` after `engines.get()`: that is where it now
   waits out another thread's load (the lease no longer does). The `/sous/`
   routes (`sous/monitor.py`) are mounted in `create_server` *before* the
-  gateway and whether or not it is enabled, behind the loopback guard in
-  `sous/loopback.py` that the gateway shares; a `/sous/` path never reaches
+  endpoint's, behind the loopback guard in
+  `sous/loopback.py` that the endpoint shares; a `/sous/` path never reaches
   the upstream, and a failure inside a route is a JSON 500, never
-  Starlette's text one. `sous claude` has no MCP client: `/sous/status`, or
+  Starlette's text one. `sous claude` speaks plain HTTP and nothing else:
+  `/sous/status`, or
   a 404 from whatever holds `daemon.lock` = "restart the daemon" (from
   anything else = "not sous on this port"), no compatibility fallback. The
-  status document is one shape everywhere (`SousService.status_document`):
-  `engine`, `inflight`, `queue`, `config`, and over HTTP `recent_turns` and
-  `recent_tasks` — the MCP tool drops the two lists because a frontier
-  model pays for every key it reads.
-- `sous/inflight.py` is the in-flight turn registry: a gateway turn
+  status document is one shape everywhere (`Daemon.status_document`):
+  `engine`, `inflight`, `config`, plus `recent_turns` when the caller asks
+  for it.
+- `sous/inflight.py` is the in-flight turn registry: an endpoint turn
   registers under its `msg_` id in `TurnRunner.run`; `progress()` runs on
   the engine's session thread from inside the decode loop, so every
   registry method is a dict write under one lock and never raises (an
   unknown id is ignored). The runner retires a turn *before* it releases
-  the gateway lock — the lock is not a queue, so a finished turn left
+  the endpoint lock — the lock is not a queue, so a finished turn left
   registered could still be the entry a reader takes as the one on the
   pass — and `snapshot()` lists the turn past `queued` first (the one whose
   phase moved most recently), then the queue in arrival order. The
@@ -196,22 +194,18 @@ Claude Code use stretches further — evaluate features against that goal.
   while the turn prefills; a later answer supersedes the first (a warm
   attempt retried cold), and a new size restarts the phase clock.
   `stats(owner)` is a locked dict copy no prefill holds the lock across.
-  `/sous/events` polls `SousService.status_version()` — the registry's
+  `/sous/events` polls `Daemon.status_version()` — the registry's
   version, `EngineManager.version` (load, unload, hold, release, and
-  every idle-clock reset: `touch()` and a `get()` hit),
-  `TaskStore.version` (any connection that inserted, updated or deleted a
-  row) and the config
+  every idle-clock reset: `touch()` and a `get()` hit) and the config
   file's mtime and size — ten times a second while the last document
-  showed a turn, a running task (`queue.running`), a load or an unload
+  showed a turn, a load or an unload
   (`engine.unloading`), and twice a second otherwise, rebuilding
   the whole document on a worker thread when the tuple moved; the
   once-a-second heartbeat runs only while busy (the TUI reads a silent
-  stream during a turn as a stalled daemon, and a task's clock is in the
-  document), never idle — the idle clock is the TUI's to run
+  stream during a turn as a stalled daemon), never idle — the idle clock is
+  the TUI's to run
   (`Top._engine_now`, seeded by every reset the engine version carries).
-  The build memoises the task counts and listing on the store's version
-  (two slots: the narrow MCP build never reads the listing) and the
-  allowlist on the config file's mtime and size; summaries are per build. Never
+  Summaries are per build. Never
   wake the loop from a writer. The routes record a summary for *every*
   `POST /v1/messages id=…` line — refused, abandoned and failed included —
   and the served line is printed from that summary (`_turn_line`,
@@ -233,22 +227,22 @@ Claude Code use stretches further — evaluate features against that goal.
   compaction switch is global to the session (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`
   is a *minimum* with the model window; `DISABLE_AUTO_COMPACT`,
   `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`), so `sous claude` sets none; the
-  per-local-model lever is `[gateway].max_context_tokens` (the default
+  per-local-model lever is `[model].max_context_tokens` (the default
   model's native length is 262144, at +8 GiB of KV reserve) — the classic
   threshold scales with it, the precompute fraction is remote-configured
   per window size and unmeasured at 262144.
-- The gateway forwards every request it does not serve (`gateway/upstream.py`)
+- The endpoint forwards every request it does not serve (`api/upstream.py`)
   as a transparent proxy: never re-serialize a forwarded body, never add or
   alter an end-to-end header (only `Host`, the hop-by-hop set and a buffered
   body's `Content-Length` change; responses lose the hop-by-hop set and gain
   `Via`, with uvicorn's own `Date`/`Server` replacing the upstream's), never turn
   `trust_env` on. The routing predicate is the decoded body's `model` after
   stripping one trailing `[…]` suffix; a body that does not decode is the
-  upstream's, not a 400. Any third-party library that enters the gateway's
-  request path gets its logger pinned in `mount_gateway`: sse-starlette logs
+  upstream's, not a 400. Any third-party library that enters the endpoint's
+  request path gets its logger pinned in `mount_endpoint`: sse-starlette logs
   each SSE frame, httpx the full upstream URL with its query string, httpcore
-  response header values — and `MCPServer.__init__` installs a root stderr
-  handler at INFO, so none of that is hypothetical.
+  response header values — and `configure_daemon_logging` sets the root level
+  to INFO, so none of that is hypothetical.
 - `engine/int8prefill.py` compiles the Metal kernel pair in `engine/kernels/` at
   model load (Apache-2.0, derived from oMLX — see THIRD_PARTY_NOTICES.md). The Python `reorder_k` and
   the GEMM's nibble decode are two halves of one K-order contract (slot
@@ -266,24 +260,24 @@ Claude Code use stretches further — evaluate features against that goal.
 
 ## Security boundary
 
-`src/sous/toolexec.py` is the sandbox (path confinement, command allowlist,
-process-group kill, stat audit). Any change there needs a test that fails
-without it. Odd-looking code is load-bearing (the un-reaped zombie during
-the group kill, EPERM suppression, ctime in the audit) — read the comments
-before touching. Suspected-flaky tests get run in a loop, not judged on one
-pass.
+sous executes nothing. `src/sous/api/` never runs a tool (Claude Code does,
+under its own permission mode: auto mode's classifier, the allow/deny rules
+and the sandbox are the boundary around the local model) and never logs a
+request body, header value or query string. Its lines go through `sous.logs`
+(one timestamped, levelled shape on the root handler); `_log_turn` runs on
+the event loop, so nothing that blocks may ever be added to it — do such
+work on the turn's thread. It forwards the client's credentials to
+`[server].upstream_url` and nowhere else, and stores none. `sous claude`
+(`cli.py`) never sets `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, a tier
+variable or a permission mode. Do not add confinement, allowlists or approval
+flows to sous: the daemon guards its own HTTP surface (`sous/loopback.py`)
+and nothing else. A change that makes any of these otherwise needs the spec
+(`docs/superpowers/specs/2026-08-26-hybrid-gateway-design.md`, as amended by
+`docs/superpowers/specs/2026-09-19-remove-mcp-path-design.md`) changed first.
 
-`src/sous/api/` is deliberately outside that boundary: it never executes a
-tool (Claude Code does, under its own permissions) and never logs a request
-body, header value or query string. Its lines go through `sous.logs` (one
-timestamped, levelled shape on the root handler); `_log_turn` runs on the
-event loop, so nothing that blocks (a database write) may ever be added to
-it — do such work on the turn's thread. It forwards the client's
-credentials to `[gateway].upstream_url` and nowhere else, and stores none.
-`sous claude` (`cli.py`) never sets `ANTHROPIC_AUTH_TOKEN`,
-`ANTHROPIC_API_KEY` or a tier variable. A change that makes any of these
-otherwise needs the spec
-(`docs/superpowers/specs/2026-08-26-hybrid-gateway-design.md`) changed first.
+`src/sous/tune/suite/tools.py` runs commands on copies of the suite's
+synthetic projects inside `sous tune` only. It is a test harness, not a
+boundary, and must never be reachable from the daemon.
 
 ## Workflow
 

@@ -89,7 +89,7 @@ def release_mlx_thread_state() -> None:
     calls mx.clear_streams() before exiting. A thread that skips it segfaults
     the ENTIRE process in the dyld TLS finalizer (CompileCache teardown
     reaching _Py_Dealloc without the GIL); observed killing the daemon
-    mid-task. A no-op when mlx is absent or the thread never touched it —
+    mid-generation. A no-op when mlx is absent or the thread never touched it —
     cleanup must never raise out of a dying thread.
     """
     try:
@@ -128,8 +128,8 @@ def measure_cache_budget(reserve_bytes: int) -> int:
     inside would destroy streams the caller still uses (#34).
 
     Runs inside both engine constructors, so it must never raise: an mlx API
-    change here would otherwise brick delegation and the gateway together, on
-    the shipped default. Every other reader of these numbers degrades instead
+    change here would otherwise brick every model load on the shipped
+    default. Every other reader of these numbers degrades instead
     (decide_context, live_headroom), and so does this one — to a single slot.
     """
     try:
@@ -319,11 +319,11 @@ def default_engine_factory(config: SousConfig) -> Callable[[str], Engine]:
 
 class ManagedEngine:
     """Serializes generations on one engine instance. MLX generation is
-    synchronous and uninterruptible: on a stall the worker abandons its
+    synchronous and uninterruptible: on a stall the caller abandons its
     generation thread, but that thread is still USING the engine, so a second
     concurrent generation (or an unload) on the same model would corrupt
-    inference. The lock makes the next task wait for the stalled generation
-    instead. Consequence: a truly wedged generation delays subsequent tasks
+    inference. The lock makes the next turn wait for the stalled generation
+    instead. Consequence: a truly wedged generation delays subsequent turns
     until the daemon is restarted — process isolation is the future fix (see
     README limitations)."""
 
@@ -371,12 +371,12 @@ class ManagedEngine:
 
     def reset_prompt_cache(self, owner: threading.Thread | None = None) -> None:
         # No _gen_lock, on purpose. An abandoned stalled generation still holds
-        # it, and run_task calls this in a finally — waiting there would wedge
-        # the next task. What actually makes a lock-free reset safe against
+        # it, and the turn runner calls this right after a stall — waiting
+        # there would wedge the next turn. What makes a lock-free reset safe against
         # that thread's late write-back is not the epoch guard by itself: a
         # slot is always published together with the exact token ids it
         # contains, and reuse_length demands a full strict-prefix match, so a
-        # stale slot adopted by a later task is either rejected outright or
+        # stale slot adopted by a later turn is either rejected outright or
         # genuinely correct for it. The epoch (and, per owner, retirement) is
         # only a cheap early-out on top of that — it skips the adoption, it
         # doesn't guarantee it.
@@ -389,7 +389,8 @@ class ManagedEngine:
         return self._gen_lock.locked()
 
     def session(self) -> GenerationSession:
-        """One task's generation thread; run_task creates one per task."""
+        """A generation thread of the caller's own; the endpoint keeps one alive
+        across turns so their caches survive."""
         return GenerationSession(self)
 
     def unload(self) -> None:
@@ -397,33 +398,33 @@ class ManagedEngine:
 
 
 class GenerationSession:
-    """One task's generations, all on one daemon thread (issue #34).
+    """One caller's generations, all on one daemon thread (issue #34).
 
     mlx KV cache arrays are usable only from the thread whose streams created
     them (streams are thread-scoped for use — probed empirically), and every
     thread that touched mlx must call release_mlx_thread_state() before it
     exits (ml-explore/mlx#4327). A fresh
     thread per generation therefore killed the prompt cache every turn; one
-    thread per task lets turn N+1 reuse turn N's cache. The cache slot itself
+    thread per session lets turn N+1 reuse turn N's cache. The cache slot itself
     now records which thread built it, so a session on any other thread gets
     a cold miss instead of touching those arrays.
 
     The loop re-checks `_abandoned` while it HOLDS _gen_lock: a request whose
-    task gave up while still queued on the lock exits instead of running
-    under the next task's identity (issue #34, consideration 7).
+    turn gave up while still queued on the lock exits instead of running
+    under the next turn's identity (issue #34, consideration 7).
 
     close() sends _CLOSE and never joins. A healthy or abandoned-but-idle
     thread dequeues it, releases its mlx state, and exits — this is also what
     un-leaks a thread whose reply lost the timeout race, so nothing it pinned
     (worst case an ("err", e) traceback holding the KV cache) outlives the
-    task. A wedged thread never dequeues it and is leaked deliberately, like
+    turn. A wedged thread never dequeues it and is leaked deliberately, like
     the abandoned per-generation threads before this class: it never exits,
     so it never hits the TLS-teardown segfault, and _gen_lock keeps the next
-    task off the engine meanwhile. _CLOSE deliberately carries no cache
+    turn off the engine meanwhile. _CLOSE deliberately carries no cache
     reset — a late reset from a stale session thread would race the next
-    task's cache and stats, the same class of bug as consideration 7. Every
-    reset belongs to the thread that owns the session: the worker thread for
-    tasks, the gateway's turn thread after a stall (`sous.api.turn`).
+    turn's cache and stats, the same class of bug as consideration 7. Every
+    reset belongs to the thread that owns the session: the endpoint's turn
+    thread after a stall (`sous.api.turn`).
 
     on_delta, when given, fires on this thread from inside the engine's decode
     loop — mid-generation, under _gen_lock. A stalled-and-abandoned generation
@@ -435,19 +436,19 @@ class GenerationSession:
         self._managed = managed
         # maxsize=1 plus put_nowait everywhere: at most one request is ever
         # outstanding, so Full in generate() means a protocol bug — failing
-        # loudly beats deadlocking the worker inside run_task's finally.
+        # loudly beats deadlocking the turn runner on its way out.
         # close() alone tolerates Full: a stalled request the starved thread
         # never dequeued may still occupy the queue.
         self._requests: queue.Queue = queue.Queue(maxsize=1)
         self._replies: queue.Queue = queue.Queue(maxsize=1)
         self._abandoned = threading.Event()
         self._closed = False
-        # How long the latest request waited for _gen_lock — behind a delegated
-        # task's generation, say. Written before the reply is queued, so the
+        # How long the latest request waited for _gen_lock — behind an
+        # abandoned stalled generation, say. Written before the reply is queued, so the
         # caller reads it once generate() returns; nothing else can see it.
         self.lock_wait_seconds = 0.0
         # Kept as an attribute so tests can join it; production never joins —
-        # a wedged generation must not block task teardown.
+        # a wedged generation must not block the turn's teardown.
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -477,7 +478,7 @@ class GenerationSession:
                 self._replies.put_nowait(reply)
                 # A parked thread must not pin either end of the exchange: an
                 # ("err", e) reply holds the whole generation frame — KV cache
-                # included — through the traceback, and a gateway request holds
+                # included — through the traceback, and an endpoint request holds
                 # its on_delta closure and through it the client's queue and
                 # event loop, for as long as the thread waits for the next one.
                 del reply, req
@@ -617,7 +618,7 @@ class EngineManager:
         A load touches mlx, and a thread that touched mlx must release its
         streams before it exits (ml-explore/mlx#4327) — a release after which
         that thread cannot run another op that needs a stream, a load
-        included. The gateway's turn and count pools
+        included. The endpoint's turn and count pools
         call get() from threads that outlive the call and release
         unconditionally, so a load on one of them left it unable to load a
         second time: after an idle unload, the next cold start on that same
@@ -652,12 +653,10 @@ class EngineManager:
     def lease(self):
         """Pin the loaded engine for the caller's whole span of use.
 
-        _gen_lock only covers generate(). A gateway turn holds the engine from
-        get() through count_tokens() — seconds on a large prompt — before
-        anything takes that lock, and the idle sweep runs on a different
-        thread (the worker's loop), so it could free the weights in between.
-        The worker never needed one: it sweeps on the same thread that runs
-        its tasks, serially.
+        _gen_lock only covers generate(). An endpoint turn holds the engine
+        from get() through count_tokens() — seconds on a large prompt —
+        before anything takes that lock, and the idle sweep runs on a thread
+        of its own, so it could free the weights in between.
         """
         with self._lock:
             self._leases += 1

@@ -7,7 +7,7 @@ A few things worth knowing before you spend time on this.
 ## Before you start
 
 **You need an Apple silicon Mac.** This is not a preference. `mlx-metal` is
-`sys_platform == 'darwin'` gated, the worker runs on Metal, and CI itself runs
+`sys_platform == 'darwin'` gated, the model runs on Metal, and CI itself runs
 on macOS ARM runners. On any other machine you will not be able to run the
 test suite, so there is no practical way to verify a change. Python 3.14 is
 also required, though uv installs that for you.
@@ -20,11 +20,12 @@ going.
 ## What's in scope
 
 Good candidates: bug reports with a reproduction, focused fixes, clearer
-documentation, additional test coverage — particularly around the sandbox.
+documentation, additional test coverage — particularly around the endpoint's
+request and response handling.
 
-Please open an issue before starting on: new tools exposed to the worker,
-changes to the task lifecycle or MCP surface, or anything that widens what a
-worker is permitted to do.
+Please open an issue before starting on: changes to the endpoint's request or
+response contract or to the status document, or anything that would have sous
+execute a tool itself.
 
 sous deliberately targets Apple silicon. Porting it to Linux or CUDA is not a
 small PR, and is not currently a goal.
@@ -57,12 +58,12 @@ the engine layer:
 
 ```bash
 uv run pytest -m model              # engine tests; downloads real models
-uv run python scripts/e2e_smoke.py  # the full agent loop, tiny model
+uv run python scripts/api_smoke.py  # one served turn, tiny model
 ```
 
 `model`-marked tests are excluded from CI because they need multi-GB
-downloads. `slow`-marked tests — the process-group kill tests, which use real
-processes on purpose — *do* run in CI, so don't skip them locally.
+downloads. `slow`-marked tests — the ones that run a real server or spawn a
+real process on purpose — *do* run in CI, so don't skip them locally.
 
 ## Pull requests
 
@@ -82,7 +83,7 @@ timing-dependent.
 - **ruff** with `line-length = 100`; config lives in `pyproject.toml`.
 - **ty** type-checks the whole repo, tests included. Test doubles that
   deliberately implement only part of an interface use `cast`, with a comment
-  saying why — see `tests/test_worker.py`.
+  saying why — see `tests/test_api_turn.py`.
 - **`docs/`** is excluded from ruff. The design spec and implementation plan
   are point-in-time records; reformatting the Python inside their code blocks
   rewrites history for no benefit.
@@ -90,30 +91,20 @@ timing-dependent.
   explains non-obvious *reasoning* in comments and is fairly light on
   restating what the code says.
 
-## Touching the sandbox
+## Verifying the endpoint
 
-`src/sous/toolexec.py` is the security boundary: path confinement, the command
-allowlist, and the process-group kill that stops a timed-out command's
-descendants from writing files after the audit. The guarantees it makes are
-described under [Security model](README.md#security-model).
+`uv run python scripts/api_smoke.py` is the short form; the recipe below
+drives a whole Claude Code session.
 
-Changes there need a test that fails without them, and will get a closer read.
-Some of the behaviour is OS-level and genuinely unmockable — the existing
-tests spawn real processes for that reason. If you are fixing something
-intermittent, run the affected test in a loop before concluding it is fixed; a
-single green run proves very little.
-
-## Verifying the gateway endpoint
-
-The supported way to drive the gateway from Claude Code is `sous claude`
-(README, "Gateway mode"): the main loop goes upstream on your subscription
+The supported way to drive the endpoint from Claude Code is `sous claude`
+(README, "How it works"): the main loop goes upstream on your subscription
 and only Task-tool subagents reach the local model. To exercise the *local*
 endpoint on every turn instead, run a *whole-session-local* session — every
 tier pinned to `sous-local`. That is a verification setup, not a supported
-mode. Set `[gateway].enabled = true`, restart the daemon, and stay online:
+mode. Start the daemon and stay online:
 `/api/hello` and Claude Code's other base-URL calls are forwarded to the
 real API even when every model turn is local. The whole-session recipe
-relies on the gateway's 131072-token default window: Claude Code's own
+relies on the 131072-token default window: Claude Code's own
 system prompt and tool schemas already fill ~40K tokens, and one tool round
 trip pushes the rendered prompt past 80K, so a smaller window — sized for a
 subagent's smaller turns — aborts a whole-session run with `prompt is too
@@ -137,7 +128,7 @@ Do **not** set `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`: either one
 switches Claude Code from your subscription login to API-credit billing for
 everything that goes upstream — here the startup probe and telemetry, in
 hybrid mode the whole main loop. The two context variables must match
-`[gateway].max_context_tokens` (Claude Code honours them only for model ids
+`[model].max_context_tokens` (Claude Code honours them only for model ids
 that are not `claude-*`, which is why the served id is honest). Setting
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is right *here*, where every model is
 local, and wrong in hybrid mode — `sous claude` leaves it unset because the

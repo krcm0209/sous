@@ -60,8 +60,8 @@ def test_lm_engine_reuses_across_turns():
     from sous.engine.lm import LMEngine
     from sous.tune.payload import TOOLS
 
-    # Explicitly on: the shipped default is off until the worker stops running
-    # each generation on its own thread, and this test is about reuse itself.
+    # Explicitly on: the constructor defaults it off, and this test is about
+    # reuse itself.
     e = LMEngine(TINY, prompt_cache=True)
     msgs = [{"role": "user", "content": "Say the word banana and nothing else."}]
     first = e.generate(msgs, TOOLS, max_tokens=32)
