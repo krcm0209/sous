@@ -81,11 +81,12 @@ class SousService:
         return (self.inflight.version, self.engines.version, self._config_stamp())
 
     def status_document(self, *, recent: bool) -> dict:
-        """The one document every status surface serves. `recent` adds the
-        last fifty turns — for the HTTP routes and the terminal, not for a
-        narrower caller, where a frontier model pays for every key it reads.
-        Runs on a worker thread: the engine's status takes its lock, and the
-        registry's snapshot may call into the prompt cache."""
+        """The one document every status surface serves. `recent=True` adds
+        the last fifty turns, for the HTTP routes and the terminal;
+        `recent=False` is the narrower shape, for a caller where every key
+        read has a cost. Runs on a worker thread: the engine's status takes
+        its lock, and the registry's snapshot may call into the prompt
+        cache."""
         try:
             engine = self.engines.status()
             live = self.inflight.snapshot()
@@ -253,10 +254,6 @@ def _install_shutdown_handler(stop: threading.Event) -> None:
     in toolexec), so it survives the daemon and goes on writing to the user's
     project. launchd restarts and `sous stop` both send SIGTERM, so this is the
     ordinary path out, not an edge case.
-
-    The worker thread is deliberately not joined: a task can run for minutes,
-    and killing the command groups is what protects the user's files. The task
-    itself is reported failed by recover_interrupted() on the next start.
     """
 
     def handle(signum, frame) -> None:  # noqa: ARG001 — signal handler signature
@@ -332,10 +329,9 @@ def main() -> None:
     enable_warning_capture()
     config = load_config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    # Adopt the login shell's PATH before the worker exists: scrubbed_env()
-    # passes PATH through, so this is what sandboxed commands resolve against,
-    # identically however the daemon was launched (launchd, `sous mcp`, or a
-    # terminal). Fallback on failure: whatever PATH we inherited.
+    # Adopt the login shell's PATH, so the daemon behaves the same however
+    # it was launched (launchd, `sous mcp`, or a terminal). Fallback on
+    # failure: whatever PATH we inherited.
     if login_path := _login_shell_path():
         os.environ["PATH"] = login_path
     # Before anything else claims the port or the data dir: the port bind at
