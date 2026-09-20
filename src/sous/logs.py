@@ -2,11 +2,10 @@
 
 `<iso-utc-ms>Z LEVEL name: message` — the timestamp launchd's log never
 had, the level the filename `daemon.err.log` falsely promised, and the
-logger name (`sous.gateway`, `sous.engine`, `mcp.…`, `uvicorn.error`) that
-says which part spoke. Installed on the root logger, replacing the
-`RichHandler` the MCP SDK's `configure_logging("INFO")` puts there from
-`MCPServer.__init__` — that handler wraps every record at 80 columns, which
-made the log ungreppable.
+logger name (`sous.gateway`, `sous.engine`, `httpx`, `uvicorn.error`) that
+says which part spoke. Installed on the root logger in place of a bare
+`RichHandler`, which wraps every record at 80 columns and made the log
+ungreppable.
 """
 
 from __future__ import annotations

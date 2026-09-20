@@ -11,22 +11,32 @@ import logging
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
-from mcp.server import MCPServer
 from sse_starlette import EventSourceResponse
+from starlette.applications import Starlette
 from starlette.requests import Request
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
 from sous.gateway.routes import MAX_BODY_DEPTH, Gateway, mount_gateway
 from sous.gateway.turn import TurnAbandoned
+from sous.logs import configure_daemon_logging
 from sous.server import create_server
 from tests.fake_engine import ChunkedFakeEngine, FakeEngine
 from tests.fake_upstream import FakeUpstream
+
+
+@pytest.fixture(autouse=True)
+def _daemon_logging():
+    """Many tests below read stderr (capsys) for the daemon's own log line
+    shape. create_server no longer installs that handler as a side effect —
+    main() does, once, before it ever calls create_server — so a test run
+    that never went through main() first needs this to see it."""
+    configure_daemon_logging()
+
 
 READ_TOOL = {
     "name": "Read",
@@ -50,7 +60,7 @@ def _app(tmp_path: Path, engine, upstream=None, **overrides):
     )
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
     upstream = upstream or FakeUpstream().upstream()
-    return create_server(engines, cfg, upstream=upstream).streamable_http_app()
+    return create_server(engines, cfg, upstream=upstream)
 
 
 def _gateway_app(tmp_path: Path, engine, upstream=None, **overrides) -> tuple[Gateway, object]:
@@ -62,10 +72,9 @@ def _gateway_app(tmp_path: Path, engine, upstream=None, **overrides) -> tuple[Ga
         **overrides,
     )
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
-    mcp = MCPServer("test")
     upstream = upstream or FakeUpstream().upstream()
-    gateway = mount_gateway(mcp, engines, cfg, upstream=upstream)
-    return gateway, mcp.streamable_http_app()
+    gateway = mount_gateway(engines, cfg, upstream=upstream)
+    return gateway, Starlette(routes=gateway.routes())
 
 
 def _request(app, method: str, path: str, body=None, headers=None) -> httpx.Response:
@@ -87,26 +96,6 @@ def _request(app, method: str, path: str, body=None, headers=None) -> httpx.Resp
 
 def _post(app, body, path="/v1/messages", headers=None) -> httpx.Response:
     return _request(app, "POST", path, body, headers)
-
-
-@contextlib.asynccontextmanager
-async def _lifespan(app) -> AsyncIterator[None]:
-    """Drives the app's ASGI lifespan around a block. httpx's ASGITransport
-    does not (a real server does), and the MCP transport's session manager
-    starts nowhere else — without it /mcp only ever raises."""
-    receive: asyncio.Queue = asyncio.Queue()
-    send: asyncio.Queue = asyncio.Queue()
-    task = asyncio.create_task(
-        app({"type": "lifespan", "asgi": {"version": "3.0"}}, receive.get, send.put)
-    )
-    await receive.put({"type": "lifespan.startup"})
-    assert (await send.get())["type"] == "lifespan.startup.complete"
-    try:
-        yield
-    finally:
-        await receive.put({"type": "lifespan.shutdown"})
-        assert (await send.get())["type"] == "lifespan.shutdown.complete"
-        await task
 
 
 def _body(**overrides) -> dict:
@@ -185,8 +174,8 @@ def test_configured_local_models_are_all_served(tmp_path: Path):
 
 
 def test_host_header_must_be_loopback(tmp_path: Path):
-    """Custom routes skip the /mcp transport's Host check; a page whose hostname
-    re-resolves to 127.0.0.1 must not get to drive the local model."""
+    """Starlette's routes carry no Host check of their own; a page whose
+    hostname re-resolves to 127.0.0.1 must not get to drive the local model."""
     app = _app(tmp_path, FakeEngine([]))
     for host in ("evil.example:8383", "evil.example"):
         r = _post(app, _body(), headers={"host": host})
@@ -1161,7 +1150,7 @@ def test_mounting_pins_the_noisy_library_loggers(tmp_path: Path, monkeypatch):
     logger's level — the no-bodies rule rests on these three pins."""
     for name in ("sse_starlette", "httpx", "httpcore"):
         monkeypatch.setattr(logging.getLogger(name), "level", logging.DEBUG)
-    _app(tmp_path, FakeEngine([]))  # create_server → configure_daemon_logging → mount_gateway
+    _app(tmp_path, FakeEngine([]))  # create_server → mount_gateway, which pins these three
     assert logging.getLogger("sse_starlette").level == logging.INFO
     assert logging.getLogger("httpx").level == logging.WARNING
     assert logging.getLogger("httpcore").level == logging.WARNING
@@ -1536,46 +1525,6 @@ def test_everything_else_streams_through_with_method_query_and_body(tmp_path: Pa
     assert _request(app, "GET", "/").headers["via"] == "1.1 sous"
 
 
-def test_the_catch_all_does_not_shadow_the_mcp_transport(tmp_path: Path):
-    """The SDK mounts custom routes after /mcp, so the MCP transport answers
-    its own path — never the upstream. Its JSON-RPC refusal of a session-less
-    ping is the proof: the fake upstream answers 200 {"upstream": true}."""
-    fake = FakeUpstream()
-    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
-
-    async def go():
-        async with _lifespan(app):
-            transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(
-                transport=transport, base_url="http://127.0.0.1:8383"
-            ) as client:
-                return await client.post("/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1})
-
-    r = asyncio.run(go())
-    assert r.status_code == 400
-    assert r.json()["jsonrpc"] == "2.0"
-    assert "via" not in r.headers
-    assert fake.requests == []
-
-
-def test_the_catch_all_redirects_the_mcp_path_with_a_trailing_slash(tmp_path: Path):
-    """The SDK's Route("/mcp") is exact, so before the catch-all existed
-    Starlette's redirect_slashes answered POST /mcp/ with a 307. The catch-all
-    matches it too, and forwarding it would put an MCP client's JSON-RPC body
-    (paths, file contents) on the wire to Anthropic — so the redirect stays."""
-    fake = FakeUpstream()
-    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
-    body = b'{"jsonrpc": "2.0", "method": "ping", "id": 1}'
-    r = _request(app, "POST", "/mcp/", body=body)
-    assert r.status_code == 307
-    assert r.headers["location"].endswith("/mcp")
-    assert "via" not in r.headers
-    r = _request(app, "POST", "/mcp//?x=1", body=body)
-    assert r.status_code == 307
-    assert r.headers["location"].endswith("/mcp?x=1")
-    assert fake.requests == []
-
-
 def test_forwarded_requests_are_loopback_only_too(tmp_path: Path):
     fake = FakeUpstream()
     app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
@@ -1623,13 +1572,12 @@ def test_an_oversized_body_is_refused_before_forwarding(tmp_path: Path):
 
 @contextlib.contextmanager
 def _root_stderr_logging():
-    """The logging setup the real daemon runs with. MCPServer.__init__ calls
-    the SDK's configure_logging("INFO"), which basicConfig's a RichHandler onto
-    the *root* logger — so anything any library logs lands on the daemon's
-    stderr next to sous' own print() lines. Under pytest the logging plugin has
-    already attached a root handler, so that basicConfig no-ops and a
-    capsys-only assertion cannot see the leak at all. Built inside the test so
-    the handler binds to capsys' replacement stderr; DEBUG because that is
+    """The logging setup the real daemon runs with: a handler on the *root*
+    logger, so anything any library logs lands on the daemon's stderr next
+    to sous' own print() lines. Built inside the test (rather than calling
+    configure_daemon_logging() itself) so the handler binds to capsys'
+    replacement stderr and is removed again after, instead of leaking a
+    second root handler into the rest of the suite; DEBUG because that is
     where httpcore logs response header values."""
     handler = logging.StreamHandler(sys.stderr)
     root = logging.getLogger()

@@ -16,7 +16,6 @@ from pathlib import Path
 import httpx
 import pytest
 import uvicorn
-from mcp.server import MCPServer
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
@@ -26,11 +25,21 @@ from sous.config import SousConfig
 from sous.engine.base import EngineManager
 from sous.gateway.routes import Gateway, mount_gateway
 from sous.gateway.upstream import Upstream
+from sous.logs import configure_daemon_logging
 from sous.server import GRACEFUL_SHUTDOWN_SECONDS, create_server, uvicorn_config
 from tests.fake_engine import ChunkedFakeEngine
 from tests.fake_upstream import FakeUpstream
 
 pytestmark = pytest.mark.slow
+
+
+@pytest.fixture(autouse=True)
+def _daemon_logging():
+    """Several tests below read stderr (capsys) for the daemon's own log
+    line shape. create_server no longer installs that handler as a side
+    effect — main() does, once, before it ever calls create_server — so a
+    test run that never went through main() first needs this to see it."""
+    configure_daemon_logging()
 
 
 def _free_port() -> int:
@@ -57,7 +66,7 @@ def _app(
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
     if upstream_url is None and upstream is None:
         upstream = FakeUpstream().upstream()
-    return create_server(engines, cfg, upstream=upstream).streamable_http_app()
+    return create_server(engines, cfg, upstream=upstream)
 
 
 def _gateway_app(tmp_path: Path, engine) -> tuple[Gateway, object]:
@@ -65,9 +74,8 @@ def _gateway_app(tmp_path: Path, engine) -> tuple[Gateway, object]:
     mount_gateway's return value, and reaching gateway._turns needs it."""
     cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
-    mcp = MCPServer("test")
-    gateway = mount_gateway(mcp, engines, cfg)
-    return gateway, mcp.streamable_http_app()
+    gateway = mount_gateway(engines, cfg)
+    return gateway, Starlette(routes=gateway.routes())
 
 
 @contextlib.contextmanager
@@ -374,20 +382,20 @@ def test_count_tokens_is_not_blocked_by_a_saturated_turn_pool(tmp_path: Path):
 
 
 def test_app_shutdown_closes_the_gateway_session_thread(tmp_path: Path, monkeypatch):
-    """End-to-end proof the SDK's lifespan hook actually fires: create_server
+    """End-to-end proof the app's lifespan hook actually fires: create_server
     wires a lifespan that closes the mounted Gateway on the app's ASGI
     shutdown. Without it the gateway's session thread stays parked in
     _requests.get() forever and never reaches release_mlx_thread_state()
     (ml-explore/mlx#4327) on a non-signal exit — this drives the real
-    lifespan (via streamable_http_app(), same as create_server's caller)
+    lifespan (through a real uvicorn server, same as create_server's caller)
     rather than calling Gateway.close() directly."""
     import sous.server as server_mod
 
     captured: list[Gateway] = []
     real_mount_gateway = server_mod.mount_gateway
 
-    def spy(mcp, engines, cfg, **kw):
-        gateway = real_mount_gateway(mcp, engines, cfg, **kw)
+    def spy(engines, cfg, **kw):
+        gateway = real_mount_gateway(engines, cfg, **kw)
         captured.append(gateway)
         return gateway
 

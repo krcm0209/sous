@@ -21,10 +21,10 @@ import threading
 import time
 from collections.abc import AsyncIterator
 
-from mcp.server import MCPServer
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.requests import ClientDisconnect, Request
-from starlette.responses import JSONResponse, RedirectResponse, Response
+from starlette.responses import JSONResponse, Response
+from starlette.routing import BaseRoute, Route
 
 from sous.config import SousConfig
 from sous.engine.base import Delta, EngineManager, GenerationStalled
@@ -50,8 +50,8 @@ from sous.sse import PING as _PING
 from sous.sse import PING_INTERVAL_SECONDS
 from sous.sse import SEP as _SEP
 
-# Anthropic's own request cap. The MCP transport's 4 MiB limit wraps only the
-# /mcp handler; custom routes get nothing unless they enforce it themselves.
+# Anthropic's own request cap. Starlette enforces no request-body limit of
+# its own, so a route here gets none unless it checks this itself.
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 # A schema a real client sends nests a handful of levels. Beyond this the
 # body is hostile or broken either way, and — same reasoning as protocol.py's
@@ -90,14 +90,6 @@ _MODEL_SUFFIX_RE = re.compile(r"\[[^\[\]]*\]$")
 # printable, space-free token is logged as "-".
 _LOG_ID_CHARS = 64
 _LOG_PATH_CHARS = 80
-
-# Where the SDK mounts the MCP transport: `streamable_http_path`, whose default
-# is "/mcp" in mcp/server/mcpserver/server.py's streamable_http_app (server.py
-# calls it without overriding). It is an exact Route, so a trailing slash never
-# matched it — Starlette's redirect_slashes used to answer /mcp/ with a 307,
-# and the catch-all below now matches it instead. See Gateway.passthrough.
-_MCP_PATH = "/mcp"
-
 
 _logger = logging.getLogger("sous.gateway")
 
@@ -479,6 +471,15 @@ class Gateway:
         self.close()
         await self._upstream.aclose()
 
+    def routes(self) -> list[BaseRoute]:
+        return [
+            Route("/v1/messages", self.messages, methods=["POST"]),
+            Route("/v1/messages/count_tokens", self.count_tokens, methods=["POST"]),
+            # Matched last: a method the two routes above do not take
+            # (GET /v1/messages) falls through to the upstream's own answer.
+            Route("/{path:path}", self.passthrough, methods=list(ALL_METHODS)),
+        ]
+
     async def passthrough(self, request: Request) -> Response:
         """Everything the gateway has no route of its own for — /api/hello,
         /api/oauth/usage, event logging, whatever Claude Code adds next —
@@ -487,14 +488,6 @@ class Gateway:
             check_loopback(request)
         except RequestError as e:
             return JSONResponse(e.body(), status_code=e.status)
-        # /mcp/ is the MCP transport's path, not the upstream's: forwarding it
-        # would put an MCP client's JSON-RPC body on the wire to Anthropic.
-        # Give back exactly what Starlette's redirect_slashes gave before this
-        # catch-all shadowed it — a 307, which preserves the method and body.
-        path = request.url.path
-        if path != _MCP_PATH and path.rstrip("/") == _MCP_PATH:
-            query = request.url.query
-            return RedirectResponse(f"{_MCP_PATH}?{query}" if query else _MCP_PATH, status_code=307)
         return await self._forward(request, None, "-")
 
     def _route(self, raw: bytes) -> tuple[object | None, str]:
@@ -899,17 +892,15 @@ class Gateway:
 
 
 def mount_gateway(
-    mcp: MCPServer,
     engines: EngineManager,
     config: SousConfig,
     *,
     upstream: Upstream | None = None,
     inflight: Inflight | None = None,
 ) -> Gateway:
-    """Register the Anthropic-compatible routes on the daemon's Starlette app.
-    custom_route adds bare routes: no auth (loopback only, like /mcp), no
-    body limit (enforced above), no DNS-rebinding check (the /mcp transport's
-    settings do not reach here)."""
+    """Build the Gateway that serves the Anthropic-compatible routes, after
+    pinning the loggers that would otherwise leak a request or response
+    body. Call `.routes()` on the result to mount it on the app."""
     # sse-starlette logs every frame it sends at DEBUG — the model's reply,
     # verbatim. The daemon runs at INFO, but the no-bodies-in-logs rule must not
     # depend on that: pin the library's logger above DEBUG where the frames are
@@ -919,17 +910,8 @@ def mount_gateway(
     # Same rule, one layer down: httpx logs "HTTP Request: <method> <full URL>"
     # at INFO — the upstream URL including its query string — and httpcore
     # logs response header values verbatim at DEBUG. Neither is hypothetical
-    # at INFO: MCPServer.__init__ calls the SDK's configure_logging("INFO"),
-    # which basicConfig's a stderr handler onto the root logger, so both reach
-    # the daemon log unless pinned above where they say those things.
+    # at INFO: configure_daemon_logging() sets the root level to INFO, so both
+    # reach the daemon log unless pinned above where they say those things.
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    gateway = Gateway(engines, config, upstream, inflight)
-    mcp.custom_route("/v1/messages", methods=["POST"])(gateway.messages)
-    mcp.custom_route("/v1/messages/count_tokens", methods=["POST"])(gateway.count_tokens)
-    # Registered last and matched last: the SDK appends custom routes after
-    # its /mcp mount, so this can never shadow the MCP transport — and a
-    # method the two routes above do not take (GET /v1/messages) falls
-    # through to here and gets the upstream's own answer for it.
-    mcp.custom_route("/{path:path}", methods=list(ALL_METHODS))(gateway.passthrough)
-    return gateway
+    return Gateway(engines, config, upstream, inflight)

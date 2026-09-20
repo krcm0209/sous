@@ -45,8 +45,8 @@ def _app(
         holder_alive=alive or (lambda pid, ct: True),
     )
     upstream = upstream or FakeUpstream().upstream()
-    server = create_server(engines, cfg, upstream=upstream, inflight=inflight)
-    return server.streamable_http_app(), engines
+    app = create_server(engines, cfg, upstream=upstream, inflight=inflight)
+    return app, engines
 
 
 def _request(app, method: str, path: str, body=None, headers=None) -> httpx.Response:
@@ -253,7 +253,7 @@ def test_status_carries_the_recent_ring_the_gateway_writes(tmp_path: Path):
 
     cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: _Fake(["reply"]))
-    app = create_server(engines, cfg, upstream=FakeUpstream().upstream()).streamable_http_app()
+    app = create_server(engines, cfg, upstream=FakeUpstream().upstream())
     body = {
         "model": "sous-local",
         "max_tokens": 16,
@@ -722,13 +722,11 @@ def test_mounting_the_monitor_pins_sse_starlette_above_debug(tmp_path: Path, mon
     leaning on the gateway's copy of the pin."""
     import logging
 
-    from mcp.server import MCPServer
-
     logger = logging.getLogger("sse_starlette")
     monkeypatch.setattr(logger, "level", logging.NOTSET)
     cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
-    monitor.mount_monitor(MCPServer("sous"), engines, lambda: {}, lambda: 0)
+    monitor.monitor_routes(engines, lambda: {}, lambda: 0)
     assert logger.level == logging.INFO
 
 

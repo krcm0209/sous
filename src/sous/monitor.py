@@ -15,10 +15,10 @@ import time
 from collections.abc import AsyncIterator, Callable
 
 from anyio.to_thread import run_sync
-from mcp.server import MCPServer
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
+from starlette.routing import BaseRoute, Route
 
 from sous.engine.base import EngineManager, release_mlx_thread_state
 from sous.gateway.convert import RequestError, _invalid
@@ -172,21 +172,20 @@ async def _served(route: str, fn: Callable[..., dict], *args: object) -> Respons
         return _refused(RequestError(500, "api_error", type(e).__name__))
 
 
-def mount_monitor(
-    mcp: MCPServer,
+def monitor_routes(
     engines: EngineManager,
     status: Callable[[], dict],
     version: Callable[[], object],
-) -> None:
-    """Register GET /sous/status, GET /sous/events, POST /sous/hold,
-    POST /sous/unload and a 404 for every other /sous/ path. `status` builds
-    the full status document (recent turns included); `version` is what the
-    event stream polls — a value that differs from the last one whenever
-    the document would. The status, hold and unload handlers hand their
-    work to a thread — status() reads the engine, the registry and the
-    config, hold() and unload() take the engine manager's lock, and neither
-    belongs on the event loop — and the event stream builds each of its
-    documents the same way."""
+) -> list[BaseRoute]:
+    """GET /sous/status, GET /sous/events, POST /sous/hold, POST /sous/unload
+    and a 404 for every other /sous/ path, in the order they must be mounted.
+    `status` builds the full status document (recent turns included);
+    `version` is what the event stream polls — a value that differs from the
+    last one whenever the document would. The status, hold and unload
+    handlers hand their work to a thread — status() reads the engine, the
+    registry and the config, hold() and unload() take the engine manager's
+    lock, and neither belongs on the event loop — and the event stream
+    builds each of its documents the same way."""
     # sse-starlette logs every frame it sends at DEBUG — the status document,
     # verbatim, up to ten times a second — and the gateway's own pin of this
     # logger only runs when the gateway is mounted. /sous/events is mounted
@@ -249,14 +248,14 @@ def mount_monitor(
             return _refused(e)
         return _refused(RequestError(404, "not_found_error", "no such route"))
 
-    mcp.custom_route("/sous/status", methods=["GET"])(sous_status)
-    mcp.custom_route("/sous/events", methods=["GET"])(sous_events)
-    mcp.custom_route("/sous/hold", methods=["POST"])(sous_hold)
-    mcp.custom_route("/sous/unload", methods=["POST"])(sous_unload)
-    # Registered after the real routes and before the gateway mounts its
-    # catch-all (the SDK keeps registration order), so no path under /sous
-    # can reach the upstream with the gateway on. The bare /sous needs its
-    # own entry: `/sous/{path:path}` does not match it, and the gateway's
-    # `/{path:path}` would.
-    mcp.custom_route("/sous", methods=list(ALL_METHODS))(sous_unknown)
-    mcp.custom_route("/sous/{path:path}", methods=list(ALL_METHODS))(sous_unknown)
+    return [
+        Route("/sous/status", sous_status, methods=["GET"]),
+        Route("/sous/events", sous_events, methods=["GET"]),
+        Route("/sous/hold", sous_hold, methods=["POST"]),
+        Route("/sous/unload", sous_unload, methods=["POST"]),
+        # After the real routes and before the endpoint's catch-all, so no
+        # path under /sous can reach the upstream. The bare /sous needs its
+        # own entry: `/sous/{path:path}` does not match it.
+        Route("/sous", sous_unknown, methods=list(ALL_METHODS)),
+        Route("/sous/{path:path}", sous_unknown, methods=list(ALL_METHODS)),
+    ]

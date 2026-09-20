@@ -9,7 +9,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from mcp.server import MCPServer
+from starlette.applications import Starlette
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
@@ -55,9 +55,8 @@ def test_real_model_streams_a_well_formed_turn_and_reuses_the_cache(tmp_path: Pa
     # below. ASGITransport drives no lifespan, so create_server(...).app()
     # alone never runs Gateway.close() — the session's thread would stay
     # parked and never reach release_mlx_thread_state() (see CLAUDE.md).
-    mcp = MCPServer("test")
-    gateway = mount_gateway(mcp, engines, cfg)
-    app = mcp.streamable_http_app()
+    gateway = mount_gateway(engines, cfg)
+    app = Starlette(routes=gateway.routes())
     tool = {
         "name": "echo",
         "description": "Echo a word back",
@@ -163,9 +162,8 @@ def test_an_attachment_keeps_the_conversation_warm_and_bit_exact(
     is bit-exact against its own cold run too."""
     cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: _engine(model_id, backend))
-    mcp = MCPServer("test")
-    gateway = mount_gateway(mcp, engines, cfg)
-    app = mcp.streamable_http_app()
+    gateway = mount_gateway(engines, cfg)
+    app = Starlette(routes=gateway.routes())
     read_tool = {
         "name": "Read",
         "description": "Read a file",

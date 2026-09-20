@@ -1,4 +1,4 @@
-"""SousService and the daemon's MCP server: no tools of its own, just the
+"""SousService and the daemon's HTTP app: no tools of its own, just the
 monitor and gateway routes mounted on it, plus daemon main()."""
 
 from __future__ import annotations
@@ -17,15 +17,15 @@ from typing import IO
 
 import anyio
 import uvicorn
-from mcp.server import MCPServer
+from starlette.applications import Starlette
 
 from sous.config import SousConfig, load_config
 from sous.engine.base import EngineManager, release_mlx_thread_state
-from sous.gateway.routes import Gateway, mount_gateway
+from sous.gateway.routes import mount_gateway
 from sous.gateway.upstream import Upstream
 from sous.inflight import Inflight
 from sous.logs import configure_daemon_logging, enable_warning_capture
-from sous.monitor import mount_monitor
+from sous.monitor import monitor_routes
 
 _logger = logging.getLogger("sous.server")
 
@@ -38,8 +38,8 @@ def _mlx_memory_gb() -> float | None:
     except Exception:  # noqa: BLE001 — mlx absent or API moved
         return None
     finally:
-        # Runs in whatever short-lived MCP worker thread served the request;
-        # mlx state left behind segfaults that thread's eventual exit
+        # Runs in whatever short-lived pool thread served the request; mlx
+        # state left behind segfaults that thread's eventual exit
         # (ml-explore/mlx#4327).
         release_mlx_thread_state()
 
@@ -121,53 +121,36 @@ def create_server(
     *,
     upstream: Upstream | None = None,
     inflight: Inflight | None = None,
-) -> MCPServer:
-    # One registry: the gateway's turns write it, and the status routes
-    # read it. A caller may pass its own (a test that writes to it while
-    # driving the app).
+) -> Starlette:
+    # One registry: the endpoint's turns write it, the status routes read it.
     inflight = inflight or Inflight()
     svc = SousService(engines, config, inflight)
-    # mount_gateway (below) runs after MCPServer(...) is constructed, so the
-    # lifespan closure below needs a late-bound holder for what it mounts.
-    mounted_gateway: list[Gateway] = []
+    gateway = mount_gateway(engines, config, upstream=upstream, inflight=inflight)
 
     @contextlib.asynccontextmanager
-    async def _lifespan(_: MCPServer) -> AsyncIterator[None]:
-        # Nothing else loops unload_if_idle() any more: the lifespan is the
-        # one span that matches the served app's lifetime exactly.
+    async def _lifespan(_: Starlette) -> AsyncIterator[None]:
         engines.start_idle_sweep()
         try:
             yield None
         finally:
+            # Fires on every path that drives the app's ASGI lifespan —
+            # uvicorn's graceful shutdown and its SIGTERM path alike. Without
+            # it the session thread stays parked in _requests.get() and never
+            # reaches release_mlx_thread_state() (ml-explore/mlx#4327), and
+            # the upstream forwarder's connection pool stays open.
             engines.stop_idle_sweep()
-            # Fires on every path that drives the app's ASGI lifespan:
-            # uvicorn's graceful shutdown and its SIGTERM path alike
-            # (capture_signals re-raises SIGTERM only after Server.shutdown()
-            # awaits this shutdown), plus any embedded lifecycle that drives
-            # lifespan. Without it the gateway's session thread stays parked
-            # in _requests.get() and never reaches release_mlx_thread_state()
-            # (ml-explore/mlx#4327) on a non-signal exit — and the upstream
-            # forwarder's connection pool is closed with it.
-            for gateway in mounted_gateway:
-                await gateway.aclose()
+            await gateway.aclose()
 
-    mcp = MCPServer("sous", lifespan=_lifespan)
-
-    # MCPServer.__init__ just ran the SDK's configure_logging("INFO"), which
-    # basicConfig's a RichHandler onto the root logger — every record wrapped
-    # at 80 columns. Replace it with the daemon's one-line shape now, before
-    # the first line anyone cares about is written.
-    configure_daemon_logging()
-
-    # The daemon's own routes go on before the gateway's: the gateway ends
+    # The daemon's own routes go on before the endpoint's: the endpoint ends
     # with a catch-all that forwards upstream, and a /sous/ path must never
     # get there.
-    mount_monitor(mcp, engines, lambda: svc.status_document(recent=True), svc.status_version)
-    mounted_gateway.append(
-        mount_gateway(mcp, engines, config, upstream=upstream, inflight=inflight)
+    return Starlette(
+        routes=[
+            *monitor_routes(engines, lambda: svc.status_document(recent=True), svc.status_version),
+            *gateway.routes(),
+        ],
+        lifespan=_lifespan,
     )
-
-    return mcp
 
 
 def _acquire_singleton_lock(data_dir: Path) -> IO[bytes]:
@@ -248,7 +231,7 @@ def uvicorn_config(app, host: str, port: int, log_level: str = "info") -> uvicor
         # daemon runs at. The gateway's catch-all forwards whatever Claude Code
         # puts in one, and nothing of value is lost by silencing it: the
         # gateway writes its own bounded metadata line per forwarded request,
-        # and the MCP transport never had a query string worth logging.
+        # and the monitor's own routes never had a query string worth logging.
         access_log=False,
         # uvicorn's default dictConfig gives `uvicorn` and `uvicorn.error`
         # their own stderr handlers and stops propagation, so its lines would
@@ -259,11 +242,8 @@ def uvicorn_config(app, host: str, port: int, log_level: str = "info") -> uvicor
     )
 
 
-def serve(mcp: MCPServer, host: str, port: int) -> None:
-    """What `mcp.run(transport="streamable-http")` does, minus the unbounded
-    shutdown wait: the SDK builds this same app and uvicorn config but exposes
-    no graceful-shutdown timeout."""
-    app = mcp.streamable_http_app(host=host)
+def serve(app: Starlette, host: str, port: int) -> None:
+    """uvicorn with a bounded graceful shutdown (see uvicorn_config)."""
     anyio.run(uvicorn.Server(uvicorn_config(app, host, port)).serve)
 
 
@@ -271,11 +251,10 @@ def main() -> None:
     # The line shape from the first line on — load_config() below is about to
     # warn on whatever is wrong with the user's config file, and that must
     # already come out shaped and leveled, not as a raw UserWarning on stderr.
-    # Install the handler (create_server re-runs the idempotent installer
-    # after MCPServer.__init__ puts the SDK's RichHandler back) and route
-    # warnings.warn through logging (pytest owns showwarning in tests) before
-    # anything else runs. Neither depends on the config or the singleton lock
-    # below, so there is no reason for either to wait.
+    # Install the handler and route warnings.warn through logging (pytest owns
+    # showwarning in tests) before anything else runs. Neither depends on the
+    # config or the singleton lock below, so there is no reason for either to
+    # wait.
     configure_daemon_logging()
     enable_warning_capture()
     config = load_config()
@@ -299,13 +278,13 @@ def main() -> None:
     engines = EngineManager(config)
     stop = threading.Event()
     _install_shutdown_handler(stop)
-    mcp = create_server(engines, config)
+    app = create_server(engines, config)
     _logger.info(
         f"serving {', '.join(config.local_models)} "
         f"at http://127.0.0.1:{config.server_port}/v1/messages; "
         f"everything else is forwarded to {config.upstream_url}"
     )
     try:
-        serve(mcp, "127.0.0.1", config.server_port)
+        serve(app, "127.0.0.1", config.server_port)
     finally:
         stop.set()

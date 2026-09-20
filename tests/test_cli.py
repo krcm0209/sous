@@ -1221,7 +1221,7 @@ def test_daemon_status_reads_the_real_daemons_config(tmp_path):
 
     cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "c.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
-    app = create_server(engines, cfg).streamable_http_app()
+    app = create_server(engines, cfg)
     port = _free_cli_port()
     with serve(app, port):
         status = _daemon_status(port, tmp_path)

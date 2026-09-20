@@ -4,14 +4,18 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
+import anyio
 import pytest
+from starlette.applications import Starlette
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
-from sous.server import SousService
+from sous.server import SousService, create_server
 from tests.fake_engine import FakeEngine
+from tests.fake_upstream import FakeUpstream
 
 
 @pytest.fixture(autouse=True)
@@ -314,30 +318,6 @@ def test_uvicorn_config_bounds_graceful_shutdown():
     assert cfg.access_log is False
 
 
-def test_create_server_installs_the_daemon_log_handler_and_drops_the_rich_one(svc):
-    import logging
-
-    from sous.logs import SOUS_HANDLER_NAME
-    from sous.server import create_server
-
-    class RichHandler(logging.Handler):  # the SDK's, matched by class name
-        def emit(self, record: logging.LogRecord) -> None:
-            pass
-
-    service, _ = svc
-    root = logging.getLogger()
-    root.addHandler(RichHandler())
-    try:
-        create_server(service.engines, service.config)
-        names = [h.get_name() for h in root.handlers]
-        assert names.count(SOUS_HANDLER_NAME) == 1
-        assert not [h for h in root.handlers if type(h).__name__ == "RichHandler"]
-    finally:
-        for h in list(root.handlers):
-            if h.get_name() == SOUS_HANDLER_NAME or type(h).__name__ == "RichHandler":
-                root.removeHandler(h)
-
-
 def test_uvicorn_config_leaves_logging_to_the_daemon():
     """uvicorn's default dictConfig gives its loggers their own handlers and
     stops propagation, so its lines would keep the `INFO:     …` shape
@@ -364,3 +344,17 @@ def test_the_status_document_carries_no_task_fields(svc):
     }
     assert set(service.status_document(recent=False)) == {"engine", "inflight", "config"}
     assert len(service.status_version()) == 3
+
+
+def test_the_lifespan_runs_the_idle_sweep_and_closes_the_endpoint(tmp_path: Path):
+    cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
+    engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
+    app = create_server(engines, cfg, upstream=FakeUpstream().upstream())
+    assert isinstance(app, Starlette)
+
+    async def inner() -> None:
+        async with app.router.lifespan_context(app):
+            assert any(t.name == "sous-idle-sweep" for t in threading.enumerate())
+        assert not any(t.name == "sous-idle-sweep" for t in threading.enumerate())
+
+    anyio.run(inner)
