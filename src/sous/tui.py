@@ -186,7 +186,7 @@ def clock_text(seconds: float, *, tenths: bool = False) -> str:
 
 
 def task_time(seconds: float) -> str:
-    """`m:ss` for a delegated task, minutes unbounded (a task can run an hour)."""
+    """`m:ss` with the minutes unbounded, for a span that can run past an hour."""
     whole = max(0, int(seconds))
     return f"{whole // 60}:{whole % 60:02d}"
 

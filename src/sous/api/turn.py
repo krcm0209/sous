@@ -1,11 +1,10 @@
 """One endpoint turn on the shared engine: serialized, thread-bridged, drained.
 
-The daemon has one engine and one generation lock; the worker and the endpoint
-share both. A turn takes the endpoint's own lock first (so endpoint turns queue
-in order and never find the one-slot GenerationSession busy), then the
-engine's lock through the session, exactly as run_task does. Everything here
-is synchronous and runs on whatever pool thread the route hands it; progress
-crosses back to the event loop through the Sink.
+The daemon has one engine and one generation lock. A turn takes the endpoint's
+own lock first (so turns queue in order and never find the one-slot
+GenerationSession busy), then the engine's lock through the session. Everything
+here is synchronous and runs on whatever pool thread the route hands it;
+progress crosses back to the event loop through the Sink.
 """
 
 from __future__ import annotations
@@ -87,8 +86,9 @@ class TurnResult:
     pressure_evictions: int = 0  # of which by the pressure valve
     load_seconds: float = 0.0  # lease + engines.get(): a model load, ours or one we waited out
     queue_seconds: float = 0.0  # wait for the endpoint lock, before `seconds` starts
-    # Wait for the engine's own lock, which a delegated task's generation
-    # holds; inside ttft_s and `seconds`, and in no phase below.
+    # Wait for the engine's own lock, which the endpoint lock in front of it
+    # normally keeps at zero — an abandoned stalled generation is what still
+    # holds it; inside ttft_s and `seconds`, and in no phase below.
     engine_wait_seconds: float = 0.0
     tokenize_seconds: float = 0.0  # count_tokens plus the fork probe's renders
     ttft_seconds: float | None = None  # generate() entry → first delta; None if none came
@@ -204,7 +204,7 @@ class TurnRunner:
         if live is not None:
             live.phase(turn_id, "loading")
         try:
-            # The idle sweep runs on the worker's thread, and _gen_lock only
+            # The idle sweep runs on a thread of its own, and _gen_lock only
             # covers generate(): without a lease the model could be unloaded
             # under count_tokens(), which is seconds of work on a long prompt.
             with self._engines.lease():
@@ -279,12 +279,12 @@ class TurnRunner:
                 except GenerationStalled:
                     # The session is unusable after a stall (its thread may still
                     # be generating, holding the engine lock); the next turn gets a
-                    # fresh one and waits on the lock like the worker would. Retire
+                    # fresh one and waits on the lock. Retire
                     # the stalled session's thread too: when the abandoned thread
                     # finishes it would publish the KV cache it built on ITS
                     # streams, and a cache is usable only from the thread that
                     # built it (#34). Retirement makes that late publish drop
-                    # itself, and leaves the worker's slots alone.
+                    # itself, and leaves every other owner's slots alone.
                     stalled = session.thread
                     self._drop_session()
                     # Best-effort: a reset that raises would replace GenerationStalled

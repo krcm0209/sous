@@ -922,8 +922,8 @@ def main(argv: list[str] | None = None) -> None:
     # main(), before argparse ever sees it, so there is no `claude` branch below.
     sub.add_parser(
         "claude",
-        help="launch Claude Code against the gateway: subagents local, main loop upstream "
-        "(every following argument passes through to claude)",
+        help="launch Claude Code with its subagents served locally and the main loop "
+        "upstream (every following argument passes through to claude)",
     )
     args = parser.parse_args(raw)
     if args.command == "serve":

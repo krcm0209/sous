@@ -1,11 +1,13 @@
 # Security Policy
 
-sous runs a local model in an autonomous tool loop against your source tree.
-Its sandbox — path confinement, the command allowlist, environment scrubbing,
-the process-group kill — is the security boundary, and bugs in it are worth
-reporting. In gateway mode (off by default) it also carries your Claude Code
-subscription credential to Anthropic's API on every forwarded request;
-leaking, storing or misrouting it is equally worth reporting.
+sous executes nothing. It is an HTTP daemon on `127.0.0.1` that answers a
+Claude Code subagent's turns from a local model and forwards every other
+request to Anthropic's API — so its security surface is that daemon and the
+credential it carries: your Claude Code subscription token, on every
+forwarded request. Leaking, storing, misrouting or logging it is worth
+reporting, as is anything that reaches the daemon from off the loopback
+interface. What the local model *does* is governed by Claude Code's own
+permission system, not by sous.
 
 ## Supported versions
 
@@ -35,47 +37,40 @@ Credit in the advisory unless you would rather stay anonymous.
 Anything that breaks a guarantee in the
 [Security model](README.md#security-model). Concretely:
 
-- **Path-confinement escapes** — a worker writing outside its task's
-  `project_root`, into `.git/`, or into the sous control directory (`~/.sous/`).
-  Symlink and path-normalisation tricks count.
-- **Allowlist bypasses** — running a command that is not allowlisted and was
-  never approved, including argv-splitting tricks that make a command look
-  like an allowlisted one.
-- **Environment leaks** — secrets surviving `scrubbed_env()` into a command's
-  environment.
-- **Audit evasion** — a command modifying files without the change appearing
-  in the report, other than by the privileged routes noted below.
-- **Descendant survival** — processes outliving the timeout kill and writing
-  files after the audit, other than by the documented double-fork route.
-- **Approval bypasses** — anything that gets a command run without the human
-  approval it should have required.
-- **The MCP endpoint** — it binds to `127.0.0.1`; reachability beyond that, or
-  anything exploitable through it, is in scope.
-- **The gateway** (`[gateway].enabled = true`) — it binds to `127.0.0.1` and
-  refuses foreign `Host`/`Origin` values and any browser request whose
-  `Sec-Fetch-Site` is not `none` or `same-origin` (a page's `<iframe>` or
-  no-cors GET carries no `Origin`); it forwards Claude Code's own
-  `Authorization` header to `[gateway].upstream_url`. In scope: reachability
-  from anything but a loopback client; a request body, header value or query
-  string reaching a log at any level, including debug; a credential being
-  stored, or sent anywhere but the configured upstream; a forwarded request
-  altered beyond `Host`, the hop-by-hop headers and a buffered body's
-  recomputed `Content-Length`; a locally served turn
-  executing a tool (the gateway returns `tool_use` blocks and never runs one).
-- **The `/sous/` routes** (`GET /sous/status`, `GET /sous/events`,
-  `POST /sous/hold`) — the daemon's own loopback routes, mounted whether or
-  not the gateway is enabled, behind the same `Host`/`Origin`/`Sec-Fetch-Site`
-  refusal.
-  `/sous/status` and `/sous/events` serve the status document (engine
-  state, the turn in flight, recent turns and tasks — counts, durations,
-  hashes and identifiers; task titles are the user's own); `/sous/hold`
-  pins the model in memory while a named process lives — the pid is logged
-  to attribute the hold and its release; the start time and the raw body
-  never are. In scope: reachability from anything but a loopback client; a
-  path under `/sous` reaching the gateway's forwarder; anything of a hold
-  body beyond a pid and a start time being acted on; any request body,
-  prompt text, tool name or file path reaching the document, the event
-  stream, `sous top` or `sous statusline`.
+- **The loopback guard** (`src/sous/loopback.py`) — the daemon binds to
+  `127.0.0.1` and refuses foreign `Host`/`Origin` values and any browser
+  request whose `Sec-Fetch-Site` is not `none` or `same-origin` (a page's
+  `<iframe>` or no-cors GET carries no `Origin` to refuse). The check runs on
+  every route, forwarded ones included. Reachability from anything but a
+  loopback client, or a request that slips past the check, is in scope.
+- **Credential handling** — sous forwards the `Authorization` header Claude
+  Code sends to `[server].upstream_url` and nowhere else, stores it nowhere,
+  and adds no credential of its own (no `~/.netrc`, no proxy environment). A
+  credential sent anywhere but the configured upstream, or persisted to disk,
+  is in scope.
+- **Anything logged that shouldn't be** — a request body, a header value or a
+  query string reaching a log at any level, debug included, is a
+  vulnerability, not a papercut. The same goes for prompt text, tool names or
+  file paths reaching the status document, the event stream, `sous top` or
+  `sous statusline`.
+- **A `/sous/` path reaching the upstream.** The daemon's own routes
+  (`GET /sous/status`, `GET /sous/events`, `POST /sous/hold`,
+  `POST /sous/unload`) are mounted before the forwarder precisely so that no
+  path under `/sous` can be proxied out. One that is, is in scope — as is
+  anything of a hold body beyond a pid and a start time being acted on (the
+  pid is logged to attribute the hold and its release; the start time and the
+  raw body never are).
+- **A request body that crashes the daemon**, or that reaches the upstream
+  re-serialized rather than byte for byte. A forwarded request must be altered
+  only in `Host`, the hop-by-hop headers and, for the two Messages routes
+  whose body sous reads, a recomputed `Content-Length`.
+- **`sous claude` setting a credential, a tier or a permission variable.** It
+  must never set `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, an
+  `ANTHROPIC_DEFAULT_*_MODEL` or a Claude Code permission mode: the first two
+  move your billing, the third pulls the main loop off the upstream, and the
+  last would weaken a boundary that is the user's to set.
+- **The daemon writing outside `~/.sous`.** Its log, its lock and its config
+  live there and nowhere else; it edits no source tree.
 
 ## What isn't
 
@@ -83,31 +78,19 @@ These are documented design limits, not vulnerabilities. They are described in
 the [Security model](README.md#security-model), and reporting them is
 reporting the README:
 
-- **Allowlisting a command that runs repo-resident code grants arbitrary code
-  execution.** Any test runner — `pytest`, `npm test`, `make test` — executes
-  code the worker just wrote. This is inherent to the feature, which is why
-  the README tells you to calibrate the allowlist and review diffs.
-- **There is no network sandbox.** An allowlisted or approved command can
-  reach the network if it does so itself.
-- **A descendant that double-forks and calls `setsid()` survives the group
-  kill.** Closing that needs OS-level confinement macOS does not offer.
-- **The stat-based audit does not defend against a privileged attacker.** Root
-  access or system-clock manipulation between snapshots can hide a change; the
-  audit is a safety net against the sandboxed worker, not against root.
-- **The model producing wrong, low-quality, or malicious-looking code.** That
-  is the expected failure mode the human review step exists for. Review the
-  diff.
-- **Gateway mode bypasses the sandbox by design.** A turn the gateway serves
-  locally returns `tool_use` blocks that Claude Code executes under its own
-  permission rules; `toolexec.py` is not in that path, and a weaker model
-  inherits whatever permissiveness you configured for frontier subagents.
-  The mitigation is positioning — subagents only by default, an experimental
-  label — not code.
-- **A plaintext upstream on loopback.** `[gateway].upstream_url` accepts
+- **What the local model does through Claude Code's tools.** sous returns
+  `tool_use` blocks and never runs one; Claude Code executes every tool under
+  its own permission mode — auto mode's frontier classifier, the allow/deny
+  rules, and the optional sandbox. A gap there is a Claude Code issue, and
+  belongs to Anthropic's own reporting channels, not here.
+- **A plaintext upstream on loopback.** `[server].upstream_url` accepts
   `http://` for `127.0.0.1`, `localhost` and `::1` so tests and local
   front-ends can sit in between; that traffic never leaves the machine.
+- **The model producing wrong, low-quality, or malicious-looking code.** That
+  is the expected failure mode a frontier main loop reviewing the subagent's
+  work exists for. Review the diff.
 
-If you think one of these is worse in practice than the README claims — for
-instance a *reliable* way to reach the double-fork escape from an ordinary
-delegated task — that is worth reporting. The limitation being documented does
+If you think one of these is worse in practice than the README claims — a
+concrete path from a local turn to something sous itself should have
+prevented, say — that is worth reporting. A limitation being documented does
 not make a sharp exploitation path uninteresting.

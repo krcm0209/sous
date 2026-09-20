@@ -2,9 +2,9 @@
 
 Not a boundary: the project is a throwaway copy under a temp dir, the only
 commands accepted are the task's own verify commands and the suite's test
-runners, and nothing here audits, scrubs or kills process groups. Output
-shapes match what the worker's tools printed, so the model reads the same
-results the suite was graded against."""
+runners, and nothing here audits, scrubs or kills process groups. The output
+shapes are fixed, so every arm the suite grades reads its results the same
+way."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ MAX_TOOL_OUTPUT = 16_000
 MAX_GREP_HITS = 200
 MAX_GLOB_HITS = 500
 # What a task may run besides its own verify commands: the runners the suite's
-# tasks are written for, matched as argv prefixes like the old allowlist was.
+# tasks are written for, matched as argv prefixes.
 ACCEPTED_RUNNERS = (
     "python -m unittest",
     "python3 -m unittest",

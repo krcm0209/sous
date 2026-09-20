@@ -1,10 +1,10 @@
 """The endpoint's HTTP surface: Anthropic-shaped routes on the daemon's app.
 
 Never logs a request body or a header value. Never executes a tool: tool_use
-blocks go back to Claude Code, whose permission system runs them (toolexec.py
-is not in this path). Requests for any other model — and every path it has no
-route for — are forwarded to [server].upstream_url by api/upstream.py,
-byte for byte.
+blocks go back to Claude Code, whose permission mode is the boundary around
+what the local model asks for. Requests for any other model — and every path
+it has no route for — are forwarded to [server].upstream_url by
+api/upstream.py, byte for byte.
 """
 
 from __future__ import annotations
