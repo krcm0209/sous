@@ -80,24 +80,13 @@ ENGINE_WORDS = {
 }
 QUIET_WORD = "KITCHEN QUIET"
 CLOSED_WORD = "KITCHEN CLOSED"
-TASK_WORDS = {
-    "queued": "ON RAIL",
-    "running": "COOKING",
-    "awaiting_approval": "NEEDS CHEF",
-    "done": "SERVED",
-    "failed": "BURNT",
-    "cancelled": "86'D",
-}
 REGION_WORDS = {
     "tools": "new tools",
     "system": "header",
     "tools-or-system": "tools or header",
     "conversation": "conversation",
 }
-LEGEND_STRIP = (
-    " SEAR prefill  PLATE decode  REHEAT hit  DRAWER fork  SCRATCH miss"
-    "  TOSSED evicted  86'D cancelled"
-)
+LEGEND_STRIP = " SEAR prefill  PLATE decode  REHEAT hit  DRAWER fork  SCRATCH miss  TOSSED evicted"
 LEGEND_STRIP_COMPACT = " SEAR prefill · PLATE decode · REHEAT hit · DRAWER fork · SCRATCH miss"
 KEYS = " q quit   l legend   ? about   m motion   p pause   ↑↓ orders   enter ticket   r reconnect"
 KEYS_COMPACT = " q quit  l legend  ? about  m motion  p pause  ↑↓ orders  enter ticket"
@@ -119,9 +108,6 @@ LEGEND = """\
  WALK-IN FULL   pressure     shelves dropped under memory pressure
  LIGHTS OUT / FIRING UP / LINE IS OPEN   no model / loading / model resident
  hold N         holders      live `sous claude` sessions pinning the model
- ON RAIL / COOKING / NEEDS CHEF / SERVED / BURNT / 86'D
-                             a delegated task queued / running / awaiting
-                             your approval / done / failed / cancelled
 """
 ABOUT = """\
 
@@ -157,7 +143,7 @@ PINK = "#D6488A"  # the title word, confetti, PLATING, the EQ's top, HI-SCORE, a
 PURPLE = "#8E68DE"  # the order slip, ORDER №, the dial, the PLATE fill, KNIFE WORK
 MUSTARD = "#A87A10"  # the SEAR fill, SEARING, PREHEATING, PLATE FULL, the stall ?
 CHILLI = "#CE5450"  # BURNT, DROPPED IT, WALK-IN FULL, KITCHEN CLOSED
-SLATE = "#79798E"  # legend, perforation, IN THE WINDOW, LIGHTS OUT, 86'D, steam, VHS
+SLATE = "#79798E"  # legend, perforation, IN THE WINDOW, LIGHTS OUT, steam, VHS
 PHASE_COLOURS = {
     "queued": SLATE,
     "loading": MUSTARD,
@@ -302,8 +288,7 @@ def rail_row(turn: dict) -> dict[str, str]:
 
 def turn_tallies(recent: list[dict]) -> tuple[int, int, int]:
     """How the book's turns ended, in the pass's own words: ORDER UP,
-    DROPPED IT, WALKED OUT — never SERVED, BURNT or 86'D, which the legend
-    reserves for delegated tasks, a different population."""
+    DROPPED IT, WALKED OUT — a turn's only three outcomes."""
     up = sum(1 for t in recent if not t.get("error"))
     dropped = sum(1 for t in recent if t.get("error") and t.get("error") != "abandoned")
     walked = sum(1 for t in recent if t.get("error") == "abandoned")
@@ -1064,13 +1049,12 @@ class LinePanel(Vertical):
         mood: str,
         engine: dict,
         config: dict,
-        queue: dict,
         recent: list[dict],
         now: float,
         motion: bool,
         subtitle: str | None = None,
     ) -> None:
-        """`subtitle` replaces the panel's own tail (`idle …`, `ON RAIL …`),
+        """`subtitle` replaces the panel's own tail (`idle …`, `loaded`),
         which is a live daemon's line: while the feed is down the caller
         hands in when the document on screen arrived instead."""
         self.query_one("#line-chef", Chef).show(mood, now, motion=motion)
@@ -1110,21 +1094,15 @@ class LinePanel(Vertical):
             ]
             # `size` is the content box: the sprite's three rows come off it.
             # The tickets block needs three more rows than the wide layout
-            # leaves once the rate panel has taken its five. Tasks and turns
-            # are two different populations, so each keeps its own row and
-            # its own vocabulary rather than sharing one heading.
+            # leaves once the rate panel has taken its five.
             if self.size.height - 3 >= len(lines) + 3:
                 lines += [
-                    f" {'TASKS':<7}ON RAIL {queue.get('queued', 0)}"
-                    f" · COOKING {queue.get('running', 0)}",
                     f" {'ORDERS':<7}{DONE_WORD} {up} · {FAILED_WORD} {dropped}",
                     f" {'':<7}{ABANDONED_WORD} {walked}",
                 ]
             self.query_one("#line-body", Line).show("\n".join(lines))
         idle = engine.get("idle_seconds")
         tail = f"idle {span_text(idle)}" if idle is not None and engine.get("loaded") else literal
-        if compact:
-            tail = f"ON RAIL {queue.get('queued', 0)} · COOKING {queue.get('running', 0)} · {tail}"
         _retitle(self, subtitle=tail if subtitle is None else subtitle)
 
 
@@ -1401,7 +1379,6 @@ class Top(App[int]):
     #digits {{ width: auto; color: {PINK}; margin: 0 2 0 2; }}
     #rate-text {{ width: 1fr; }}
     #rail {{ height: 1fr; overflow-x: hidden; scrollbar-size: 0 0; }}
-    #tasks {{ height: 1; color: ansi_default; }}
     #legend {{ height: 1; color: {SLATE}; }}
     #footer {{ height: 1; }}
     .stale {{ text-style: dim; }}
@@ -1415,11 +1392,10 @@ class Top(App[int]):
     Screen.compact #line-body {{ display: none; }}
     Screen.compact #tps {{ width: 12; }}
     Screen.narrow #strip, Screen.narrow #rule, Screen.narrow #main, Screen.narrow #gingham,
-    Screen.narrow #rail, Screen.narrow #tasks, Screen.narrow #legend {{ display: none; }}
+    Screen.narrow #rail, Screen.narrow #legend {{ display: none; }}
     Screen.wide #main {{ height: 16; }}
     Screen.wide #left {{ width: 78; }}
     Screen.wide #rate {{ display: block; }}
-    Screen.wide #tasks {{ height: 3; }}
     Overlay {{ align: center middle; }}
     #overlay {{ width: 84; border: round {PINK}; border-title-color: {PINK}; padding: 0 2;
                 background: ansi_default; }}
@@ -1497,7 +1473,6 @@ class Top(App[int]):
                 yield RatePanel()
         yield Rule("RECENT ORDERS", id="gingham")
         yield Rail()
-        yield Line(id="tasks")
         yield Line(LEGEND_STRIP, id="legend")
         yield Line(KEYS, id="footer")
 
@@ -1583,7 +1558,7 @@ class Top(App[int]):
             self._ticker.pause()
         if self._idler is not None:
             self._idler.resume()  # the redial countdown and the tracking bands
-        for selector in ("#right", "#rail", "#tasks"):
+        for selector in ("#right", "#rail"):
             self.query_one(selector).add_class("stale")
         _retitle(self.query_one(LinePanel), subtitle=self._stale_subtitle())
         self._show_left(None)
@@ -1605,7 +1580,7 @@ class Top(App[int]):
             self._connected = self._ever_connected = True
             self._attempt = 0
             self._retry_at = None
-            for selector in ("#right", "#rail", "#tasks"):
+            for selector in ("#right", "#rail"):
                 self.query_one(selector).remove_class("stale")
         # On a fresh document the offset is nothing; on a resize it is the
         # clock already on screen, never the document's older one. Read once
@@ -1618,7 +1593,6 @@ class Top(App[int]):
         config = document.get("config") or {}
         inflight = document.get("inflight") or []
         recent = document.get("recent_turns") or []
-        queue = document.get("queue") or {}
         previous = self._turn
         # A resize re-applies the document that is already on screen, which
         # while the feed is down is a stale one: reading its turn back would
@@ -1640,9 +1614,8 @@ class Top(App[int]):
             self._show_left(None, now, engine)
         if not engine.get("loading"):
             self._firing_since = None
-        self._paint_line(engine, config, queue, recent, now)
+        self._paint_line(engine, config, recent, now)
         self.query_one(Rail).show(recent)
-        self._show_tasks(document.get("recent_tasks") or [])
         cache = engine.get("prompt_cache") or {}
         if not resize:
             rose = {
@@ -1751,17 +1724,6 @@ class Top(App[int]):
         else:
             card.show_quiet(engine, config, recent, now, self.motion)
 
-    def _show_tasks(self, tasks: list[dict]) -> None:
-        rows = []
-        for t in tasks[: 2 if self._width >= WIDE_COLUMNS else 1]:
-            word = TASK_WORDS.get(t.get("state", ""), "?")
-            seconds = t.get("seconds") or 0
-            rows.append(
-                f" TASK  {word} {task_time(seconds) if seconds else '—'}  "
-                f"{(t.get('title') or '')[:70]}"
-            )
-        self.query_one("#tasks", Line).show("\n".join(rows) if rows else " TASK  none on the rail")
-
     def _refresh_footer(self, now: float | None = None, engine: dict | None = None) -> None:
         footer = self.query_one("#footer", Line)
         width = self._width
@@ -1825,9 +1787,7 @@ class Top(App[int]):
             engine["idle_seconds"] = idle + max(0.0, self._monotonic() - self._received_mono)
         return engine
 
-    def _paint_line(
-        self, engine: dict, config: dict, queue: dict, recent: list[dict], now: float
-    ) -> None:
+    def _paint_line(self, engine: dict, config: dict, recent: list[dict], now: float) -> None:
         """THE LINE, PLATE RATE, the headline and the footer from one engine
         block and one `now` — what a document paints and what the idle tick
         repaints once a second, so the two cannot drift apart. The card is
@@ -1838,7 +1798,6 @@ class Top(App[int]):
             mood,
             engine,
             config,
-            queue,
             recent,
             now,
             self.motion,
@@ -1872,11 +1831,10 @@ class Top(App[int]):
         document = self._document
         config = document.get("config") or {}
         recent = document.get("recent_turns") or []
-        queue = document.get("queue") or {}
         card = self.query_one(Card)
         if card.display and not engine.get("loading"):
             card.show_quiet(engine, config, recent, now, self.motion)
-        self._paint_line(engine, config, queue, recent, now)
+        self._paint_line(engine, config, recent, now)
 
     def _idle_tick(self) -> None:
         now = self._clock()
