@@ -146,7 +146,9 @@ def render_report(
             "wall = the sum of every run's seconds)",
             "",
         ]
-        out += [_suite_line(s) for s in suite or []] or ["  (no suite runs)"]
+        out += [_suite_line(s) for s in suite or []] or [
+            "  (the suite did not run)" if not tasks else "  (no suite runs)"
+        ]
     out += ["", "## Choice", ""]
     if choice is None and quick:
         out.append(
@@ -155,6 +157,10 @@ def render_report(
             "machine, run the full `sous tune` or set [model].id by hand to one of the "
             "candidates above."
         )
+    elif choice is None and not tasks:
+        # The run stopped before the suite began (a bench arm's weights
+        # stayed resident): the stop line above the report says why.
+        out.append("  cannot recommend a setting: the suite did not run")
     elif choice is None:
         out.append("  cannot recommend a setting: no arm completed the suite")
     else:

@@ -301,7 +301,7 @@ def _summary(label, model=M, grade=0.91, wall=812.0, peak=20 * 2**30):
     )
 
 
-def _full_report(tmp_path, choice, suite):
+def _full_report(tmp_path, choice, suite, tasks=8):
     return render_report(
         hardware=_hardware(tmp_path),
         table_age_days=1,
@@ -312,7 +312,7 @@ def _full_report(tmp_path, choice, suite):
         current_model=M,
         quick=False,
         suite=suite,
-        tasks=8,
+        tasks=tasks,
         runs=2,
     )
 
@@ -360,6 +360,15 @@ def test_a_full_report_without_a_choice_says_no_arm_completed_the_suite(tmp_path
     text = _full_report(tmp_path, None, [])
     assert "  (no suite runs)" in text
     assert "cannot recommend a setting: no arm completed the suite" in text
+
+
+def test_a_full_report_whose_run_stopped_before_the_suite_says_so(tmp_path):
+    # A bench arm's weights stayed resident: the suite never started, and
+    # the report must not describe it as one nobody completed.
+    text = _full_report(tmp_path, None, [], tasks=0)
+    assert "  (the suite did not run)" in text
+    assert "cannot recommend a setting: the suite did not run" in text
+    assert "no arm completed the suite" not in text
 
 
 def test_the_quick_report_is_unchanged_by_the_full_fields(tmp_path):
