@@ -382,7 +382,7 @@ def status_lines(document: dict, now: float) -> list[str]:
     ]
     idle = engine.get("idle_seconds")
     if state == "loaded" and idle is not None:
-        engine_parts.append(f"idle {_clock(idle)}")
+        engine_parts.append(f"idle {_span(idle)}")
     lines = [
         f"sous daemon: listening on 127.0.0.1:{config.get('port', '?')}",
         "  " + " · ".join(engine_parts),
@@ -398,17 +398,26 @@ def status_lines(document: dict, now: float) -> list[str]:
             )
     else:
         lines.append("  turns in flight: none")
-    recent = list(document.get("recent_turns") or [])[-5:]
+    # The ring is newest first already.
+    recent = list(document.get("recent_turns") or [])[:5]
     if recent:
         lines.append("  recent turns:")
-        for s in reversed(recent):
-            lines.append(
-                f"    {s.get('id', '?')} {s.get('model', '?')} status={s.get('status', '?')} "
-                f"stop={s.get('stop_reason') or '-'} cache={s.get('cache') or '-'} "
-                f"in={s.get('input_tokens', '-')} out={s.get('output_tokens', '-')} "
-                f"{s.get('seconds', '-')}s"
-            )
+        lines.extend("    " + _recent_turn_text(s) for s in recent)
     return lines
+
+
+def _recent_turn_text(s: dict) -> str:
+    seconds = s.get("seconds")
+    took = f"{seconds:.1f}s" if isinstance(seconds, int | float) else "-"
+    head = f"{s.get('id', '?')} {s.get('model', '?')} status={s.get('status', '?')}"
+    if s.get("error"):
+        # A refused, abandoned or failed turn: its summary carries the error
+        # and none of the served fields.
+        return f"{head} error={s['error']} {took}"
+    return (
+        f"{head} stop={s.get('stop_reason') or '-'} cache={s.get('cache') or '-'} "
+        f"in={s.get('input_tokens', '-')} out={s.get('output_tokens', '-')} {took}"
+    )
 
 
 def _cmd_status() -> None:
@@ -428,7 +437,23 @@ def _cmd_status() -> None:
         )
         raise SystemExit(1) from None
     document = _json_object(raw) if status == 200 else None
+    if document is not None and not ("engine" in document and "config" in document):
+        # A JSON object without the engine block is some other service on the
+        # port; read as a document it would print a confident report about a
+        # daemon that isn't there.
+        print(
+            f"sous daemon: port {config.server_port} answered /sous/status with something "
+            "that is not the status document; is it sous?"
+        )
+        raise SystemExit(1)
     if document is None:
+        if status == 404 and not _lock_is_held(config.data_dir):
+            print(
+                f"sous daemon: 127.0.0.1:{config.server_port} is not a sous daemon (nothing "
+                f"holds {config.data_dir / 'daemon.lock'}); stop what listens there, or "
+                "change [server].port"
+            )
+            raise SystemExit(1)
         print(
             f"sous daemon: port {config.server_port} answered {status} to /sous/status; "
             f"restart it ({restart_hint(managed=_launchd_loaded(LABEL))})"
@@ -436,6 +461,17 @@ def _cmd_status() -> None:
         raise SystemExit(1)
     for line in status_lines(document, now=time.time()):
         print(line)
+
+
+def _span(seconds: float) -> str:
+    """`48s`, `4m 12s`, `1h 03m`: the idle span, in the shape `sous top` gives
+    it (span_text lives in tui.py, which this module must not import)."""
+    seconds = max(0, int(seconds))
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds}s"
 
 
 def _clock(seconds: float) -> str:

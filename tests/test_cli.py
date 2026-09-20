@@ -1641,27 +1641,50 @@ def test_status_lines_show_the_engine_the_turn_and_the_recent_ring():
             {"id": "msg_1", "model": "sous-local", "phase": "decode", "started_at": 100.0}
         ],
         "config": {"port": 8383},
+        # Newest first, as the registry keeps it: seven turns, the newest a
+        # refusal whose summary carries an error and none of the served fields.
         "recent_turns": [
             {
-                "id": "msg_0",
+                "id": "msg_7",
                 "model": "sous-local",
-                "status": 200,
-                "stop_reason": "tool_use",
-                "cache": "hit",
-                "input_tokens": 66262,
-                "output_tokens": 50,
-                "seconds": 4.9,
-            }
+                "status": 529,
+                "error": "EndpointBusy",
+                "seconds": 0.0021456,
+            },
+            *(
+                {
+                    "id": f"msg_{n}",
+                    "model": "sous-local",
+                    "status": 200,
+                    "stop_reason": "tool_use",
+                    "cache": "hit",
+                    "input_tokens": 66262,
+                    "output_tokens": 50,
+                    "seconds": 4.9123,
+                }
+                for n in range(6, -1, -1)
+            ),
         ],
     }
     lines = status_lines(doc, now=130.0)
     assert lines[0] == "sous daemon: listening on 127.0.0.1:8383"
-    assert lines[1].startswith("  engine: org/m loaded · holders 1 · idle ")
-    assert lines[2].startswith("  turn msg_1 sous-local decode ")
+    assert lines[1] == "  engine: org/m loaded · holders 1 · idle 12s"
+    assert lines[2] == "  turn msg_1 sous-local decode 00:30"
     assert lines[3] == "  recent turns:"
-    assert (
-        lines[4] == "    msg_0 sous-local status=200 stop=tool_use cache=hit in=66262 out=50 4.9s"
+    assert lines[4] == "    msg_7 sous-local status=529 error=EndpointBusy 0.0s"
+    assert lines[5] == (
+        "    msg_6 sous-local status=200 stop=tool_use cache=hit in=66262 out=50 4.9s"
     )
+    assert [line.split()[0] for line in lines[4:]] == ["msg_7", "msg_6", "msg_5", "msg_4", "msg_3"]
+
+
+def test_status_lines_give_a_long_idle_span_in_hours():
+    doc = {
+        "engine": {"loaded": True, "model_id": "org/m", "idle_seconds": 10842.4, "holders": 1},
+        "inflight": [],
+        "config": {"port": 8383},
+    }
+    assert status_lines(doc, now=0.0)[1] == "  engine: org/m loaded · holders 1 · idle 3h 00m"
 
 
 def test_status_lines_for_an_idle_unloaded_daemon():
@@ -1709,6 +1732,52 @@ def test_status_prints_the_document_when_the_daemon_answers(monkeypatch, capsys,
     out = capsys.readouterr().out.splitlines()
     assert out[0] == "sous daemon: listening on 127.0.0.1:8383"
     assert out[1] == "  engine: org/m unloaded · holders 0"
+
+
+def test_status_refuses_a_200_that_is_not_the_status_document(monkeypatch, capsys, tmp_path):
+    from sous import cli
+
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: SousConfig(
+            server_port=8383, data_dir=tmp_path, config_path=tmp_path / "config.toml"
+        ),
+    )
+    monkeypatch.setattr(cli, "_port_open", lambda port: True)
+    monkeypatch.setattr(
+        cli, "_sous_request", lambda port, method, path, json=None: (200, b'{"ok": true}')
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["status"])
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "not the status document" in out
+    assert "restart" not in out
+
+
+def test_status_tells_a_foreign_listener_from_a_daemon_that_predates_the_route(
+    monkeypatch, capsys, tmp_path
+):
+    """A 404 means 'restart' only from the process holding daemon.lock; from
+    anything else the advice is to free the port or move off it."""
+    from sous import cli
+
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: SousConfig(
+            server_port=8383, data_dir=tmp_path, config_path=tmp_path / "config.toml"
+        ),
+    )
+    monkeypatch.setattr(cli, "_port_open", lambda port: True)
+    monkeypatch.setattr(cli, "_sous_request", lambda port, method, path, json=None: (404, b""))
+    monkeypatch.setattr(cli, "_launchd_loaded", lambda _label: False)
+    for held, expected in ((False, "is not a sous daemon"), (True, "restart it")):
+        monkeypatch.setattr(cli, "_lock_is_held", lambda _data_dir, h=held: h)
+        with pytest.raises(SystemExit):
+            cli.main(["status"])
+        assert expected in capsys.readouterr().out
 
 
 def test_status_names_launchds_restart_when_launchd_manages_the_daemon(
