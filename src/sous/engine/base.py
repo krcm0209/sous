@@ -236,7 +236,7 @@ def _default_factory(
     reserve_tokens: int = 0,
     int8_prefill: bool = False,
 ) -> Engine:
-    from sous.context import kv_bytes_per_token
+    from sous.engine.window import kv_bytes_per_token
 
     model_config = fetch_model_config(model_id)
     backend = select_backend(model_config)

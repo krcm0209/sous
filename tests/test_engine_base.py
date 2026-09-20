@@ -1116,7 +1116,7 @@ def test_default_factory_passes_int8_prefill_to_both_engines(monkeypatch):
     monkeypatch.setattr(vlm, "VLMEngine", RecordingVLM)
     monkeypatch.setattr(lm, "LMEngine", RecordingLM)
     monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"vision_config": {}})
-    monkeypatch.setattr("sous.context.kv_bytes_per_token", lambda cfg: 1024)
+    monkeypatch.setattr("sous.engine.window.kv_bytes_per_token", lambda cfg: 1024)
     base._default_factory("m", 0.7, 0.8, 20, True, cache_budget=0, int8_prefill=True)
     assert seen["vlm"]["int8_prefill"] is True
     monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"model_type": "qwen3_5"})

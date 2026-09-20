@@ -5,7 +5,6 @@ import pytest
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager, ManagedEngine, ReplaySafe
-from sous.protocol import WORKER_TOOLS
 from sous.tune import bench
 from sous.tune.arms import Arm
 from sous.tune.bench import (
@@ -17,6 +16,7 @@ from sous.tune.bench import (
     build_prompt,
     release,
 )
+from sous.tune.payload import TOOLS
 from tests.fake_engine import ChunkedFakeEngine, FakeEngine
 
 
@@ -28,14 +28,14 @@ def test_build_prompt_reaches_the_target_deterministically():
     a = build_prompt(_count, 2048)
     b = build_prompt(_count, 2048)
     assert a == b
-    assert _count(a, WORKER_TOOLS) >= 2048
+    assert _count(a, TOOLS) >= 2048
     assert a[0]["role"] == "system" and a[1]["role"] == "user"
     assert "def " in a[1]["content"]
 
 
 @pytest.mark.parametrize("target", [1024, 2048, 16384])
 def test_build_prompt_overshoots_by_less_than_ten_percent(target):
-    counted = _count(build_prompt(_count, target), WORKER_TOOLS)
+    counted = _count(build_prompt(_count, target), TOOLS)
     assert counted >= target
     assert counted < target * 1.1
 

@@ -1,8 +1,6 @@
-"""Worker-facing tool schemas and the tool-call parser.
-
-A parsed call's name is validated against a `ToolSet` — `WORKER_TOOLSET` by
-default, or the request's own tools in the gateway, which parses calls
-against whatever tool set Claude Code sent rather than the worker's eight.
+"""The tool-call parser and the `ToolSet` a parsed call's name is checked
+against: the gateway's request tools, or `sous.tune.payload.TOOLSET` for a
+tune run.
 
 Two wire formats are accepted, distinguished by the first non-space
 character after ``<tool_call>``:
@@ -26,85 +24,6 @@ import json
 import math
 import re
 from dataclasses import dataclass
-
-
-def _tool(name: str, description: str, properties: dict, required: list[str]) -> dict:
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-            },
-        },
-    }
-
-
-WORKER_TOOLS: list[dict] = [
-    _tool(
-        "read_file",
-        "Read a file (line-numbered). Use offset/limit for large files.",
-        {
-            "path": {"type": "string"},
-            "offset": {"type": "integer", "description": "0-based start line"},
-            "limit": {"type": "integer", "description": "max lines"},
-        },
-        ["path"],
-    ),
-    _tool(
-        "write_file",
-        "Create or overwrite a file with the given content.",
-        {"path": {"type": "string"}, "content": {"type": "string"}},
-        ["path", "content"],
-    ),
-    _tool(
-        "edit_file",
-        "Replace one exact, unique occurrence of `old` with `new`.",
-        {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}},
-        ["path", "old", "new"],
-    ),
-    _tool(
-        "list_dir",
-        "List one directory's entries.",
-        {"path": {"type": "string", "description": "default: project root"}},
-        [],
-    ),
-    _tool(
-        "glob",
-        "Find files by glob pattern, e.g. **/*.py",
-        {"pattern": {"type": "string"}},
-        ["pattern"],
-    ),
-    _tool(
-        "grep",
-        "Regex-search file contents. Returns path:line:text hits.",
-        {
-            "pattern": {"type": "string"},
-            "glob_pattern": {"type": "string", "description": "default **/*"},
-        },
-        ["pattern"],
-    ),
-    _tool(
-        "run_command",
-        "Run a verification command (tests/linter/formatter). "
-        "Only allowlisted commands run; others need human approval, which may "
-        "take a while or be denied — continue without it if denied.",
-        {"command": {"type": "string"}},
-        ["command"],
-    ),
-    _tool(
-        "finish",
-        "Declare the task complete and report what you did.",
-        {
-            "summary": {"type": "string", "description": "what was done and why"},
-            "concerns": {"type": "string", "description": "doubts, TODOs, risks"},
-        },
-        ["summary"],
-    ),
-]
 
 
 class ParseError(Exception):
@@ -172,7 +91,7 @@ class ToolSet:
     tojson, so the schema is the only way to know that e.g. read_file's offset
     must become an int — hence the per-tool parameter types.
 
-    `strict` is the worker's contract: a name outside the set is a malformed
+    `strict` is a tune run's contract: a name outside the set is a malformed
     turn, handled by FORMAT_REMINDER. The gateway is not strict — Claude Code
     answers a hallucinated tool with its own tool-not-found result, which the
     model can recover from, whereas ending the turn here could not be undone.
@@ -204,8 +123,6 @@ class ToolSet:
             raise ParseError(f"unknown tool: {name!r}")
         return {}
 
-
-WORKER_TOOLSET = ToolSet.from_tools(WORKER_TOOLS)
 
 _OPEN_RE = re.compile(r"<tool_call>\s*")
 _FUNCTION_RE = re.compile(r"<function=([^>\s]+)>")
@@ -243,7 +160,7 @@ class ToolCall:
     arguments: dict
 
 
-def parse_tool_calls(text: str, toolset: ToolSet = WORKER_TOOLSET) -> list[ToolCall]:
+def parse_tool_calls(text: str, toolset: ToolSet) -> list[ToolCall]:
     calls: list[ToolCall] = []
     pos = 0
     while (match := _OPEN_RE.search(text, pos)) is not None:
@@ -329,7 +246,7 @@ def _strip_wrapping_newlines(raw: str) -> str:
     of a parameter value ('<parameter=KEY>\\n' + value + '\\n</parameter>').
 
     Never .strip(): a write_file content that legitimately ends with a
-    newline must keep it, or the worker writes a corrupted file.
+    newline must keep it, or the file it writes comes out corrupted.
     """
     if raw.startswith("\n"):
         raw = raw[1:]

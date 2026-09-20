@@ -115,7 +115,7 @@ def test_hybrid_9b_routes_its_real_gdn_and_mlp_classes_and_still_generates():
     with the kernels loaded (the mlx thread-teardown rule)."""
     from sous.engine.base import ManagedEngine
     from sous.engine.vlm import VLMEngine
-    from sous.protocol import WORKER_TOOLS
+    from sous.tune.payload import TOOLS
 
     engine = VLMEngine(HYBRID_VLM, cache_budget=0, int8_prefill=True)
     assert engine.int8_prefill_status["state"] == "active"
@@ -125,7 +125,7 @@ def test_hybrid_9b_routes_its_real_gdn_and_mlp_classes_and_still_generates():
     msgs = [{"role": "user", "content": prompt}]
     session = managed.session()
     try:
-        out = session.generate(msgs, WORKER_TOOLS, 32, 600.0)
+        out = session.generate(msgs, TOOLS, 32, 600.0)
     finally:
         session.close()
         assert session.join(timeout=30)

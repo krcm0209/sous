@@ -8,10 +8,7 @@ import errno
 import fcntl
 import logging
 import os
-import pwd
-import re
 import signal
-import subprocess
 import sys
 import threading
 from collections.abc import AsyncIterator
@@ -27,9 +24,8 @@ from sous.engine.base import EngineManager, release_mlx_thread_state
 from sous.gateway.routes import Gateway, mount_gateway
 from sous.gateway.upstream import Upstream
 from sous.inflight import Inflight
-from sous.logs import configure_daemon_logging, enable_warning_capture, format_line
+from sous.logs import configure_daemon_logging, enable_warning_capture
 from sous.monitor import mount_monitor
-from sous.toolexec import terminate_active_commands
 
 _logger = logging.getLogger("sous.server")
 
@@ -180,37 +176,6 @@ def create_server(
     return mcp
 
 
-def _login_shell_path() -> str | None:
-    """PATH as the user's login shell sees it, or None if that can't be learned.
-
-    Under launchd the daemon inherits the bare system PATH, so allowlisted
-    commands (`uv run pytest`, anything user-installed) stop resolving even
-    though they work in the user's terminal — each one silently degrades into
-    a human approval request. Guessing at install time (shim directories,
-    `which uv`, hardcoded Homebrew paths) bakes one machine's setup into a
-    plist that rots; the user's own shell is the only authority on where
-    their tools live, so ask it once at startup. Markers bracket the answer
-    because login shells are entitled to print banners from init files, and
-    `-i` is included because plenty of real PATH setup lives in rc files that
-    non-interactive shells skip.
-    """
-    shell = os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell
-    if not shell:
-        return None
-    probe = 'printf "%s" "<<sous-path>>$PATH<<sous-path-end>>"'
-    try:
-        out = subprocess.run(
-            [shell, "-l", "-i", "-c", probe],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except OSError, subprocess.SubprocessError:
-        return None
-    found = re.findall(r"<<sous-path>>(.*?)<<sous-path-end>>", out.stdout, re.DOTALL)
-    return found[-1] if found and found[-1] else None
-
-
 def _acquire_singleton_lock(data_dir: Path) -> IO[bytes]:
     """Take the daemon's exclusive lock, or exit if another daemon holds it.
 
@@ -246,24 +211,16 @@ def _acquire_singleton_lock(data_dir: Path) -> IO[bytes]:
 
 
 def _install_shutdown_handler(stop: threading.Event) -> None:
-    """Kill in-flight commands on SIGTERM/SIGINT before the process goes away.
+    """Exit cleanly on SIGTERM/SIGINT instead of the default abrupt kill.
 
     Default handling terminates the daemon outright — measured: exit -15 with
     main()'s finally never reached — so cleanup in a finally would be dead
-    code. Meanwhile a command's child is in its own session (start_new_session
-    in toolexec), so it survives the daemon and goes on writing to the user's
-    project. launchd restarts and `sous stop` both send SIGTERM, so this is the
+    code. launchd restarts and `sous stop` both send SIGTERM, so this is the
     ordinary path out, not an edge case.
     """
 
     def handle(signum, frame) -> None:  # noqa: ARG001 — signal handler signature
         stop.set()
-        killed = terminate_active_commands()
-        if killed:
-            print(
-                format_line("WARNING", "sous.server", f"killed {killed} running command group(s)"),
-                file=sys.stderr,
-            )
         sys.stderr.flush()
         os._exit(0)
 
@@ -275,7 +232,7 @@ def _install_shutdown_handler(stop: threading.Event) -> None:
 # handler out and re-raises the signal only after its own shutdown returns,
 # and by default that shutdown waits for every open connection with no bound.
 # A non-streaming gateway turn (Claude Code's retry shape) can hold one for
-# the whole generation timeout, which would defer the command-group kill in
+# the whole generation timeout, which would defer the daemon's own exit in
 # _install_shutdown_handler by the same amount. Bound it: streams already
 # cancel themselves on the exit signal (sse-starlette), and a cancelled
 # non-streaming handler leaves its turn draining on the executor thread.
@@ -329,11 +286,6 @@ def main() -> None:
     enable_warning_capture()
     config = load_config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    # Adopt the login shell's PATH, so the daemon behaves the same however
-    # it was launched (launchd, `sous mcp`, or a terminal). Fallback on
-    # failure: whatever PATH we inherited.
-    if login_path := _login_shell_path():
-        os.environ["PATH"] = login_path
     # Before anything else claims the port or the data dir: the port bind at
     # the end of this function is far too late to be the guard against a
     # second daemon starting. `_lock` is unused by design — it must stay
