@@ -1,5 +1,5 @@
 """Score = 1 if the worker's tests pass on the pristine module, times the
-share of four mutants — one per documented behaviour — those tests catch.
+share of five mutants — one per documented behaviour — those tests catch.
 No tests, or tests that fail on the real module, score zero."""
 
 import shutil
@@ -30,6 +30,12 @@ MUTANTS = {
     + (
         "def slugify(text: str, max_length: int = 40) -> str:\n"
         '    return _NON_WORD.sub("-", text.lower()).strip("-")\n'
+    ),
+    "a dash the cut leaves is kept": _HEAD
+    + (
+        "def slugify(text: str, max_length: int = 40) -> str:\n"
+        '    slug = _NON_WORD.sub("-", text.lower()).strip("-")\n'
+        "    return slug[:max_length]\n"
     ),
 }
 
