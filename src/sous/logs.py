@@ -2,7 +2,7 @@
 
 `<iso-utc-ms>Z LEVEL name: message` — the timestamp launchd's log never
 had, the level the filename `daemon.err.log` falsely promised, and the
-logger name (`sous.gateway`, `sous.engine`, `httpx`, `uvicorn.error`) that
+logger name (`sous.api`, `sous.engine`, `httpx`, `uvicorn.error`) that
 says which part spoke. Installed on the root logger in place of a bare
 `RichHandler`, which wraps every record at 80 columns and made the log
 ungreppable.
@@ -18,7 +18,7 @@ SOUS_HANDLER_NAME = "sous-daemon-log"
 
 
 class UTCFormatter(logging.Formatter):
-    """`2026-09-10T19:26:14.025Z INFO sous.gateway: …` — UTC, milliseconds,
+    """`2026-09-10T19:26:14.025Z INFO sous.api: …` — UTC, milliseconds,
     Python's level names. Exception and stack info are appended the way
     logging always formats them."""
 

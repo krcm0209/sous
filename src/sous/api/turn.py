@@ -1,7 +1,7 @@
-"""One gateway turn on the shared engine: serialized, thread-bridged, drained.
+"""One endpoint turn on the shared engine: serialized, thread-bridged, drained.
 
-The daemon has one engine and one generation lock; the worker and the gateway
-share both. A turn takes the gateway's own lock first (so gateway turns queue
+The daemon has one engine and one generation lock; the worker and the endpoint
+share both. A turn takes the endpoint's own lock first (so endpoint turns queue
 in order and never find the one-slot GenerationSession busy), then the
 engine's lock through the session, exactly as run_task does. Everything here
 is synchronous and runs on whatever pool thread the route hands it; progress
@@ -50,12 +50,12 @@ class PromptTooLong(Exception):
         self.window = window
 
 
-class GatewayBusy(Exception):
-    """The gateway lock was not acquired within the turn timeout."""
+class EndpointBusy(Exception):
+    """The endpoint lock was not acquired within the turn timeout."""
 
 
 class TurnAbandoned(Exception):
-    """The client left while the turn was still queued for the gateway lock."""
+    """The client left while the turn was still queued for the endpoint lock."""
 
 
 @dataclass(frozen=True)
@@ -79,14 +79,14 @@ class TurnResult:
     # of either reaching the log. Always 0 on a hit.
     lcp: int = 0
     # Where the seconds went, and what the cache did — every one a count or a
-    # duration; formatted by the gateway's turn line.
+    # duration; formatted by the endpoint's turn line.
     prefilled_tokens: int = 0  # stable tokens the cache had to prefill
     took_len: int = 0  # length of the slot that served the turn; 0 on a miss
     forks: int = 0  # fork slots this turn published
     evictions: int = 0  # slots dropped while it ran, charged to this session
     pressure_evictions: int = 0  # of which by the pressure valve
     load_seconds: float = 0.0  # lease + engines.get(): a model load, ours or one we waited out
-    queue_seconds: float = 0.0  # wait for the gateway lock, before `seconds` starts
+    queue_seconds: float = 0.0  # wait for the endpoint lock, before `seconds` starts
     # Wait for the engine's own lock, which a delegated task's generation
     # holds; inside ttft_s and `seconds`, and in no phase below.
     engine_wait_seconds: float = 0.0
@@ -137,7 +137,7 @@ class TurnRunner:
         self._window = config.max_context_tokens
         self._timeout = float(config.generation_timeout_minutes * 60)
         self._lock = threading.Lock()
-        # One long-lived session for every gateway turn: the prompt cache
+        # One long-lived session for every endpoint turn: the prompt cache
         # lives on the session thread's mlx streams (#34), so a per-request
         # session would throw the cache away between a subagent's turns — and
         # the cache is what turns gate 2's ~200s cold prefill into seconds.
@@ -146,11 +146,11 @@ class TurnRunner:
         # Set once close() has given up on acquiring _lock from a turn in
         # flight: that turn's own finally then drops the session for it
         # (see run()'s finally), and any turn still queued on the lock must
-        # refuse to start rather than outlive a gateway that gave up on it.
+        # refuse to start rather than outlive an endpoint that gave up on it.
         self._closing = False
         # Where a turn says what phase it is in and how far along. A runner
         # built without one (tests) keeps a private registry nobody reads;
-        # the gateway hands in the daemon's.
+        # the endpoint hands in the daemon's.
         self._inflight = inflight or Inflight()
 
     def run(
@@ -172,7 +172,7 @@ class TurnRunner:
             live.begin(turn_id, model=model, stream=stream, max_tokens=max_tokens)
         try:
             return self._turn(messages, tools, max_tokens, sink, abandoned, live, turn_id)
-        except GatewayBusy:
+        except EndpointBusy:
             # Refused before the lock: _turn retires the registration in the
             # finally it runs once it holds the lock, and this turn never did.
             if live is not None:
@@ -191,14 +191,14 @@ class TurnRunner:
     ) -> TurnResult:
         queued = time.monotonic()
         if not self._lock.acquire(timeout=self._timeout):
-            raise GatewayBusy(f"no generation slot within {self._timeout:.0f}s")
+            raise EndpointBusy(f"no generation slot within {self._timeout:.0f}s")
         if self._closing:
             # Queued behind another turn while close() was giving up on it;
             # that other turn's finally already dropped (or will drop) the
-            # session, so this one must not start a new generation on a
-            # gateway that has already been told to shut down.
+            # session, so this one must not start a new generation on an
+            # endpoint that has already been told to shut down.
             self._lock.release()
-            raise GatewayBusy("gateway is shutting down")
+            raise EndpointBusy("endpoint is shutting down")
         started = time.monotonic()
         queue_seconds = started - queued
         if live is not None:
@@ -238,7 +238,7 @@ class TurnRunner:
                     live.sized(turn_id, input_tokens)
                 # Owner-scoped, so the before/after delta is exact: only this
                 # session's thread moves these counters, and the turn holds
-                # the gateway lock, so nothing else's hit or reset can land
+                # the endpoint lock, so nothing else's hit or reset can land
                 # between the two reads.
                 before = engine.prompt_cache_stats(owner=session.thread)
                 sink.started(input_tokens)

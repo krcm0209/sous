@@ -1,4 +1,4 @@
-"""Gateway behaviour only a real server shows: keepalive pings while the
+"""Endpoint behaviour only a real server shows: keepalive pings while the
 model is silent, and a client that hangs up mid-stream. httpx's in-process
 transport buffers whole responses, so these run uvicorn on a loopback port in
 a thread — same stack as the daemon, no subprocess."""
@@ -21,10 +21,10 @@ from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
+from sous.api.routes import Endpoint, mount_endpoint
+from sous.api.upstream import Upstream
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
-from sous.gateway.routes import Gateway, mount_gateway
-from sous.gateway.upstream import Upstream
 from sous.logs import configure_daemon_logging
 from sous.server import GRACEFUL_SHUTDOWN_SECONDS, create_server, uvicorn_config
 from tests.fake_engine import ChunkedFakeEngine
@@ -56,7 +56,7 @@ def _app(
 ):
     """`upstream_url` points [server].upstream_url at a fake served by _serve
     (a loopback http origin the config accepts); tests that forward nothing
-    get an in-process fake so no Gateway in this file can ever reach the
+    get an in-process fake so no Endpoint in this file can ever reach the
     network."""
     cfg = SousConfig(
         data_dir=tmp_path / "data",
@@ -69,13 +69,13 @@ def _app(
     return create_server(engines, cfg, upstream=upstream)
 
 
-def _gateway_app(tmp_path: Path, engine) -> tuple[Gateway, object]:
-    """Like _app, but hands back the Gateway too — create_server drops
-    mount_gateway's return value, and reaching gateway._turns needs it."""
+def _endpoint_app(tmp_path: Path, engine) -> tuple[Endpoint, object]:
+    """Like _app, but hands back the Endpoint too — create_server drops
+    mount_endpoint's return value, and reaching endpoint._turns needs it."""
     cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
-    gateway = mount_gateway(engines, cfg)
-    return gateway, Starlette(routes=gateway.routes())
+    endpoint = mount_endpoint(engines, cfg)
+    return endpoint, Starlette(routes=endpoint.routes())
 
 
 @contextlib.contextmanager
@@ -141,11 +141,11 @@ def _fake_upstream_app(record: dict) -> Starlette:
     closed; /api/hello answers 200. Records the headers it saw.
 
     With record["delay_headers"] it answers nothing for 5 s — the shape of a
-    real upstream thinking — while watching for the gateway to drop the
+    real upstream thinking — while watching for the endpoint to drop the
     connection, so a test can see whether a client leaving early reaches this
     far."""
     record["closed"] = threading.Event()
-    record["gateway_hung_up"] = threading.Event()
+    record["endpoint_hung_up"] = threading.Event()
 
     async def messages(request: Request) -> Response:
         record["headers"] = dict(request.headers)
@@ -153,7 +153,7 @@ def _fake_upstream_app(record: dict) -> Starlette:
         if record.get("delay_headers"):
             for _ in range(50):
                 if await request.is_disconnected():
-                    record["gateway_hung_up"].set()
+                    record["endpoint_hung_up"].set()
                     return Response(status_code=499)
                 await asyncio.sleep(0.1)
             return Response(status_code=200)
@@ -176,7 +176,7 @@ def _fake_upstream_app(record: dict) -> Starlette:
         return Response(status_code=200)
 
     async def batch(request: Request) -> Response:
-        # A bodiless catch-all POST, so h11 on the gateway's side has to frame
+        # A bodiless catch-all POST, so h11 on the endpoint's side has to frame
         # (or not frame) it for real; the ASGI transport never puts bytes on a
         # wire and cannot show that.
         record["batch_headers"] = dict(request.headers)
@@ -199,7 +199,7 @@ def test_pings_keep_flowing_while_the_model_is_silent(tmp_path: Path, monkeypatc
     """Checklist item 2: Claude Code disconnects on a silent stream. The first
     ping is the first byte; sse-starlette repeats it on the interval while the
     fake engine sleeps between its two pieces."""
-    import sous.gateway.routes as routes
+    import sous.api.routes as routes
 
     monkeypatch.setattr(routes, "PING_INTERVAL_SECONDS", 1)
     inner = ChunkedFakeEngine(["slow|reply"], delay=1.3)
@@ -275,7 +275,7 @@ def test_a_request_abandoned_while_queued_never_generates(tmp_path: Path):
 
         first = threading.Thread(target=first_turn, daemon=True)
         first.start()
-        _wait_for_generation(inner)  # the first turn holds the gateway lock
+        _wait_for_generation(inner)  # the first turn holds the endpoint lock
         with client.stream("POST", f"{base}/v1/messages", json=_body()) as r:
             assert r.status_code == 200  # headers and the first ping arrive while queued
         # Leaving the block closed the second request while it was still queued.
@@ -302,7 +302,7 @@ def test_a_request_abandoned_while_queued_logs_status_and_error(tmp_path: Path, 
 
         first = threading.Thread(target=first_turn, daemon=True)
         first.start()
-        _wait_for_generation(inner)  # the first turn holds the gateway lock
+        _wait_for_generation(inner)  # the first turn holds the endpoint lock
         with client.stream("POST", f"{base}/v1/messages", json=_body()) as r:
             assert r.status_code == 200  # headers and the first ping arrive while queued
         # Leaving the block closed the second request while it was still queued.
@@ -316,11 +316,11 @@ def test_a_request_abandoned_while_queued_logs_status_and_error(tmp_path: Path, 
 
 def test_shutdown_is_bounded_while_a_non_streaming_turn_runs(tmp_path: Path):
     """uvicorn owns SIGTERM while it serves and, unbounded, waits for every open
-    connection before sous's own handler runs; a non-streaming gateway turn
+    connection before sous's own handler runs; a non-streaming endpoint turn
     (Claude Code's retry shape) can hold one for the whole generation timeout.
     What bounds that wait is the daemon's `timeout_graceful_shutdown`, and this
     test measures exactly that bound. It can only see it because turns run on
-    the gateway's private pool: this harness pokes `should_exit` on a server
+    the endpoint's private pool: this harness pokes `should_exit` on a server
     off the main thread, where `capture_signals` is a no-op, so `Server.run`'s
     `asyncio.run` teardown runs and joins the DEFAULT executor for up to 300s —
     a turn draining there would hold the serving thread for the whole
@@ -363,8 +363,8 @@ def test_count_tokens_is_not_blocked_by_a_saturated_turn_pool(tmp_path: Path):
     reproducible: put count_tokens back on _turns and this times out instead
     of returning quickly."""
     inner = ChunkedFakeEngine(["a slow reply"], delay=3.0)  # one piece, ~3s generation
-    gateway, app = _gateway_app(tmp_path, inner)
-    gateway._turns = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    endpoint, app = _endpoint_app(tmp_path, inner)
+    endpoint._turns = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     count_body = {"model": "sous-local", "messages": [{"role": "user", "content": "hi"}]}
     with (
         _serve(app) as (base, _server, _thread),
@@ -381,38 +381,38 @@ def test_count_tokens_is_not_blocked_by_a_saturated_turn_pool(tmp_path: Path):
     assert inner.finished.wait(10)
 
 
-def test_app_shutdown_closes_the_gateway_session_thread(tmp_path: Path, monkeypatch):
+def test_app_shutdown_closes_the_endpoint_session_thread(tmp_path: Path, monkeypatch):
     """End-to-end proof the app's lifespan hook actually fires: create_server
-    wires a lifespan that closes the mounted Gateway on the app's ASGI
-    shutdown. Without it the gateway's session thread stays parked in
+    wires a lifespan that closes the mounted Endpoint on the app's ASGI
+    shutdown. Without it the endpoint's session thread stays parked in
     _requests.get() forever and never reaches release_mlx_thread_state()
     (ml-explore/mlx#4327) on a non-signal exit — this drives the real
     lifespan (through a real uvicorn server, same as create_server's caller)
-    rather than calling Gateway.close() directly."""
+    rather than calling Endpoint.close() directly."""
     import sous.server as server_mod
 
-    captured: list[Gateway] = []
-    real_mount_gateway = server_mod.mount_gateway
+    captured: list[Endpoint] = []
+    real_mount_endpoint = server_mod.mount_endpoint
 
     def spy(engines, cfg, **kw):
-        gateway = real_mount_gateway(engines, cfg, **kw)
-        captured.append(gateway)
-        return gateway
+        endpoint = real_mount_endpoint(engines, cfg, **kw)
+        captured.append(endpoint)
+        return endpoint
 
-    monkeypatch.setattr(server_mod, "mount_gateway", spy)
+    monkeypatch.setattr(server_mod, "mount_endpoint", spy)
     inner = ChunkedFakeEngine(["ok"])
     with _serve(_app(tmp_path, inner)) as (base, server, thread):
         r = httpx.post(f"{base}/v1/messages", json=_body(stream=False), timeout=30)
         assert r.status_code == 200
-        [gateway] = captured
-        session = gateway._runner._session
+        [endpoint] = captured
+        session = endpoint._runner._session
         assert session is not None and session._thread.is_alive()
         server.should_exit = True
     # _serve's own finally already set should_exit and joined the uvicorn
     # thread with a generous bound; by the time that join returns, uvicorn's
     # Server.shutdown() has already awaited the app's ASGI lifespan shutdown
     # (Server.shutdown -> self.lifespan.shutdown()) — so create_server's
-    # lifespan, and therefore Gateway.close(), has already run.
+    # lifespan, and therefore Endpoint.close(), has already run.
     assert not thread.is_alive()
     assert not session._thread.is_alive()
 
@@ -421,10 +421,10 @@ def test_a_full_queue_answers_529_immediately_and_releases_on_completion(
     tmp_path: Path, monkeypatch
 ):
     """MAX_PENDING_TURNS bounds admission to the turn pool: a burst beyond it
-    gets a real 529 before any bytes, not an untimed wait behind Gateway._turns'
+    gets a real 529 before any bytes, not an untimed wait behind Endpoint._turns'
     executor queue — and the slot it holds is released only when the turn
     that holds it actually finishes, not when a later request merely asks."""
-    import sous.gateway.routes as routes
+    import sous.api.routes as routes
 
     monkeypatch.setattr(routes, "MAX_PENDING_TURNS", 1)
     inner = ChunkedFakeEngine(["a|b|c", "third"], delay=1.0)  # first turn ~3s, second scripted
@@ -508,7 +508,7 @@ def test_a_bodiless_post_crosses_the_wire_without_invented_framing(tmp_path: Pat
         httpx.Client(timeout=30) as client,
     ):
         # httpx would frame a bodiless POST itself, so hand h11 a request with
-        # no framing headers at all — the shape the gateway must pass through.
+        # no framing headers at all — the shape the endpoint must pass through.
         request = client.build_request("POST", f"{base}/api/event_logging/v2/batch")
         request.headers.pop("content-length", None)
         assert client.send(request).status_code == 204
@@ -550,7 +550,7 @@ def test_a_client_that_leaves_before_the_upstream_answers_is_not_left_billing(
             client.post(f"{base}/v1/messages", json=_upstream_body())
         # Within ~3 s of the client leaving, not at the fake's own 5 s mark
         # (which would mean nothing but its own reply ended the wait).
-        assert record["gateway_hung_up"].wait(3), "the upstream was left generating"
+        assert record["endpoint_hung_up"].wait(3), "the upstream was left generating"
         err = ""
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
@@ -604,7 +604,7 @@ def test_the_real_server_never_logs_a_request_target(tmp_path: Path, capsys):
 
 
 def test_app_shutdown_closes_the_upstream_client(tmp_path: Path):
-    """The lifespan hook that closes the gateway (Phase 1) now also closes the
+    """The lifespan hook that closes the endpoint (Phase 1) now also closes the
     forwarder's connection pool — through the real ASGI lifespan, not by
     calling aclose() directly."""
     upstream = Upstream("https://api.anthropic.com")

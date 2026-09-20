@@ -24,7 +24,7 @@ class FakeEngine:
         self.generate_threads: list[threading.Thread] = []
         self.reset_idents: list[int] = []
         # The on_delta object itself (not called) — pins whether a caller
-        # wrapped it in ReplaySafe (sous.gateway.turn's replay_safe contract).
+        # wrapped it in ReplaySafe (sous.api.turn's replay_safe contract).
         self.on_deltas_seen: list[OnDelta | None] = []
 
     def _take(self, messages: list[dict], tools: list[dict], max_tokens: int) -> str:

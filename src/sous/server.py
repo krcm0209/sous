@@ -1,5 +1,5 @@
-"""SousService and the daemon's HTTP app: no tools of its own, just the
-monitor and gateway routes mounted on it, plus daemon main()."""
+"""Daemon and the daemon's HTTP app: no tools of its own, just the
+monitor and endpoint routes mounted on it, plus daemon main()."""
 
 from __future__ import annotations
 
@@ -19,10 +19,10 @@ import anyio
 import uvicorn
 from starlette.applications import Starlette
 
+from sous.api.routes import mount_endpoint
+from sous.api.upstream import Upstream
 from sous.config import SousConfig, load_config
 from sous.engine.base import EngineManager, release_mlx_thread_state
-from sous.gateway.routes import mount_gateway
-from sous.gateway.upstream import Upstream
 from sous.inflight import Inflight
 from sous.logs import configure_daemon_logging, enable_warning_capture
 from sous.monitor import monitor_routes
@@ -44,7 +44,7 @@ def _mlx_memory_gb() -> float | None:
         release_mlx_thread_state()
 
 
-class SousService:
+class Daemon:
     def __init__(
         self,
         engines: EngineManager,
@@ -53,8 +53,8 @@ class SousService:
     ):
         self.engines = engines
         self.config = config
-        # The gateway's turns report here; create_server hands the same
-        # registry to both, so the status document sees what the gateway does.
+        # The endpoint's turns report here; create_server hands the same
+        # registry to both, so the status document sees what the endpoint does.
         self.inflight = inflight or Inflight()
 
     def _config_stamp(self) -> tuple[int, int]:
@@ -124,8 +124,8 @@ def create_server(
 ) -> Starlette:
     # One registry: the endpoint's turns write it, the status routes read it.
     inflight = inflight or Inflight()
-    svc = SousService(engines, config, inflight)
-    gateway = mount_gateway(engines, config, upstream=upstream, inflight=inflight)
+    svc = Daemon(engines, config, inflight)
+    endpoint = mount_endpoint(engines, config, upstream=upstream, inflight=inflight)
 
     @contextlib.asynccontextmanager
     async def _lifespan(_: Starlette) -> AsyncIterator[None]:
@@ -139,7 +139,7 @@ def create_server(
             # reaches release_mlx_thread_state() (ml-explore/mlx#4327), and
             # the upstream forwarder's connection pool stays open.
             engines.stop_idle_sweep()
-            await gateway.aclose()
+            await endpoint.aclose()
 
     # The daemon's own routes go on before the endpoint's: the endpoint ends
     # with a catch-all that forwards upstream, and a /sous/ path must never
@@ -147,7 +147,7 @@ def create_server(
     return Starlette(
         routes=[
             *monitor_routes(engines, lambda: svc.status_document(recent=True), svc.status_version),
-            *gateway.routes(),
+            *endpoint.routes(),
         ],
         lifespan=_lifespan,
     )
@@ -208,7 +208,7 @@ def _install_shutdown_handler(stop: threading.Event) -> None:
 # uvicorn owns SIGTERM/SIGINT while it serves: capture_signals swaps sous's
 # handler out and re-raises the signal only after its own shutdown returns,
 # and by default that shutdown waits for every open connection with no bound.
-# A non-streaming gateway turn (Claude Code's retry shape) can hold one for
+# A non-streaming endpoint turn (Claude Code's retry shape) can hold one for
 # the whole generation timeout, which would defer the daemon's own exit in
 # _install_shutdown_handler by the same amount. Bound it: streams already
 # cancel themselves on the exit signal (sse-starlette), and a cancelled
@@ -228,9 +228,9 @@ def uvicorn_config(app, host: str, port: int, log_level: str = "info") -> uvicor
         log_level=log_level,
         # uvicorn's access log prints the raw request target for every
         # response — query string included — at INFO, which is the level the
-        # daemon runs at. The gateway's catch-all forwards whatever Claude Code
+        # daemon runs at. The endpoint's catch-all forwards whatever Claude Code
         # puts in one, and nothing of value is lost by silencing it: the
-        # gateway writes its own bounded metadata line per forwarded request,
+        # endpoint writes its own bounded metadata line per forwarded request,
         # and the monitor's own routes never had a query string worth logging.
         access_log=False,
         # uvicorn's default dictConfig gives `uvicorn` and `uvicorn.error`

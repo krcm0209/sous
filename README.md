@@ -127,7 +127,7 @@ Stopping the daemon also ends any running `sous mcp` bridges; their clients
 reconnect and start a fresh one on the next call.
 
 The daemon writes one log, `~/.sous/daemon.log`, both streams. Every line
-sous emits reads `2026-09-10T19:26:14.025Z INFO sous.gateway: …` — UTC
+sous emits reads `2026-09-10T19:26:14.025Z INFO sous.api: …` — UTC
 timestamp with milliseconds, then `INFO` (served or forwarded), `WARNING`
 (a request sous refused: a 4xx, a 529, a client gone while queued, tools it
 had to drop) or `ERROR` (a failure sous produced), then which part spoke.
@@ -435,7 +435,7 @@ Each `/v1/messages` turn served locally logs one metadata-only line, for
 example (wrapped here):
 
 ```
-2026-09-10T19:26:14.025Z INFO sous.gateway: POST /v1/messages id=msg_… model=sous-local
+2026-09-10T19:26:14.025Z INFO sous.api: POST /v1/messages id=msg_… model=sous-local
   stream=1 status=200 input_tokens=84335 output_tokens=2887 stop=end_turn
   cache=hit took=turn@82647 reused_tokens=82647 prefilled_tokens=1681 forks=0 evicted=1 pressure=0
   load_s=0.0 queue_s=2.5 engine_wait_s=0.0 tokenize_s=1.1 ttft_s=9.8 prefill_s=7.9 decode_s=196.6

@@ -145,7 +145,7 @@ setting is global and would cap the frontier main loop.
 `API_TIMEOUT_MS` covers model load plus a long prefill; `--disallowedTools
 LSP` keeps a language server from appending its schema mid-session and
 re-prefilling the whole conversation. Watch `~/.sous/daemon.log` for the
-`INFO sous.gateway:` lines (both streams land there; every line carries a
+`INFO sous.api:` lines (both streams land there; every line carries a
 timestamp and a level), or `sous top` in a second terminal for the same
 turns as they happen. The main loop's turns should now report `cache=hit`
 after the first: Claude Code's small background queries (titles, suggestions)
@@ -157,7 +157,7 @@ otherwise. This session is where those claims get measured.
 
 To verify *forwarding* rather than the endpoint, `sous claude` plus
 `~/.sous/daemon.log` is enough: every forwarded request logs an `INFO
-sous.gateway: upstream <METHOD> <path> model=<id> status=<code>` line,
+sous.api: upstream <METHOD> <path> model=<id> status=<code>` line,
 every local turn a `POST /v1/messages id=… model=sous-local …` line with
 its phase timings. The forwarded `upstream` line drops to `ERROR` or
 `WARNING` only when the forwarder itself produced the status — an

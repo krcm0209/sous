@@ -5,14 +5,14 @@ import re
 
 import pytest
 
-from sous.engine.base import Delta
-from sous.gateway.response import (
+from sous.api.response import (
     TextSplitter,
     TurnAssembler,
     new_message_id,
     new_tool_use_id,
     stop_reason,
 )
+from sous.engine.base import Delta
 from sous.protocol import _MAX_ARGUMENT_DEPTH, ToolSet
 
 TOOLS = ToolSet.from_tools(

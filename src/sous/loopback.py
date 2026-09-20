@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 from starlette.requests import Request
 
-from sous.gateway.convert import RequestError
+from sous.api.convert import RequestError
 
 # Without the Host check a web page whose hostname re-resolves to 127.0.0.1
 # could drive the local model. Same allow-list as the SDK's.

@@ -4,7 +4,7 @@ the daemon's /sous/ routes: what it lets through and what it refuses."""
 import pytest
 from starlette.requests import Request
 
-from sous.gateway.convert import RequestError
+from sous.api.convert import RequestError
 from sous.loopback import check_loopback
 
 

@@ -272,7 +272,7 @@ the group kill, EPERM suppression, ctime in the audit) — read the comments
 before touching. Suspected-flaky tests get run in a loop, not judged on one
 pass.
 
-`src/sous/gateway/` is deliberately outside that boundary: it never executes a
+`src/sous/api/` is deliberately outside that boundary: it never executes a
 tool (Claude Code does, under its own permissions) and never logs a request
 body, header value or query string. Its lines go through `sous.logs` (one
 timestamped, levelled shape on the root handler); `_log_turn` runs on the

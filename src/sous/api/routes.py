@@ -1,9 +1,9 @@
-"""The gateway's HTTP surface: Anthropic-shaped routes on the daemon's app.
+"""The endpoint's HTTP surface: Anthropic-shaped routes on the daemon's app.
 
 Never logs a request body or a header value. Never executes a tool: tool_use
 blocks go back to Claude Code, whose permission system runs them (toolexec.py
 is not in this path). Requests for any other model — and every path it has no
-route for — are forwarded to [server].upstream_url by gateway/upstream.py,
+route for — are forwarded to [server].upstream_url by api/upstream.py,
 byte for byte.
 """
 
@@ -26,23 +26,23 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import BaseRoute, Route
 
-from sous.config import SousConfig
-from sous.engine.base import Delta, EngineManager, GenerationStalled
-from sous.gateway.convert import (
+from sous.api.convert import (
     ChatRequest,
     RequestError,
     parse_count_tokens_request,
     parse_messages_request,
 )
-from sous.gateway.response import TurnAssembler, new_message_id
-from sous.gateway.turn import (
-    GatewayBusy,
+from sous.api.response import TurnAssembler, new_message_id
+from sous.api.turn import (
+    EndpointBusy,
     PromptTooLong,
     TurnAbandoned,
     TurnResult,
     TurnRunner,
 )
-from sous.gateway.upstream import SynthesizedError, Upstream
+from sous.api.upstream import SynthesizedError, Upstream
+from sous.config import SousConfig
+from sous.engine.base import Delta, EngineManager, GenerationStalled
 from sous.inflight import Inflight
 from sous.loopback import ALL_METHODS, check_loopback
 from sous.protocol import ToolSet
@@ -62,12 +62,12 @@ MAX_REQUEST_BYTES = 32 * 1024 * 1024
 MAX_BODY_DEPTH = 128
 # The turn pool's executor queue is unbounded: without this, a burst beyond
 # _turns' worker count sits in that queue holding its parsed request while
-# GatewayBusy's timeout has not even started — an untimed wait instead of a
+# EndpointBusy's timeout has not even started — an untimed wait instead of a
 # real 529. Bounds memory held by queued/draining requests and gives Claude
 # Code's hybrid mode (a handful of subagents at once) a 529 both official
 # SDKs already retry with backoff, instead of hanging until the client gives
 # up. Counts turns running, queued on TurnRunner._lock, or draining after a
-# disconnect (see Gateway._stream) — not just requests in the executor queue.
+# disconnect (see Endpoint._stream) — not just requests in the executor queue.
 MAX_PENDING_TURNS = 8
 # Same failure mode as MAX_PENDING_TURNS, one pool over: count_tokens' executor
 # queue is unbounded too, and each queued count holds its parsed body (up to
@@ -91,7 +91,7 @@ _MODEL_SUFFIX_RE = re.compile(r"\[[^\[\]]*\]$")
 _LOG_ID_CHARS = 64
 _LOG_PATH_CHARS = 80
 
-_logger = logging.getLogger("sous.gateway")
+_logger = logging.getLogger("sous.api")
 
 
 def _log(message: str, level: int = logging.INFO) -> None:
@@ -177,7 +177,7 @@ def _classify(exc: Exception) -> tuple[int, str, str]:
     """(status, error type, message) for a failure while turning."""
     if isinstance(exc, PromptTooLong):
         return 400, "invalid_request_error", str(exc)
-    if isinstance(exc, GatewayBusy):
+    if isinstance(exc, EndpointBusy):
         return 529, "overloaded_error", str(exc)
     if isinstance(exc, GenerationStalled):
         return 500, "api_error", str(exc)
@@ -300,7 +300,7 @@ def _depth_exceeds(value: object, limit: int) -> bool:
     this would reintroduce the exact stack-size dependence the cap exists to
     remove. Kept local to routes.py rather than shared with protocol.py's
     _check_depth: two tiny iterative loops are cheaper than a cross-module
-    dependency between the gateway and the protocol parser. `value` itself is
+    dependency between the endpoint and the protocol parser. `value` itself is
     depth 1 when it is a container; a scalar never adds depth."""
     worklist: list[tuple[object, int]] = [(value, 1)]
     while worklist:
@@ -401,7 +401,7 @@ class _NullSink:
     def delta(self, delta: Delta) -> None: ...
 
 
-class Gateway:
+class Endpoint:
     def __init__(
         self,
         engines: EngineManager,
@@ -434,14 +434,14 @@ class Gateway:
         # test driving admission to zero (BoundedSemaphore(0) refuses every
         # turn outright): the pool itself still needs at least one thread.
         self._turns = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, MAX_PENDING_TURNS), thread_name_prefix="sous-gateway-turn"
+            max_workers=max(1, MAX_PENDING_TURNS), thread_name_prefix="sous-api-turn"
         )
         # count_tokens never takes TurnRunner._lock, so it must never queue
         # behind a turn parked waiting on that lock inside a saturated _turns
         # pool. A dedicated pool also keeps it off asyncio's default executor
         # — a count can load the model, seconds of work on a large prompt.
         self._counts = concurrent.futures.ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="sous-gateway-count"
+            max_workers=2, thread_name_prefix="sous-api-count"
         )
         # Read here, not at class-definition time, so tests can monkeypatch
         # the module constant before building the app.
@@ -481,7 +481,7 @@ class Gateway:
         ]
 
     async def passthrough(self, request: Request) -> Response:
-        """Everything the gateway has no route of its own for — /api/hello,
+        """Everything the endpoint has no route of its own for — /api/hello,
         /api/oauth/usage, event logging, whatever Claude Code adds next —
         streams through to the upstream untouched."""
         try:
@@ -891,21 +891,21 @@ class Gateway:
         _log(_turn_line(summary))
 
 
-def mount_gateway(
+def mount_endpoint(
     engines: EngineManager,
     config: SousConfig,
     *,
     upstream: Upstream | None = None,
     inflight: Inflight | None = None,
-) -> Gateway:
-    """Build the Gateway that serves the Anthropic-compatible routes, after
+) -> Endpoint:
+    """Build the Endpoint that serves the Anthropic-compatible routes, after
     pinning the loggers that would otherwise leak a request or response
     body. Call `.routes()` on the result to mount it on the app."""
     # sse-starlette logs every frame it sends at DEBUG — the model's reply,
     # verbatim. The daemon runs at INFO, but the no-bodies-in-logs rule must not
     # depend on that: pin the library's logger above DEBUG where the frames are
     # made. Here rather than at import, because server.py imports this module
-    # unconditionally and a disabled gateway must not reconfigure a logger.
+    # unconditionally and a disabled endpoint must not reconfigure a logger.
     logging.getLogger("sse_starlette").setLevel(logging.INFO)
     # Same rule, one layer down: httpx logs "HTTP Request: <method> <full URL>"
     # at INFO — the upstream URL including its query string — and httpcore
@@ -914,4 +914,4 @@ def mount_gateway(
     # reach the daemon log unless pinned above where they say those things.
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    return Gateway(engines, config, upstream, inflight)
+    return Endpoint(engines, config, upstream, inflight)

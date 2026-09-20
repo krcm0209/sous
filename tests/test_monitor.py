@@ -1,5 +1,5 @@
 """The daemon's own loopback routes under /sous/: never forwarded to the
-upstream, guarded like the gateway's own routes."""
+upstream, guarded like the endpoint's own routes."""
 
 import asyncio
 import json
@@ -14,9 +14,9 @@ import pytest
 from starlette.requests import Request
 
 from sous import monitor
+from sous.api.convert import RequestError
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
-from sous.gateway.convert import RequestError
 from sous.inflight import Inflight
 from sous.monitor import HOLD_BODY_LIMIT
 from sous.monitor import _hold_body as _parse_hold_body
@@ -189,7 +189,7 @@ def test_routes_are_loopback_guarded(tmp_path: Path):
 def test_anything_else_under_sous_is_404_and_never_forwarded(tmp_path: Path):
     fake = FakeUpstream()
     app, _ = _app(tmp_path, upstream=fake.upstream())
-    # `/sous` without the slash would full-match the gateway's catch-all
+    # `/sous` without the slash would full-match the endpoint's catch-all
     # and be forwarded with the client's credentials; a method the real
     # routes do not take falls through to the 404 too.
     for method, path in (
@@ -206,7 +206,7 @@ def test_anything_else_under_sous_is_404_and_never_forwarded(tmp_path: Path):
     assert _request(app, "HEAD", "/sous/status").status_code == 200
     assert _request(app, "POST", "/sous/hold", _hold_body()).status_code == 200
     assert fake.requests == []
-    # The gateway's own catch-all still forwards what is not ours.
+    # The endpoint's own catch-all still forwards what is not ours.
     assert _request(app, "GET", "/api/hello").status_code == 200
     assert [s["path"] for s in fake.requests] == ["/api/hello"]
 
@@ -219,7 +219,7 @@ def test_a_failing_status_or_hold_is_an_error_body_not_a_bare_500(
     route speaks, and names its type in the log."""
     import logging
 
-    from sous.server import SousService
+    from sous.server import Daemon
 
     def failing_status(self, *, recent):
         raise RuntimeError("tasks.db is locked")
@@ -227,7 +227,7 @@ def test_a_failing_status_or_hold_is_an_error_body_not_a_bare_500(
     def failing_hold(self, pid, create_time):
         raise RuntimeError("no thread")
 
-    monkeypatch.setattr(SousService, "status_document", failing_status)
+    monkeypatch.setattr(Daemon, "status_document", failing_status)
     monkeypatch.setattr(EngineManager, "hold", failing_hold)
     app, _ = _app(tmp_path)
     with caplog.at_level(logging.ERROR, logger="sous.monitor"):
@@ -246,9 +246,9 @@ def test_a_failing_status_or_hold_is_an_error_body_not_a_bare_500(
     ]
 
 
-def test_status_carries_the_recent_ring_the_gateway_writes(tmp_path: Path):
-    """create_server builds one registry for the gateway and the status
-    routes: a turn the gateway served shows up in /sous/status."""
+def test_status_carries_the_recent_ring_the_endpoint_writes(tmp_path: Path):
+    """create_server builds one registry for the endpoint and the status
+    routes: a turn the endpoint served shows up in /sous/status."""
     from tests.fake_engine import FakeEngine as _Fake
 
     cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
@@ -605,16 +605,16 @@ def test_events_refuse_a_cross_site_fetch_and_serve_a_typed_url(tmp_path: Path):
 
 
 def test_events_document_is_built_off_the_event_loop(tmp_path: Path, monkeypatch):
-    from sous.server import SousService
+    from sous.server import Daemon
 
     threads: set[str] = set()
-    original = SousService.status_document
+    original = Daemon.status_document
 
     def recording(self, *, recent):
         threads.add(threading.current_thread().name)
         return original(self, recent=recent)
 
-    monkeypatch.setattr(SousService, "status_document", recording)
+    monkeypatch.setattr(Daemon, "status_document", recording)
     app, _ = _app(tmp_path)
     _collect_events(app, want=1)
     assert threads and "MainThread" not in threads
@@ -628,12 +628,12 @@ def test_a_failing_status_build_ends_the_events_stream_not_a_traceback(
     uvicorn and never a message that could name a path."""
     import logging
 
-    from sous.server import SousService
+    from sous.server import Daemon
 
     def failing_status(self, *, recent):
         raise RuntimeError("tasks.db is locked")
 
-    monkeypatch.setattr(SousService, "status_document", failing_status)
+    monkeypatch.setattr(Daemon, "status_document", failing_status)
     app, _ = _app(tmp_path)
     with caplog.at_level(logging.ERROR, logger="sous.monitor"):
         status, frames = _collect_events(app, want=0)
@@ -652,12 +652,12 @@ def test_a_failing_version_read_ends_the_events_stream_the_same_way(
     failed build, never leave through uvicorn with its message."""
     import logging
 
-    from sous.server import SousService
+    from sous.server import Daemon
 
     def failing_version(self):
         raise RuntimeError("stat: /nowhere/config.toml")
 
-    monkeypatch.setattr(SousService, "status_version", failing_version)
+    monkeypatch.setattr(Daemon, "status_version", failing_version)
     app, _ = _app(tmp_path)
     with caplog.at_level(logging.ERROR, logger="sous.monitor"):
         status, frames = _collect_events(app, want=0)
@@ -674,11 +674,9 @@ def test_a_document_json_cannot_encode_ends_the_stream_too(tmp_path: Path, monke
     uvicorn from inside the generator."""
     import logging
 
-    from sous.server import SousService
+    from sous.server import Daemon
 
-    monkeypatch.setattr(
-        SousService, "status_document", lambda self, *, recent: {"engine": object()}
-    )
+    monkeypatch.setattr(Daemon, "status_document", lambda self, *, recent: {"engine": object()})
     app, _ = _app(tmp_path)
     with caplog.at_level(logging.ERROR, logger="sous.monitor"):
         status, frames = _collect_events(app, want=0)
@@ -697,10 +695,10 @@ def test_a_non_finite_number_ends_the_stream_as_status_refuses_it(
     one route and a `NaN` token no other parser reads on the other."""
     import logging
 
-    from sous.server import SousService
+    from sous.server import Daemon
 
     monkeypatch.setattr(
-        SousService,
+        Daemon,
         "status_document",
         lambda self, *, recent: {"engine": {"memory_gb": float("nan")}},
     )
@@ -719,7 +717,7 @@ def test_a_non_finite_number_ends_the_stream_as_status_refuses_it(
 def test_mounting_the_monitor_pins_sse_starlette_above_debug(tmp_path: Path, monkeypatch):
     """sse-starlette logs every frame it sends at DEBUG and /sous/events sends
     one per change — the monitor pins the logger on its own mount rather than
-    leaning on the gateway's copy of the pin."""
+    leaning on the endpoint's copy of the pin."""
     import logging
 
     logger = logging.getLogger("sse_starlette")

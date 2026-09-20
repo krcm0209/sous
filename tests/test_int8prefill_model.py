@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _standard_text() -> str:
     return (ROOT / "src/sous/engine/promptcache.py").read_text() + (
-        ROOT / "src/sous/gateway/turn.py"
+        ROOT / "src/sous/api/turn.py"
     ).read_text()
 
 

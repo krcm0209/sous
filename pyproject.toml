@@ -36,7 +36,7 @@ classifiers = [
 dependencies = [
     # server.serve imports anyio directly.
     "anyio>=4",
-    # The gateway's upstream forwarder (src/sous/gateway/upstream.py) imports
+    # The endpoint's upstream forwarder (src/sous/api/upstream.py) imports
     # it directly.
     "httpx>=0.28",
     "huggingface-hub",
@@ -55,7 +55,7 @@ dependencies = [
     # `sous top` (src/sous/tui.py) imports rich.text.Text directly. Textual
     # pulls rich in, but a direct import must be a direct dependency.
     "rich>=15",
-    # The gateway (src/sous/gateway) and server.serve import these directly.
+    # The endpoint (src/sous/api) and server.serve import these directly.
     "sse-starlette>=3.4",
     "starlette>=1.6",
     # `sous top` only (src/sous/tui.py), imported inside that command

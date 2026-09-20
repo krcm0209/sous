@@ -638,7 +638,7 @@ _DEFAULT_STATUS = object()
 
 
 def _status(**config) -> dict:
-    """The keys of `GET /sous/status` — `SousService.status_document()`,
+    """The keys of `GET /sous/status` — `Daemon.status_document()`,
     less the recent turns — of which the launcher reads `config.local_models`
     and `config.max_context_tokens` for its checks and `engine.model_id` for
     its one line."""

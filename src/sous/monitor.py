@@ -1,6 +1,6 @@
 """The daemon's own loopback routes under /sous/: what `sous claude`, `sous
-top` and `sous statusline` speak to the daemon. Mounted before the gateway's
-routes and whatever the gateway flag says, so a path under /sous — the bare
+top` and `sous statusline` speak to the daemon. Mounted before the endpoint's
+routes and whatever the endpoint flag says, so a path under /sous — the bare
 /sous included — is answered here or 404s here for every method the routes
 register (a verb none of them lists gets Starlette's own 405 first), and is
 never forwarded to the upstream."""
@@ -20,8 +20,8 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import BaseRoute, Route
 
+from sous.api.convert import RequestError, _invalid
 from sous.engine.base import EngineManager, release_mlx_thread_state
-from sous.gateway.convert import RequestError, _invalid
 from sous.loopback import ALL_METHODS, check_loopback
 from sous.sse import PING as _PING
 from sous.sse import PING_INTERVAL_SECONDS as EVENT_PING_SECONDS
@@ -187,8 +187,8 @@ def monitor_routes(
     lock, and neither belongs on the event loop — and the event stream
     builds each of its documents the same way."""
     # sse-starlette logs every frame it sends at DEBUG — the status document,
-    # verbatim, up to ten times a second — and the gateway's own pin of this
-    # logger only runs when the gateway is mounted. /sous/events is mounted
+    # verbatim, up to ten times a second — and the endpoint's own pin of this
+    # logger only runs when the endpoint is mounted. /sous/events is mounted
     # unconditionally, so the no-bodies-in-logs rule cannot depend on that.
     logging.getLogger("sse_starlette").setLevel(logging.INFO)
 

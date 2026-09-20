@@ -13,7 +13,7 @@ from starlette.applications import Starlette
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
-from sous.server import SousService, create_server
+from sous.server import Daemon, create_server
 from tests.fake_engine import FakeEngine
 from tests.fake_upstream import FakeUpstream
 
@@ -33,7 +33,7 @@ def svc(tmp_path: Path):
     root.mkdir()
     cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
-    return SousService(engines, cfg), root
+    return Daemon(engines, cfg), root
 
 
 def test_the_memory_read_is_the_last_thing_the_document_does(svc, monkeypatch):
@@ -131,7 +131,7 @@ def test_main_installs_the_shutdown_handler_before_serving(tmp_path: Path, monke
     untestable in-process (it ends in os._exit) — so pinning this one-line
     link is the only coverage the wiring gets. The same is true of the
     daemon's log handler: nothing but main() installs it any more (the
-    gateway test files' autouse fixtures call configure_daemon_logging()
+    endpoint test files' autouse fixtures call configure_daemon_logging()
     themselves, so they would stay green even if main() stopped calling it),
     so this test removes any copy left by an earlier test before asserting
     that main() is what put one back.
@@ -269,7 +269,7 @@ def test_main_disables_progress_bars_only_when_stderr_is_not_a_tty(tmp_path: Pat
 
 def test_status_memory_probe_releases_mlx_thread_state(svc, monkeypatch):
     """status_document runs in whatever short-lived worker thread the monitor
-    and gateway routes hand it; any mlx state it created must be released
+    and endpoint routes hand it; any mlx state it created must be released
     before that thread can exit (ml-explore/mlx#4327)."""
     import sous.server as server
 
@@ -317,7 +317,7 @@ def test_server_status_reports_the_served_config(svc):
 
 def test_uvicorn_config_bounds_graceful_shutdown():
     """uvicorn holds SIGTERM while serving and, unbounded, waits for open
-    connections — a long non-streaming gateway turn would defer sous's own
+    connections — a long non-streaming endpoint turn would defer sous's own
     shutdown handler by minutes. The bound is what keeps `sous stop` prompt."""
     from sous.server import GRACEFUL_SHUTDOWN_SECONDS, uvicorn_config
 
