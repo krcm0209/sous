@@ -1,7 +1,7 @@
-"""One suite run is one task through sous's own worker loop — the sandbox,
-the allowlist, the approval hook, the budgets, the verify commands — on an
-engine the arm loaded once for every task; graded afterwards, recorded as
-it finishes, and released the way the bench releases its arm."""
+"""One suite run is one task through the suite's own loop — its scratch
+tools, its budget, its transcript — on an engine the arm loaded once for
+every task; graded afterwards, recorded as it finishes, and released the
+way the bench releases its arm."""
 
 from __future__ import annotations
 
@@ -18,8 +18,6 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from sous.config import DEFAULT_ALLOWLIST, SousConfig
-from sous.context import ContextDecision
 from sous.engine.base import (
     Delta,
     Engine,
@@ -30,7 +28,6 @@ from sous.engine.base import (
     default_engine_factory,
     release_mlx_thread_state,
 )
-from sous.tasks import TaskState, TaskStore
 from sous.tune.arms import Arm
 from sous.tune.bench import (
     _GIB,
@@ -44,10 +41,9 @@ from sous.tune.bench import (
 )
 from sous.tune.suite import SuiteTask
 from sous.tune.suite.grading import grade_task
-from sous.worker import run_task
+from sous.tune.suite.loop import Budget, Transcript, run_loop
+from sous.tune.suite.tools import ScratchTools
 
-SUITE_ALLOWLIST = (*DEFAULT_ALLOWLIST, "python -m unittest", "python3 -m unittest")
-_POLL_SECONDS = 0.1
 # The ETA's picture of one run — the turns a task takes and what each turn
 # prefills and decodes — from the M5 Pro's delegated tasks of 2026-09.
 ETA_TURNS = 8
@@ -86,7 +82,7 @@ class SuiteRun:
 
     @property
     def completed(self) -> bool:
-        return self.state == TaskState.DONE
+        return self.state == "done"
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -107,7 +103,7 @@ class SuiteOutcome:
 
 class CountingEngine:
     """The real engine behind a callback that sums what every generate
-    produced: run_task passes no on_delta of its own, so this is the one
+    produced: run_loop passes no on_delta of its own, so this is the one
     reader of Delta.output_tokens on a suite run. The callback is
     ReplaySafe — nothing it sees leaves the process — so a warm attempt
     that fails may still be retried cold, as with no callback at all."""
@@ -192,10 +188,10 @@ def metrics_from_transcript(path: Path) -> tuple[int, int]:
 
 @contextlib.contextmanager
 def interpreter_first(python: Path) -> Iterator[None]:
-    """`python` on the worker's PATH resolves to the tune's own interpreter
-    for the span: the sandbox passes PATH through (toolexec.scrubbed_env)
-    and the `python -m unittest` the worker runs must be the Python the
-    graders use, with the standard library and nothing else."""
+    """`python` on PATH resolves to the tune's own interpreter for the span:
+    ScratchTools.run_command inherits this process's environment untouched,
+    and the test runner a task invokes must be the Python the graders use,
+    with the standard library and nothing else."""
     before = os.environ.get("PATH")
     os.environ["PATH"] = os.pathsep.join([str(python.parent), *([before] if before else [])])
     try:
@@ -205,66 +201,6 @@ def interpreter_first(python: Path) -> Iterator[None]:
             os.environ.pop("PATH", None)
         else:
             os.environ["PATH"] = before
-
-
-class _Denier:
-    """Denies every approval the worker asks for the moment it appears, and
-    counts it: a suite run has no human, and a command outside the
-    allowlist must cost the run a denial, not the approval timeout."""
-
-    def __init__(self, store: TaskStore, task_id: str, poll: float):
-        self._store, self._task_id, self._poll = store, task_id, poll
-        self.denied = 0
-        # Set once a store call raises: TaskStore._conn's own comment notes
-        # the WAL pragma can raise SQLITE_BUSY under contention. A run whose
-        # denier died silently would let every approval ride out the full
-        # timeout instead, mislabelling a budget-exhausted run as measured.
-        self.error: str | None = None
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._loop, name="sous-tune-denier", daemon=True)
-
-    def _loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                task = self._store.get(self._task_id)
-                # respond_approval is true only for the decision that took
-                # effect, so a request seen twice before the worker polls it
-                # is counted once.
-                if (
-                    task is not None
-                    and task.state == TaskState.AWAITING_APPROVAL
-                    and self._store.respond_approval(self._task_id, approve=False)
-                ):
-                    self.denied += 1
-            except Exception as e:  # noqa: BLE001 — transient; keep looping, don't kill the denier
-                self.error = f"{type(e).__name__}: {e}"
-            self._stop.wait(self._poll)
-
-    def __enter__(self) -> _Denier:
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self._stop.set()
-        self._thread.join(5.0)
-
-
-def _scratch_config(arm: Arm, scratch: Path, task: SuiteTask) -> SousConfig:
-    """The arm's config over a scratch control directory: the worker reads
-    the allowlist from config_path on every command, so the file has to
-    exist, and the data dir holds this run's store and transcript."""
-    config_path = scratch / "config.toml"
-    entries = ", ".join(json.dumps(e) for e in SUITE_ALLOWLIST)
-    config_path.write_text(f"[commands]\nallowlist = [{entries}]\n")
-    return dataclasses.replace(
-        arm.config,
-        data_dir=scratch / "data",
-        config_path=config_path,
-        max_turns=task.max_turns,
-        max_minutes=task.max_minutes,
-        context_mode="fixed",
-        max_context_tokens=arm.window,
-    )
 
 
 def _error_run(task: SuiteTask, index: int, arm: Arm, error: str) -> SuiteRun:
@@ -302,52 +238,29 @@ def run_one(
     scratch: Path,
     *,
     python: Path,
-    poll: float = _POLL_SECONDS,
     grade_timeout: float = 120.0,
 ) -> SuiteRun:
-    """One task, once, through run_task — the loop the daemon runs, minus
-    the queue polling around it — then the grade over what it left."""
+    """One task, once, through the suite loop, then the grade over what it
+    left in the scratch copy of the project."""
     project = scratch / "project"
     shutil.copytree(task.project, project)
-    config = _scratch_config(arm, scratch, task)
-    store = TaskStore(scratch / "tasks.db")
-    queued = store.enqueue(
-        title=task.title,
-        instructions=task.instructions,
-        project_root=str(project),
-        context_files=list(task.context_files),
-        verify_commands=list(task.verify_commands),
-    )
-    claimed = store.claim_next()
-    if claimed is None or claimed.id != queued.id:
-        raise RuntimeError("the scratch store handed back another task")
+    transcript = Transcript(scratch / "transcript.jsonl")
+    tools = ScratchTools(project, task.verify_commands)
     before = counting.output_tokens
-    with _Denier(store, claimed.id, poll) as denier, interpreter_first(python):
-        run_task(claimed, store, engine, config, context=ContextDecision(arm.window, "tune"))
-    final = store.get(claimed.id)
-    if final is None:
-        raise RuntimeError("the task vanished from the scratch store")
-    transcript = config.data_dir / "tasks" / claimed.id / "transcript.jsonl"
-    malformed, repetitions = metrics_from_transcript(transcript)
+    with interpreter_first(python):
+        result = run_loop(
+            instructions=task.instructions,
+            context_files=task.context_files,
+            root=project,
+            engine=engine,
+            window=arm.window,
+            budget=Budget(turns=task.max_turns, minutes=task.max_minutes),
+            tools=tools,
+            transcript=transcript,
+        )
+    malformed, repetitions = metrics_from_transcript(transcript.path)
     grade = grade_task(task, project, python=python, timeout=grade_timeout)
-    finished = final.finished_at if final.finished_at is not None else time.time()
-    started = final.started_at if final.started_at is not None else final.created_at
-    report = final.report or {}
-    raw_budget = report.get("budget")
-    budget = raw_budget if isinstance(raw_budget, dict) else {}
-    # run_task counts turns itself in the report's budget block; the store's
-    # turns_used is bumped only on tool calls, so it misses the finish turn.
-    turns = int(budget.get("turns", final.turns_used))
-    state = final.state
-    error = None if final.state == TaskState.DONE else str(report.get("error") or final.state)
-    if denier.error is not None:
-        # The denier is the only thing answering approvals in a suite run;
-        # if its thread died mid-run, every request rode out the full
-        # approval timeout instead of being denied at once, so this run
-        # measured a wedged approval loop, not the arm. Every other field
-        # (grade included) still stands — only the label changes.
-        state = "error"
-        error = f"approval denier failed: {denier.error}"
+    failed = result.error is not None
     return SuiteRun(
         task=task.name,
         index=index,
@@ -358,18 +271,18 @@ def run_one(
         int8_prefill=arm.int8_prefill,
         greedy=arm.greedy,
         window=arm.window,
-        state=state,
-        outcome=final.outcome,
-        turns=turns,
-        seconds=finished - started,
+        state="failed" if failed else "done",
+        outcome=None if failed else result.outcome,
+        turns=result.turns,
+        seconds=result.seconds,
         output_tokens=counting.output_tokens - before,
         malformed=malformed,
         repetitions=repetitions,
-        approvals_denied=denier.denied,
+        approvals_denied=tools.denied,
         grade=grade.score,
         grade_detail=grade.detail,
-        error=error,
-        transcript_path=str(transcript),
+        error=result.error,
+        transcript_path=str(transcript.path),
     )
 
 
@@ -413,7 +326,7 @@ def _drain(
     wait: float = _INFLIGHT_WAIT_SECONDS,
 ) -> None:
     """Wait out this run's own abandoned generation before the next run's
-    budget clock starts. run_task can give up on a stalled generation at its
+    budget clock starts. run_loop can give up on a stalled generation at its
     wall-clock deadline (recorded budget-exhausted) while the engine's
     session thread keeps decoding under ManagedEngine._gen_lock until it
     reaches its token cap — minutes on a slow model. Left alone, the next
@@ -439,7 +352,6 @@ def _run_suite(
     factory: Callable[[str], Engine] | None,
     python: Path,
     active_memory: Callable[[], int],
-    poll: float,
 ) -> SuiteOutcome:
     baseline = active_memory()
     base = factory or default_engine_factory(arm.config)
@@ -504,7 +416,6 @@ def _run_suite(
                             counters[-1],
                             run_scratch,
                             python=python,
-                            poll=poll,
                         )
                     except Exception as e:  # noqa: BLE001 — one run's failure, recorded; goes on
                         result = _error_run(task, index, arm, f"{type(e).__name__}: {e}")
@@ -541,7 +452,6 @@ def run_suite(
     factory: Callable[[str], Engine] | None = None,
     python: Path | None = None,
     active_memory: Callable[[], int] | None = None,
-    poll: float = _POLL_SECONDS,
 ) -> SuiteOutcome:
     """Every (task, run index) of the arm not in `done`, on a thread of its
     own that loads the engine once, hands each run to `record` as it
@@ -562,7 +472,6 @@ def run_suite(
                     factory,
                     python or Path(sys.executable),
                     active_memory or _active_memory,
-                    poll,
                 )
             )
         except BaseException as e:  # noqa: BLE001 — becomes the outcome's error
