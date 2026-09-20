@@ -320,10 +320,11 @@ def default_engine_factory(config: SousConfig) -> Callable[[str], Engine]:
 
 class ManagedEngine:
     """Serializes generations on one engine instance. MLX generation is
-    synchronous and uninterruptible: on a stall the caller abandons its
-    generation thread, but that thread is still USING the engine, so a second
-    concurrent generation (or an unload) on the same model would corrupt
-    inference. The lock makes the next turn wait for the stalled generation
+    synchronous and uninterruptible: on a stall the caller (the endpoint's
+    turn runner, a tune run) abandons its generation thread, but that thread
+    is still USING the engine, so a second concurrent generation (or an
+    unload) on the same model would corrupt inference. The lock makes the
+    next turn wait for the stalled generation
     instead. Consequence: a truly wedged generation delays subsequent turns
     until the daemon is restarted — process isolation is the future fix (see
     README limitations)."""
@@ -425,7 +426,8 @@ class GenerationSession:
     reset — a late reset from a stale session thread would race the next
     turn's cache and stats, the same class of bug as consideration 7. Every
     reset belongs to the thread that owns the session: the endpoint's turn
-    thread after a stall (`sous.api.turn`).
+    thread after a stall (`sous.api.turn`), the tune suite's thread at the
+    end of every run (`sous.tune.suite.loop`).
 
     on_delta, when given, fires on this thread from inside the engine's decode
     loop — mid-generation, under _gen_lock. A stalled-and-abandoned generation
@@ -437,7 +439,8 @@ class GenerationSession:
         self._managed = managed
         # maxsize=1 plus put_nowait everywhere: at most one request is ever
         # outstanding, so Full in generate() means a protocol bug — failing
-        # loudly beats deadlocking the turn runner on its way out.
+        # loudly beats deadlocking the session's owner (the endpoint's turn
+        # runner, a tune run) on its way out.
         # close() alone tolerates Full: a stalled request the starved thread
         # never dequeued may still occupy the queue.
         self._requests: queue.Queue = queue.Queue(maxsize=1)
@@ -657,7 +660,8 @@ class EngineManager:
         _gen_lock only covers generate(). An endpoint turn holds the engine
         from get() through count_tokens() — seconds on a large prompt —
         before anything takes that lock, and the idle sweep runs on a thread
-        of its own, so it could free the weights in between.
+        of its own (`sous-idle-sweep`, start_idle_sweep()), so it could free
+        the weights in between.
         """
         with self._lock:
             self._leases += 1
