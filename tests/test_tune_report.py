@@ -64,7 +64,6 @@ def test_the_report_has_every_section_and_labels_other_models_quality_untested(t
         drafter_id="d",
         block_size=3,
         window=131072,
-        gateway_window=None,
         changes={},
         reasons=["the current arm is already the fastest measured"],
     )
@@ -192,13 +191,13 @@ def test_config_diff_preserves_comments_and_untouched_keys(tmp_path):
     p = tmp_path / "config.toml"
     original = (
         '# mine\n[model]\nid = "x/y"   # keep\nspeculative_block_size = 3\n'
-        "\n[gateway]\nenabled = true\n"
+        "\n[server]\nport = 9000\n"
     )
     p.write_text(original)
     new, diff = config_diff(
-        p, {"model": {"speculative_block_size": 2}, "gateway": {"max_context_tokens": 65536}}
+        p, {"model": {"speculative_block_size": 2, "max_context_tokens": 65536}}
     )
-    assert "# mine" in new and 'id = "x/y"   # keep' in new
+    assert "# mine" in new and 'id = "x/y"   # keep' in new and "port = 9000" in new
     assert "speculative_block_size = 2" in new and "max_context_tokens = 65536" in new
     assert "-speculative_block_size = 3" in diff and "+speculative_block_size = 2" in diff
     assert "+max_context_tokens = 65536" in diff
@@ -327,7 +326,6 @@ def test_a_full_report_has_the_suite_section_and_no_quality_untested_tag(tmp_pat
         drafter_id="",
         block_size=0,
         window=131072,
-        gateway_window=None,
         tier="9b",
         current=False,
     )

@@ -134,8 +134,8 @@ class TurnRunner:
         self, engines: EngineManager, config: SousConfig, inflight: Inflight | None = None
     ):
         self._engines = engines
-        self._window = config.gateway_max_context_tokens
-        self._timeout = float(config.gateway_generation_timeout_minutes * 60)
+        self._window = config.max_context_tokens
+        self._timeout = float(config.generation_timeout_minutes * 60)
         self._lock = threading.Lock()
         # One long-lived session for every gateway turn: the prompt cache
         # lives on the session thread's mlx streams (#34), so a per-request

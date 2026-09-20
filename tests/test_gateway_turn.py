@@ -53,7 +53,6 @@ class RecordingSink:
 
 
 def _cfg(tmp_path: Path, **overrides) -> SousConfig:
-    overrides.setdefault("gateway_enabled", True)
     return SousConfig(
         data_dir=tmp_path / "data",
         config_path=tmp_path / "config.toml",
@@ -826,7 +825,7 @@ def test_a_failed_turn_leaves_the_registry_too(tmp_path: Path):
 def test_a_turn_refused_at_the_lock_leaves_the_registry(tmp_path: Path):
     live = Inflight()
     engines = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: FakeEngine([]))
-    runner = TurnRunner(engines, _cfg(tmp_path, gateway_generation_timeout_minutes=1), live)
+    runner = TurnRunner(engines, _cfg(tmp_path, generation_timeout_minutes=1), live)
     runner._timeout = 0.05
     with runner._lock, pytest.raises(GatewayBusy):
         runner.run(MSGS, [], 4096, RecordingSink(), turn_id="msg_1")

@@ -48,9 +48,7 @@ def _events(text: str) -> list[tuple[str, dict]]:
 def test_real_model_streams_a_well_formed_turn_and_reuses_the_cache(tmp_path: Path):
     from sous.engine.lm import LMEngine
 
-    cfg = SousConfig(
-        data_dir=tmp_path / "data", config_path=tmp_path / "config.toml", gateway_enabled=True
-    )
+    cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: LMEngine(TINY, prompt_cache=True))
     # Same construction as tests/test_gateway_routes.py::_gateway_app: it hands
     # back the mounted Gateway so its real MLX GenerationSession can be closed
@@ -163,9 +161,7 @@ def test_an_attachment_keeps_the_conversation_warm_and_bit_exact(
     — the render is the same text in the same place, only warm. Then a branch
     of T1 (a summary-shaped last turn) is served from the retained slot and
     is bit-exact against its own cold run too."""
-    cfg = SousConfig(
-        data_dir=tmp_path / "data", config_path=tmp_path / "config.toml", gateway_enabled=True
-    )
+    cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: _engine(model_id, backend))
     mcp = MCPServer("test")
     gateway = mount_gateway(mcp, engines, cfg)

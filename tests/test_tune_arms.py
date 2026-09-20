@@ -74,21 +74,21 @@ def test_on_the_m2_air_the_27b_is_refused_and_the_9b_runs_at_a_lowered_window(tm
     assert not any(a.current for a in arms)
 
 
-def test_the_gateway_window_is_lowered_too_and_floors_at_claude_codes_minimum(tmp_path):
+def test_a_lowered_window_still_floors_at_claude_codes_minimum(tmp_path):
+    """Claude Code refuses a model under 48K of context, so a fit that cannot
+    reach the floor refuses the model rather than proposing a window nothing
+    would use."""
     user = SousConfig(
         data_dir=tmp_path,
         config_path=tmp_path / "c.toml",
-        gateway_enabled=True,
-        gateway_max_context_tokens=262144,
+        max_context_tokens=262144,
     )
     arms, _ = quick_arms(
         user, _candidates(), _checkpoints(), working_set_bytes=fx.M2_AIR_WORKING_SET
     )
     nine = [a for a in arms if a.model_id == "mlx-community/Qwen3.5-9B-MLX-4bit"]
-    assert nine and all(
-        a.gateway_window is not None and a.gateway_window >= 48 * 1024 for a in nine
-    )
-    assert all(a.config.gateway_max_context_tokens == a.gateway_window for a in nine)
+    assert nine and all(48 * 1024 <= a.window < 262144 for a in nine)
+    assert all(a.config.max_context_tokens == a.window for a in nine)
 
 
 def test_a_current_model_outside_the_table_is_still_an_arm(tmp_path):
@@ -224,7 +224,7 @@ def test_each_arm_carries_the_window_it_alone_fits_at(tmp_path):
     # ...but the drafterless arm proposes the window it fits at by itself.
     assert plain.fit_window is not None and drafted.fit_window is not None
     assert plain.fit_window > drafted.fit_window == drafted.window
-    assert plain.key == (plain.model_id, "", 0) and plain.serving_window == plain.window
+    assert plain.key == (plain.model_id, "", 0)
 
 
 def test_a_text_only_model_gets_no_drafter_arms(tmp_path):
@@ -263,7 +263,6 @@ def _winner(tmp_path, temperature=0.7, int8=False):
         drafter_id="z-lab/Qwen3.8-27B-DFlash2",
         block_size=3,
         window=131072,
-        gateway_window=None,
         tier="27b-dense",
         current=True,
         fit_window=131072,

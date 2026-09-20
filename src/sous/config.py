@@ -1,49 +1,21 @@
-"""sous configuration: TOML file with defaults, hot-reloaded allowlist."""
+"""sous configuration: one TOML file, `[server]` for the endpoint and
+`[model]` for the engine behind it, every key with a default."""
 
 from __future__ import annotations
 
 import math
 import re
-import shlex
 import tomllib
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import tomlkit
-
 DEFAULT_CONFIG_PATH = Path.home() / ".sous" / "config.toml"
 DEFAULT_DATA_DIR = Path.home() / ".sous"
 
-DEFAULT_ALLOWLIST: list[str] = [
-    "pytest",
-    "python -m pytest",
-    "npm test",
-    "npx eslint",
-    "npx prettier",
-    "ruff",
-    "black",
-    "mypy",
-    "go test",
-    "cargo test",
-    "cargo check",
-    "make test",
-    # `uv run <tool>` variants of the Python tools above (plus ty): in uv
-    # projects the bare tools usually aren't on the daemon's PATH at all, so
-    # without these every worker self-check needs a human approval. Full
-    # `uv run <tool>` entries, never a bare `uv run` prefix — that would
-    # allowlist running arbitrary scripts.
-    "uv run pytest",
-    "uv run python -m pytest",
-    "uv run ruff",
-    "uv run black",
-    "uv run mypy",
-    "uv run ty",
-]
-
 _KNOWN = {
-    "server": {"port"},
+    "server": {"port", "upstream_url", "local_models", "generation_timeout_minutes"},
     "model": {
         "id",
         "idle_unload_minutes",
@@ -57,25 +29,31 @@ _KNOWN = {
         "speculative_block_size",
         "int8_prefill",
     },
-    "budgets": {"max_turns", "max_minutes", "max_tokens_per_generation"},
-    "commands": {"allowlist", "timeout_seconds", "approval_timeout_minutes"},
-    "context": {"mode", "fraction", "min_tokens"},
-    "tasks": {"retention"},
+}
+
+# Settings 0.7.0 removed with the worker path, and where the ones that moved
+# now live: a config written for 0.6 is told so once at load, instead of
+# steering nothing in silence.
+_OBSOLETE: dict[str, dict[str, str | None]] = {
     "gateway": {
-        "enabled",
-        "local_models",
-        "max_context_tokens",
-        "generation_timeout_minutes",
-        "upstream_url",
+        "enabled": None,
+        "local_models": "[server].local_models",
+        "upstream_url": "[server].upstream_url",
+        "generation_timeout_minutes": "[server].generation_timeout_minutes",
+        "max_context_tokens": "[model].max_context_tokens",
     },
+    "budgets": {},
+    "commands": {},
+    "context": {},
+    "tasks": {},
 }
 
 # Claude Code refuses to run against a model advertising less than 48K of
-# context (oMLX gates on the same 48 * 1024). A smaller gateway window would
-# never be used, so the config clamps up to this instead of serving it.
-GATEWAY_MIN_CONTEXT_TOKENS = 48 * 1024
-# Where the gateway forwards every request it does not serve itself.
-GATEWAY_DEFAULT_UPSTREAM = "https://api.anthropic.com"
+# context (oMLX gates on the same 48 * 1024). A smaller window would never be
+# used, so the config clamps up to this instead of serving it.
+MIN_CONTEXT_TOKENS = 48 * 1024
+# Where the daemon forwards every request it does not serve itself.
+DEFAULT_UPSTREAM = "https://api.anthropic.com"
 # Plaintext is tolerated only this far: the forwarded requests carry the
 # user's OAuth token, and an http:// upstream anywhere else would put it on
 # the wire in the clear.
@@ -85,13 +63,19 @@ _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 @dataclass(frozen=True)
 class SousConfig:
     server_port: int = 8383
+    upstream_url: str = DEFAULT_UPSTREAM
+    local_models: tuple[str, ...] = ("sous-local",)
+    generation_timeout_minutes: int = 30
     model_id: str = "mlx-community/Qwen3.8-27B-4bit"
     idle_unload_minutes: int = 30
-    max_context_tokens: int = 32768
+    # The served window: what `sous claude` exports as CLAUDE_CODE_MAX_CONTEXT_TOKENS
+    # and the render cap of a local turn. Below 49152 Claude Code compacts
+    # constantly, so the floor is enforced at load.
+    max_context_tokens: int = 131072
     # Qwen's documented non-thinking-mode sampling settings — greedy (temp=0)
     # decoding cannot escape a bad completion once one happens (a nudge can't
-    # change an argmax pick over a near-identical prompt), so some stochastic
-    # sampling is required for the worker to have any chance of recovering.
+    # change an argmax pick over a near-identical prompt), so a retry of a
+    # turn that went wrong would go wrong identically.
     temperature: float = 0.7
     top_p: float = 0.8
     top_k: int = 20
@@ -114,42 +98,19 @@ class SousConfig:
     # tool-loop A/B says otherwise. Ignored, with a status reason, on GPUs
     # without neural accelerators (pre-M5) or macOS < 26.2.
     int8_prefill: bool = False
-    # Reuse one KV cache across the turns of a task, prefilling only what the
-    # conversation gained, instead of re-prefilling from scratch every turn.
-    # Works because all of a task's generations share one GenerationSession
-    # thread (#34) — mlx streams are thread-scoped, so the cache only
-    # survives between turns that run on the thread that built it.
+    # Reuse one KV cache across the turns of a conversation, prefilling only
+    # what it gained, instead of re-prefilling from scratch every turn. Works
+    # because mlx streams are thread-scoped (#34): a slot only survives
+    # between turns that run on the thread that built it.
     prompt_cache: bool = True
     # Memory resident prompt-cache slots may hold beyond the in-flight turn's
     # own cache, in GiB. None means automatic: what Metal's working set has
-    # left once the weights, one full window of KV (the larger of the worker's
-    # and the gateway's) and 2 GiB of slack are paid for. 0 keeps a single
-    # slot. Slots are what let two conversations interleave on the local model
-    # without evicting each other, and what lets a new subagent start from a
-    # copy of the ~50K-token header its predecessor already prefilled.
+    # left once the weights, one full window of KV and 2 GiB of slack are paid
+    # for. 0 keeps a single slot. Slots are what let two conversations
+    # interleave on the local model without evicting each other, and what lets
+    # a new subagent start from a copy of the ~50K-token header its
+    # predecessor already prefilled.
     prompt_cache_gb: float | None = None
-    max_turns: int = 40
-    max_minutes: int = 15
-    max_tokens_per_generation: int = 4096
-    command_timeout_seconds: int = 120
-    approval_timeout_minutes: int = 10
-    task_retention: int = 200
-    # "fixed": serve max_context_tokens as-is. "auto": size the window per
-    # task from live memory headroom (see sous.context), using `fraction` of
-    # it and never dropping below `min_tokens`.
-    context_mode: str = "fixed"
-    context_fraction: float = 0.8
-    context_min_tokens: int = 8192
-    # Anthropic-compatible endpoint on the daemon (issue #41), off by default
-    # and experimental. It serves Claude Code with the local model and never
-    # touches the toolexec sandbox: Claude Code executes the tools under its
-    # own permission system. The window is the gateway's own — Claude Code's
-    # prompts are far larger than the worker's, and the worker's cap stays put.
-    gateway_enabled: bool = False
-    gateway_local_models: tuple[str, ...] = ("sous-local",)
-    gateway_max_context_tokens: int = 131072
-    gateway_generation_timeout_minutes: int = 30
-    gateway_upstream_url: str = GATEWAY_DEFAULT_UPSTREAM
     data_dir: Path = DEFAULT_DATA_DIR
     config_path: Path = DEFAULT_CONFIG_PATH
 
@@ -170,6 +131,8 @@ def _read_toml(path: Path) -> dict:
 
 def _warn_unknown(raw: dict) -> None:
     for section, values in raw.items():
+        if section in _OBSOLETE:
+            continue
         if section not in _KNOWN:
             warnings.warn(f"sous config: unknown section [{section}]", stacklevel=3)
             continue
@@ -177,6 +140,38 @@ def _warn_unknown(raw: dict) -> None:
             for key in values:
                 if key not in _KNOWN[section]:
                     warnings.warn(f"sous config: unknown key {key!r} in [{section}]", stacklevel=3)
+
+
+def _warn_obsolete(raw: dict, window: int) -> None:
+    """One warning for a whole config written for 0.6, naming where each
+    setting went. One and not one per key: the point is to send the reader to
+    the file once, and a dozen warnings on a daemon's first line is noise
+    nobody reads to the end of."""
+    notes: list[str] = []
+    for section, keys in _OBSOLETE.items():
+        values = raw.get(section)
+        if values is None:
+            continue
+        if not keys or not isinstance(values, dict):
+            notes.append(f"[{section}] (removed with the worker path)")
+            continue
+        for key in values:
+            home = keys.get(key)
+            if key not in keys:
+                notes.append(f"[{section}].{key} (unknown)")
+            elif home is None:
+                notes.append(f"[{section}].{key} (removed: the endpoint is always on)")
+            elif key == "max_context_tokens":
+                notes.append(f"[{section}].{key} (now {home}; the served window is {window})")
+            else:
+                notes.append(f"[{section}].{key} (now {home})")
+    if notes:
+        warnings.warn(
+            "sous config: settings from 0.6 ignored: "
+            + "; ".join(notes)
+            + " — see README, Upgrading from 0.6",
+            stacklevel=3,
+        )
 
 
 def _section(raw: dict, name: str) -> dict:
@@ -194,35 +189,68 @@ def _section(raw: dict, name: str) -> dict:
     return value
 
 
-def _context_values(context: dict) -> tuple[str, float, int]:
-    """Validated [context] policy values, each degrading to its default with
-    a warning — same stance as the rest of the config. These are safety
-    knobs: a fraction over 1 defeats the anti-thrashing headroom guarantee,
-    and a typo'd mode would silently disable the auto sizing the user asked
-    for."""
-    mode = context.get("mode", "fixed")
-    if mode not in ("fixed", "auto"):
+def _server_values(server: dict) -> tuple[tuple[str, ...], int]:
+    """Validated [server].local_models and [server].generation_timeout_minutes,
+    each degrading to its default with a warning — the stance the whole file
+    takes: a typo must not stop the daemon from coming up."""
+    models = server.get("local_models", ["sous-local"])
+    if (
+        not isinstance(models, list)
+        or not models
+        or not all(isinstance(m, str) and m for m in models)
+    ):
         warnings.warn(
-            f"sous config: [context].mode {mode!r} is neither 'fixed' nor 'auto'; using 'fixed'",
+            f"sous config: [server].local_models {models!r} must be a non-empty list of "
+            "model ids; using ['sous-local']",
             stacklevel=3,
         )
-        mode = "fixed"
-    fraction = context.get("fraction", 0.8)
-    if isinstance(fraction, bool) or not isinstance(fraction, int | float) or not 0 < fraction <= 1:
+        models = ["sous-local"]
+    # Honest ids are mandatory. Claude Code ignores
+    # CLAUDE_CODE_MAX_CONTEXT_TOKENS for any id that canonicalizes to claude-*
+    # and trusts its built-in window instead, so an impersonating id silently
+    # forfeits the window control the endpoint relies on, and pulls real
+    # Claude traffic onto the local model. Substring, not prefix:
+    # canonicalization strips provider prefixes, and no honest local id has
+    # any reason to contain the word at all.
+    if any("claude" in m.lower() for m in models):
         warnings.warn(
-            f"sous config: [context].fraction {fraction!r} must be in (0, 1]; using 0.8",
+            f"sous config: [server].local_models {models!r} impersonates a Claude model; "
+            "Claude Code ignores its context-window env vars for claude-* ids, so use an "
+            "honest id like 'sous-local'; using ['sous-local']",
             stacklevel=3,
         )
-        fraction = 0.8
-    min_tokens = context.get("min_tokens", 8192)
-    if isinstance(min_tokens, bool) or not isinstance(min_tokens, int) or min_tokens <= 0:
+        models = ["sous-local"]
+    timeout = server.get("generation_timeout_minutes", 30)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
         warnings.warn(
-            f"sous config: [context].min_tokens {min_tokens!r} must be a positive "
-            f"integer; using 8192",
+            f"sous config: [server].generation_timeout_minutes {timeout!r} must be a "
+            "positive integer; using 30",
             stacklevel=3,
         )
-        min_tokens = 8192
-    return mode, float(fraction), min_tokens
+        timeout = 30
+    return tuple(models), timeout
+
+
+def _model_window(model: dict) -> int:
+    """[model].max_context_tokens, clamped UP to the Claude Code floor rather
+    than defaulted: a smaller value can only be a misjudged floor, and the
+    floor is the closest thing to what the user asked for that would work."""
+    window = model.get("max_context_tokens", 131072)
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        warnings.warn(
+            f"sous config: [model].max_context_tokens {window!r} must be a positive "
+            "integer; using 131072",
+            stacklevel=3,
+        )
+        return 131072
+    if window < MIN_CONTEXT_TOKENS:
+        warnings.warn(
+            f"sous config: [model].max_context_tokens {window} is below Claude Code's "
+            f"{MIN_CONTEXT_TOKENS}-token floor; using {MIN_CONTEXT_TOKENS}",
+            stacklevel=3,
+        )
+        return MIN_CONTEXT_TOKENS
+    return window
 
 
 SPECULATIVE_BLOCK_DEFAULT = 3
@@ -235,8 +263,8 @@ SPECULATIVE_BLOCK_MAX = 5
 
 def _speculative_block_size(model: dict) -> int:
     """Validated [model].speculative_block_size: 0 (the drafter's own policy)
-    or 2..5, degrading to the default with a warning — same stance as
-    [context]. This one is a silent-truncation knob: mlx-vlm treats the value
+    or 2..5, degrading to the default with a warning — same stance as the rest
+    of the file. This one is a silent-truncation knob: mlx-vlm treats the value
     as the total verify-block size and ends its round loop when it is <= 1,
     so a configured 1 (or a negative) would cap every response at a single
     token without any error. Above the maximum is clamped rather than
@@ -304,71 +332,6 @@ def _int8_prefill(model: dict) -> bool:
     return False
 
 
-def _gateway_values(gateway: dict) -> tuple[bool, tuple[str, ...], int, int]:
-    """Validated [gateway] values, each degrading to its default with a
-    warning — except the window, which is clamped UP to the Claude Code floor:
-    a smaller value can only be a misjudged floor, and the floor is the
-    closest thing to what the user asked for that would actually work."""
-    enabled = gateway.get("enabled", False)
-    if not isinstance(enabled, bool):
-        warnings.warn(
-            f"sous config: [gateway].enabled {enabled!r} must be true or false; using false",
-            stacklevel=3,
-        )
-        enabled = False
-    models = gateway.get("local_models", ["sous-local"])
-    if (
-        not isinstance(models, list)
-        or not models
-        or not all(isinstance(m, str) and m for m in models)
-    ):
-        warnings.warn(
-            f"sous config: [gateway].local_models {models!r} must be a non-empty list of "
-            "model ids; using ['sous-local']",
-            stacklevel=3,
-        )
-        models = ["sous-local"]
-    # Honest ids are mandatory. Claude Code ignores
-    # CLAUDE_CODE_MAX_CONTEXT_TOKENS for any id that canonicalizes to claude-*
-    # and trusts its built-in window instead, so an impersonating id silently
-    # forfeits the window control the gateway relies on (and, once routing
-    # lands, would pull real Claude traffic onto the local model). Substring,
-    # not prefix: canonicalization strips provider prefixes, and no honest
-    # local id has any reason to contain the word at all.
-    if any("claude" in m.lower() for m in models):
-        warnings.warn(
-            f"sous config: [gateway].local_models {models!r} impersonates a Claude model; "
-            "Claude Code ignores its context-window env vars for claude-* ids, so use an "
-            "honest id like 'sous-local'; using ['sous-local']",
-            stacklevel=3,
-        )
-        models = ["sous-local"]
-    window = gateway.get("max_context_tokens", 131072)
-    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
-        warnings.warn(
-            f"sous config: [gateway].max_context_tokens {window!r} must be a positive "
-            "integer; using 131072",
-            stacklevel=3,
-        )
-        window = 131072
-    elif window < GATEWAY_MIN_CONTEXT_TOKENS:
-        warnings.warn(
-            f"sous config: [gateway].max_context_tokens {window} is below Claude Code's "
-            f"{GATEWAY_MIN_CONTEXT_TOKENS}-token floor; using {GATEWAY_MIN_CONTEXT_TOKENS}",
-            stacklevel=3,
-        )
-        window = GATEWAY_MIN_CONTEXT_TOKENS
-    timeout = gateway.get("generation_timeout_minutes", 30)
-    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
-        warnings.warn(
-            f"sous config: [gateway].generation_timeout_minutes {timeout!r} must be a "
-            "positive integer; using 30",
-            stacklevel=3,
-        )
-        timeout = 30
-    return enabled, tuple(models), window, timeout
-
-
 # A registered name (letters, digits, dots, hyphens — RFC 3986's reg-name as
 # the DNS world actually spells it) or an IPv6 literal with its brackets
 # already stripped by urlsplit.
@@ -388,9 +351,7 @@ def _is_buildable_origin(hostname: str, origin: str) -> bool:
         return False
     # Function-local so `import sous.config` itself stays cheap; load_config()
     # does reach here for every valid upstream_url, so each CLI invocation
-    # pays httpx's ~45 ms import once. Acceptable for a command-line tool —
-    # the alternative, skipping the check while the gateway is disabled,
-    # would let a bad value sit unnoticed until the day it is enabled.
+    # pays httpx's ~45 ms import once. Acceptable for a command-line tool.
     import httpx
 
     try:
@@ -400,11 +361,11 @@ def _is_buildable_origin(hostname: str, origin: str) -> bool:
     return True
 
 
-def _upstream_url(gateway: dict) -> str:
+def _upstream_url(server: dict) -> str:
     """The forwarding target as an origin — scheme + host[:port] and nothing
     else. A path or query would silently change what is forwarded; userinfo
     would be a credential sous stored; http is allowed only to loopback."""
-    value = gateway.get("upstream_url", GATEWAY_DEFAULT_UPSTREAM)
+    value = server.get("upstream_url", DEFAULT_UPSTREAM)
     if isinstance(value, str):
         try:
             parts = urlsplit(value)
@@ -433,11 +394,11 @@ def _upstream_url(gateway: dict) -> str:
             if _is_buildable_origin(parts.hostname, candidate):
                 return candidate
     warnings.warn(
-        f"sous config: [gateway].upstream_url {value!r} must be an https origin with no "
-        f"path (plain http only for a loopback host); using {GATEWAY_DEFAULT_UPSTREAM}",
+        f"sous config: [server].upstream_url {value!r} must be an https origin with no "
+        f"path (plain http only for a loopback host); using {DEFAULT_UPSTREAM}",
         stacklevel=3,
     )
-    return GATEWAY_DEFAULT_UPSTREAM
+    return DEFAULT_UPSTREAM
 
 
 def load_config(config_path: Path | None = None) -> SousConfig:
@@ -446,18 +407,17 @@ def load_config(config_path: Path | None = None) -> SousConfig:
     _warn_unknown(raw)
     server = _section(raw, "server")
     model = _section(raw, "model")
-    budgets = _section(raw, "budgets")
-    commands = _section(raw, "commands")
-    context = _section(raw, "context")
-    context_mode, context_fraction, context_min_tokens = _context_values(context)
-    tasks = _section(raw, "tasks")
-    gateway = _section(raw, "gateway")
-    gateway_enabled, gateway_models, gateway_window, gateway_timeout = _gateway_values(gateway)
+    window = _model_window(model)
+    _warn_obsolete(raw, window)
+    local_models, generation_timeout = _server_values(server)
     return SousConfig(
         server_port=server.get("port", 8383),
+        upstream_url=_upstream_url(server),
+        local_models=local_models,
+        generation_timeout_minutes=generation_timeout,
         model_id=model.get("id", "mlx-community/Qwen3.8-27B-4bit"),
         idle_unload_minutes=model.get("idle_unload_minutes", 30),
-        max_context_tokens=model.get("max_context_tokens", 32768),
+        max_context_tokens=window,
         temperature=model.get("temperature", 0.7),
         top_p=model.get("top_p", 0.8),
         top_k=model.get("top_k", 20),
@@ -466,72 +426,6 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         speculative_draft_id=model.get("speculative_draft_id", "z-lab/Qwen3.8-27B-DFlash2"),
         speculative_block_size=_speculative_block_size(model),
         int8_prefill=_int8_prefill(model),
-        max_turns=budgets.get("max_turns", 40),
-        max_minutes=budgets.get("max_minutes", 15),
-        max_tokens_per_generation=budgets.get("max_tokens_per_generation", 4096),
-        command_timeout_seconds=commands.get("timeout_seconds", 120),
-        approval_timeout_minutes=commands.get("approval_timeout_minutes", 10),
-        task_retention=tasks.get("retention", 200),
-        context_mode=context_mode,
-        context_fraction=context_fraction,
-        context_min_tokens=context_min_tokens,
-        gateway_enabled=gateway_enabled,
-        gateway_local_models=gateway_models,
-        gateway_max_context_tokens=gateway_window,
-        gateway_generation_timeout_minutes=gateway_timeout,
-        gateway_upstream_url=_upstream_url(gateway),
         data_dir=(path.parent if path.parent != Path(".") else DEFAULT_DATA_DIR),
         config_path=path,
     )
-
-
-def current_allowlist(config_path: Path) -> list[list[str]]:
-    """Hot path: re-read the allowlist on every command execution."""
-    raw = _read_toml(config_path)
-    entries = _section(raw, "commands").get("allowlist", DEFAULT_ALLOWLIST)
-    if not isinstance(entries, list):
-        # This escapes into delegate_task/server_status/run_command — a wrong
-        # shape must degrade to defaults, never raise out of the service API.
-        warnings.warn(
-            f"sous config: [commands].allowlist is not a list "
-            f"(got {type(entries).__name__}); using defaults",
-            stacklevel=2,
-        )
-        entries = DEFAULT_ALLOWLIST
-    parsed: list[list[str]] = []
-    for entry in entries:
-        if not isinstance(entry, str):
-            warnings.warn(
-                f"sous config: skipping non-string allowlist entry {entry!r}", stacklevel=2
-            )
-            continue
-        try:
-            parsed.append(shlex.split(entry))
-        except ValueError as e:
-            # One unparseable entry (e.g. an unbalanced quote) must not
-            # disable delegation — skip it, keep the valid ones.
-            warnings.warn(
-                f"sous config: skipping unparseable allowlist entry {entry!r} ({e})", stacklevel=2
-            )
-    return parsed
-
-
-def persist_allowlist_entry(command: str, config_path: Path) -> None:
-    """Append one command to the allowlist, preserving file formatting."""
-    doc = tomlkit.parse(config_path.read_text()) if config_path.is_file() else tomlkit.document()
-    commands = doc.setdefault("commands", tomlkit.table())
-    # Seed the defaults ONLY when the key is absent — i.e. the array is being
-    # created for the first time (new file, or a section that never had an
-    # allowlist). An explicitly empty allowlist (`allowlist = []`) is a
-    # deliberate fail-closed posture — deny everything, make a human approve
-    # each command — and must gain only the command just approved, never be
-    # silently repopulated with the defaults.
-    seed_defaults = "allowlist" not in commands
-    allow = commands.setdefault("allowlist", tomlkit.array())
-    if seed_defaults:
-        for entry in DEFAULT_ALLOWLIST:
-            allow.append(entry)
-    if command not in list(allow):
-        allow.append(command)
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(tomlkit.dumps(doc))

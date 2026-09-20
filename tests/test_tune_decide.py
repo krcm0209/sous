@@ -43,11 +43,9 @@ def _arm(
     drafter=D,
     block=3,
     window=131072,
-    gateway_window=None,
     current=False,
     model=M,
     fit_window=None,
-    fit_gateway_window=None,
 ):
     return Arm(
         label=label,
@@ -56,11 +54,9 @@ def _arm(
         drafter_id=drafter,
         block_size=block,
         window=window,
-        gateway_window=gateway_window,
         tier="27b-dense",
         current=current,
         fit_window=fit_window,
-        fit_gateway_window=fit_gateway_window,
     )
 
 
@@ -97,22 +93,17 @@ def test_no_drafter_winning_clears_the_drafter_key(tmp_path):
     assert choice.changes == {"model": {"speculative_draft_id": ""}}
 
 
-def test_a_lowered_window_is_written_for_the_worker_and_the_gateway(tmp_path):
+def test_a_window_the_arm_could_not_reach_is_written_back(tmp_path):
     user = SousConfig(
         data_dir=tmp_path,
         config_path=tmp_path / "c.toml",
-        max_context_tokens=131072,
-        gateway_enabled=True,
-        gateway_max_context_tokens=262144,
+        max_context_tokens=262144,
     )
-    arms = [_arm(user, "cur", current=True, window=65536, gateway_window=65536)]
+    arms = [_arm(user, "cur", current=True, window=65536)]
     rows = [_row("cur", window=65536)]
     choice = quick_decision(user, arms, rows)
     assert choice is not None
-    assert choice.changes == {
-        "model": {"max_context_tokens": 65536},
-        "gateway": {"max_context_tokens": 65536},
-    }
+    assert choice.changes == {"model": {"max_context_tokens": 65536}}
 
 
 def test_other_models_never_win_and_a_missing_current_model_is_none(tmp_path):
@@ -206,21 +197,10 @@ def test_a_proposal_writes_the_arms_own_fit_window_not_the_shared_one(tmp_path):
         data_dir=tmp_path,
         config_path=tmp_path / "c.toml",
         max_context_tokens=131072,
-        gateway_enabled=True,
-        gateway_max_context_tokens=131072,
     )
     arms = [
-        _arm(user, "cur", current=True, window=78080, gateway_window=78080, fit_window=78080),
-        _arm(
-            user,
-            "plain",
-            drafter="",
-            block=0,
-            window=78080,
-            gateway_window=78080,
-            fit_window=100864,
-            fit_gateway_window=100864,
-        ),
+        _arm(user, "cur", current=True, window=78080, fit_window=78080),
+        _arm(user, "plain", drafter="", block=0, window=78080, fit_window=100864),
     ]
     rows = [
         _row("cur", d16k=10.0, window=78080),
@@ -228,10 +208,7 @@ def test_a_proposal_writes_the_arms_own_fit_window_not_the_shared_one(tmp_path):
     ]
     choice = quick_decision(user, arms, rows)
     assert choice is not None
-    assert choice.changes == {
-        "model": {"speculative_draft_id": "", "max_context_tokens": 100864},
-        "gateway": {"max_context_tokens": 100864},
-    }
+    assert choice.changes == {"model": {"speculative_draft_id": "", "max_context_tokens": 100864}}
 
 
 M9 = "mlx-community/Qwen3.5-9B-MLX-4bit"
@@ -481,8 +458,8 @@ def test_the_winner_stage_judges_each_extra_arm_against_the_winner(tmp_path):
 
 
 def test_a_full_choice_over_another_model_writes_its_drafter_block_and_fit_window(tmp_path):
-    user = _user(tmp_path, gateway_enabled=True)
-    cur = _arm(user, "27 @3", current=True, fit_window=131072, fit_gateway_window=131072)
+    user = _user(tmp_path)
+    cur = _arm(user, "27 @3", current=True, fit_window=131072)
     nine = _arm(
         user,
         "9 + d @2",
@@ -490,19 +467,20 @@ def test_a_full_choice_over_another_model_writes_its_drafter_block_and_fit_windo
         block=2,
         model=M9,
         window=65536,
-        gateway_window=65536,
         fit_window=65536,
-        fit_gateway_window=65536,
     )
     runs = _runs(cur, [1.0], seconds=100.0) + _runs(nine, [1.0], seconds=50.0)
     choice = full_decision(user, [cur, nine], runs, [], runs_per_task=1)
     assert choice is not None
-    # The worker's window is not written: the arm's fit (65536) is not below
-    # the configured 32768, and a window is only ever lowered. The gateway's
-    # is, from 131072.
+    # The window comes down with the model: the 9B fits 65536 where the
+    # configured 131072 was measured on the 27B.
     assert choice.changes == {
-        "model": {"id": M9, "speculative_draft_id": "z/9d", "speculative_block_size": 2},
-        "gateway": {"max_context_tokens": 65536},
+        "model": {
+            "id": M9,
+            "speculative_draft_id": "z/9d",
+            "speculative_block_size": 2,
+            "max_context_tokens": 65536,
+        }
     }
 
 

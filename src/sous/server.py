@@ -104,12 +104,10 @@ class SousService:
                 "model_id": self.config.model_id,
                 "idle_unload_minutes": self.config.idle_unload_minutes,
                 "port": self.config.server_port,
-                "gateway": {
-                    "enabled": self.config.gateway_enabled,
-                    "local_models": list(self.config.gateway_local_models),
-                    "max_context_tokens": self.config.gateway_max_context_tokens,
-                    "upstream_url": self.config.gateway_upstream_url,
-                },
+                "local_models": list(self.config.local_models),
+                "max_context_tokens": self.config.max_context_tokens,
+                "upstream_url": self.config.upstream_url,
+                "generation_timeout_minutes": self.config.generation_timeout_minutes,
             },
         }
         if recent:
@@ -130,9 +128,7 @@ def create_server(
     inflight = inflight or Inflight()
     svc = SousService(engines, config, inflight)
     # mount_gateway (below) runs after MCPServer(...) is constructed, so the
-    # lifespan closure below needs a late-bound holder for whatever it
-    # mounts — empty when the gateway is disabled, since there is then
-    # nothing for close() to mean.
+    # lifespan closure below needs a late-bound holder for what it mounts.
     mounted_gateway: list[Gateway] = []
 
     @contextlib.asynccontextmanager
@@ -165,13 +161,11 @@ def create_server(
 
     # The daemon's own routes go on before the gateway's: the gateway ends
     # with a catch-all that forwards upstream, and a /sous/ path must never
-    # get there. Mounted whatever the gateway flag says — `sous claude`
-    # asks /sous/status whether the gateway is on.
+    # get there.
     mount_monitor(mcp, engines, lambda: svc.status_document(recent=True), svc.status_version)
-    if config.gateway_enabled:
-        mounted_gateway.append(
-            mount_gateway(mcp, engines, config, upstream=upstream, inflight=inflight)
-        )
+    mounted_gateway.append(
+        mount_gateway(mcp, engines, config, upstream=upstream, inflight=inflight)
+    )
 
     return mcp
 
@@ -306,12 +300,11 @@ def main() -> None:
     stop = threading.Event()
     _install_shutdown_handler(stop)
     mcp = create_server(engines, config)
-    if config.gateway_enabled:
-        _logger.info(
-            f"gateway (experimental) serving {', '.join(config.gateway_local_models)} "
-            f"at http://127.0.0.1:{config.server_port}/v1/messages; "
-            f"everything else is forwarded to {config.gateway_upstream_url}"
-        )
+    _logger.info(
+        f"serving {', '.join(config.local_models)} "
+        f"at http://127.0.0.1:{config.server_port}/v1/messages; "
+        f"everything else is forwarded to {config.upstream_url}"
+    )
     try:
         serve(mcp, "127.0.0.1", config.server_port)
     finally:

@@ -41,7 +41,6 @@ def _arm(tmp_path, **over):
         model_id="org/m",
         speculative_draft_id="",
         max_context_tokens=8192,
-        approval_timeout_minutes=1,
         **over,
     )
     return Arm(
@@ -51,7 +50,6 @@ def _arm(tmp_path, **over):
         drafter_id="",
         block_size=0,
         window=8192,
-        gateway_window=None,
         tier="t",
         current=True,
     )

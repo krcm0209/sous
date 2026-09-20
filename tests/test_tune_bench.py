@@ -40,7 +40,7 @@ def test_build_prompt_overshoots_by_less_than_ten_percent(target):
     assert counted < target * 1.1
 
 
-def _arm(tmp_path, window=131072, gateway_window=None):
+def _arm(tmp_path, window=131072):
     cfg = SousConfig(
         data_dir=tmp_path / "d",
         config_path=tmp_path / "c.toml",
@@ -55,7 +55,6 @@ def _arm(tmp_path, window=131072, gateway_window=None):
         drafter_id="z/draft",
         block_size=3,
         window=window,
-        gateway_window=gateway_window,
         tier="t",
         current=True,
     )
@@ -361,20 +360,6 @@ def test_an_arm_whose_drafter_the_engine_did_not_load_fails_instead_of_mislabell
     )
     assert row.ok is False and "drafter z/draft" in (row.error or "")
     assert engines[0].calls == [] and engines[0].unloaded is True
-
-
-def test_the_long_context_is_measured_when_only_the_gateway_window_holds_it(tmp_path):
-    factory, engines = _fake()
-    row = bench_arm(
-        _arm(tmp_path, window=8192, gateway_window=131072),
-        factory=factory,
-        repeat=1,
-        peak_memory=lambda: 1,
-        reset_peak=lambda: None,
-        active_memory=lambda: 0,
-        out=lambda *a, **k: None,
-    )
-    assert row.ok and row.decode_tps_16k == DECODE_TOKENS / 4.0
 
 
 def test_memory_that_never_comes_back_after_the_unload_stops_the_run(tmp_path, monkeypatch):

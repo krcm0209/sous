@@ -45,15 +45,14 @@ def _app(
     upstream_url: str | None = None,
     upstream: Upstream | None = None,
 ):
-    """`upstream_url` points [gateway].upstream_url at a fake served by _serve
+    """`upstream_url` points [server].upstream_url at a fake served by _serve
     (a loopback http origin the config accepts); tests that forward nothing
     get an in-process fake so no Gateway in this file can ever reach the
     network."""
     cfg = SousConfig(
         data_dir=tmp_path / "data",
         config_path=tmp_path / "config.toml",
-        gateway_enabled=True,
-        gateway_upstream_url=upstream_url or "https://api.anthropic.com",
+        upstream_url=upstream_url or "https://api.anthropic.com",
     )
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
     if upstream_url is None and upstream is None:
@@ -64,9 +63,7 @@ def _app(
 def _gateway_app(tmp_path: Path, engine) -> tuple[Gateway, object]:
     """Like _app, but hands back the Gateway too — create_server drops
     mount_gateway's return value, and reaching gateway._turns needs it."""
-    cfg = SousConfig(
-        data_dir=tmp_path / "data", config_path=tmp_path / "config.toml", gateway_enabled=True
-    )
+    cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
     mcp = MCPServer("test")
     gateway = mount_gateway(mcp, engines, cfg)

@@ -312,12 +312,7 @@ def default_engine_factory(config: SousConfig) -> Callable[[str], Engine]:
         cache_budget=(
             None if config.prompt_cache_gb is None else int(config.prompt_cache_gb * (1 << 30))
         ),
-        # The largest cache one turn can build on this daemon: the
-        # gateway's window when it is on, else the worker's.
-        reserve_tokens=max(
-            config.max_context_tokens,
-            config.gateway_max_context_tokens if config.gateway_enabled else 0,
-        ),
+        reserve_tokens=config.max_context_tokens,
         int8_prefill=config.int8_prefill,
     )
 

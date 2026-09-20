@@ -1,5 +1,5 @@
-"""The daemon's own loopback routes under /sous/: reachable with the gateway
-off, never forwarded with it on, guarded like the gateway's routes."""
+"""The daemon's own loopback routes under /sous/: never forwarded to the
+upstream, guarded like the gateway's own routes."""
 
 import asyncio
 import json
@@ -28,7 +28,6 @@ from tests.fake_upstream import FakeUpstream
 def _app(
     tmp_path: Path,
     *,
-    gateway_enabled: bool = False,
     upstream=None,
     alive=None,
     inflight=None,
@@ -38,7 +37,6 @@ def _app(
     cfg = SousConfig(
         data_dir=tmp_path / "data",
         config_path=tmp_path / "config.toml",
-        gateway_enabled=gateway_enabled,
         **({} if idle_minutes is None else {"idle_unload_minutes": idle_minutes}),
     )
     engines = EngineManager(
@@ -94,11 +92,14 @@ def test_status_is_the_full_status_document(tmp_path: Path):
     assert doc["engine"]["holders"] == 0
     assert "memory_gb" in doc["engine"]
     assert doc["inflight"] == [] and doc["recent_turns"] == []
-    assert doc["config"]["gateway"] == {
-        "enabled": False,
+    assert doc["config"] == {
+        "model_id": "mlx-community/Qwen3.8-27B-4bit",
+        "idle_unload_minutes": 30,
+        "port": 8383,
         "local_models": ["sous-local"],
         "max_context_tokens": 131072,
         "upstream_url": "https://api.anthropic.com",
+        "generation_timeout_minutes": 30,
     }
     assert set(doc) == {"engine", "inflight", "config", "recent_turns"}
 
@@ -187,7 +188,7 @@ def test_routes_are_loopback_guarded(tmp_path: Path):
 
 def test_anything_else_under_sous_is_404_and_never_forwarded(tmp_path: Path):
     fake = FakeUpstream()
-    app, _ = _app(tmp_path, gateway_enabled=True, upstream=fake.upstream())
+    app, _ = _app(tmp_path, upstream=fake.upstream())
     # `/sous` without the slash would full-match the gateway's catch-all
     # and be forwarded with the client's credentials; a method the real
     # routes do not take falls through to the 404 too.
@@ -208,15 +209,6 @@ def test_anything_else_under_sous_is_404_and_never_forwarded(tmp_path: Path):
     # The gateway's own catch-all still forwards what is not ours.
     assert _request(app, "GET", "/api/hello").status_code == 200
     assert [s["path"] for s in fake.requests] == ["/api/hello"]
-
-
-def test_routes_are_up_with_the_gateway_off(tmp_path: Path):
-    app, _ = _app(tmp_path, gateway_enabled=False)
-    assert _request(app, "GET", "/sous/status").status_code == 200
-    assert _request(app, "POST", "/sous/hold", _hold_body()).status_code == 200
-    assert _request(app, "GET", "/sous/nope").status_code == 404
-    assert _request(app, "GET", "/sous").status_code == 404
-    assert _request(app, "GET", "/api/hello").status_code == 404  # no gateway, no forwarding
 
 
 def test_a_failing_status_or_hold_is_an_error_body_not_a_bare_500(
@@ -259,9 +251,7 @@ def test_status_carries_the_recent_ring_the_gateway_writes(tmp_path: Path):
     routes: a turn the gateway served shows up in /sous/status."""
     from tests.fake_engine import FakeEngine as _Fake
 
-    cfg = SousConfig(
-        data_dir=tmp_path / "data", config_path=tmp_path / "config.toml", gateway_enabled=True
-    )
+    cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: _Fake(["reply"]))
     app = create_server(engines, cfg, upstream=FakeUpstream().upstream()).streamable_http_app()
     body = {
@@ -727,14 +717,18 @@ def test_a_non_finite_number_ends_the_stream_as_status_refuses_it(
 
 
 def test_mounting_the_monitor_pins_sse_starlette_above_debug(tmp_path: Path, monkeypatch):
-    """/sous/events is mounted whether or not the gateway is, and sse-starlette
-    logs every frame it sends at DEBUG — the pin must not depend on the
-    gateway's own copy of it, which only runs when the gateway is mounted."""
+    """sse-starlette logs every frame it sends at DEBUG and /sous/events sends
+    one per change — the monitor pins the logger on its own mount rather than
+    leaning on the gateway's copy of the pin."""
     import logging
+
+    from mcp.server import MCPServer
 
     logger = logging.getLogger("sse_starlette")
     monkeypatch.setattr(logger, "level", logging.NOTSET)
-    _app(tmp_path, gateway_enabled=False)
+    cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
+    engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
+    monitor.mount_monitor(MCPServer("sous"), engines, lambda: {}, lambda: 0)
     assert logger.level == logging.INFO
 
 

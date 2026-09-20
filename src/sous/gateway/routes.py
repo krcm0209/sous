@@ -3,7 +3,7 @@
 Never logs a request body or a header value. Never executes a tool: tool_use
 blocks go back to Claude Code, whose permission system runs them (toolexec.py
 is not in this path). Requests for any other model — and every path it has no
-route for — are forwarded to [gateway].upstream_url by gateway/upstream.py,
+route for — are forwarded to [server].upstream_url by gateway/upstream.py,
 byte for byte.
 """
 
@@ -455,7 +455,7 @@ class Gateway:
         # the module constant before building the app.
         self._pending = threading.BoundedSemaphore(MAX_PENDING_TURNS)
         self._pending_counts = threading.BoundedSemaphore(MAX_PENDING_COUNTS)
-        self._upstream = upstream or Upstream(config.gateway_upstream_url)
+        self._upstream = upstream or Upstream(config.upstream_url)
         # The event loop holds its tasks weakly; these log a turn whose client
         # left mid-stream (_stream), and must outlive the request that made them.
         self._drains: set[asyncio.Task] = set()
@@ -512,7 +512,7 @@ class Gateway:
             return None, "-"
         # Exact first, then suffix-stripped: a configured id may itself end in
         # brackets, and stripping alone would make it permanently unroutable.
-        local = self._config.gateway_local_models
+        local = self._config.local_models
         if model in local or _MODEL_SUFFIX_RE.sub("", model, count=1) in local:
             return body, model
         return None, _log_token(model, _LOG_ID_CHARS)

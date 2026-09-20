@@ -167,9 +167,9 @@ def _daemon_status(port: int, data_dir: Path) -> dict | None:
 
     The config FILE is not the truth: the daemon loads it once at startup and
     holds that snapshot for its whole life, so an edit since then — a changed
-    `local_models`, a wider `max_context_tokens`, `enabled` flipped — is a
-    setting the running gateway does not have. /sous/status is where the
-    daemon reports the gateway config it is actually serving.
+    `local_models`, a wider `max_context_tokens` — is a setting the running
+    daemon does not have. /sous/status is where it reports the configuration
+    it is actually serving.
     """
     import httpx
 
@@ -261,17 +261,8 @@ def _cmd_claude(user_args: list[str]) -> None:
                 file=sys.stderr,
             )
         raise SystemExit(1)
-    gateway = status.get("config", {}).get("gateway", {})
-    if not gateway.get("enabled"):
-        print(
-            f"sous claude: the running daemon has the gateway off (config edited without a "
-            f"restart?); set [gateway].enabled = true in {config.config_path} and restart "
-            "the daemon",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
-    local_models = gateway.get("local_models")
-    max_context_tokens = gateway.get("max_context_tokens")
+    local_models = status.get("config", {}).get("local_models")
+    max_context_tokens = status.get("config", {}).get("max_context_tokens")
     if (
         not isinstance(local_models, list)
         or not local_models
@@ -290,8 +281,8 @@ def _cmd_claude(user_args: list[str]) -> None:
     drifted = [
         key
         for key, running, on_disk in (
-            ("local_models", list(local_models), list(config.gateway_local_models)),
-            ("max_context_tokens", max_context_tokens, config.gateway_max_context_tokens),
+            ("local_models", list(local_models), list(config.local_models)),
+            ("max_context_tokens", max_context_tokens, config.max_context_tokens),
         )
         if running != on_disk
     ]
@@ -349,10 +340,8 @@ def launchd_plist(sous_executable: str, log_dir: Path) -> str:
     # plistlib handles XML escaping — a path containing & or < must still
     # produce a plist launchctl can parse (string formatting silently
     # produced invalid XML while install-launchd reported success).
-    # No EnvironmentVariables.PATH here on purpose: the daemon adopts the
-    # user's login-shell PATH itself at startup (server._login_shell_path),
-    # which works identically however it was launched — an install-time
-    # snapshot in the plist would just be a second, staler mechanism.
+    # No EnvironmentVariables.PATH here on purpose: the daemon runs no
+    # commands of its own, so launchd's bare system PATH is all it needs.
     return plistlib.dumps(
         {
             "Label": LABEL,

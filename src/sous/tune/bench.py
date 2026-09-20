@@ -372,7 +372,7 @@ def _measure(
         decode_16k: list[float] = []
         # The 16K decode is what the decision ranks on, so it gets every
         # repeat too; the one 16K prefill is the prefix it continues from.
-        if long_tokens + DECODE_TOKENS + _LONG_HEADROOM <= arm.serving_window:
+        if long_tokens + DECODE_TOKENS + _LONG_HEADROOM <= arm.window:
             result = turn.run(long, 1)
             prefill_16k = _prefill_rate(result.gauges, long_tokens, result.first_delta_seconds)
             warm = _continue(long, result.text)

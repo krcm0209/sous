@@ -40,10 +40,9 @@ XML_CALL = (
 
 
 def _app(tmp_path: Path, engine, upstream=None, **overrides):
-    """The daemon's app with the gateway on. Every forward goes to `upstream`
+    """The daemon's app. Every forward goes to `upstream`
     (a FakeUpstream's .upstream()) — never to the network; a fresh, unobserved
     fake when the test does not care what was forwarded."""
-    overrides.setdefault("gateway_enabled", True)
     cfg = SousConfig(
         data_dir=tmp_path / "data",
         config_path=tmp_path / "config.toml",
@@ -57,7 +56,6 @@ def _app(tmp_path: Path, engine, upstream=None, **overrides):
 def _gateway_app(tmp_path: Path, engine, upstream=None, **overrides) -> tuple[Gateway, object]:
     """Like _app, but hands back the Gateway too — create_server drops
     mount_gateway's return value, and Gateway.close() tests need it."""
-    overrides.setdefault("gateway_enabled", True)
     cfg = SousConfig(
         data_dir=tmp_path / "data",
         config_path=tmp_path / "config.toml",
@@ -154,15 +152,8 @@ def test_hello_is_forwarded_upstream(tmp_path: Path):
     ]
 
 
-def test_routes_are_absent_when_the_gateway_is_disabled(tmp_path: Path):
-    app = _app(tmp_path, FakeEngine([]), gateway_enabled=False)
-    assert _request(app, "HEAD", "/api/hello").status_code == 404
-    assert _post(app, _body()).status_code == 404
-    assert _request(app, "GET", "/sous/status").status_code == 200  # the daemon's own routes stay
-
-
 def test_a_non_local_model_is_forwarded_byte_for_byte(tmp_path: Path):
-    """The routing predicate: anything not in [gateway].local_models is the
+    """The routing predicate: anything not in [server].local_models is the
     upstream's request. The body goes up exactly as received (whitespace and
     all — the gateway must never re-serialize what it forwards) and the
     credential travels with it."""
@@ -189,7 +180,7 @@ def test_a_non_local_model_is_forwarded_byte_for_byte(tmp_path: Path):
 
 
 def test_configured_local_models_are_all_served(tmp_path: Path):
-    app = _app(tmp_path, FakeEngine(["ok"]), gateway_local_models=("sous-local", "sous-fast"))
+    app = _app(tmp_path, FakeEngine(["ok"]), local_models=("sous-local", "sous-fast"))
     assert _post(app, _body(model="sous-fast")).status_code == 200
 
 
@@ -1474,7 +1465,7 @@ def test_a_configured_id_that_itself_ends_in_brackets_matches_exactly(tmp_path: 
         tmp_path,
         FakeEngine(["ok", "ok"]),
         upstream=fake.upstream(),
-        gateway_local_models=("sous-local", "model[prod]"),
+        local_models=("sous-local", "model[prod]"),
     )
     for served in ("model[prod]", "model[prod][1m]"):
         r = _post(app, _body(model=served))

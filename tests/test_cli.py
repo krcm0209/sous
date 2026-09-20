@@ -33,10 +33,8 @@ def test_plist_is_valid_and_correct():
 
 
 def test_plist_sets_no_environment_variables():
-    """PATH is deliberately NOT baked into the plist: the daemon adopts the
-    user's login-shell PATH at startup (server._login_shell_path), which stays
-    current and works however the daemon was launched. An install-time PATH
-    snapshot here would be a second, staler mechanism that shadows it."""
+    """PATH is deliberately NOT baked into the plist: the daemon runs no
+    commands of its own, so launchd's bare system PATH is all it needs."""
     xml = launchd_plist("/Users/x/.local/bin/sous", Path("/Users/x/.sous"))
     data = plistlib.loads(xml.encode())
     assert "EnvironmentVariables" not in data
@@ -639,10 +637,11 @@ def test_install_launchd_exits_nonzero_when_bootstrap_fails(tmp_path, capsys, mo
 _DEFAULT_STATUS = object()
 
 
-def _status(**gateway) -> dict:
+def _status(**config) -> dict:
     """The keys of `GET /sous/status` — `SousService.status_document()`,
-    less the recent turns and tasks — of which the launcher reads
-    `config.gateway` for its checks and `engine.model_id` for its one line."""
+    less the recent turns — of which the launcher reads `config.local_models`
+    and `config.max_context_tokens` for its checks and `engine.model_id` for
+    its one line."""
     return {
         "engine": {
             "model_id": "mlx-community/Qwen3.8-27B-4bit",
@@ -651,35 +650,31 @@ def _status(**gateway) -> dict:
             "holders": 0,
         },
         "config": {
-            "gateway": {
-                "enabled": True,
-                "local_models": ["sous-local"],
-                "max_context_tokens": 131072,
-                "upstream_url": "https://api.anthropic.com",
-                **gateway,
-            }
+            "model_id": "org/m",
+            "idle_unload_minutes": 30,
+            "port": 8383,
+            "local_models": ["sous-local"],
+            "max_context_tokens": 131072,
+            "upstream_url": "https://api.anthropic.com",
+            "generation_timeout_minutes": 30,
+            **config,
         },
     }
 
 
 def _claude_setup(tmp_path, monkeypatch, *, status=_DEFAULT_STATUS, **overrides):
-    """A gateway-enabled config file, a `claude` on PATH, a daemon that answers
-    `GET /sous/status`, and an execve that records instead of replacing the
+    """A config file, a `claude` on PATH, a daemon that answers `GET
+    /sous/status`, and an execve that records instead of replacing the
     process."""
     import os
 
     from sous import cli
     from sous.config import SousConfig
 
-    # Popped rather than passed alongside **overrides: a test overriding
-    # gateway_enabled would otherwise collide with a literal keyword of the
-    # same name below and raise "got multiple values for keyword argument".
-    gateway_enabled = overrides.pop("gateway_enabled", True)
     cfg = SousConfig(
         server_port=8383,
         data_dir=tmp_path,
         config_path=tmp_path / "c.toml",
-        gateway_enabled=gateway_enabled,
         **overrides,
     )
     monkeypatch.setattr(cli, "load_config", lambda: cfg)
@@ -841,20 +836,6 @@ def test_claude_warns_about_an_inherited_tier_variable_but_still_launches(
     assert calls[0][2]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "sous-local"
 
 
-def test_claude_refuses_when_the_running_daemon_has_the_gateway_off(tmp_path, capsys, monkeypatch):
-    """The file says enabled; the daemon says off. The daemon's startup
-    snapshot is the truth — a file edited since it started changes nothing
-    until it restarts."""
-    from sous import cli
-
-    _, calls, _ = _claude_setup(tmp_path, monkeypatch, status=_status(enabled=False))
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["claude"])
-    assert exc.value.code == 1 and calls == []
-    err = capsys.readouterr().err
-    assert "[gateway]" in err and "restart" in err
-
-
 def test_claude_refuses_when_no_daemon_answers(tmp_path, capsys, monkeypatch):
     from sous import cli
 
@@ -879,8 +860,8 @@ def test_claude_uses_the_daemons_values_and_says_so_when_the_file_disagrees(
         tmp_path,
         monkeypatch,
         status=_status(local_models=["sous-fast"], max_context_tokens=131072),
-        gateway_local_models=("sous-local",),
-        gateway_max_context_tokens=65536,
+        local_models=("sous-local",),
+        max_context_tokens=65536,
     )
     cli.main(["claude"])
     [(_exe, _argv, env)] = calls
@@ -1185,7 +1166,7 @@ def test_claude_launches_even_when_the_hold_is_refused(tmp_path, capsys, monkeyp
 def test_claude_does_not_hold_when_a_check_fails(tmp_path, capsys, monkeypatch):
     from sous import cli
 
-    _, calls, holds = _claude_setup(tmp_path, monkeypatch, status=_status(enabled=False))
+    _, calls, holds = _claude_setup(tmp_path, monkeypatch, status=_status(local_models=[]))
     with pytest.raises(SystemExit):
         cli.main(["claude"])
     assert holds == [] and calls == []
@@ -1208,7 +1189,7 @@ def test_claude_does_not_hold_for_an_invocation_that_exits_at_once(
 
 
 @pytest.mark.slow
-def test_daemon_status_reads_the_real_daemons_gateway_config(tmp_path):
+def test_daemon_status_reads_the_real_daemons_config(tmp_path):
     """The launcher's one source of truth, against the real server: a plain
     GET /sous/status on the daemon's port, and None when nothing is
     listening."""
@@ -1238,20 +1219,21 @@ def test_daemon_status_reads_the_real_daemons_gateway_config(tmp_path):
             server.should_exit = True
             thread.join(20)
 
-    cfg = SousConfig(
-        data_dir=tmp_path / "data", config_path=tmp_path / "c.toml", gateway_enabled=True
-    )
+    cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "c.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
     app = create_server(engines, cfg).streamable_http_app()
     port = _free_cli_port()
     with serve(app, port):
         status = _daemon_status(port, tmp_path)
     assert status is not None
-    assert status["config"]["gateway"] == {
-        "enabled": True,
+    assert status["config"] == {
+        "model_id": "mlx-community/Qwen3.8-27B-4bit",
+        "idle_unload_minutes": 30,
+        "port": 8383,
         "local_models": ["sous-local"],
         "max_context_tokens": 131072,
         "upstream_url": "https://api.anthropic.com",
+        "generation_timeout_minutes": 30,
     }
     # Nothing listening on that port any more.
     assert _daemon_status(port, tmp_path) is None
@@ -1272,13 +1254,13 @@ def test_claude_skips_the_hold_for_an_exit_at_once_flag_anywhere_before_a_double
     assert holds == [8383] and len(calls) == 2
 
 
-def test_claude_refuses_a_status_document_without_the_gateway_values(tmp_path, capsys, monkeypatch):
+def test_claude_refuses_a_status_document_without_the_served_values(tmp_path, capsys, monkeypatch):
     """A 200 that is an object but not the document: a KeyError traceback
     would name nothing the user can act on."""
     from sous import cli
 
     status = _status()
-    del status["config"]["gateway"]["local_models"]
+    del status["config"]["local_models"]
     _, calls, holds = _claude_setup(tmp_path, monkeypatch, status=status)
     with pytest.raises(SystemExit) as exc:
         cli.main(["claude"])

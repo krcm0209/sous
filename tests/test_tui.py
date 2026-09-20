@@ -57,7 +57,7 @@ def _doc(
         "config": {
             "model_id": "mlx-community/Qwen3.8-27B-4bit",
             "idle_unload_minutes": 30,
-            "gateway": {"enabled": True, "max_context_tokens": 262144},
+            "max_context_tokens": 262144,
         },
         "recent_turns": recent or [],
     }

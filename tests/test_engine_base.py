@@ -1373,8 +1373,7 @@ def test_status_leaves_out_the_per_turn_gauges(tmp_path):
 
 
 def test_default_factory_threads_the_cache_budget_and_reserve(monkeypatch):
-    """The reserve is one full window of KV at the model's per-token cost, for
-    the larger of the worker's and the gateway's windows."""
+    """The reserve is one full window of KV at the model's per-token cost."""
     from sous.engine import base, lm
 
     seen = {}
@@ -1472,7 +1471,7 @@ def _fake_mlx(monkeypatch, *, info) -> None:
     monkeypatch.setitem(sys.modules, "mlx.core", core)
 
 
-def test_engine_manager_passes_the_configured_budget_and_the_larger_window(tmp_path, monkeypatch):
+def test_engine_manager_passes_the_configured_budget_and_window(tmp_path, monkeypatch):
     from sous.engine import base
 
     seen = {}
@@ -1482,20 +1481,14 @@ def test_engine_manager_passes_the_configured_budget_and_the_larger_window(tmp_p
         return FakeEngine([])
 
     monkeypatch.setattr(base, "_default_factory", factory)
-    cfg = _cfg(
-        tmp_path,
-        prompt_cache_gb=1.5,
-        max_context_tokens=32768,
-        gateway_enabled=True,
-        gateway_max_context_tokens=131072,
-    )
+    cfg = _cfg(tmp_path, prompt_cache_gb=1.5, max_context_tokens=131072)
     EngineManager(cfg).get()
     assert seen["cache_budget"] == int(1.5 * (1 << 30))
     assert seen["reserve_tokens"] == 131072
     seen.clear()
-    EngineManager(_cfg(tmp_path, gateway_enabled=False, max_context_tokens=32768)).get()
+    EngineManager(_cfg(tmp_path, max_context_tokens=65536)).get()
     assert seen["cache_budget"] is None  # auto
-    assert seen["reserve_tokens"] == 32768
+    assert seen["reserve_tokens"] == 65536
 
 
 def test_kernel_memory_pressure_reads_the_kernels_level_or_none():
@@ -1768,9 +1761,7 @@ def test_default_engine_factory_maps_every_model_value_onto_the_backend(monkeypa
         speculative_draft_id="z/d",
         speculative_block_size=2,
         prompt_cache_gb=1.5,
-        max_context_tokens=4096,
-        gateway_enabled=True,
-        gateway_max_context_tokens=65536,
+        max_context_tokens=65536,
         int8_prefill=True,
     )
     base.default_engine_factory(cfg)("org/m")

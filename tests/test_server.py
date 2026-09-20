@@ -285,16 +285,18 @@ def test_status_document_releases_mlx_thread_state_when_the_build_fails(svc, mon
     assert released
 
 
-def test_server_status_reports_gateway_config(svc):
-    """The gateway is off by default and experimental; the status document is
-    how a user confirms which model ids the daemon would serve locally."""
+def test_server_status_reports_the_served_config(svc):
+    """The status document is how a user confirms which model ids the daemon
+    would serve locally, and at what window."""
     service, _ = svc
-    gw = service.status_document(recent=False)["config"]["gateway"]
-    assert gw == {
-        "enabled": False,
+    assert service.status_document(recent=False)["config"] == {
+        "model_id": "mlx-community/Qwen3.8-27B-4bit",
+        "idle_unload_minutes": 30,
+        "port": 8383,
         "local_models": ["sous-local"],
         "max_context_tokens": 131072,
         "upstream_url": "https://api.anthropic.com",
+        "generation_timeout_minutes": 30,
     }
 
 
@@ -351,6 +353,14 @@ def test_the_status_document_carries_no_task_fields(svc):
     service, _root = svc
     doc = service.status_document(recent=True)
     assert set(doc) == {"engine", "inflight", "config", "recent_turns"}
-    assert set(doc["config"]) == {"model_id", "idle_unload_minutes", "port", "gateway"}
+    assert set(doc["config"]) == {
+        "model_id",
+        "idle_unload_minutes",
+        "port",
+        "local_models",
+        "max_context_tokens",
+        "upstream_url",
+        "generation_timeout_minutes",
+    }
     assert set(service.status_document(recent=False)) == {"engine", "inflight", "config"}
     assert len(service.status_version()) == 3

@@ -32,7 +32,6 @@ def test_bench_arm_measures_the_tiny_model_and_releases_it(tmp_path):
         drafter_id="",
         block_size=0,
         window=8192,
-        gateway_window=None,
         tier="test",
         current=True,
     )
@@ -63,7 +62,6 @@ def test_the_smallest_suite_task_runs_through_the_runner_on_the_tiny_model(tmp_p
         drafter_id="",
         block_size=0,
         window=8192,
-        gateway_window=None,
         tier="test",
         current=True,
     )
