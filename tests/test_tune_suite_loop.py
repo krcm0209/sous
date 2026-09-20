@@ -1,8 +1,9 @@
 import json
 from pathlib import Path
 
+import sous.tune.suite.loop as loop_module
 from sous.config import SousConfig
-from sous.engine.base import EngineManager
+from sous.engine.base import EngineManager, GenerationStalled
 from sous.tune.suite.loop import Budget, Transcript, run_loop
 from sous.tune.suite.tools import ScratchTools
 from tests.fake_engine import FakeEngine
@@ -10,6 +11,8 @@ from tests.fake_engine import FakeEngine
 CALL = '<tool_call>{{"name": "{name}", "arguments": {args}}}</tool_call>'
 FINISH = CALL.format(name="finish", args='{"summary": "done", "concerns": ""}')
 WRITE = CALL.format(name="write_file", args='{"path": "hello.txt", "content": "hi"}')
+LIST_DIR = CALL.format(name="list_dir", args="{}")
+BAD = "<tool_call>{not json}</tool_call>"
 WINDOW = 8192
 ELIDED = "<tool_result>[elided: re-read the file if needed]</tool_result>"
 
@@ -73,6 +76,14 @@ def test_three_malformed_turns_fail_the_task_and_are_counted(tmp_path: Path):
     assert sum(e["event"] == "malformed" for e in events) == 3
 
 
+def test_a_good_call_between_malformed_ones_resets_the_count(tmp_path: Path):
+    """Three strikes are consecutive, not cumulative: a small model that
+    fumbles a call now and then still finishes its task."""
+    result, events, _ = _run(tmp_path, [BAD, LIST_DIR, BAD, BAD, FINISH])
+    assert result.outcome == "completed"
+    assert sum(e["event"] == "malformed" for e in events) == 3
+
+
 def test_three_turns_without_a_tool_call_fail_the_task(tmp_path: Path):
     result, _, _ = _run(tmp_path, ["thinking...", "still thinking", "hmm"])
     assert result.outcome == "failed"
@@ -96,6 +107,66 @@ def test_finish_without_a_summary_is_a_tool_error_and_the_loop_goes_on(tmp_path:
         "arguments": {"summary": ""},
         "result": "error: finish requires a non-empty summary",
     }
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _StallingEngine(FakeEngine):
+    """Stalls on its first generation, moving the loop's clock to `at` first:
+    a real stall is what the wall clock does while nothing comes back."""
+
+    def __init__(self, clock: _Clock, at: float):
+        super().__init__([])
+        self.clock, self.at = clock, at
+
+    def generate(self, messages, tools, max_tokens, on_delta=None):
+        self.clock.now = self.at
+        raise GenerationStalled("generation stalled")
+
+
+def test_a_stall_past_the_deadline_is_budget_exhausted_not_failed(tmp_path: Path, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(loop_module.time, "monotonic", clock)
+    engine = _StallingEngine(clock, at=61.0)
+    result, events, _ = _run(tmp_path, [], Budget(turns=8, minutes=1), engine=engine)
+    assert result.outcome == "budget-exhausted"
+    assert result.error is None
+    assert {"event": "budget-exhausted", "error": "generation stalled"} in events
+
+
+def test_a_stall_with_budget_left_is_a_failure(tmp_path: Path, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(loop_module.time, "monotonic", clock)
+    engine = _StallingEngine(clock, at=1.0)
+    result, events, _ = _run(tmp_path, [], Budget(turns=8, minutes=1), engine=engine)
+    assert result.outcome == "failed"
+    assert result.error == "generation stalled"
+    assert {"event": "stalled", "error": "generation stalled"} in events
+
+
+class _ExactWindowEngine(FakeEngine):
+    """The prompt lands exactly on the window: nothing to elide, and no room
+    left to generate a single token."""
+
+    def count_tokens(self, messages: list[dict], tools: list[dict]) -> int:
+        return WINDOW
+
+
+def test_a_prompt_that_fills_the_window_exactly_has_no_room_to_generate(tmp_path: Path):
+    script: list[str] = [WRITE, FINISH]
+    result, events, _ = _run(tmp_path, script, engine=_ExactWindowEngine(script))
+    assert result.outcome == "failed"
+    assert result.turns == 0
+    assert result.error == (
+        f"context overflow: prompt fills the {WINDOW}-token window; no room to generate"
+    )
+    assert events[0] == {"event": "context_overflow", "error": result.error}
 
 
 class _ElidingEngine(FakeEngine):
@@ -124,6 +195,7 @@ def test_old_tool_results_are_elided_so_a_long_task_keeps_going(tmp_path: Path):
     assert result.error is None
     assert result.elisions >= 1
     assert not any(e["event"] == "context_overflow" for e in events)
+    assert any(e["event"] == "elided" and e["count"] >= 1 for e in events)
     results_sent = [m for m in engine.calls[-1] if m["content"].startswith("<tool_result")]
     assert results_sent and all(m["content"] == ELIDED for m in results_sent)
 

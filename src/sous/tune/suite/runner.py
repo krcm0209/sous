@@ -41,7 +41,7 @@ from sous.tune.bench import (
 )
 from sous.tune.suite import SuiteTask
 from sous.tune.suite.grading import grade_task
-from sous.tune.suite.loop import Budget, Transcript, run_loop
+from sous.tune.suite.loop import EVENT_MALFORMED, EVENT_TOOL, Budget, Transcript, run_loop
 from sous.tune.suite.tools import ScratchTools
 
 # The ETA's picture of one run — the turns a task takes and what each turn
@@ -175,9 +175,9 @@ def metrics_from_transcript(path: Path) -> tuple[int, int]:
         except ValueError:
             continue
         kind = event.get("event") if isinstance(event, dict) else None
-        if kind == "malformed":
+        if kind == EVENT_MALFORMED:
             malformed += 1
-        elif kind == "tool":
+        elif kind == EVENT_TOOL:
             call = (event.get("name"), json.dumps(event.get("arguments"), sort_keys=True))
             streak = streak + 1 if call == last else 1
             last = call

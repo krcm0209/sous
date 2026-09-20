@@ -23,6 +23,15 @@ def test_paths_resolve_under_the_root_and_escapes_are_refused(tmp_path: Path):
     assert not (tmp_path / "outside.txt").exists()
 
 
+def test_glob_and_grep_never_reach_past_the_root(tmp_path: Path):
+    (tmp_path / "secret.txt").write_text("TOKEN=hunter2\n")
+    t = _tools(tmp_path)
+    t.write_file("a.py", "TOKEN = None\n")
+    assert "secret" not in t.glob("../*")
+    assert t.grep("TOKEN", "../*") == "(no matches)"
+    assert t.grep("TOKEN") == "a.py:1:TOKEN = None"
+
+
 def test_edit_requires_exactly_one_match(tmp_path: Path):
     t = _tools(tmp_path)
     t.write_file("a.py", "a\nb\na\n")
@@ -51,6 +60,39 @@ def test_only_verify_commands_and_the_test_runners_run(tmp_path: Path):
     assert t.run_command("pytest --version").startswith("exit code 0")
     assert t.run_command("") == "command rejected: empty"
     assert t.run_command("echo 'unterminated").startswith("command rejected: unparseable")
+
+
+def test_a_blank_verify_command_accepts_nothing(tmp_path: Path):
+    t = _tools(tmp_path, verify_commands=(" ",))
+    assert t.run_command("rm -rf .") == "command denied (not allowlisted): rm -rf ."
+    assert t.denied == 1
+
+
+def test_the_cd_idiom_runs_its_command_from_the_root(tmp_path: Path):
+    """Local models write `cd <project> && <cmd>` whatever the prompt says;
+    the cd is dropped, never a cwd, and anything past one command is refused."""
+    verify = f"{sys.executable} -c 'print(7)'"
+    t = _tools(tmp_path, verify_commands=(verify,))
+    t.write_file("pkg/__init__.py", "")
+    assert t.run_command(f"cd {t.root} && {verify}") == "exit code 0\n7\n"
+    assert t.run_command(f"cd pkg && {verify}") == "exit code 0\n7\n"
+    guidance = "command rejected: run a single command from the project root"
+    assert t.run_command("cd").startswith(guidance)
+    assert t.run_command(f"cd {t.root} && {verify} && echo x").startswith(guidance)
+    assert t.run_command(f"cd .. && {verify}") == (
+        "command rejected: cd target .. is outside the project"
+    )
+    assert t.run_command(f"cd missing && {verify}") == (
+        "command rejected: cd target missing is not a directory in the project"
+    )
+    assert t.run_command(f"cd {t.root} && rm -rf .").startswith("command denied")
+    assert t.denied == 1
+
+
+def test_a_command_that_reads_stdin_gets_eof(tmp_path: Path):
+    reader = f"{sys.executable} -c 'import sys; print(len(sys.stdin.read()))'"
+    t = _tools(tmp_path, verify_commands=(reader,))
+    assert t.run_command(reader) == "exit code 0\n0\n"
 
 
 def test_a_command_past_its_timeout_is_reported_not_raised(tmp_path: Path):

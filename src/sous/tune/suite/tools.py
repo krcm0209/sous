@@ -9,14 +9,18 @@ this set, which is narrower than the 0.6 allowlist."""
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import subprocess
+import tempfile
 from pathlib import Path
 
 MAX_TOOL_OUTPUT = 16_000
 MAX_GREP_HITS = 200
 MAX_GLOB_HITS = 500
+# One command's wall-clock bound, unless the task's own deadline is nearer.
+COMMAND_TIMEOUT = 120.0
 # What a task may run besides its own verify commands: the runners the suite's
 # tasks are written for, matched as argv prefixes.
 ACCEPTED_RUNNERS = (
@@ -27,6 +31,8 @@ ACCEPTED_RUNNERS = (
     "pytest",
 )
 _CAP_HALF = MAX_TOOL_OUTPUT // 2
+_SHELL_OPERATORS = ("&&", "||", ";", "|", "<", ">")
+CD_GUIDANCE = "run a single command from the project root, without cd, &&, pipes or redirection"
 
 
 class ToolError(Exception):
@@ -39,35 +45,39 @@ def _truncate(text: str) -> str:
     return text
 
 
-def _capped_command_output(text: str) -> str:
-    # Command output keeps the head and tail: a verify command's verdict
-    # ("3 failed", traceback, summary) is at the end, which head-only
-    # truncation would hide. Keep both halves with an elision marker.
-    if len(text) <= MAX_TOOL_OUTPUT:
-        return text
-    head = text[:_CAP_HALF]
-    tail = text[-_CAP_HALF:]
-    elided = len(text) - 2 * _CAP_HALF
-    return f"{head}\n[... {elided} characters elided ...]\n{tail}"
+def _spooled(f) -> str:
+    """A command's spooled output, read back under the cap: all of a short
+    one, the head and tail of a long one with the elided count between. Tail
+    as well as head because a verify command's verdict ("3 failed", the
+    traceback, the summary) is at the end, which head-only truncation would
+    hide."""
+    size = f.seek(0, os.SEEK_END)
+    f.seek(0)
+    if size <= MAX_TOOL_OUTPUT:
+        return f.read().decode(errors="replace")
+    head = f.read(_CAP_HALF).decode(errors="replace")
+    f.seek(size - _CAP_HALF)
+    tail = f.read().decode(errors="replace")
+    return f"{head}\n[... {size - 2 * _CAP_HALF} characters elided ...]\n{tail}"
 
 
 class ScratchTools:
-    def __init__(
-        self,
-        root: Path,
-        verify_commands: tuple[str, ...] = (),
-        *,
-        command_timeout: float = 120.0,
-    ):
+    def __init__(self, root: Path, verify_commands: tuple[str, ...] = ()):
         self.root = root.resolve()
         self.denied = 0
-        self._accepted = [shlex.split(c) for c in (*verify_commands, *ACCEPTED_RUNNERS)]
-        self._command_timeout = command_timeout
+        # A blank entry would split to an empty prefix, and an empty prefix
+        # matches every command.
+        self._accepted = [
+            argv for argv in (shlex.split(c) for c in (*verify_commands, *ACCEPTED_RUNNERS)) if argv
+        ]
+
+    def _inside(self, resolved: Path) -> bool:
+        return resolved.is_relative_to(self.root)
 
     def _confined(self, path: str) -> Path:
         raw = Path(path)
         candidate = (raw if raw.is_absolute() else self.root / raw).resolve()
-        if candidate != self.root and not candidate.is_relative_to(self.root):
+        if not self._inside(candidate):
             raise ToolError(f"path escapes the project: {path}")
         return candidate
 
@@ -114,7 +124,7 @@ class ScratchTools:
         hits = sorted(
             str(p.relative_to(self.root))
             for p in self.root.glob(pattern)
-            if ".git" not in p.parts and p.resolve().is_relative_to(self.root)
+            if ".git" not in p.parts and self._inside(p.resolve())
         )
         return _truncate("\n".join(hits[:MAX_GLOB_HITS]) or "(no matches)")
 
@@ -122,7 +132,7 @@ class ScratchTools:
         rx = re.compile(pattern)
         out: list[str] = []
         for p in sorted(self.root.glob(glob_pattern)):
-            if not p.is_file() or ".git" in p.parts or not p.resolve().is_relative_to(self.root):
+            if not p.is_file() or ".git" in p.parts or not self._inside(p.resolve()):
                 continue
             try:
                 for i, line in enumerate(p.read_text(errors="replace").splitlines(), 1):
@@ -134,30 +144,63 @@ class ScratchTools:
                 continue
         return _truncate("\n".join(out) or "(no matches)")
 
+    def _strip_cd(self, argv: list[str]) -> list[str]:
+        """`cd <dir> && <command>` down to `<command>`: every command already
+        runs at the project root, and local models emit the idiom whatever the
+        prompt says. `<dir>` must be a directory inside the project (a failed
+        cd short-circuits the && in a real shell), the remainder one command
+        with no further shell operator, and cwd is never taken from it."""
+        if not argv or argv[0] != "cd":
+            return argv
+        if len(argv) < 4 or argv[2] != "&&":
+            raise ToolError(f"command rejected: {CD_GUIDANCE}")
+        rest = argv[3:]
+        if any(op in token for token in rest for op in _SHELL_OPERATORS):
+            raise ToolError(f"command rejected: {CD_GUIDANCE}")
+        try:
+            target = self._confined(argv[1])
+        except ToolError:
+            raise ToolError(
+                f"command rejected: cd target {argv[1]} is outside the project"
+            ) from None
+        if not target.is_dir():
+            raise ToolError(
+                f"command rejected: cd target {argv[1]} is not a directory in the project"
+            )
+        return rest
+
     def run_command(self, command: str, timeout: float | None = None) -> str:
         try:
-            argv = shlex.split(command)
+            argv = self._strip_cd(shlex.split(command))
         except ValueError as e:
             return f"command rejected: unparseable ({e})"
+        except ToolError as e:
+            return str(e)
         if not argv:
             return "command rejected: empty"
         if not any(argv[: len(prefix)] == prefix for prefix in self._accepted):
             self.denied += 1
             return f"command denied (not allowlisted): {command}"
-        budget = self._command_timeout if timeout is None else timeout
-        try:
-            proc = subprocess.run(
-                argv,
-                cwd=self.root,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=budget,
-                check=False,
-            )
-        except FileNotFoundError:
-            return f"command not found: {argv[0]}"
-        except subprocess.TimeoutExpired:
-            return f"command timed out after {budget}s: {command}"
-        body = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
-        return _capped_command_output(f"exit code {proc.returncode}\n{body}")
+        budget = COMMAND_TIMEOUT if timeout is None else timeout
+        # Spooled to one unlinked temp file, not pipes: capture_output would
+        # hold a runaway test's whole output in this process, beside the
+        # resident weights, before the cap could apply. Both streams in write
+        # order, as a terminal would show them. stdin is closed: a child that
+        # reads it must see EOF, not the operator's terminal.
+        with tempfile.TemporaryFile() as spool:
+            try:
+                proc = subprocess.run(
+                    argv,
+                    cwd=self.root,
+                    stdin=subprocess.DEVNULL,
+                    stdout=spool,
+                    stderr=spool,
+                    timeout=budget,
+                    check=False,
+                )
+            except FileNotFoundError:
+                return f"command not found: {argv[0]}"
+            except subprocess.TimeoutExpired:
+                return f"command timed out after {budget}s: {command}"
+            body = _spooled(spool)
+        return f"exit code {proc.returncode}\n{body}"

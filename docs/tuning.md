@@ -29,7 +29,8 @@ Rules the loader and CI enforce (`tests/test_tune_suite.py`):
   same tests rather than in tests of their own.
 - Standard library only, in the fixture, the grader and the solution: an end
   user's machine has nothing else, and the suite loop runs only a task's
-  verify commands and `python -m unittest` / `python -m pytest`.
+  verify commands and the test runners (`python -m unittest`,
+  `python -m pytest`, their `python3` spellings and bare `pytest`).
 - A task must never require deleting, moving or renaming a file: the suite's tools
   read, write and edit files and run those commands; there is no `rm` or `mv`.
   Ask for a rewrite, or say "leave the old file in place".

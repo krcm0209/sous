@@ -13,9 +13,13 @@ from pathlib import Path
 from sous.engine.base import GenerationStalled, ManagedEngine
 from sous.protocol import ParseError, ToolCall, parse_tool_calls
 from sous.tune.payload import TOOLS, TOOLSET, build_system_prompt
-from sous.tune.suite.tools import ScratchTools, ToolError
+from sous.tune.suite.tools import COMMAND_TIMEOUT, ScratchTools, ToolError
 
 MAX_CONSECUTIVE_MALFORMED = 3
+# The transcript events the runner's metrics read back; a rename here that
+# the reader missed would zero every suite run's counters without a sound.
+EVENT_TOOL = "tool"
+EVENT_MALFORMED = "malformed"
 FORMAT_REMINDER = (
     "Your tool call could not be parsed ({error}). Re-emit it using exactly "
     "the tool-call format specified in your instructions."
@@ -125,7 +129,7 @@ def run_loop(
     budget: Budget,
     tools: ScratchTools,
     transcript: Transcript,
-    command_timeout: float = 120.0,
+    command_timeout: float = COMMAND_TIMEOUT,
 ) -> LoopResult:
     session = engine.session()
     try:
@@ -153,6 +157,8 @@ def run_loop(
         while turns < budget.turns and time.monotonic() < deadline:
             token_count, elided = _elide_if_needed(messages, engine, window)
             elisions += elided
+            if elided:
+                transcript.log(event="elided", count=elided, tokens=token_count)
             if token_count > window:
                 reason = (
                     f"context overflow: {token_count} tokens exceeds the "
@@ -198,7 +204,7 @@ def run_loop(
                 calls = parse_tool_calls(text, TOOLSET)
             except ParseError as e:
                 malformed += 1
-                transcript.log(event="malformed", error=str(e))
+                transcript.log(event=EVENT_MALFORMED, error=str(e))
                 if malformed >= MAX_CONSECUTIVE_MALFORMED:
                     fail("model-confused: 3 consecutive malformed tool calls")
                     break
@@ -220,7 +226,7 @@ def run_loop(
                     if raw_summary is None or not str(raw_summary).strip():
                         result = "error: finish requires a non-empty summary"
                         transcript.log(
-                            event="tool",
+                            event=EVENT_TOOL,
                             name=call.name,
                             arguments=call.arguments,
                             result=result[:2000],
@@ -233,7 +239,7 @@ def run_loop(
                     break
                 result = _execute(call, tools, deadline, command_timeout)
                 transcript.log(
-                    event="tool", name=call.name, arguments=call.arguments, result=result[:2000]
+                    event=EVENT_TOOL, name=call.name, arguments=call.arguments, result=result[:2000]
                 )
                 messages.append(_tool_result_message(call.name, result))
             if finished:

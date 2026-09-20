@@ -70,7 +70,7 @@ def _text(raw: dict, key: str, name: str) -> str:
 
 def _strings(raw: dict, key: str, name: str) -> tuple[str, ...]:
     value = raw.get(key, [])
-    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
         raise ValueError(f"suite task {name}: {key} must be a list of non-empty strings")
     return tuple(value)
 
