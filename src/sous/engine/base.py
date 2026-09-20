@@ -18,6 +18,10 @@ from sous.config import SousConfig
 
 _logger = logging.getLogger("sous.engine")
 
+# The idle sweep's cadence. Each tick is a lock and a clock comparison, so the
+# only thing it buys by being slow is nothing; idle_unload_minutes is minutes.
+IDLE_SWEEP_SECONDS = 15.0
+
 
 @dataclass(frozen=True)
 class Delta:
@@ -565,6 +569,8 @@ class EngineManager:
         # between documents, so a reset it never hears about is a wrong
         # number on screen until the next one.
         self._version = 0
+        self._sweep: threading.Thread | None = None
+        self._sweep_stop: threading.Event | None = None
 
     @property
     def version(self) -> int:
@@ -804,6 +810,45 @@ class EngineManager:
             engine = self._take()
         self._free(engine)
         return True
+
+    def start_idle_sweep(self, interval_s: float = IDLE_SWEEP_SECONDS) -> None:
+        """Retire an idle model without anyone asking: one daemon thread,
+        `sous-idle-sweep`, calls unload_if_idle() every `interval_s` seconds
+        until stop_idle_sweep(). A second start while one runs is a no-op."""
+        with self._lock:
+            if self._sweep is not None:
+                return
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=self._run_idle_sweep,
+                args=(interval_s, stop),
+                name="sous-idle-sweep",
+                daemon=True,
+            )
+            self._sweep, self._sweep_stop = thread, stop
+            thread.start()
+
+    def stop_idle_sweep(self, timeout: float = 5.0) -> None:
+        with self._lock:
+            thread, stop = self._sweep, self._sweep_stop
+            self._sweep, self._sweep_stop = None, None
+        if thread is None or stop is None:
+            return
+        stop.set()
+        thread.join(timeout)
+
+    def _run_idle_sweep(self, interval_s: float, stop: threading.Event) -> None:
+        # An unload frees mlx arrays on this thread, and a thread that touched
+        # mlx must release its state once before it exits (ml-explore/mlx#4327).
+        # This thread never loads, so releasing on the way out is enough.
+        try:
+            while not stop.wait(interval_s):
+                try:
+                    self.unload_if_idle()
+                except Exception as e:  # noqa: BLE001 — one bad tick must not end the sweep
+                    _logger.warning(f"idle sweep failed ({type(e).__name__}: {e})")
+        finally:
+            release_mlx_thread_state()
 
     def unload_now(self) -> dict:
         """Free the weights on request — `sous tune` needs the memory — with

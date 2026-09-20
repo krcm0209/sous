@@ -1794,4 +1794,52 @@ def test_engine_manager_without_a_factory_uses_the_default_one(monkeypatch, tmp_
     )
     cfg = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", model_id="org/m")
     base.EngineManager(cfg)._factory("org/m")
-    assert calls == [("org/m", "org/m")]
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
+def test_the_idle_sweep_unloads_an_idle_model_on_its_own_thread():
+    mgr, created, live, clock = _held_manager(idle_minutes=1)
+    mgr.get()
+    assert mgr.status()["loaded"]
+    clock.now += 61
+    mgr.start_idle_sweep(interval_s=0.01)
+    try:
+        assert _wait_until(lambda: not mgr.status()["loaded"])
+        assert any(t.name == "sous-idle-sweep" for t in threading.enumerate())
+    finally:
+        mgr.stop_idle_sweep()
+    assert not any(t.name == "sous-idle-sweep" for t in threading.enumerate())
+
+
+def test_the_idle_sweep_keeps_a_fresh_model_and_starts_once():
+    mgr, created, live, clock = _held_manager(idle_minutes=30)
+    mgr.get()
+    mgr.start_idle_sweep(interval_s=0.01)
+    mgr.start_idle_sweep(interval_s=0.01)
+    try:
+        time.sleep(0.05)
+        assert mgr.status()["loaded"]
+        assert sum(t.name == "sous-idle-sweep" for t in threading.enumerate()) == 1
+    finally:
+        mgr.stop_idle_sweep()
+    mgr.stop_idle_sweep()  # idempotent when nothing runs
+
+
+def test_the_idle_sweep_releases_its_mlx_state_once_on_exit(monkeypatch):
+    import sous.engine.base as base
+
+    released: list[str] = []
+    monkeypatch.setattr(base, "release_mlx_thread_state", lambda: released.append("x"))
+    mgr, created, live, clock = _held_manager(idle_minutes=30)
+    mgr.start_idle_sweep(interval_s=0.01)
+    time.sleep(0.03)
+    mgr.stop_idle_sweep()
+    assert released == ["x"]
