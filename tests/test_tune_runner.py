@@ -310,11 +310,14 @@ def test_a_load_failure_is_an_outcome_with_no_runs(tmp_path):
     assert outcome.error == "load failed: RuntimeError: no weights"
 
 
-def test_a_load_that_failed_with_weights_left_resident_is_not_released(tmp_path):
+def test_a_load_that_failed_with_weights_left_resident_is_not_released(tmp_path, monkeypatch):
     # A drafter that would not fit beside a target already mapped: the
     # factory raises with the target's weights still on the GPU, and the
     # next arm must not load beside them.
-    readings = iter([0, 3 * 2**30, 3 * 2**30])
+    from sous.tune import bench
+
+    monkeypatch.setattr(bench, "_UNLOAD_WAIT_SECONDS", 0.0)
+    readings = [0]  # the baseline; every later reading is the resident 3 GiB
 
     def factory(model_id):
         raise RuntimeError("drafter would not fit")
@@ -330,7 +333,7 @@ def test_a_load_that_failed_with_weights_left_resident_is_not_released(tmp_path)
         out=lines.append,
         factory=factory,
         python=PYTHON,
-        active_memory=lambda: next(readings),
+        active_memory=lambda: readings.pop(0) if readings else 3 * 2**30,
     )
     assert outcome.runs == [] and not outcome.released
     assert outcome.error == (
@@ -338,6 +341,45 @@ def test_a_load_that_failed_with_weights_left_resident_is_not_released(tmp_path)
         "memory not released: 3.0 GiB still resident"
     )
     assert "  m: 3.0 GiB still resident after the failed load" in lines
+
+
+def test_a_failed_load_is_judged_only_after_its_exception_is_dropped(tmp_path, monkeypatch):
+    # The exception's traceback holds the loader thread's frames and, with
+    # them, whatever the factory had built before it raised: a reading taken
+    # while the exception is bound sees those arrays as resident. The
+    # judging read must come after they are gone.
+    from sous.tune import bench
+
+    monkeypatch.setattr(bench, "_UNLOAD_WAIT_SECONDS", 0.0)
+    events: list[str] = []
+
+    class HalfBuilt:
+        def __del__(self):
+            events.append("freed")
+
+    def factory(model_id):
+        half_built = HalfBuilt()  # noqa: F841 — alive through the traceback until the exception is
+        raise RuntimeError("drafter would not fit")
+
+    def active_memory():
+        events.append("read")
+        return 0
+
+    outcome = run_suite(
+        _arm(tmp_path),
+        [_task()],
+        runs=1,
+        done=set(),
+        record=lambda r: None,
+        scratch=tmp_path / "scratch",
+        out=lambda *a: None,
+        factory=factory,
+        python=PYTHON,
+        active_memory=active_memory,
+    )
+    assert outcome.released and outcome.error == "load failed: RuntimeError: drafter would not fit"
+    assert events[0] == "read" and "freed" in events
+    assert events.index("freed") < len(events) - 1 and events[-1] == "read"
 
 
 def test_an_arm_whose_drafter_or_int8_did_not_load_runs_nothing(tmp_path):

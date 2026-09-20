@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import gc
 import json
 import os
 import shutil
@@ -39,6 +40,7 @@ from sous.tune.bench import (
     _active_memory,
     _check_drafter,
     release,
+    settle_resident,
 )
 from sous.tune.suite import SuiteTask
 from sous.tune.suite.grading import grade_task
@@ -448,19 +450,26 @@ def _run_suite(
         return counters[-1]
 
     manager = EngineManager(arm.config, engine_factory=wrapped)
+    engine: ManagedEngine | None = None
+    load_error = ""
     try:
         engine = manager.get()
     except Exception as e:  # noqa: BLE001 — the arm is skipped, named
-        # A load that failed partway (a drafter that would not fit beside a
-        # target already mapped) can leave the target's weights resident:
-        # the next arm must not load beside them, so the memory is judged
-        # the way release() judges it rather than assumed clean.
-        resident = active_memory() - baseline
-        error = f"load failed: {type(e).__name__}: {e}"
+        load_error = f"load failed: {type(e).__name__}: {e}"
+    if engine is None:
+        # Judged only here, outside the except block: the exception's
+        # traceback held the loader thread's frames, and with them the
+        # half-built engine and its arrays, so a reading taken while it was
+        # bound would have called every failed load "still resident". A
+        # load that failed partway (a drafter that would not fit beside a
+        # target already mapped) can still leave weights behind through
+        # other references, and the next arm must not load beside them.
+        gc.collect()
+        resident = settle_resident(active_memory, baseline)
         if resident > _UNLOAD_SLACK_BYTES:
             out(f"  {arm.label}: {resident / _GIB:.1f} GiB still resident after the failed load")
-            error += f"; memory not released: {resident / _GIB:.1f} GiB still resident"
-        return SuiteOutcome([], resident <= _UNLOAD_SLACK_BYTES, error)
+            load_error += f"; memory not released: {resident / _GIB:.1f} GiB still resident"
+        return SuiteOutcome([], resident <= _UNLOAD_SLACK_BYTES, load_error)
     results: list[SuiteRun] = []
     check_error: str | None = None
     loop_error: str | None = None

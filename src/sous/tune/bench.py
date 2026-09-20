@@ -262,6 +262,16 @@ def _check_drafter(arm: Arm, engine) -> None:
         )
 
 
+def settle_resident(active_memory: Callable[[], int], baseline: int) -> int:
+    """How much active memory stays above `baseline` once the allocator has
+    had up to _UNLOAD_WAIT_SECONDS to give freed weights back: the figure a
+    caller judges "released" on, after an unload or a failed load alike."""
+    deadline = time.monotonic() + _UNLOAD_WAIT_SECONDS
+    while active_memory() > baseline + _UNLOAD_SLACK_BYTES and time.monotonic() < deadline:
+        time.sleep(0.2)
+    return active_memory() - baseline
+
+
 def release(
     manager: EngineManager,
     session,
@@ -302,10 +312,7 @@ def release(
             # memory that cannot come back.
             out(f"  {label}: model not released ({released['reason']})")
             return f"unload refused: {released['reason']}"
-        deadline = time.monotonic() + _UNLOAD_WAIT_SECONDS
-        while active_memory() > baseline + _UNLOAD_SLACK_BYTES and time.monotonic() < deadline:
-            time.sleep(0.2)
-        resident = active_memory() - baseline
+        resident = settle_resident(active_memory, baseline)
         if resident > _UNLOAD_SLACK_BYTES:
             # The unload ran but the memory never came back: the same dirty
             # machine as a refused unload.
