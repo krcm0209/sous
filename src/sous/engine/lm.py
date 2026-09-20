@@ -208,10 +208,9 @@ class LMEngine:
         a subagent type's tool array is byte-identical across sessions and
         projects, so a new `claude` process's first subagent turn starts
         ~45–56K tokens warm instead of prefilling ~57K cold. The header fork
-        serves the same session's next subagent of that type, ~57K warm. The
-        worker's short system prompt never clears the floor, and a render
-        below it cannot contain a boundary above it — so it never pays the
-        probe."""
+        serves the same session's next subagent of that type, ~57K warm. A
+        short system prompt never clears the floor, and a render below it
+        cannot contain a boundary above it — so it never pays the probe."""
         if (
             len(messages) < 2
             or messages[0].get("role") != "system"

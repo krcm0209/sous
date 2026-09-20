@@ -357,7 +357,37 @@ def test_the_status_document_carries_no_task_fields(svc):
     assert len(service.status_version()) == 3
 
 
-def test_the_lifespan_runs_the_idle_sweep_and_closes_the_endpoint(tmp_path: Path):
+def test_the_status_version_is_the_registry_the_engine_and_the_config_stamp(svc):
+    service, _root = svc
+    path = service.config.config_path
+    assert not path.exists()
+    assert service._config_stamp() == (-1, -1)  # no file to stamp
+    path.write_text("[server]\nport = 8383\n")
+    st = path.stat()
+    assert service._config_stamp() == (st.st_mtime_ns, st.st_size)
+    assert service.status_version() == (
+        service.inflight.version,
+        service.engines.version,
+        (st.st_mtime_ns, st.st_size),
+    )
+
+
+def test_a_config_rewrite_under_the_old_mtime_still_moves_the_stamp(svc):
+    """`cp -p` and a backup restore both put a different file back under the
+    mtime it had; the size is what catches that one."""
+    service, _root = svc
+    path = service.config.config_path
+    path.write_text("[server]\nport = 8383\n")
+    before = path.stat()
+    stamp = service._config_stamp()
+    path.write_text('[server]\nport = 8383\nlocal_models = ["sous-local"]\n')
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert path.stat().st_mtime_ns == before.st_mtime_ns  # the mtime is back
+    assert service._config_stamp() != stamp
+    assert service.status_version()[2] == service._config_stamp()
+
+
+def test_the_lifespan_runs_the_idle_sweep(tmp_path: Path):
     cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
     app = create_server(engines, cfg, upstream=FakeUpstream().upstream())

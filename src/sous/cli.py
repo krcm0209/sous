@@ -429,7 +429,7 @@ def _cmd_status() -> None:
     if document is None:
         print(
             f"sous daemon: port {config.server_port} answered {status} to /sous/status; "
-            f"restart it ({restart_hint(managed=False)})"
+            f"restart it ({restart_hint(managed=_launchd_loaded(LABEL))})"
         )
         raise SystemExit(1)
     for line in status_lines(document, now=time.time()):

@@ -97,7 +97,7 @@ addopts = "-q"
 filterwarnings = ["error::pytest.PytestUnhandledThreadExceptionWarning"]
 markers = [
     "model: needs a real MLX model downloaded (manual/local only)",
-    "slow: takes several seconds of real wall-clock (process-group kill tests)",
+    "slow: takes several seconds of real wall-clock (runs a real server or spawns a real process)",
 ]
 
 [tool.ruff]

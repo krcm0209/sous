@@ -1,6 +1,6 @@
 """Throughput of one arm through sous's own engine: prefill and decode at a
 short and a long context, warm-turn TTFT, load time and peak memory, read
-from the prompt cache's per-turn gauges the way the gateway's turn line is."""
+from the prompt cache's per-turn gauges the way the endpoint's turn line is."""
 
 from __future__ import annotations
 

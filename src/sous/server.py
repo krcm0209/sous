@@ -72,17 +72,17 @@ class Daemon:
     def status_version(self) -> tuple[int, int, tuple[int, int]]:
         """What the event stream polls between documents: the in-flight
         registry's version, the engine manager's, and the config file's
-        stamp. Three cheap reads and no lock; a change to any of them is a
-        document worth sending, and nothing else is."""
+        stamp. Three cheap reads and no lock. The stamp is in there for the
+        reader, not for the document — nothing the document carries is read
+        from the file — so that an edit on disk still pushes one and whoever
+        is watching learns the running config has gone stale."""
         return (self.inflight.version, self.engines.version, self._config_stamp())
 
     def status_document(self, *, recent: bool) -> dict:
         """The one document every status surface serves. `recent=True` adds
-        the last fifty turns, for the HTTP routes and the terminal;
-        `recent=False` is the narrower shape, for a caller where every key
-        read has a cost. Runs on a worker thread: the engine's status takes
-        its lock, and the registry's snapshot may call into the prompt
-        cache."""
+        the last fifty turns, for the HTTP routes and the terminal. Runs on a
+        worker thread: the engine's status takes its lock, and the registry's
+        snapshot may call into the prompt cache."""
         try:
             engine = self.engines.status()
             live = self.inflight.snapshot()

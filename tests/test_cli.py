@@ -1310,7 +1310,6 @@ def _document(**overrides) -> dict:
         "inflight": [],
         "config": {},
         "recent_turns": [],
-        "recent_tasks": [],
     }
     doc.update(overrides)
     return doc
@@ -1708,6 +1707,29 @@ def test_status_prints_the_document_when_the_daemon_answers(monkeypatch, capsys,
     out = capsys.readouterr().out.splitlines()
     assert out[0] == "sous daemon: listening on 127.0.0.1:8383"
     assert out[1] == "  engine: org/m unloaded · holders 0"
+
+
+def test_status_names_launchds_restart_when_launchd_manages_the_daemon(
+    monkeypatch, capsys, tmp_path
+):
+    """A listener that will not answer the document has to be restarted, and
+    the command that does it depends on who started the daemon."""
+    from sous import cli
+
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: SousConfig(
+            server_port=8383, data_dir=tmp_path, config_path=tmp_path / "config.toml"
+        ),
+    )
+    monkeypatch.setattr(cli, "_port_open", lambda port: True)
+    monkeypatch.setattr(cli, "_sous_request", lambda port, method, path, json=None: (503, b""))
+    for managed in (True, False):
+        monkeypatch.setattr(cli, "_launchd_loaded", lambda _label, m=managed: m)
+        with pytest.raises(SystemExit):
+            cli.main(["status"])
+        assert cli.restart_hint(managed=managed) in capsys.readouterr().out
 
 
 def json_dumps(doc: dict) -> bytes:

@@ -1,5 +1,5 @@
 """How a suite run is scored: hidden unittest modules run against the
-worker's project in a subprocess, or a task's own grade.py over that same
+candidate's project in a subprocess, or a task's own grade.py over that same
 runner for the categories a pass count cannot express."""
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ class Grade:
 def run_tests(cwd: Path, tests_dir: Path, *, python: Path, timeout: float) -> tuple[int, int, str]:
     """(passed, total, detail) of the test_*.py modules under `tests_dir`,
     run with `cwd` importable. A timeout, a crash or output that is not the
-    runner's JSON is (0, 0, why): the worker's code is untrusted and a
+    runner's JSON is (0, 0, why): the candidate's code is untrusted and a
     project that hangs must not hang the tune."""
     argv = [str(python), "-m", "sous.tune.suite.unittests", str(tests_dir)]
     try:
@@ -64,7 +64,7 @@ def grade_task(
     python: Path = Path(sys.executable),
     timeout: float = 120.0,
 ) -> Grade:
-    """The task's score over the worker's finished project, in [0, 1]. With
+    """The task's score over the candidate's finished project, in [0, 1]. With
     a grade.py the task decides — it gets the project and a test runner
     whose default test directory is the hidden one — else the hidden
     modules' pass fraction. A grader that raises or returns something that

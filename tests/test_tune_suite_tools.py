@@ -66,7 +66,7 @@ def test_command_output_keeps_the_verdict_by_capping_head_and_tail(tmp_path: Pat
     t = _tools(tmp_path, verify_commands=(verdict,))
     result = t.run_command(verdict)
     assert result.startswith("exit code 0")
-    assert "[... " in result and " bytes elided ...]" in result
+    assert "[... " in result and " characters elided ...]" in result
     assert "VERDICT" in result and result.rstrip().endswith("VERDICT")
     # Capped size: two halves + marker + newlines
     from sous.tune.suite.tools import MAX_TOOL_OUTPUT

@@ -686,7 +686,7 @@ and greedy sampling (`temperature = 0`, which also lets the drafter's
 exact-match verify run). A setting lands in the diff only when its own
 measured arm is eligible and faster — that is why there is no `--greedy`
 flag to understand. The full run may therefore change `[model].id`, the
-drafter and block size, the windows, `int8_prefill` and `temperature`.
+drafter and block size, the window, `int8_prefill` and `temperature`.
 
 The daemon is asked to release the model first (`POST /sous/unload`) and
 refuses while a `sous claude` session holds it, a turn is in flight, or a

@@ -66,7 +66,7 @@ jobs:
         run: uv sync
 
       # The `model` marker needs a multi-GB MLX model download — local only.
-      # `slow` tests (process-group kills) do run here.
+      # `slow` tests — a real server, a real process — do run here.
       - name: pytest
         run: uv run --no-sync pytest -m "not model"
 

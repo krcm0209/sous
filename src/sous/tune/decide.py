@@ -34,7 +34,7 @@ class QuickChoice:
 
 
 def score(row: BenchRow, long: bool | None = None) -> float | None:
-    """Decode at the long context when `long` — the gateway's regime and
+    """Decode at the long context when `long` — the endpoint's regime and
     where the drafter's gain is smallest — else at the short one. With
     `long` unset, whichever the row has, longest first: a reading of one
     row. A ranking across rows must score every row in one unit (see

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -122,6 +123,9 @@ def main() -> int:
             daemon.wait(30)
         except subprocess.TimeoutExpired:
             daemon.kill()
+            daemon.wait()
+        # Only once it is gone: the temp HOME holds the daemon's data dir.
+        shutil.rmtree(home, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,8 @@ Not a boundary: the project is a throwaway copy under a temp dir, the only
 commands accepted are the task's own verify commands and the suite's test
 runners, and nothing here audits, scrubs or kills process groups. The output
 shapes are fixed, so every arm the suite grades reads its results the same
-way."""
+way. `approvals_denied` in a suite run counts the commands refused against
+this set, which is narrower than the 0.6 allowlist."""
 
 from __future__ import annotations
 
@@ -47,7 +48,7 @@ def _capped_command_output(text: str) -> str:
     head = text[:_CAP_HALF]
     tail = text[-_CAP_HALF:]
     elided = len(text) - 2 * _CAP_HALF
-    return f"{head}\n[... {elided} bytes elided ...]\n{tail}"
+    return f"{head}\n[... {elided} characters elided ...]\n{tail}"
 
 
 class ScratchTools:

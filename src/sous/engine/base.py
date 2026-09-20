@@ -18,8 +18,9 @@ from sous.config import SousConfig
 
 _logger = logging.getLogger("sous.engine")
 
-# The idle sweep's cadence. Each tick is a lock and a clock comparison, so the
-# only thing it buys by being slow is nothing; idle_unload_minutes is minutes.
+# The idle sweep's cadence. A tick is a lock, a clock comparison and one psutil
+# check per holder, so a slower one saves nothing worth having; all it has to be
+# is well under idle_unload_minutes, which is minutes.
 IDLE_SWEEP_SECONDS = 15.0
 
 
