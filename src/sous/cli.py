@@ -340,8 +340,10 @@ def launchd_plist(sous_executable: str, log_dir: Path) -> str:
     # plistlib handles XML escaping — a path containing & or < must still
     # produce a plist launchctl can parse (string formatting silently
     # produced invalid XML while install-launchd reported success).
-    # No EnvironmentVariables.PATH here on purpose: the daemon runs no
-    # commands of its own, so launchd's bare system PATH is all it needs.
+    # No EnvironmentVariables block on purpose: the daemon runs no commands
+    # of its own, so launchd's bare system PATH is all it needs, and it reads
+    # no credential or proxy from its environment (api/upstream.py) — a block
+    # here would only snapshot the installing shell into the plist.
     return plistlib.dumps(
         {
             "Label": LABEL,

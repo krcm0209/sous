@@ -33,8 +33,10 @@ def test_plist_is_valid_and_correct():
 
 
 def test_plist_sets_no_environment_variables():
-    """PATH is deliberately NOT baked into the plist: the daemon runs no
-    commands of its own, so launchd's bare system PATH is all it needs."""
+    """No environment block at all: the daemon runs no commands of its own,
+    so launchd's bare system PATH is all it needs, and it reads no credential
+    or proxy from its environment — a block would only snapshot the
+    installing shell into the plist."""
     xml = launchd_plist("/Users/x/.local/bin/sous", Path("/Users/x/.sous"))
     data = plistlib.loads(xml.encode())
     assert "EnvironmentVariables" not in data
