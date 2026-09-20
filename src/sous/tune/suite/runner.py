@@ -571,10 +571,10 @@ def estimate_seconds(
     short-context prefill and decode over ETA_TURNS turns of a typical
     task's prompt and answer, times the tasks and runs. None when an arm has
     no usable row — a guess would be read as a measurement."""
-    by_key = {r.key: r for r in rows if r.ok}
+    by_key = {(r.key, r.window): r for r in rows if r.ok}
     total = 0.0
     for arm in arms:
-        row = by_key.get(arm.key)
+        row = by_key.get((arm.key, arm.window))
         if row is None or not row.prefill_tps_2k or not row.decode_tps_1k:
             return None
         per_turn = ETA_PROMPT_TOKENS / row.prefill_tps_2k + ETA_OUTPUT_TOKENS / row.decode_tps_1k

@@ -324,6 +324,18 @@ def test_summarize_reads_the_runs_and_the_bench_peak(tmp_path):
     assert summarize(_arm(user, "27 @5", block=5), runs, []) is None
 
 
+def test_summarize_takes_the_peak_from_the_row_at_the_arms_window(tmp_path):
+    # A resumed run under a lowered window holds bench rows of both windows
+    # for the same key; the peak the tie-break reads must be this window's.
+    user = _user(tmp_path)
+    arm = _arm(user, "27 @3", current=True)
+    stale = dataclasses.replace(_peak("27 @3", M, D, 3, 30.0), window=arm.window * 2)
+    s = summarize(arm, _runs(arm, [1.0]), [stale, _peak("27 @3", M, D, 3, 20.0)])
+    assert s is not None and s.peak_memory_bytes == 20 * 2**30
+    only_stale = summarize(arm, _runs(arm, [1.0]), [stale])
+    assert only_stale is not None and only_stale.peak_memory_bytes is None
+
+
 def test_summarize_ignores_runs_measured_at_another_window(tmp_path):
     """A resumed run whose max_context_tokens changed in between carries
     suite rows of two windows, exactly like _suite_stage's own done-set:

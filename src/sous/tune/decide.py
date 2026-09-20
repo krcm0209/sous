@@ -187,7 +187,10 @@ def summarize(arm: Arm, runs: list[SuiteRun], rows: list[BenchRow]) -> ArmSummar
     for r in mine:
         latest[(r.task, r.index)] = r
     mine = list(latest.values())
-    peak = next((r.peak_memory_bytes for r in rows if r.ok and r.key == arm.key), None)
+    peak = next(
+        (r.peak_memory_bytes for r in rows if r.ok and r.key == arm.key and r.window == arm.window),
+        None,
+    )
     return ArmSummary(
         label=arm.label,
         key=arm.suite_key,
