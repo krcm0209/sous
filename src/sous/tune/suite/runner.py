@@ -32,7 +32,9 @@ from sous.engine.base import (
 from sous.tasks import TaskState, TaskStore
 from sous.tune.arms import Arm
 from sous.tune.bench import (
+    _GIB,
     _INFLIGHT_WAIT_SECONDS,
+    _UNLOAD_SLACK_BYTES,
     BenchRow,
     _active_memory,
     _check_drafter,
@@ -448,8 +450,17 @@ def _run_suite(
     manager = EngineManager(arm.config, engine_factory=wrapped)
     try:
         engine = manager.get()
-    except Exception as e:  # noqa: BLE001 — the arm is skipped, named; nothing is resident
-        return SuiteOutcome([], True, f"load failed: {type(e).__name__}: {e}")
+    except Exception as e:  # noqa: BLE001 — the arm is skipped, named
+        # A load that failed partway (a drafter that would not fit beside a
+        # target already mapped) can leave the target's weights resident:
+        # the next arm must not load beside them, so the memory is judged
+        # the way release() judges it rather than assumed clean.
+        resident = active_memory() - baseline
+        error = f"load failed: {type(e).__name__}: {e}"
+        if resident > _UNLOAD_SLACK_BYTES:
+            out(f"  {arm.label}: {resident / _GIB:.1f} GiB still resident after the failed load")
+            error += f"; memory not released: {resident / _GIB:.1f} GiB still resident"
+        return SuiteOutcome([], resident <= _UNLOAD_SLACK_BYTES, error)
     results: list[SuiteRun] = []
     check_error: str | None = None
     loop_error: str | None = None

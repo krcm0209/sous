@@ -310,6 +310,36 @@ def test_a_load_failure_is_an_outcome_with_no_runs(tmp_path):
     assert outcome.error == "load failed: RuntimeError: no weights"
 
 
+def test_a_load_that_failed_with_weights_left_resident_is_not_released(tmp_path):
+    # A drafter that would not fit beside a target already mapped: the
+    # factory raises with the target's weights still on the GPU, and the
+    # next arm must not load beside them.
+    readings = iter([0, 3 * 2**30, 3 * 2**30])
+
+    def factory(model_id):
+        raise RuntimeError("drafter would not fit")
+
+    lines = []
+    outcome = run_suite(
+        _arm(tmp_path),
+        [_task()],
+        runs=1,
+        done=set(),
+        record=lambda r: None,
+        scratch=tmp_path / "scratch",
+        out=lines.append,
+        factory=factory,
+        python=PYTHON,
+        active_memory=lambda: next(readings),
+    )
+    assert outcome.runs == [] and not outcome.released
+    assert outcome.error == (
+        "load failed: RuntimeError: drafter would not fit; "
+        "memory not released: 3.0 GiB still resident"
+    )
+    assert "  m: 3.0 GiB still resident after the failed load" in lines
+
+
 def test_an_arm_whose_drafter_or_int8_did_not_load_runs_nothing(tmp_path):
     class Engine(FakeEngine):
         drafter = ""
