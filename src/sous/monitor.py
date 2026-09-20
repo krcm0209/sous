@@ -1,6 +1,6 @@
 """The daemon's own loopback routes under /sous/: what `sous claude`, `sous
 top` and `sous statusline` speak to the daemon. Mounted before the endpoint's
-routes and whatever the endpoint flag says, so a path under /sous — the bare
+routes, so a path under /sous — the bare
 /sous included — is answered here or 404s here for every method the routes
 register (a verb none of them lists gets Starlette's own 405 first), and is
 never forwarded to the upstream."""

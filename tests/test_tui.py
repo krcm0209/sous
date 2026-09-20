@@ -136,7 +136,6 @@ RECENT = [
 
 def test_clock_span_and_number_text():
     assert tui.clock_text(41.34) == "00:41" and tui.clock_text(41.3, tenths=True) == "00:41.3"
-    assert tui.task_time(794) == "13:14" and tui.task_time(3725) == "62:05"
     assert tui.clock_text(-3) == "00:00" and tui.clock_text(3725) == "62:05"
     assert tui.span_text(252) == "4m 12s" and tui.span_text(48) == "48s"
     assert tui.span_text(3 * 3600 + 5 * 60) == "3h 05m"

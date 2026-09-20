@@ -177,9 +177,10 @@ def _acquire_singleton_lock(data_dir: Path) -> IO[bytes]:
         # daemon that does not exist.
         raise
     # Record the holder now that the lock is ours (so this cannot clobber a live
-    # daemon's entry). `sous mcp` reads it to tell a restarted daemon from the
-    # one it connected to: the port alone cannot, because launchd puts a new
-    # daemon on the same port within a second and every old session is dead.
+    # daemon's entry). `sous stop` reads the pid from it to signal the right
+    # process, and the CLI reads the holder to tell a daemon that predates a
+    # route from something else on the port: the port alone cannot, because
+    # launchd puts a new daemon on the same port within a second.
     handle.seek(0)
     handle.truncate()
     handle.write(f"{os.getpid()}\n".encode())

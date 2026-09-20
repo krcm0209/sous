@@ -296,8 +296,9 @@ _GAUGES = frozenset({"snapshot_bytes", "miss_lcp"}) | TURN_GAUGES
 
 
 def without_turn_gauges(stats: dict) -> dict:
-    """`stats` for an MCP-facing report. The per-turn gauges mean something
-    only on the turn line: daemon-wide they are a max over every owner ever
+    """The `prompt_cache` block every status document carries, with the
+    per-turn gauges dropped. They mean something only on the turn line, where
+    they describe that turn: daemon-wide they are a max over every owner ever
     seen, beside counters that span every turn — numbers no reader can use,
     paid for in the frontier model's tokens."""
     return {k: v for k, v in stats.items() if k not in TURN_GAUGES}

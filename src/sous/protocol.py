@@ -1,5 +1,5 @@
 """The tool-call parser and the `ToolSet` a parsed call's name is checked
-against: the gateway's request tools, or `sous.tune.payload.TOOLSET` for a
+against: a served request's own tools, or `sous.tune.payload.TOOLSET` for a
 tune run.
 
 Two wire formats are accepted, distinguished by the first non-space
@@ -92,7 +92,7 @@ class ToolSet:
     must become an int — hence the per-tool parameter types.
 
     `strict` is a tune run's contract: a name outside the set is a malformed
-    turn, handled by FORMAT_REMINDER. The gateway is not strict — Claude Code
+    turn, handled by FORMAT_REMINDER. A served turn is not strict — Claude Code
     answers a hallucinated tool with its own tool-not-found result, which the
     model can recover from, whereas ending the turn here could not be undone.
     An unknown tool then coerces nothing: every parameter stays a string.

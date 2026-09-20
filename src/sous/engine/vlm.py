@@ -166,8 +166,8 @@ class VLMEngine:
 
     def _ids(self, slot: str, messages: list[dict], tools: list[dict]) -> list[int]:
         # One lock for every tokenization: HF's fast tokenizer mutates shared
-        # Rust state on each encode (set_truncation_and_padding), and since the
-        # gateway there are two callers — a turn on a pool thread and Claude
+        # Rust state on each encode (set_truncation_and_padding), and there are
+        # two callers — a turn on a pool thread and Claude
         # Code's count_tokens, which it sends mid-turn. Not _gen_lock: that
         # would queue a token count behind a whole generation.
         with self._tokenize_lock:

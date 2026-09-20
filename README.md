@@ -611,8 +611,10 @@ model is) with affine 4-bit, group-size-64 weights route, and the MoE variant is
 a checkpoint with no eligible projection warns once; in a mixed checkpoint, ineligible
 projections fall through per projection.
 
-`[server].generation_timeout_minutes` bounds how long a turn may wait for a
-generation slot before the endpoint answers `529`.
+`[server].generation_timeout_minutes` bounds a turn at both ends: how long it
+may wait for a generation slot before the endpoint answers `529`, and how long
+one generation may run before the turn abandons it and answers `500` (the
+generation itself cannot be interrupted and runs on to completion).
 
 `temperature`/`top_p`/`top_k` control the local model's sampler (Qwen's own
 documented non-thinking-mode defaults). Greedy decoding (temperature 0)

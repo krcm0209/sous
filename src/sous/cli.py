@@ -89,11 +89,11 @@ def claude_env(
     max_context_tokens: int,
     base: Mapping[str, str],
 ) -> dict[str, str]:
-    """The inherited environment plus the five variables the gateway needs.
+    """The inherited environment plus the five variables Claude Code needs.
 
-    The gateway values are the RUNNING daemon's (see _daemon_status), not the
-    config file's: pinning subagents to an id the daemon does not serve would
-    send every one of them upstream.
+    They are the RUNNING daemon's values (see _daemon_status), not the config
+    file's: pinning subagents to an id the daemon does not serve would send
+    every one of them upstream.
 
     CLAUDE_CODE_MAX_CONTEXT_TOKENS is honoured only for non-claude-* ids, so
     it sizes the local subagent's window and leaves the main loop alone.
@@ -128,7 +128,7 @@ def _sous_request(port: int, method: str, path: str, json: dict | None = None) -
 
     deadline = time.monotonic() + _STATUS_TIMEOUT_SECONDS
     # 127.0.0.1 is loopback: a proxy variable must never route or see this
-    # call — same rule as gateway/upstream.py's trust_env=False.
+    # call — same rule as api/upstream.py's trust_env=False.
     with (
         httpx.Client(timeout=_STATUS_TIMEOUT_SECONDS, trust_env=False) as client,
         client.stream(method, f"http://127.0.0.1:{port}{path}", json=json) as reply,
@@ -232,12 +232,12 @@ def _hold(port: int) -> dict | None:
 
 
 def _cmd_claude(user_args: list[str]) -> None:
-    """Replace this process with Claude Code pointed at the gateway.
+    """Replace this process with Claude Code pointed at the daemon.
 
-    Every gateway value Claude Code is given comes from the running daemon;
+    Every served value Claude Code is given comes from the running daemon;
     the config file supplies the port to reach it on, the path to name in an
-    error message, and the two gateway values compared against the daemon's
-    for the drift note — never the values themselves.
+    error message, and the two values compared against the daemon's for the
+    drift note — never the values themselves.
     """
     config = load_config()
     exe = shutil.which("claude")
@@ -350,8 +350,8 @@ def launchd_plist(sous_executable: str, log_dir: Path) -> str:
             "KeepAlive": True,
             # Both streams to one file, in write order. The stderr file was
             # named daemon.err.log and held everything the daemon said — Python
-            # logging, the gateway's lines, warnings, the SDK's handler all
-            # write to stderr — while daemon.log held the banner. One file,
+            # logging, the daemon's own lines, warnings, every library's
+            # handler all write to stderr — while daemon.log held the banner. One file,
             # and the level on every line (sous.logs) says what is an error.
             "StandardOutPath": f"{log_dir}/daemon.log",
             "StandardErrorPath": f"{log_dir}/daemon.log",
@@ -496,7 +496,7 @@ def _statusline_fetch(port: int) -> str | None:
         if not sys.stdin.isatty():
             sys.stdin.read()
     # No proxy, whatever the environment says: 127.0.0.1 is loopback, the
-    # same rule as the launcher's httpx client and the gateway's forwarder.
+    # same rule as the launcher's httpx client and the daemon's forwarder.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     url = f"http://127.0.0.1:{port}/sous/status"
     try:
@@ -575,7 +575,7 @@ def _await_port_closed(port: int, seconds: float) -> bool:
 
 # How long install-launchd waits for the daemon it just unloaded to let go of
 # the lock. Past the port closing, that daemon still runs uvicorn's graceful
-# bound (server.GRACEFUL_SHUTDOWN_SECONDS), the gateway runner's close and the
+# bound (server.GRACEFUL_SHUTDOWN_SECONDS), the turn runner's close and the
 # teardown of a resident model — well past _UNLOAD_GRACE_SECONDS.
 _DAEMON_EXIT_SECONDS = 30.0
 

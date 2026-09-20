@@ -958,7 +958,7 @@ def test_daemon_status_reads_sous_status_over_http(tmp_path):
 def test_loopback_calls_ignore_a_configured_proxy(tmp_path, monkeypatch):
     """The daemon is loopback; a stray HTTP_PROXY/ALL_PROXY (no matching
     no_proxy) must never route _daemon_status or _hold through it, or see
-    the hold body — same rule as gateway/upstream.py's trust_env=False."""
+    the hold body — same rule as api/upstream.py's trust_env=False."""
     from sous import cli
 
     monkeypatch.setenv("HTTP_PROXY", "http://10.255.255.1:9")

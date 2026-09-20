@@ -185,12 +185,6 @@ def clock_text(seconds: float, *, tenths: bool = False) -> str:
     return f"{whole // 60:02d}:{whole % 60:02d}"
 
 
-def task_time(seconds: float) -> str:
-    """`m:ss` with the minutes unbounded, for a span that can run past an hour."""
-    whole = max(0, int(seconds))
-    return f"{whole // 60}:{whole % 60:02d}"
-
-
 def span_text(seconds: float) -> str:
     """`4m 12s`, `1h 03m`, `48s`: the idle and unload spans."""
     seconds = max(0, int(seconds))

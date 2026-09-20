@@ -69,8 +69,11 @@ Anything that breaks a guarantee in the
   `ANTHROPIC_DEFAULT_*_MODEL` or a Claude Code permission mode: the first two
   move your billing, the third pulls the main loop off the upstream, and the
   last would weaken a boundary that is the user's to set.
-- **The daemon writing outside `~/.sous`.** Its log, its lock and its config
-  live there and nowhere else; it edits no source tree.
+- **The daemon writing outside `~/.sous` and the model cache.** Its log, its
+  lock and its config live in `~/.sous`; the weights it downloads land in
+  Hugging Face's cache under `HF_HOME` (default `~/.cache/huggingface`), which
+  is the one other place it writes, by design. Anywhere else — a source tree
+  included — is in scope.
 
 ## What isn't
 

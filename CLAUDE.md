@@ -35,8 +35,8 @@ goal.
   array op, `mx.eval`, a model load — with "There is no Stream(gpu, 0) in
   current thread"; device and allocator calls (`device_info`,
   `get_active_memory`, `get_cache_memory`, `clear_cache`) and the freeing of
-  arrays made earlier still work, which is what `server._mlx_memory_gb` and
-  `context._live_memory` rely on from threads that are reused. So a thread
+  arrays made earlier still work, which is what `server._mlx_memory_gb`
+  relies on from threads that are reused. So a thread
   that releases before each unit of work ends — an endpoint pool thread,
   which releases after every turn — may keep querying and freeing, but must
   never run a load: a load runs on a `sous-model-load` thread of its own
