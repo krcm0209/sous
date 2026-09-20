@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 
-from sous.context import TOKEN_STEP, kv_bytes_per_token, native_max_tokens
 from sous.engine.base import fetch_model_config, select_backend
+from sous.engine.window import TOKEN_STEP, kv_bytes_per_token, native_max_tokens
 
 # A drafter ships bf16 and sous quantizes it to 4-bit at load: 4 bits of
 # code plus group scales against 16, so ~3.5x smaller resident.

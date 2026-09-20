@@ -12,8 +12,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from sous.engine.base import Delta, EngineManager, ReplaySafe, release_mlx_thread_state
-from sous.protocol import WORKER_TOOLS
 from sous.tune.arms import Arm
+from sous.tune.payload import TOOLS
 
 LONG_CONTEXT = 16384
 SHORT_CONTEXT = 1024
@@ -140,13 +140,13 @@ def build_prompt(
         return [{"role": "system", "content": _SYSTEM}, {"role": "user", "content": body}]
 
     fn = 0
-    current = count(render(), WORKER_TOOLS)
+    current = count(render(), TOOLS)
     while current < target_tokens:
         deficit = target_tokens - current
         n = max(1, deficit // _TOKENS_PER_FUNCTION)
         lines.extend(_code_lines(rng, n, fn))
         fn += n
-        current = count(render(), WORKER_TOOLS)
+        current = count(render(), TOOLS)
     return render()
 
 
@@ -192,7 +192,7 @@ class _Turn:
         # Accounting only — nothing this callback sees leaves the process —
         # so a warm attempt that fails may still be retried cold.
         text = self.session.generate(
-            messages, WORKER_TOOLS, max_tokens, self.timeout, ReplaySafe(on_delta)
+            messages, TOOLS, max_tokens, self.timeout, ReplaySafe(on_delta)
         )
         gauges = self.engine.prompt_cache_stats(owner=self.session.thread)
         timed = bool(first) and not retried[0]
@@ -359,7 +359,7 @@ def _measure(
             if ttft is not None:
                 ttfts.append(ttft)
         prefill_prompt = build_prompt(count, PREFILL_CONTEXT, seed=1)
-        prefill_tokens = count(prefill_prompt, WORKER_TOOLS)
+        prefill_tokens = count(prefill_prompt, TOOLS)
         prefill_2k_samples: list[float] = []
         for _ in range(repeats):
             result = turn.run(prefill_prompt, 1)
@@ -367,7 +367,7 @@ def _measure(
             if rate is not None:
                 prefill_2k_samples.append(rate)
         long = build_prompt(count, LONG_CONTEXT, seed=2)
-        long_tokens = count(long, WORKER_TOOLS)
+        long_tokens = count(long, TOOLS)
         prefill_16k = None
         decode_16k: list[float] = []
         # The 16K decode is what the decision ranks on, so it gets every
