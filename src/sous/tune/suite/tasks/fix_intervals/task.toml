@@ -1,0 +1,8 @@
+title = "Fix the failing interval test"
+category = "bug-fix"
+instructions = """Run `python -m unittest discover -s tests`: one test in tests/test_intervals.py \
+fails. Fix the bug in intervals.py so that every test passes. The tests are correct — do not \
+modify them, and do not change what merge returns for the cases that already pass."""
+context_files = ["intervals.py", "tests/test_intervals.py"]
+verify_commands = ["python -m unittest discover -s tests"]
+max_turns = 12

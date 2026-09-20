@@ -12,7 +12,7 @@ import tomlkit
 from sous.tune.arms import Refusal
 from sous.tune.bench import BenchRow
 from sous.tune.candidates import DRAFTER_QUANT_DIVISOR, Checkpoint
-from sous.tune.decide import QuickChoice
+from sous.tune.decide import ArmSummary, FullChoice, QuickChoice
 from sous.tune.hardware import Hardware, gib
 
 STALE_AFTER_DAYS = 90
@@ -64,17 +64,19 @@ def _candidate_line(cp: Checkpoint, refusal: Refusal | None) -> str:
     return line
 
 
-def _row_line(row: BenchRow, current_model: str) -> str:
-    tag = "" if row.model_id == current_model else "  [quality untested]"
+def _row_line(row: BenchRow, current_model: str, *, tag: bool) -> str:
+    # In a quick run only the current model's quality is known; the full run
+    # measured every model's, so nothing is untested there.
+    untested = "  [quality untested]" if tag and row.model_id != current_model else ""
     if not row.ok:
-        return f"  {row.label:45s} failed: {row.error}{tag}"
+        return f"  {row.label:45s} failed: {row.error}{untested}"
     peak = "-" if row.peak_memory_bytes is None else gib(row.peak_memory_bytes)
     line = (
         f"  {row.label:45s} prefill {_fmt(row.prefill_tps_2k)}/{_fmt(row.prefill_tps_16k)} tok/s"
         f"  decode {_fmt(row.decode_tps_1k)}/{_fmt(row.decode_tps_16k)} tok/s"
         f"  ttft {_fmt(row.ttft_seconds, ' s')}  peak {peak}"
         f"  spread {_fmt(None if row.spread is None else row.spread * 100, '%', 0)}"
-        f"  load {_fmt(row.load_seconds, ' s')}{tag}"
+        f"  load {_fmt(row.load_seconds, ' s')}{untested}"
     )
     if row.error:
         # A finished measurement whose teardown was refused or failed: the
@@ -84,6 +86,15 @@ def _row_line(row: BenchRow, current_model: str) -> str:
     return line
 
 
+def _suite_line(s: ArmSummary) -> str:
+    return (
+        f"  {s.label:45s} grade {s.mean_grade:.2f}  completed {s.completed}/{s.runs}"
+        f"  wall {s.wall_seconds:.0f} s  repetitions {s.repetitions}  malformed {s.malformed}"
+        f"  denied {s.approvals_denied}  output {s.output_tokens} tok"
+        f"  peak {'-' if s.peak_memory_bytes is None else gib(s.peak_memory_bytes)}"
+    )
+
+
 def render_report(
     *,
     hardware: Hardware,
@@ -91,11 +102,15 @@ def render_report(
     checkpoints: dict[str, Checkpoint],
     refusals: list[Refusal],
     rows: list[BenchRow],
-    choice: QuickChoice | None,
+    choice: QuickChoice | FullChoice | None,
     current_model: str,
+    quick: bool = True,
+    suite: list[ArmSummary] | None = None,
+    tasks: int = 0,
+    runs: int = 0,
 ) -> str:
     refused = {r.model_id: r for r in refusals if not r.drafter_id}
-    out = ["# sous tune --quick", "", "## Hardware", ""]
+    out = ["# sous tune --quick" if quick else "# sous tune", "", "## Hardware", ""]
     out.append(
         f"  {hardware.chip}, {gib(hardware.memory_bytes)} unified memory, Metal working set "
         f"{gib(hardware.working_set_bytes)}, macOS {hardware.macos}"
@@ -122,15 +137,32 @@ def render_report(
         elif r.model_id not in checkpoints:
             out.append(f"  {r.model_id:45s} refused: {r.reason}")
     out += ["", "## Throughput", "  (prefill/decode at 2K/16K and 1K/16K tokens of context)", ""]
-    out += [_row_line(r, current_model) for r in rows] or ["  (nothing measured)"]
+    out += [_row_line(r, current_model, tag=quick) for r in rows] or ["  (nothing measured)"]
+    if not quick:
+        out += [
+            "",
+            "## Suite",
+            f"  ({tasks} tasks x {runs} runs per arm; grade = mean hidden-grader score in [0, 1]; "
+            "wall = the sum of every run's seconds)",
+            "",
+        ]
+        out += [_suite_line(s) for s in suite or []] or [
+            "  (the suite did not run)" if not tasks else "  (no suite runs)"
+        ]
     out += ["", "## Choice", ""]
-    if choice is None:
+    if choice is None and quick:
         out.append(
             f"  cannot recommend a setting: no successful measurement of the configured model "
             f"({current_model}). A quick run never changes the model; if it does not fit this "
-            "machine, run the full `sous tune` (a later release) or set [model].id by hand to "
-            "one of the candidates above."
+            "machine, run the full `sous tune` or set [model].id by hand to one of the "
+            "candidates above."
         )
+    elif choice is None and not tasks:
+        # The run stopped before the suite began (a bench arm's weights
+        # stayed resident): the stop line above the report says why.
+        out.append("  cannot recommend a setting: the suite did not run")
+    elif choice is None:
+        out.append("  cannot recommend a setting: no arm completed the suite")
     else:
         out.append(f"  {choice.label}")
         out += [f"    {r}" for r in choice.reasons]

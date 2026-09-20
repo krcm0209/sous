@@ -1,0 +1,12 @@
+{
+  "title": "Record",
+  "type": "object",
+  "required": ["id", "name", "active"],
+  "properties": {
+    "id": {"type": "integer"},
+    "name": {"type": "string"},
+    "active": {"type": "boolean"},
+    "tags": {"type": "array", "items": {"type": "string"}, "default": []},
+    "score": {"type": "number"}
+  }
+}

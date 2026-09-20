@@ -8,7 +8,7 @@ from sous.engine.int8prefill import Availability
 from sous.tune.arms import Refusal
 from sous.tune.bench import BenchRow
 from sous.tune.candidates import describe
-from sous.tune.decide import QuickChoice
+from sous.tune.decide import ArmSummary, FullChoice, QuickChoice
 from sous.tune.hardware import detect
 from sous.tune.report import apply_changes, config_diff, render_report, restart_note
 from tests import tune_fixtures as fx
@@ -282,3 +282,111 @@ def test_apply_keeps_the_configs_mode_on_the_file_and_its_backup(tmp_path):
     assert oct(p.stat().st_mode & 0o777) == "0o600"
     assert oct(backup.stat().st_mode & 0o777) == "0o600"
     assert load_config(p).speculative_block_size == 2
+
+
+def _summary(label, model=M, grade=0.91, wall=812.0, peak=20 * 2**30):
+    return ArmSummary(
+        label=label,
+        key=(model, "d", 3, False, False),
+        model_id=model,
+        runs=16,
+        completed=16,
+        mean_grade=grade,
+        wall_seconds=wall,
+        repetitions=0,
+        malformed=1,
+        approvals_denied=2,
+        output_tokens=41203,
+        peak_memory_bytes=peak,
+    )
+
+
+def _full_report(tmp_path, choice, suite, tasks=8):
+    return render_report(
+        hardware=_hardware(tmp_path),
+        table_age_days=1,
+        checkpoints={M: describe(M, config_fn=lambda m: fx.qwen_27b(), size_fn=lambda m: 1)},
+        refusals=[],
+        rows=[_row("27B @3"), _row("9B", model="mlx-community/Qwen3.5-9B-MLX-4bit")],
+        choice=choice,
+        current_model=M,
+        quick=False,
+        suite=suite,
+        tasks=tasks,
+        runs=2,
+    )
+
+
+def test_a_full_report_has_the_suite_section_and_no_quality_untested_tag(tmp_path):
+    from sous.tune.arms import Arm
+
+    arm = Arm(
+        label="9B",
+        config=load_config(tmp_path / "c.toml"),
+        model_id="mlx-community/Qwen3.5-9B-MLX-4bit",
+        drafter_id="",
+        block_size=0,
+        window=131072,
+        gateway_window=None,
+        tier="9b",
+        current=False,
+    )
+    choice = FullChoice(
+        label="9B",
+        arm=arm,
+        reference_label="27B @3",
+        changes={"model": {"id": arm.model_id}},
+        reasons=[
+            "reference: 27B @3 (the configured arm)",
+            "winner: 9B (400 s vs 812 s for the reference)",
+        ],
+    )
+    text = _full_report(
+        tmp_path,
+        choice,
+        [_summary("27B @3"), _summary("9B", model=arm.model_id, wall=400.0, peak=8 * 2**30)],
+    )
+    assert text.startswith("# sous tune\n")
+    assert "[quality untested]" not in text
+    assert "## Suite" in text and "(8 tasks x 2 runs per arm" in text
+    assert (
+        f"  {'27B @3':45s} grade 0.91  completed 16/16  wall 812 s"
+        "  repetitions 0  malformed 1  denied 2  output 41203 tok  peak 20.0 GiB"
+    ) in text
+    assert "## Choice\n\n  9B\n    reference: 27B @3 (the configured arm)\n    winner: 9B" in text
+
+
+def test_a_full_report_without_a_choice_says_no_arm_completed_the_suite(tmp_path):
+    text = _full_report(tmp_path, None, [])
+    assert "  (no suite runs)" in text
+    assert "cannot recommend a setting: no arm completed the suite" in text
+
+
+def test_a_full_report_whose_run_stopped_before_the_suite_says_so(tmp_path):
+    # A bench arm's weights stayed resident: the suite never started, and
+    # the report must not describe it as one nobody completed.
+    text = _full_report(tmp_path, None, [], tasks=0)
+    assert "  (the suite did not run)" in text
+    assert "cannot recommend a setting: the suite did not run" in text
+    assert "no arm completed the suite" not in text
+
+
+def test_the_quick_report_is_unchanged_by_the_full_fields(tmp_path):
+    kwargs = dict(
+        hardware=_hardware(tmp_path),
+        table_age_days=1,
+        checkpoints={},
+        refusals=[],
+        rows=[_row("27B @3")],
+        choice=None,
+        current_model=M,
+    )
+    # kwargs' inferred value type is the union of every field's type, so ty
+    # checks each call below against that whole union rather than the
+    # per-key types the dict actually holds — a real false positive, not a
+    # real mismatch.
+    quick = render_report(**kwargs)  # ty: ignore[invalid-argument-type]
+    full = render_report(**kwargs, quick=True, suite=None)  # ty: ignore[invalid-argument-type]
+    assert quick == full
+    assert quick.startswith("# sous tune --quick\n")
+    assert "## Suite" not in quick

@@ -1811,10 +1811,22 @@ def test_tune_subcommand_dispatches_with_its_flags(monkeypatch):
     seen = {}
     monkeypatch.setattr(sous.tune, "main", lambda args, **k: seen.update(vars(args)) or 0)
     with pytest.raises(SystemExit) as e:
-        cli.main(["tune", "--quick", "--repeat", "3", "--models", "a/b", "c/d", "--yes"])
+        cli.main(
+            ["tune", "--quick", "--repeat", "3", "--runs", "3", "--models", "a/b", "c/d", "--yes"]
+        )
     assert e.value.code == 0
     assert seen["quick"] is True and seen["repeat"] == 3
+    assert seen["runs"] == 3
     assert seen["models"] == ["a/b", "c/d"] and seen["yes"] is True and seen["apply"] is False
+
+
+def test_tune_runs_must_be_at_least_one(capsys):
+    from sous import cli
+
+    with pytest.raises(SystemExit) as e:
+        cli.main(["tune", "--runs", "0"])
+    assert e.value.code == 2
+    assert "must be at least 1" in capsys.readouterr().err
 
 
 def test_restart_hint_names_launchds_kickstart_or_the_two_commands():

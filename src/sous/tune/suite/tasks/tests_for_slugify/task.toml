@@ -1,0 +1,10 @@
+title = "Write tests for slugify"
+category = "test-scaffolding"
+instructions = """slugify.py has no tests. Write tests/test_slugify.py, a unittest module with one \
+test per behaviour the module docstring documents: lower-casing, a run of characters that are \
+not letters or digits becoming one dash, leading and trailing dashes being removed, the cut at \
+max_length, and a dash left at the end by the cut being removed. Use assertEqual on the exact \
+slug. Run `python -m unittest discover -s tests` and make sure every test passes before you \
+finish. Do not change slugify.py."""
+context_files = ["slugify.py"]
+verify_commands = ["python -m unittest discover -s tests"]
