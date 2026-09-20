@@ -4,7 +4,7 @@
 # this uses the fallback the design spec reserved.
 name = "sous-mcp"
 version = "0.6.1"
-description = "The sous-chef for Claude's kitchen: an MCP daemon that delegates mechanical, volume-heavy coding tasks to a sandboxed local MLX worker on Apple silicon, so heavy Claude Code use stretches further on the same plan"
+description = "The sous-chef for Claude's kitchen: serve Claude Code's subagents from a local MLX model on Apple silicon, so heavy Claude Code use stretches further on the same plan"
 readme = "README.md"
 authors = [
     { name = "krcm0209", email = "17315774+krcm0209@users.noreply.github.com" }
@@ -15,15 +15,13 @@ requires-python = ">=3.14"
 keywords = [
     "claude",
     "claude-code",
-    "mcp",
-    "mcp-server",
-    "model-context-protocol",
+    "subagent",
     "local-llm",
+    "local-model",
     "mlx",
     "apple-silicon",
     "qwen",
     "ai-agents",
-    "delegation",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -86,9 +84,6 @@ dev = [
 
 [project.scripts]
 sous = "sous.cli:main"
-# `uvx sous-mcp` resolves the script matching the distribution name, which is
-# how MCP clients launch registry packages — same CLI, second name.
-sous-mcp = "sous.cli:main"
 
 [project.urls]
 Repository = "https://github.com/krcm0209/sous"
