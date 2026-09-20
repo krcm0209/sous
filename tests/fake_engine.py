@@ -22,7 +22,6 @@ class FakeEngine:
         # Which thread ran each call: the per-task-thread design (issue #34)
         # is pinned on these. Thread objects, not idents — idents recycle.
         self.generate_threads: list[threading.Thread] = []
-        self.reset_idents: list[int] = []
         # The on_delta object itself (not called) — pins whether a caller
         # wrapped it in ReplaySafe (sous.api.turn's replay_safe contract).
         self.on_deltas_seen: list[OnDelta | None] = []
@@ -56,7 +55,6 @@ class FakeEngine:
 
     def reset_prompt_cache(self, owner: threading.Thread | None = None) -> None:
         self.resets += 1
-        self.reset_idents.append(threading.get_ident())
         self.reset_owners.append(owner)
 
     def prompt_cache_stats(self, owner: threading.Thread | None = None) -> dict:
@@ -69,7 +67,7 @@ class FakeEngine:
 
 class ChunkedFakeEngine(FakeEngine):
     """Streams each scripted reply in pieces split on `|`, sleeping `delay`
-    seconds before each piece, so gateway tests can watch deltas and
+    seconds before each piece, so endpoint tests can watch deltas and
     keepalives arrive while a generation is still running. `finished` is set
     when a generation completes — the drain-on-disconnect tests wait on it."""
 

@@ -10,7 +10,6 @@ import logging
 import os
 import signal
 import sys
-import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import IO
@@ -78,11 +77,10 @@ class Daemon:
         is watching learns the running config has gone stale."""
         return (self.inflight.version, self.engines.version, self._config_stamp())
 
-    def status_document(self, *, recent: bool) -> dict:
-        """The one document every status surface serves. `recent=True` adds
-        the last fifty turns, for the HTTP routes and the terminal. Runs on a
-        worker thread: the engine's status takes its lock, and the registry's
-        snapshot may call into the prompt cache."""
+    def status_document(self) -> dict:
+        """The one document every status surface serves, the last fifty turns
+        included. Runs on a worker thread: the engine's status takes its
+        lock, and the registry's snapshot may call into the prompt cache."""
         try:
             engine = self.engines.status()
             live = self.inflight.snapshot()
@@ -97,9 +95,10 @@ class Daemon:
             # raise: a build that fails between the two would otherwise hand
             # a pooled thread back with its mlx state live.
             release_mlx_thread_state()
-        document = {
+        return {
             "engine": engine,
             "inflight": live["inflight"],
+            "recent_turns": live["recent_turns"],
             "config": {
                 "model_id": self.config.model_id,
                 "idle_unload_minutes": self.config.idle_unload_minutes,
@@ -110,9 +109,6 @@ class Daemon:
                 "generation_timeout_minutes": self.config.generation_timeout_minutes,
             },
         }
-        if recent:
-            document["recent_turns"] = live["recent_turns"]
-        return document
 
 
 def create_server(
@@ -129,8 +125,8 @@ def create_server(
 
     @contextlib.asynccontextmanager
     async def _lifespan(_: Starlette) -> AsyncIterator[None]:
-        engines.start_idle_sweep()
         try:
+            engines.start_idle_sweep()
             yield None
         finally:
             # Fires on every path that drives the app's ASGI lifespan —
@@ -146,7 +142,7 @@ def create_server(
     # get there.
     return Starlette(
         routes=[
-            *monitor_routes(engines, lambda: svc.status_document(recent=True), svc.status_version),
+            *monitor_routes(engines, svc.status_document, svc.status_version),
             *endpoint.routes(),
         ],
         lifespan=_lifespan,
@@ -188,7 +184,7 @@ def _acquire_singleton_lock(data_dir: Path) -> IO[bytes]:
     return handle
 
 
-def _install_shutdown_handler(stop: threading.Event) -> None:
+def _install_shutdown_handler() -> None:
     """Exit cleanly on SIGTERM/SIGINT instead of the default abrupt kill.
 
     Default handling terminates the daemon outright — measured: exit -15 with
@@ -198,7 +194,6 @@ def _install_shutdown_handler(stop: threading.Event) -> None:
     """
 
     def handle(signum, frame) -> None:  # noqa: ARG001 — signal handler signature
-        stop.set()
         sys.stderr.flush()
         os._exit(0)
 
@@ -277,15 +272,11 @@ def main() -> None:
     if sys.stderr is None or not sys.stderr.isatty():
         disable_progress_bars()
     engines = EngineManager(config)
-    stop = threading.Event()
-    _install_shutdown_handler(stop)
+    _install_shutdown_handler()
     app = create_server(engines, config)
     _logger.info(
         f"serving {', '.join(config.local_models)} "
         f"at http://127.0.0.1:{config.server_port}/v1/messages; "
         f"everything else is forwarded to {config.upstream_url}"
     )
-    try:
-        serve(app, "127.0.0.1", config.server_port)
-    finally:
-        stop.set()
+    serve(app, "127.0.0.1", config.server_port)

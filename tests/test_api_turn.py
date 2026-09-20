@@ -166,8 +166,8 @@ def test_a_reloaded_engine_gets_a_fresh_session(tmp_path: Path):
 
 def test_a_running_turn_pins_the_engine_against_the_idle_unload(tmp_path: Path):
     """count_tokens runs before anything takes _gen_lock and takes seconds on
-    a real 80K prompt. The worker sweeps unload_if_idle() from its own thread
-    every 0.5s, so with a 0-minute idle threshold it would free the weights
+    a real 80K prompt. The idle sweep calls unload_if_idle() from its own
+    thread, so with a 0-minute idle threshold it would free the weights
     mid-count and the turn would then generate on an unloaded engine."""
     counting = threading.Event()
     gate = threading.Event()
@@ -269,7 +269,7 @@ def test_a_stall_drops_the_session_and_the_next_turn_gets_a_new_one(tmp_path: Pa
 
 def test_a_stall_retires_the_dropped_sessions_thread_not_everything(tmp_path: Path):
     """The stall retires the abandoned session's own thread, so its late
-    publish drops itself — and only its slots go. A worker task's slots
+    publish drops itself — and only its slots go. Another owner's slots
     belong to a thread this turn knows nothing about and must survive."""
     gate = threading.Event()
     generated = threading.Event()
@@ -433,7 +433,7 @@ def test_cache_hit_is_reported_from_the_sessions_own_counters(tmp_path: Path):
     assert (second.cache_hit, second.forked, second.reused_tokens) == (True, False, 900)
     assert (third.cache_hit, third.forked, third.reused_tokens) == (True, True, 4000)
     # Every read named the endpoint session's thread: exact per-turn deltas,
-    # unaffected by a worker task's counters or resets.
+    # unaffected by another owner's counters or resets.
     session_thread = inner.generate_threads[0]
     assert inner.stats_owners and all(o is session_thread for o in inner.stats_owners)
 
@@ -666,7 +666,7 @@ def test_load_seconds_includes_waiting_out_another_threads_load(tmp_path: Path):
 
 
 def test_a_turn_reports_its_wait_for_the_engine_lock(tmp_path: Path):
-    """A delegated task's generation holds the engine's lock; an endpoint turn
+    """An abandoned generation holds the engine's lock; an endpoint turn
     behind it waits inside generate(), past the endpoint lock and every phase
     timer — the one place that wait can be seen is the session thread."""
     runner, engines = _runner(tmp_path, FakeEngine(["ok", "again"]))

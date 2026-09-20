@@ -1,4 +1,4 @@
-"""The Host/Origin/fetch-metadata guard shared by the gateway's routes and
+"""The Host/Origin/fetch-metadata guard shared by the endpoint's routes and
 the daemon's /sous/ routes: what it lets through and what it refuses."""
 
 import pytest

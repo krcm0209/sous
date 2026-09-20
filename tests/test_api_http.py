@@ -604,7 +604,7 @@ def test_the_real_server_never_logs_a_request_target(tmp_path: Path, capsys):
 
 
 def test_app_shutdown_closes_the_upstream_client(tmp_path: Path):
-    """The lifespan hook that closes the endpoint (Phase 1) now also closes the
+    """The lifespan hook that closes the endpoint also closes the
     forwarder's connection pool — through the real ASGI lifespan, not by
     calling aclose() directly."""
     upstream = Upstream("https://api.anthropic.com")

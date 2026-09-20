@@ -138,11 +138,11 @@ PREFILL_CAP = 0.95
 DIAL = "◴◵◶◷"
 
 # --- palette (relative luminance 0.19–0.29: ≥ 3:1 on #1e1e1e and on white) ------------
-TEAL = "#17A2A2"  # chrome, rules, the apron, LINE IS OPEN, REHEAT, SERVED
+TEAL = "#17A2A2"  # chrome, rules, the apron, LINE IS OPEN, REHEAT
 PINK = "#D6488A"  # the title word, confetti, PLATING, the EQ's top, HI-SCORE, a flash
 PURPLE = "#8E68DE"  # the order slip, ORDER №, the dial, the PLATE fill, KNIFE WORK
 MUSTARD = "#A87A10"  # the SEAR fill, SEARING, PREHEATING, PLATE FULL, the stall ?
-CHILLI = "#CE5450"  # BURNT, DROPPED IT, WALK-IN FULL, KITCHEN CLOSED
+CHILLI = "#CE5450"  # DROPPED IT, WALK-IN FULL, KITCHEN CLOSED
 SLATE = "#79798E"  # legend, perforation, IN THE WINDOW, LIGHTS OUT, steam, VHS
 PHASE_COLOURS = {
     "queued": SLATE,
@@ -1087,9 +1087,9 @@ class LinePanel(Vertical):
                 f" reused {c.get('reused_tokens', 0):,} tok",
             ]
             # `size` is the content box: the sprite's three rows come off it.
-            # The tickets block needs three more rows than the wide layout
+            # The tickets block needs two more rows than the wide layout
             # leaves once the rate panel has taken its five.
-            if self.size.height - 3 >= len(lines) + 3:
+            if self.size.height - 3 >= len(lines) + 2:
                 lines += [
                     f" {'ORDERS':<7}{DONE_WORD} {up} · {FAILED_WORD} {dropped}",
                     f" {'':<7}{ABANDONED_WORD} {walked}",

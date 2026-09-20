@@ -1088,9 +1088,8 @@ class PrefixCache:
                     f"warm generation failed after streaming {emitted} delta(s) "
                     f"({retry_reason}); not retrying cold, which would replay the turn"
                 )
-            # An optimization bug must never fail a turn; decide_context sets
-            # the same rule for auto sizing. Only a warm attempt is retried, so
-            # a genuine engine error still surfaces at once.
+            # An optimization bug must never fail a turn. Only a warm attempt
+            # is retried, so a genuine engine error still surfaces at once.
             stats.cold_retries += 1
             # The per-turn gauges describe the attempt that produced the text:
             # left alone they would add the failed warm attempt to the retry

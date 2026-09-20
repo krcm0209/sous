@@ -221,8 +221,8 @@ def test_a_failing_status_or_hold_is_an_error_body_not_a_bare_500(
 
     from sous.server import Daemon
 
-    def failing_status(self, *, recent):
-        raise RuntimeError("tasks.db is locked")
+    def failing_status(self):
+        raise RuntimeError("the prompt cache is locked")
 
     def failing_hold(self, pid, create_time):
         raise RuntimeError("no thread")
@@ -610,9 +610,9 @@ def test_events_document_is_built_off_the_event_loop(tmp_path: Path, monkeypatch
     threads: set[str] = set()
     original = Daemon.status_document
 
-    def recording(self, *, recent):
+    def recording(self):
         threads.add(threading.current_thread().name)
-        return original(self, recent=recent)
+        return original(self)
 
     monkeypatch.setattr(Daemon, "status_document", recording)
     app, _ = _app(tmp_path)
@@ -630,8 +630,8 @@ def test_a_failing_status_build_ends_the_events_stream_not_a_traceback(
 
     from sous.server import Daemon
 
-    def failing_status(self, *, recent):
-        raise RuntimeError("tasks.db is locked")
+    def failing_status(self):
+        raise RuntimeError("the prompt cache is locked")
 
     monkeypatch.setattr(Daemon, "status_document", failing_status)
     app, _ = _app(tmp_path)
@@ -676,7 +676,7 @@ def test_a_document_json_cannot_encode_ends_the_stream_too(tmp_path: Path, monke
 
     from sous.server import Daemon
 
-    monkeypatch.setattr(Daemon, "status_document", lambda self, *, recent: {"engine": object()})
+    monkeypatch.setattr(Daemon, "status_document", lambda self: {"engine": object()})
     app, _ = _app(tmp_path)
     with caplog.at_level(logging.ERROR, logger="sous.monitor"):
         status, frames = _collect_events(app, want=0)
@@ -700,7 +700,7 @@ def test_a_non_finite_number_ends_the_stream_as_status_refuses_it(
     monkeypatch.setattr(
         Daemon,
         "status_document",
-        lambda self, *, recent: {"engine": {"memory_gb": float("nan")}},
+        lambda self: {"engine": {"memory_gb": float("nan")}},
     )
     app, _ = _app(tmp_path)
     with caplog.at_level(logging.ERROR, logger="sous.monitor"):

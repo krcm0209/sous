@@ -52,7 +52,7 @@ def test_the_memory_read_is_the_last_thing_the_document_does(svc, monkeypatch):
         return snapshot()
 
     monkeypatch.setattr(service.inflight, "snapshot", probing_snapshot)
-    doc = service.status_document(recent=True)
+    doc = service.status_document()
     assert order == ["snapshot", "memory"]
     assert doc["engine"]["memory_gb"] == 1.5
 
@@ -156,9 +156,7 @@ def test_main_installs_the_shutdown_handler_before_serving(tmp_path: Path, monke
         )
         cfg.config_path.write_text("")
         monkeypatch.setattr(server, "load_config", lambda: cfg)
-        monkeypatch.setattr(
-            server, "_install_shutdown_handler", lambda stop: installed.append(stop)
-        )
+        monkeypatch.setattr(server, "_install_shutdown_handler", lambda: installed.append(True))
         with pytest.raises(SystemExit):
             server.main()
     assert installed, "main() served without installing the shutdown handler"
@@ -276,7 +274,7 @@ def test_status_memory_probe_releases_mlx_thread_state(svc, monkeypatch):
     service, _ = svc
     released = []
     monkeypatch.setattr(server, "release_mlx_thread_state", lambda: released.append(True))
-    service.status_document(recent=False)
+    service.status_document()
     assert released
 
 
@@ -296,7 +294,7 @@ def test_status_document_releases_mlx_thread_state_when_the_build_fails(svc, mon
 
     monkeypatch.setattr(service.inflight, "snapshot", boom)
     with pytest.raises(RuntimeError):
-        service.status_document(recent=True)
+        service.status_document()
     assert released
 
 
@@ -304,7 +302,7 @@ def test_server_status_reports_the_served_config(svc):
     """The status document is how a user confirms which model ids the daemon
     would serve locally, and at what window."""
     service, _ = svc
-    assert service.status_document(recent=False)["config"] == {
+    assert service.status_document()["config"] == {
         "model_id": "mlx-community/Qwen3.8-27B-4bit",
         "idle_unload_minutes": 30,
         "port": 8383,
@@ -342,7 +340,7 @@ def test_uvicorn_config_leaves_logging_to_the_daemon():
 
 def test_the_status_document_carries_no_task_fields(svc):
     service, _root = svc
-    doc = service.status_document(recent=True)
+    doc = service.status_document()
     assert set(doc) == {"engine", "inflight", "config", "recent_turns"}
     assert set(doc["config"]) == {
         "model_id",
@@ -353,7 +351,7 @@ def test_the_status_document_carries_no_task_fields(svc):
         "upstream_url",
         "generation_timeout_minutes",
     }
-    assert set(service.status_document(recent=False)) == {"engine", "inflight", "config"}
+    assert set(service.status_document()) == {"engine", "inflight", "recent_turns", "config"}
     assert len(service.status_version()) == 3
 
 

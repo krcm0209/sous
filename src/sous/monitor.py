@@ -187,9 +187,8 @@ def monitor_routes(
     lock, and neither belongs on the event loop — and the event stream
     builds each of its documents the same way."""
     # sse-starlette logs every frame it sends at DEBUG — the status document,
-    # verbatim, up to ten times a second — and the endpoint's own pin of this
-    # logger only runs when the endpoint is mounted. /sous/events is mounted
-    # unconditionally, so the no-bodies-in-logs rule cannot depend on that.
+    # verbatim, up to ten times a second. Pinned here as well as by the
+    # endpoint: each route builder must be safe to mount on its own.
     logging.getLogger("sse_starlette").setLevel(logging.INFO)
 
     def _unload() -> dict:

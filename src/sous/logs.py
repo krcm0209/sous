@@ -36,9 +36,9 @@ class UTCFormatter(logging.Formatter):
 def format_line(
     level: str, name: str, message: str, created: float | None = None, msecs: float | None = None
 ) -> str:
-    """The line shape, for the formatter and for the one place that cannot
-    log: the SIGTERM handler in server.py, which runs asynchronously to
-    whatever thread holds logging's lock and must print instead."""
+    """The line shape, kept apart from the formatter so a caller that cannot
+    go through logging (a signal handler runs asynchronously to whatever
+    thread holds logging's lock) can print the same line."""
     now = time.time() if created is None else created
     millis = int((now % 1) * 1000) if msecs is None else int(msecs)
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
