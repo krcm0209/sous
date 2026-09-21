@@ -12,7 +12,7 @@ import time
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from sous.config import SousConfig
 
@@ -788,10 +788,20 @@ class EngineManager:
         self._bump()
         return engine
 
-    def _free(self, engine: ManagedEngine) -> None:
-        """Outside the lock — the weights come off the GPU over seconds."""
+    def _free(self, engine: ManagedEngine, reason: Literal["idle", "requested"]) -> None:
+        """Outside the lock — the weights come off the GPU over seconds. The
+        line is the unload's only trace besides the status document, and the
+        sweep's is the one nobody asked for."""
+        started = time.monotonic()
         try:
             engine.unload()
+            # Before the finally wakes anyone: a get() waiting out the unload
+            # starts the next load at once, and the status document reports
+            # the model gone, so a line written after either could trail them.
+            _logger.info(
+                f"model_unload seconds={time.monotonic() - started:.1f} "
+                f"model={engine.model_id} reason={reason}"
+            )
         finally:
             with self._changed:
                 self._unloading = False
@@ -807,7 +817,7 @@ class EngineManager:
             if idle <= self._config.idle_unload_minutes * 60:
                 return False
             engine = self._take()
-        self._free(engine)
+        self._free(engine, "idle")
         return True
 
     def start_idle_sweep(self, interval_s: float = IDLE_SWEEP_SECONDS) -> None:
@@ -878,7 +888,7 @@ class EngineManager:
                 return {"unloaded": False, "reason": reason}
             engine = self._take()
             self._last_used = None
-        self._free(engine)
+        self._free(engine, "requested")
         return {"unloaded": True, "reason": None}
 
     def status(self) -> dict:

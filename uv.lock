@@ -1112,6 +1112,7 @@ dependencies = [
     { name = "starlette" },
     { name = "textual" },
     { name = "tomlkit" },
+    { name = "tqdm" },
     { name = "uvicorn" },
 ]
 
@@ -1138,6 +1139,7 @@ requires-dist = [
     { name = "starlette", specifier = ">=1.6" },
     { name = "textual", specifier = ">=8.2,<9" },
     { name = "tomlkit", specifier = ">=0.13" },
+    { name = "tqdm", specifier = ">=4.66.2" },
     { name = "uvicorn", specifier = ">=0.31" },
 ]
 

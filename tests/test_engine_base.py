@@ -105,6 +105,51 @@ def test_get_logs_the_load_once_with_its_duration(caplog):
     assert lines[0].startswith("model_load seconds=") and lines[0].endswith(" model=fake/model")
 
 
+def test_an_unload_logs_its_duration_and_reason(caplog):
+    """The sweep's unload is the one nobody asked for, so the log is the
+    only place it shows; a requested one says who wanted the memory."""
+    import logging
+
+    mgr, created, live, clock = _held_manager(idle_minutes=1)
+    mgr.get()
+    clock.now += 61
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        assert mgr.unload_if_idle()
+        mgr.get()
+        assert mgr.unload_now()["unloaded"]
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("model_unload")]
+    assert len(lines) == 2
+    assert lines[0].startswith("model_unload seconds=")
+    assert lines[0].endswith(" model=fake/model reason=idle")
+    assert lines[1].endswith(" model=fake/model reason=requested")
+
+
+def test_the_unload_line_lands_before_the_unload_is_over(caplog):
+    """A get() waiting out the unload starts the next load the moment it
+    ends, and the status document reports the model gone from then on; a
+    line written after that could trail both in the log."""
+    import logging
+
+    mgr, _ = _manager(idle_minutes=0)
+    mgr.get()
+    unloading: list[bool] = []
+
+    class Probe(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.getMessage().startswith("model_unload"):
+                unloading.append(mgr.status()["unloading"])
+
+    logger = logging.getLogger("sous.engine")
+    probe = Probe()
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        logger.addHandler(probe)
+        try:
+            assert mgr.unload_now()["unloaded"]
+        finally:
+            logger.removeHandler(probe)
+    assert unloading == [True]
+
+
 def _positional_factory(model_id: str) -> FakeEngine:
     """An engine that reports which side owns the rotary positions, the way
     the VLM backend does."""
