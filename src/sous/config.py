@@ -81,8 +81,8 @@ class SousConfig:
     top_k: int = 20
     # Speculative decoding (VLM backend only): a DFlash-style drafter predicts
     # blocks the target verifies in one forward — ~1.8x decode on the default
-    # affine-4bit model with the shipped sampling, up to ~2.4x greedy
-    # (krcm0209/sous#55, #58). Empty id disables it. The
+    # affine-4bit model with the shipped sampling (krcm0209/sous#55, #58);
+    # the greedy path is unmeasured (#87). Empty id disables it. The
     # drafter must match the target architecture; when it doesn't (or fails to
     # load), the engine logs and continues without it. Block size 3 measured
     # best on the M5 Pro against the drafter's adaptive policy (+3% on prose,

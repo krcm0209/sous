@@ -623,13 +623,16 @@ completion once it happens, since a near-identical prompt plus a nudge
 still argmaxes to the same wrong output every time.
 
 Speculative decoding (`speculative_draft_id`, `speculative_block_size`) is
-~1.8x decode on the default model with the shipped sampling, up to ~2.4x
-greedy; `""` disables it. Block size 3 measured best on an M5 Pro (+3% on
-prose, +13% on code re-emission over the drafter's adaptive policy); 0 lets
-that policy pick the depth; anything above 5 is clamped, because mlx's fused
-attention kernel takes at most 5 verify rows on this model and 6–8 rows run
-5–6x slower per layer. It auto-disables with a warning when the drafter
-can't serve the configured model.
+~1.8x decode on the default model with the shipped sampling; `""` disables
+it. The greedy path's speedup is unmeasured: the "~2.4x greedy" figure
+earlier versions quoted ran an argmax sampler through the sampled
+speculative walk, before the engine reached mlx-vlm's greedy branch, and
+that branch also drafts differently (#87). Block size 3 measured best on an
+M5 Pro (+3% on prose, +13% on code re-emission over the drafter's adaptive
+policy); 0 lets that policy pick the depth; anything above 5 is clamped,
+because mlx's fused attention kernel takes at most 5 verify rows on this
+model and 6–8 rows run 5–6x slower per layer. It auto-disables with a
+warning when the drafter can't serve the configured model.
 
 ## Tuning
 
