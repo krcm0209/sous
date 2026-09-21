@@ -1,7 +1,7 @@
-"""The Host/Origin/fetch-metadata check every custom route on the daemon's
-loopback bind applies — the Host/Origin pair is what the MCP transport checks
-on /mcp, which custom routes get none of; the fetch-metadata rule goes one
-step further. Shared by the gateway's routes and the daemon's own /sous/
+"""The Host/Origin/fetch-metadata check every route on the daemon's loopback
+bind applies — the Host/Origin pair a browser cannot forge from another
+origin, and a fetch-metadata rule that goes one step further. Shared by the
+endpoint's routes, the ones it forwards included, and the daemon's own /sous/
 routes."""
 
 from __future__ import annotations
@@ -10,16 +10,16 @@ from urllib.parse import urlsplit
 
 from starlette.requests import Request
 
-from sous.gateway.convert import RequestError
+from sous.api.convert import RequestError
 
 # Without the Host check a web page whose hostname re-resolves to 127.0.0.1
-# could drive the local model. Same allow-list as the SDK's.
+# could drive the local model.
 ALLOWED_HOSTS = ("127.0.0.1", "localhost", "[::1]")
-# The SDK checks Origin as well, and Host alone does not cover what it covers:
+# Origin is checked as well, because Host alone does not cover what it covers:
 # a cross-origin fetch with Content-Type: text/plain is a CORS simple request,
 # so it skips the preflight and arrives with a perfectly legitimate loopback
 # Host. The page cannot read the reply, but the turn it starts holds the
-# gateway lock, the engine lock and a prompt-cache slot for a whole generation
+# endpoint lock, the engine lock and a prompt-cache slot for a whole generation
 # timeout — a drive-by DoS of the daemon. urlsplit unwraps the IPv6 brackets a
 # netloc carries, so these are bare addresses. Any port passes: this rule is
 # the fallback for a browser without fetch metadata, and the fetch-metadata
@@ -76,7 +76,7 @@ def check_loopback(request: Request) -> None:
         raise RequestError(403, "permission_error", "loopback origins only")
 
 
-# Every verb the gateway's catch-all forwards and the daemon's /sous/ 404
+# Every verb the endpoint's catch-all forwards and the daemon's /sous/ 404
 # answers: the two lists must stay one, or a verb would fall through one
 # and reach the other.
 ALL_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")

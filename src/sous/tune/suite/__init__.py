@@ -1,6 +1,6 @@
-"""The graded suite: mechanical coding tasks the worker runs for real, each
+"""The graded suite: mechanical coding tasks the candidate runs for real, each
 with a hidden grader and a reference solution. A task is a directory —
-task.toml, project/ (what the worker sees), grade/ (what scores it),
+task.toml, project/ (what the candidate sees), grade/ (what scores it),
 solution/ (the solved project, so CI can prove the grader)."""
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def _text(raw: dict, key: str, name: str) -> str:
 
 def _strings(raw: dict, key: str, name: str) -> tuple[str, ...]:
     value = raw.get(key, [])
-    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
         raise ValueError(f"suite task {name}: {key} must be a list of non-empty strings")
     return tuple(value)
 

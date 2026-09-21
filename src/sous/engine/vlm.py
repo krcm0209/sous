@@ -166,8 +166,8 @@ class VLMEngine:
 
     def _ids(self, slot: str, messages: list[dict], tools: list[dict]) -> list[int]:
         # One lock for every tokenization: HF's fast tokenizer mutates shared
-        # Rust state on each encode (set_truncation_and_padding), and since the
-        # gateway there are two callers — a turn on a pool thread and Claude
+        # Rust state on each encode (set_truncation_and_padding), and there are
+        # two callers — a turn on a pool thread and Claude
         # Code's count_tokens, which it sends mid-turn. Not _gen_lock: that
         # would queue a token count behind a whole generation.
         with self._tokenize_lock:
@@ -398,10 +398,9 @@ class VLMEngine:
         a subagent type's tool array is byte-identical across sessions and
         projects, so a new `claude` process's first subagent turn starts
         ~45–56K tokens warm instead of prefilling ~57K cold. The header fork
-        serves the same session's next subagent of that type, ~57K warm. The
-        worker's short system prompt never clears the floor, and a render
-        below it cannot contain a boundary above it — so it never pays the
-        probe."""
+        serves the same session's next subagent of that type, ~57K warm. A
+        short system prompt never clears the floor, and a render below it
+        cannot contain a boundary above it — so it never pays the probe."""
         if (
             len(messages) < 2
             or messages[0].get("role") != "system"

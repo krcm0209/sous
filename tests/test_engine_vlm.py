@@ -10,13 +10,13 @@ HYBRID_VLM = "mlx-community/Qwen3.5-9B-MLX-4bit"  # ~5.6 GB, linear-attention hy
 
 def test_vlm_engine_text_only_generation():
     from sous.engine.vlm import VLMEngine
-    from sous.protocol import WORKER_TOOLS
+    from sous.tune.payload import TOOLS
 
     e = VLMEngine(TINY_VLM)
     msgs = [{"role": "user", "content": "Say the word kiwi and nothing else."}]
-    out = e.generate(msgs, WORKER_TOOLS, max_tokens=64)
+    out = e.generate(msgs, TOOLS, max_tokens=64)
     assert isinstance(out, str) and len(out) > 0
-    assert e.count_tokens(msgs, WORKER_TOOLS) > 0
+    assert e.count_tokens(msgs, TOOLS) > 0
     e.unload()
 
 
@@ -185,18 +185,18 @@ def test_vlm_a_continuation_is_positioned_behind_its_cache(model_id, is_hybrid):
 
 def test_vlm_engine_reuses_across_turns():
     from sous.engine.vlm import VLMEngine
-    from sous.protocol import WORKER_TOOLS
+    from sous.tune.payload import TOOLS
 
-    # Explicitly on: the shipped default is off until the worker stops running
-    # each generation on its own thread, and this test is about reuse itself.
+    # Explicitly on: the constructor defaults it off, and this test is about
+    # reuse itself.
     e = VLMEngine(TINY_VLM, prompt_cache=True)
     msgs = [{"role": "user", "content": "Say the word kiwi and nothing else."}]
-    first = e.generate(msgs, WORKER_TOOLS, max_tokens=32)
+    first = e.generate(msgs, TOOLS, max_tokens=32)
     msgs = msgs + [
         {"role": "assistant", "content": first},
         {"role": "user", "content": "Now say plum and nothing else."},
     ]
-    e.generate(msgs, WORKER_TOOLS, max_tokens=32)
+    e.generate(msgs, TOOLS, max_tokens=32)
     stats = e.prompt_cache_stats()
     assert stats["hits"] == 1, stats
     e.unload()
@@ -219,12 +219,12 @@ def test_vlm_drafter_speeds_up_generation_on_default_model(prompt_cache):
     drafter with no captured hidden state would break. Two generations in the
     warm case so the second one actually rides a reused prefix."""
     from sous.engine.vlm import VLMEngine
-    from sous.protocol import WORKER_TOOLS
+    from sous.tune.payload import TOOLS
 
     e = VLMEngine(DEFAULT_27B, draft_id=DRAFTER, prompt_cache=prompt_cache)
     assert e._draft is not None, "drafter should load and validate on the default model"
     msgs = [{"role": "user", "content": "Write a haiku about rain."}]
-    out = e.generate(msgs, WORKER_TOOLS, max_tokens=64)
+    out = e.generate(msgs, TOOLS, max_tokens=64)
     assert isinstance(out, str) and len(out) > 0
     assert len(getattr(e._draft, "accept_lens", [])) > 0, "no speculative rounds ran"
     if prompt_cache:
@@ -234,7 +234,7 @@ def test_vlm_drafter_speeds_up_generation_on_default_model(prompt_cache):
             {"role": "user", "content": "Now one about snow."},
         ]
         e._draft.accept_lens.clear()
-        out2 = e.generate(msgs, WORKER_TOOLS, max_tokens=64)
+        out2 = e.generate(msgs, TOOLS, max_tokens=64)
         assert isinstance(out2, str) and len(out2) > 0
         stats = e.prompt_cache_stats()
         assert stats.get("hits", 0) >= 1, f"warm path never engaged: {stats}"
@@ -249,7 +249,7 @@ def test_vlm_incompatible_drafter_degrades_gracefully():
     import warnings as w
 
     from sous.engine.vlm import VLMEngine
-    from sous.protocol import WORKER_TOOLS
+    from sous.tune.payload import TOOLS
 
     with w.catch_warnings(record=True) as caught:
         w.simplefilter("always")
@@ -257,7 +257,7 @@ def test_vlm_incompatible_drafter_degrades_gracefully():
     assert e._draft is None
     assert any("drafter" in str(x.message).lower() for x in caught)
     msgs = [{"role": "user", "content": "Say the word kiwi and nothing else."}]
-    out = e.generate(msgs, WORKER_TOOLS, max_tokens=32)
+    out = e.generate(msgs, TOOLS, max_tokens=32)
     assert isinstance(out, str) and len(out) > 0
     e.unload()
 
@@ -282,12 +282,12 @@ def test_incompatible_drafter_never_materializes_bf16():
 def test_vlm_engine_streams_deltas_that_reassemble_the_reply():
     from sous.engine.base import Delta
     from sous.engine.vlm import VLMEngine
-    from sous.protocol import WORKER_TOOLS
+    from sous.tune.payload import TOOLS
 
     e = VLMEngine(TINY_VLM)
     seen: list[Delta] = []
     msgs = [{"role": "user", "content": "Count from one to five."}]
-    out = e.generate(msgs, WORKER_TOOLS, max_tokens=32, on_delta=seen.append)
+    out = e.generate(msgs, TOOLS, max_tokens=32, on_delta=seen.append)
     assert "".join(d.text for d in seen) == out
     assert seen[-1].finish_reason in ("stop", "length")
     assert all(d.finish_reason is None for d in seen[:-1])

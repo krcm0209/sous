@@ -1,19 +1,21 @@
-import asyncio
 import io
 import logging
 import os
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
+import anyio
 import pytest
+from starlette.applications import Starlette
 
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
-from sous.server import SousService
-from sous.tasks import TaskStore
+from sous.server import Daemon, create_server
 from tests.fake_engine import FakeEngine
+from tests.fake_upstream import FakeUpstream
 
 
 @pytest.fixture(autouse=True)
@@ -30,346 +32,8 @@ def svc(tmp_path: Path):
     root = tmp_path / "proj"
     root.mkdir()
     cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
-    cfg.config_path.write_text('[commands]\nallowlist = ["pytest"]\n')
-    store = TaskStore(tmp_path / "tasks.db")
     engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
-    return SousService(store, engines, cfg), store, root
-
-
-def test_delegate_returns_id_and_position(svc):
-    service, store, root = svc
-    out = service.delegate_task("t", "do it", str(root))
-    assert "task_id" in out and out["queue_position"] == 1
-    assert store.get(out["task_id"]).state == "queued"
-
-
-def test_delegate_rejects_relative_root(svc):
-    service, _, _ = svc
-    assert "error" in service.delegate_task("t", "x", "relative/path")
-
-
-def test_delegate_rejects_missing_root(svc):
-    service, _, _ = svc
-    assert "error" in service.delegate_task("t", "x", "/nope/not/here")
-
-
-def test_delegate_rejects_root_containing_data_dir(svc, tmp_path: Path):
-    """C1 (MCP boundary): a project_root that is an ancestor of the sous
-    data dir would put config.toml/tasks.db inside the sandbox."""
-    service, _, _ = svc
-    out = service.delegate_task("t", "x", str(tmp_path))  # tmp_path contains data_dir
-    assert "error" in out and "data dir" in out["error"]
-
-
-def test_delegate_rejects_root_equal_to_data_dir(svc, tmp_path: Path):
-    service, _, _ = svc
-    (tmp_path / "data").mkdir()
-    out = service.delegate_task("t", "x", str(tmp_path / "data"))
-    assert "error" in out and "data dir" in out["error"]
-
-
-def test_delegate_accepts_sibling_of_data_dir(svc):
-    service, _, root = svc
-    assert "task_id" in service.delegate_task("t", "x", str(root))
-
-
-def _fs_is_case_insensitive(tmp_path: Path) -> bool:
-    probe = tmp_path / "sous_case_probe_x"
-    probe.write_text("x")
-    hit = (tmp_path / "sous_case_probe_X").exists()
-    probe.unlink()
-    return hit
-
-
-def test_delegate_rejects_case_variant_root_containing_data_dir(tmp_path: Path):
-    """C1 (case bypass): a case-variant ancestor of the data dir must be
-    rejected just like the exact-case ancestor, or the boundary check is
-    defeated on a case-insensitive FS."""
-    if not _fs_is_case_insensitive(tmp_path):
-        pytest.skip("requires a case-insensitive filesystem (APFS/HFS+)")
-    home = tmp_path / "home"
-    home.mkdir()
-    data = home / "data"
-    data.mkdir()
-    cfg = SousConfig(data_dir=data, config_path=home / "config.toml")
-    store = TaskStore(tmp_path / "tasks.db")
-    engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
-    service = SousService(store, engines, cfg)
-    # exact-case ancestor is rejected (sanity)
-    assert "error" in service.delegate_task("t", "x", str(home))
-    # case-variant ancestor must be rejected the same way
-    out = service.delegate_task("t", "x", str(tmp_path / "HOME"))
-    assert "error" in out and "data dir" in out["error"]
-
-
-def test_delegate_rejects_non_allowlisted_verify(svc):
-    service, _, root = svc
-    out = service.delegate_task("t", "x", str(root), verify_commands=["rm -rf /"])
-    assert "error" in out and "rm -rf /" in out["error"]
-
-
-def test_delegate_accepts_allowlisted_verify(svc):
-    service, _, root = svc
-    out = service.delegate_task("t", "x", str(root), verify_commands=["pytest -q"])
-    assert "task_id" in out
-
-
-def test_delegate_unparseable_verify_command_returns_error(svc):
-    """C4: an unmatched quote in a client-supplied verify_command must come
-    back as a structured error, not raise ValueError out of the service."""
-    service, _, root = svc
-    out = service.delegate_task("t", "x", str(root), verify_commands=['echo "unclosed'])
-    assert "error" in out and 'echo "unclosed' in out["error"]
-
-
-def test_status_single_and_all(svc):
-    service, store, root = svc
-    a = service.delegate_task("a", "x", str(root))["task_id"]
-    service.delegate_task("b", "x", str(root))
-    one = service.task_status(a)
-    assert one["state"] == "queued" and one["queue_position"] == 1
-    both = service.task_status()
-    assert len(both["tasks"]) == 2
-
-
-def test_status_unknown_id(svc):
-    service, _, _ = svc
-    assert "error" in service.task_status("nope")
-
-
-def test_result_not_ready_then_ready(svc):
-    service, store, root = svc
-    tid = service.delegate_task("t", "x", str(root))["task_id"]
-    assert "error" in service.task_result(tid)
-    store.claim_next()
-    store.finish(tid, "completed", {"summary": "s", "files_changed": []})
-    out = service.task_result(tid)
-    assert out["outcome"] == "completed" and out["report"]["summary"] == "s"
-
-
-def test_result_include_diff_from_git(svc, tmp_path: Path):
-    service, store, root = svc
-    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-    (root / "f.txt").write_text("one\n")
-    subprocess.run(["git", "add", "."], cwd=root, check=True)
-    subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
-        cwd=root,
-        check=True,
-    )
-    (root / "f.txt").write_text("two\n")
-    tid = service.delegate_task("t", "x", str(root))["task_id"]
-    store.claim_next()
-    store.finish(tid, "completed", {"summary": "s", "files_changed": [{"path": "f.txt"}]})
-    out = service.task_result(tid, include_diff=True)
-    assert "-one" in out["diff"] and "+two" in out["diff"]
-
-
-def test_result_include_diff_from_git_worktree(svc, tmp_path: Path):
-    """A git *worktree* has a `.git` FILE (gitdir pointer), not a directory —
-    the diff must still be produced there (and in submodules / subdirectories
-    of a repo), which is why the repo check must be `git rev-parse
-    --is-inside-work-tree` rather than `.git`-is-a-directory."""
-    service, store, root = svc
-    main_repo = tmp_path / "main_repo"
-    main_repo.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=main_repo, check=True)
-    (main_repo / "f.txt").write_text("one\n")
-    subprocess.run(["git", "add", "."], cwd=main_repo, check=True)
-    subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
-        cwd=main_repo,
-        check=True,
-    )
-    worktree = tmp_path / "wt"
-    subprocess.run(["git", "worktree", "add", str(worktree)], cwd=main_repo, check=True)
-    assert not (worktree / ".git").is_dir()  # sanity: it's a file, not a dir
-    (worktree / "f.txt").write_text("two\n")
-    tid = service.delegate_task("t", "x", str(worktree))["task_id"]
-    store.claim_next()
-    store.finish(tid, "completed", {"summary": "s", "files_changed": [{"path": "f.txt"}]})
-    out = service.task_result(tid, include_diff=True)
-    assert "-one" in out["diff"] and "+two" in out["diff"]
-
-
-def _git_repo_with_commit(root: Path) -> None:
-    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-    (root / "f.txt").write_text("one\n")
-    subprocess.run(["git", "add", "."], cwd=root, check=True)
-    subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
-        cwd=root,
-        check=True,
-    )
-
-
-def test_result_include_diff_shows_created_untracked_file(svc):
-    """D1: `git diff -- <paths>` omits untracked files, and a worker CREATING
-    a file is the most common action — the diff must include the new file's
-    contents, or 'Claude always reviews the diff' silently fails for exactly
-    the case the review workflow exists to cover."""
-    service, store, root = svc
-    _git_repo_with_commit(root)
-    (root / "made.txt").write_text("brand new line\n")  # untracked
-    tid = service.delegate_task("t", "x", str(root))["task_id"]
-    store.claim_next()
-    store.finish(tid, "completed", {"summary": "s", "files_changed": [{"path": "made.txt"}]})
-    out = service.task_result(tid, include_diff=True)
-    assert out["diff"] is not None
-    assert "made.txt" in out["diff"]
-    assert "+brand new line" in out["diff"]
-
-
-def test_result_include_diff_shows_modified_and_created_together(svc):
-    service, store, root = svc
-    _git_repo_with_commit(root)
-    (root / "f.txt").write_text("two\n")  # modified, tracked
-    (root / "made.txt").write_text("brand new line\n")  # created, untracked
-    tid = service.delegate_task("t", "x", str(root))["task_id"]
-    store.claim_next()
-    store.finish(
-        tid,
-        "completed",
-        {"summary": "s", "files_changed": [{"path": "f.txt"}, {"path": "made.txt"}]},
-    )
-    out = service.task_result(tid, include_diff=True)
-    assert "-one" in out["diff"] and "+two" in out["diff"]
-    assert "+brand new line" in out["diff"]
-
-
-def test_result_include_diff_non_repo_returns_none(svc):
-    service, store, root = svc  # root is a plain directory, no git repo
-    (root / "made.txt").write_text("brand new line\n")
-    tid = service.delegate_task("t", "x", str(root))["task_id"]
-    store.claim_next()
-    store.finish(tid, "completed", {"summary": "s", "files_changed": [{"path": "made.txt"}]})
-    out = service.task_result(tid, include_diff=True)
-    assert out["diff"] is None
-
-
-def test_cancel(svc):
-    service, _, root = svc
-    tid = service.delegate_task("t", "x", str(root))["task_id"]
-    assert service.cancel_task(tid)["cancelled"] is True
-    assert "error" in service.cancel_task("nope")
-
-
-def test_respond_requires_awaiting(svc):
-    service, _, root = svc
-    tid = service.delegate_task("t", "x", str(root))["task_id"]
-    assert "error" in service.respond_to_command_request(tid, approve=True)
-
-
-def test_respond_approves_and_persists(svc):
-    service, store, root = svc
-    tid = service.delegate_task("t", "x", str(root))["task_id"]
-    store.claim_next()
-    store.request_approval(tid, "go vet ./...")
-    out = service.respond_to_command_request(tid, approve=True, persist_to_allowlist=True)
-    assert out["ok"] is True
-    from sous.config import current_allowlist
-
-    assert ["go", "vet", "./..."] in current_allowlist(service.config.config_path)
-    assert store.poll_approval(tid) == "approved"
-
-
-def test_persisting_a_cd_prefixed_command_matches_the_next_request(svc):
-    """Approve-and-persist on `cd <dir> && <cmd>` must persist the canonical
-    form the allowlist actually matches (the stripped remainder), so the same
-    cd-prefixed request runs next time WITHOUT prompting. Persisting the raw
-    `cd ... && ...` would write an entry that can never match the stripped
-    argv, and the 'remembered' approval would keep asking."""
-    from sous.config import current_allowlist
-    from sous.toolexec import ToolExecutor, command_allowed
-
-    service, store, root = svc
-    tid = service.delegate_task("t", "x", str(root))["task_id"]
-    store.claim_next()
-    store.request_approval(tid, "cd sub && go vet ./...")
-    out = service.respond_to_command_request(tid, approve=True, persist_to_allowlist=True)
-    assert out["ok"] is True
-    # persisted the remainder, not the cd-prefixed string
-    allow = current_allowlist(service.config.config_path)
-    assert ["go", "vet", "./..."] in allow
-    assert not any(entry and entry[0] == "cd" for entry in allow)
-    # and the same request now passes the allowlist that run_command applies
-    ex = ToolExecutor(root, service.config.config_path)
-    (ex.project_root / "sub").mkdir()
-    from sous.toolexec import normalize_cd_prefix
-
-    cmd = "cd sub && go vet ./..."
-    argv = normalize_cd_prefix(cmd, ["cd", "sub", "&&", "go", "vet", "./..."], ex.project_root)
-    assert command_allowed(argv, current_allowlist(service.config.config_path))
-
-
-def test_respond_race_does_not_persist_allowlist(svc, monkeypatch):
-    """M2: if the approval races a timeout-deny (respond_approval returns
-    False), the command must NOT already be persisted to the allowlist."""
-    service, store, root = svc
-    tid = service.delegate_task("t", "x", str(root))["task_id"]
-    store.claim_next()
-    store.request_approval(tid, "go vet ./...")
-    before = service.config.config_path.read_text()
-    monkeypatch.setattr(store, "respond_approval", lambda task_id, approve: False)
-    out = service.respond_to_command_request(tid, approve=True, persist_to_allowlist=True)
-    assert out["ok"] is False
-    assert service.config.config_path.read_text() == before
-    from sous.config import current_allowlist
-
-    assert ["go", "vet", "./..."] not in current_allowlist(service.config.config_path)
-
-
-def test_second_respond_cannot_reverse_persisted_approval(svc):
-    """A3 (service boundary): approve-with-persist writes the allowlist entry;
-    a later deny must NOT win the approval state, or the command would be left
-    permanently allowlisted while reported as denied."""
-    service, store, root = svc
-    tid = service.delegate_task("t", "x", str(root))["task_id"]
-    store.claim_next()
-    store.request_approval(tid, "go vet ./...")
-    first = service.respond_to_command_request(tid, approve=True, persist_to_allowlist=True)
-    assert first["ok"] is True
-    second = service.respond_to_command_request(tid, approve=False)
-    assert second["ok"] is False  # first response already landed
-    assert store.poll_approval(tid) == "approved"
-
-
-def test_server_status(svc):
-    service, _, root = svc
-    service.delegate_task("t", "x", str(root))
-    s = service.server_status()
-    assert s["queue"]["queued"] == 1
-    assert s["engine"]["loaded"] is False and s["engine"]["loading"] is False
-    assert s["engine"]["holders"] == 0 and "memory_gb" in s["engine"]
-    assert s["inflight"] == []
-    assert s["config"]["model_id"]
-    assert s["config"]["idle_unload_minutes"] == 30
-    assert ["pytest"] in s["config"]["allowlist"]
-    # The MCP tool's answer is the document without the two recent lists:
-    # a frontier model pays to read every key.
-    assert set(s) == {"engine", "inflight", "queue", "config"}
-
-
-def test_status_document_with_recents_lists_turns_and_tasks(svc):
-    from sous.inflight import Inflight
-
-    service, store, root = svc
-    assert isinstance(service.inflight, Inflight)
-    tid = service.delegate_task("scaffold the fixtures", "x", str(root))["task_id"]
-    store.claim_next()
-    service.inflight.begin("msg_1", model="sous-local", stream=True, max_tokens=64)
-    service.inflight.finished({"ts": 1.0, "id": "msg_0", "status": 200})
-    doc = service.status_document(recent=True)
-    assert set(doc) == {"engine", "inflight", "queue", "config", "recent_turns", "recent_tasks"}
-    assert [t["id"] for t in doc["inflight"]] == ["msg_1"]
-    # The MCP tool drops the two recent lists, never the turn in flight.
-    assert [t["id"] for t in service.server_status()["inflight"]] == ["msg_1"]
-    assert doc["recent_turns"] == [{"ts": 1.0, "id": "msg_0", "status": 200}]
-    (task,) = doc["recent_tasks"]
-    assert task["id"] == tid and task["state"] == "running"
-    assert task["title"] == "scaffold the fixtures" and task["seconds"] >= 0
-    assert set(task) == {"id", "state", "title", "seconds"}
-    assert doc["queue"] == {"queued": 0, "running": 1}
+    return Daemon(engines, cfg), root
 
 
 def test_the_memory_read_is_the_last_thing_the_document_does(svc, monkeypatch):
@@ -378,7 +42,7 @@ def test_the_memory_read_is_the_last_thing_the_document_does(svc, monkeypatch):
     after the release is what segfaults the thread on its way out."""
     from sous import server as server_module
 
-    service, _, _ = svc
+    service, _ = svc
     order: list[str] = []
     monkeypatch.setattr(server_module, "_mlx_memory_gb", lambda: order.append("memory") or 1.5)
     snapshot = service.inflight.snapshot
@@ -388,130 +52,13 @@ def test_the_memory_read_is_the_last_thing_the_document_does(svc, monkeypatch):
         return snapshot()
 
     monkeypatch.setattr(service.inflight, "snapshot", probing_snapshot)
-    doc = service.status_document(recent=True)
+    doc = service.status_document()
     assert order == ["snapshot", "memory"]
     assert doc["engine"]["memory_gb"] == 1.5
 
 
-def test_recent_tasks_are_capped_at_ten_newest_first(svc):
-    service, store, root = svc
-    for n in range(12):
-        store.enqueue(
-            title=f"t{n}",
-            instructions="x",
-            project_root=str(root),
-            context_files=[],
-            verify_commands=[],
-        )
-    titles = [t["title"] for t in service.status_document(recent=True)["recent_tasks"]]
-    assert titles == [f"t{n}" for n in range(11, 1, -1)]
-
-
-def test_server_status_counts_past_200_tasks(svc):
-    """E2: queue depth came from list_recent(limit=200), so more than 200
-    active tasks under-reported — the count must cover every row."""
-    service, store, root = svc
-    for i in range(205):
-        store.enqueue(
-            title=f"t{i}",
-            instructions="x",
-            project_root=str(root),
-            context_files=[],
-            verify_commands=[],
-        )
-    store.claim_next()
-    s = service.server_status()
-    assert s["queue"]["queued"] == 204
-    assert s["queue"]["running"] == 1
-
-
-def test_create_server_registers_six_tools(svc):
-    service, store, root = svc
-    from sous.server import create_server
-
-    mcp = create_server(store, service.engines, service.config)
-    tools = asyncio.run(mcp.list_tools())
-    names = {t.name for t in tools}
-    assert names == {
-        "delegate_to_local_model",
-        "task_status",
-        "task_result",
-        "cancel_task",
-        "respond_to_command_request",
-        "server_status",
-    }
-
-
-def test_create_server_sets_discovery_instructions(svc):
-    """Server-level instructions are the one part of the MCP surface clients
-    put in front of the model unconditionally — tool descriptions can be
-    deferred out of context, leaving only names. Discovery therefore lives or
-    dies on instructions being present, naming the delegate tool, and fitting
-    under Claude Code's 2KB truncation limit (an overlong block silently loses
-    its own ending)."""
-    service, store, root = svc
-    from sous.server import create_server
-
-    mcp = create_server(store, service.engines, service.config)
-    assert mcp.instructions
-    assert "delegate_to_local_model" in mcp.instructions
-    assert len(mcp.instructions.encode()) < 2048
-
-
-def test_delegate_tool_description_carries_the_motive(svc):
-    """The description lists what QUALIFIES for delegation; it must also say
-    why delegation beats doing the work inline (which the model always can) —
-    the plan-economics rationale is the tie-breaker at tool-selection time."""
-    service, store, root = svc
-    from sous.server import create_server
-
-    mcp = create_server(store, service.engines, service.config)
-    tools = asyncio.run(mcp.list_tools())
-    delegate = next(t for t in tools if t.name == "delegate_to_local_model")
-    assert "plan" in (delegate.description or "").lower()
-
-
-# --- only one daemon may run: a second would fail the first's in-flight task
-# --- via recover_interrupted() and load a second copy of the model.
-
-
-def test_second_daemon_exits_without_touching_the_queue(tmp_path: Path, monkeypatch):
-    """The lock must be taken before ANY queue access.
-
-    server.main() opens the TaskStore and calls recover_interrupted() — which
-    marks the first daemon's RUNNING task failed — then starts a worker that
-    can load a second model. All of that happens before mcp.run() binds the
-    port, so the bind is far too late to be the guard. If the lock is acquired
-    first, tasks.db is never even created.
-    """
-    from sous.server import _acquire_singleton_lock
-    from sous.server import main as serve_main
-
-    data = tmp_path / "data"
-    data.mkdir()
-
-    # Hold the port for the whole test: without the lock, main() would reach
-    # mcp.run() and serve forever instead of failing, hanging the suite. An
-    # occupied port makes the unlocked path terminate so the assertion below
-    # is what distinguishes pass from fail.
-    with socket.socket() as occupied:
-        occupied.bind(("127.0.0.1", 0))
-        occupied.listen(1)
-        cfg = SousConfig(
-            data_dir=data,
-            config_path=tmp_path / "config.toml",
-            server_port=occupied.getsockname()[1],
-        )
-        cfg.config_path.write_text("")
-
-        holder = _acquire_singleton_lock(data)  # stand-in for the live daemon
-        try:
-            monkeypatch.setattr("sous.server.load_config", lambda: cfg)
-            with pytest.raises(SystemExit):
-                serve_main()
-            assert not (data / "tasks.db").exists(), "second daemon opened the shared queue"
-        finally:
-            holder.close()
+# --- only one daemon may run: a second would load its own copy of the
+# --- model beside the first's.
 
 
 def test_lock_excludes_a_separate_process(tmp_path: Path):
@@ -580,17 +127,26 @@ def test_lock_file_records_the_holder_pid(tmp_path: Path):
 
 
 def test_main_installs_the_shutdown_handler_before_serving(tmp_path: Path, monkeypatch):
-    """The handler is useless if main() never installs it.
-
-    Everything else about shutdown is covered in tests/test_commands.py; this
-    pins the one-line link between them, which no other test would catch.
+    """The handler is useless if main() never installs it, and its body is
+    untestable in-process (it ends in os._exit) — so pinning this one-line
+    link is the only coverage the wiring gets. The same is true of the
+    daemon's log handler: nothing but main() installs it any more (the
+    endpoint test files' autouse fixtures call configure_daemon_logging()
+    themselves, so they would stay green even if main() stopped calling it),
+    so this test removes any copy left by an earlier test before asserting
+    that main() is what put one back.
     """
     import sous.server as server
+    from sous.logs import SOUS_HANDLER_NAME
 
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        if h.name == SOUS_HANDLER_NAME:
+            root.removeHandler(h)
     data = tmp_path / "data"
     data.mkdir()
     installed = []
-    with socket.socket() as occupied:  # make mcp.run() fail fast instead of serving
+    with socket.socket() as occupied:  # make serve() fail fast instead of serving
         occupied.bind(("127.0.0.1", 0))
         occupied.listen(1)
         cfg = SousConfig(
@@ -600,12 +156,11 @@ def test_main_installs_the_shutdown_handler_before_serving(tmp_path: Path, monke
         )
         cfg.config_path.write_text("")
         monkeypatch.setattr(server, "load_config", lambda: cfg)
-        monkeypatch.setattr(
-            server, "_install_shutdown_handler", lambda stop: installed.append(stop)
-        )
+        monkeypatch.setattr(server, "_install_shutdown_handler", lambda: installed.append(True))
         with pytest.raises(SystemExit):
             server.main()
     assert installed, "main() served without installing the shutdown handler"
+    assert sum(1 for h in root.handlers if h.name == SOUS_HANDLER_NAME) == 1
 
 
 def test_main_routes_config_load_warnings_through_the_daemon_shape(
@@ -627,7 +182,7 @@ def test_main_routes_config_load_warnings_through_the_daemon_shape(
     config_path = tmp_path / "config.toml"
     config_path.write_text("[nonsense]\n")  # unknown section: load_config warns
 
-    with socket.socket() as occupied:  # make mcp.run() fail fast instead of serving
+    with socket.socket() as occupied:  # make serve() fail fast instead of serving
         occupied.bind(("127.0.0.1", 0))
         occupied.listen(1)
 
@@ -653,58 +208,6 @@ def test_main_routes_config_load_warnings_through_the_daemon_shape(
     warning_records = [r for r in caplog.records if r.name == "py.warnings"]
     assert warning_records, "config warning never reached logging as py.warnings"
     assert "unknown section" in warning_records[0].getMessage()
-
-
-# --- login-shell PATH resolution ------------------------------------------------
-
-
-def test_login_shell_path_extracted_despite_noisy_init_files(tmp_path: Path, monkeypatch):
-    """Login shells are entitled to print banners from init files; the probe's
-    markers must keep that noise out of the captured PATH."""
-    from sous.server import _login_shell_path
-
-    fake = tmp_path / "shell"
-    fake.write_text(
-        '#!/bin/sh\necho "welcome banner"\nPATH="/fake/tools:/usr/bin"\nexport PATH\neval "$4"\n'
-    )
-    fake.chmod(0o755)
-    monkeypatch.setenv("SHELL", str(fake))
-    assert _login_shell_path() == "/fake/tools:/usr/bin"
-
-
-def test_login_shell_path_none_when_the_shell_is_broken(monkeypatch):
-    """An exotic or missing shell must mean fallback, never a crashed daemon."""
-    from sous.server import _login_shell_path
-
-    monkeypatch.setenv("SHELL", "/nonexistent/shell")
-    assert _login_shell_path() is None
-
-
-def test_main_adopts_the_login_shell_path_before_serving(tmp_path: Path, monkeypatch):
-    """Under launchd the daemon inherits the bare system PATH, so allowlisted
-    commands like `uv run pytest` stop resolving even though they work in the
-    user's terminal. main() must adopt the login shell's PATH before the worker
-    exists — scrubbed_env() passes PATH through, so this is what sandboxed
-    commands resolve against."""
-    import sous.server as server
-
-    data = tmp_path / "data"
-    data.mkdir()
-    with socket.socket() as occupied:  # make mcp.run() fail fast instead of serving
-        occupied.bind(("127.0.0.1", 0))
-        occupied.listen(1)
-        cfg = SousConfig(
-            data_dir=data,
-            config_path=tmp_path / "config.toml",
-            server_port=occupied.getsockname()[1],
-        )
-        cfg.config_path.write_text("")
-        monkeypatch.setattr(server, "load_config", lambda: cfg)
-        monkeypatch.setattr(server, "_login_shell_path", lambda: "/resolved/bin:/usr/bin")
-        monkeypatch.setenv("PATH", "/usr/bin:/bin")  # launchd-bare stand-in
-        with pytest.raises(SystemExit):
-            server.main()
-    assert os.environ["PATH"] == "/resolved/bin:/usr/bin"
 
 
 class _FakeStderr(io.StringIO):
@@ -762,31 +265,16 @@ def test_main_disables_progress_bars_only_when_stderr_is_not_a_tty(tmp_path: Pat
     assert calls == [True, True]
 
 
-def test_server_status_reports_context_policy(svc):
-    """Users need to see which sizing policy the daemon is running without
-    reading config files — this is the MCP-visible surface for it."""
-    service, _, _ = svc
-    ctx = service.server_status()["config"]["context"]
-    # max_context_tokens included so fixed mode reports its operative value,
-    # not just the fact that the policy is fixed.
-    assert ctx == {
-        "mode": "fixed",
-        "fraction": 0.8,
-        "min_tokens": 8192,
-        "max_context_tokens": 32768,
-    }
-
-
 def test_status_memory_probe_releases_mlx_thread_state(svc, monkeypatch):
-    """server_status runs in whatever short-lived worker thread the MCP layer
-    hands it; any mlx state it created must be released before that thread can
-    exit (ml-explore/mlx#4327)."""
+    """status_document runs in whatever short-lived worker thread the monitor
+    and endpoint routes hand it; any mlx state it created must be released
+    before that thread can exit (ml-explore/mlx#4327)."""
     import sous.server as server
 
-    service, _, _ = svc
+    service, _ = svc
     released = []
     monkeypatch.setattr(server, "release_mlx_thread_state", lambda: released.append(True))
-    service.server_status()
+    service.status_document()
     assert released
 
 
@@ -797,7 +285,7 @@ def test_status_document_releases_mlx_thread_state_when_the_build_fails(svc, mon
     the release cannot depend on reaching the read."""
     import sous.server as server
 
-    service, _, _ = svc
+    service, _ = svc
     released = []
     monkeypatch.setattr(server, "release_mlx_thread_state", lambda: released.append(True))
 
@@ -806,26 +294,28 @@ def test_status_document_releases_mlx_thread_state_when_the_build_fails(svc, mon
 
     monkeypatch.setattr(service.inflight, "snapshot", boom)
     with pytest.raises(RuntimeError):
-        service.status_document(recent=True)
+        service.status_document()
     assert released
 
 
-def test_server_status_reports_gateway_config(svc):
-    """The gateway is off by default and experimental; the MCP-visible status
-    is how a user confirms which model ids the daemon would serve locally."""
-    service, _, _ = svc
-    gw = service.server_status()["config"]["gateway"]
-    assert gw == {
-        "enabled": False,
+def test_server_status_reports_the_served_config(svc):
+    """The status document is how a user confirms which model ids the daemon
+    would serve locally, and at what window."""
+    service, _ = svc
+    assert service.status_document()["config"] == {
+        "model_id": "mlx-community/Qwen3.8-27B-4bit",
+        "idle_unload_minutes": 30,
+        "port": 8383,
         "local_models": ["sous-local"],
         "max_context_tokens": 131072,
         "upstream_url": "https://api.anthropic.com",
+        "generation_timeout_minutes": 30,
     }
 
 
 def test_uvicorn_config_bounds_graceful_shutdown():
     """uvicorn holds SIGTERM while serving and, unbounded, waits for open
-    connections — a long non-streaming gateway turn would defer sous's own
+    connections — a long non-streaming endpoint turn would defer sous's own
     shutdown handler by minutes. The bound is what keeps `sous stop` prompt."""
     from sous.server import GRACEFUL_SHUTDOWN_SECONDS, uvicorn_config
 
@@ -835,30 +325,6 @@ def test_uvicorn_config_bounds_graceful_shutdown():
     # uvicorn's access log prints the raw request target, query string
     # included, at INFO — the daemon's own level.
     assert cfg.access_log is False
-
-
-def test_create_server_installs_the_daemon_log_handler_and_drops_the_rich_one(svc):
-    import logging
-
-    from sous.logs import SOUS_HANDLER_NAME
-    from sous.server import create_server
-
-    class RichHandler(logging.Handler):  # the SDK's, matched by class name
-        def emit(self, record: logging.LogRecord) -> None:
-            pass
-
-    service, store, _ = svc
-    root = logging.getLogger()
-    root.addHandler(RichHandler())
-    try:
-        create_server(store, service.engines, service.config)
-        names = [h.get_name() for h in root.handlers]
-        assert names.count(SOUS_HANDLER_NAME) == 1
-        assert not [h for h in root.handlers if type(h).__name__ == "RichHandler"]
-    finally:
-        for h in list(root.handlers):
-            if h.get_name() == SOUS_HANDLER_NAME or type(h).__name__ == "RichHandler":
-                root.removeHandler(h)
 
 
 def test_uvicorn_config_leaves_logging_to_the_daemon():
@@ -872,119 +338,62 @@ def test_uvicorn_config_leaves_logging_to_the_daemon():
     assert cfg.access_log is False
 
 
-def test_status_version_is_the_three_counters_and_the_config_stamp(svc):
-    service, store, _ = svc
+def test_the_status_document_carries_no_task_fields(svc):
+    service, _root = svc
+    doc = service.status_document()
+    assert set(doc) == {"engine", "inflight", "config", "recent_turns"}
+    assert set(doc["config"]) == {
+        "model_id",
+        "idle_unload_minutes",
+        "port",
+        "local_models",
+        "max_context_tokens",
+        "upstream_url",
+        "generation_timeout_minutes",
+    }
+    assert set(service.status_document()) == {"engine", "inflight", "recent_turns", "config"}
+    assert len(service.status_version()) == 3
+
+
+def test_the_status_version_is_the_registry_the_engine_and_the_config_stamp(svc):
+    service, _root = svc
     path = service.config.config_path
-    before = service.status_version()
-    stat = path.stat()
-    assert before == (
+    assert not path.exists()
+    assert service._config_stamp() == (-1, -1)  # no file to stamp
+    path.write_text("[server]\nport = 8383\n")
+    st = path.stat()
+    assert service._config_stamp() == (st.st_mtime_ns, st.st_size)
+    assert service.status_version() == (
         service.inflight.version,
         service.engines.version,
-        store.version,
-        (stat.st_mtime_ns, stat.st_size),
+        (st.st_mtime_ns, st.st_size),
     )
-    store.enqueue("t", "do it", "/tmp/nowhere", [], [])
-    after = service.status_version()
-    assert after[2] == before[2] + 1 and after[:2] == before[:2] and after[3] == before[3]
-    # An edit changes the document's allowlist, so an idle client that hears
-    # no version move never sees it.
-    path.write_text('[commands]\nallowlist = ["pytest", "ruff"]\n')
-    stat = path.stat()
-    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
-    edited = service.status_version()
-    assert edited[3] == (stat.st_mtime_ns + 1_000_000, stat.st_size) and edited[:3] == after[:3]
 
 
-def test_a_config_write_that_keeps_the_mtime_still_moves_the_stamp(svc):
-    """A `cp -p` or a backup restore lands the new bytes under the old
-    mtime; the size is the stamp's second chance to notice, or the served
-    allowlist would be the old one until an unrelated edit."""
-    service, _, _ = svc
+def test_a_config_rewrite_under_the_old_mtime_still_moves_the_stamp(svc):
+    """`cp -p` and a backup restore both put a different file back under the
+    mtime it had; the size is what catches that one."""
+    service, _root = svc
     path = service.config.config_path
-    assert service.status_document(recent=False)["config"]["allowlist"] == [["pytest"]]
-    stat = path.stat()
-    path.write_text('[commands]\nallowlist = ["pytest", "ruff"]\n')
-    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
-    assert service.status_document(recent=False)["config"]["allowlist"] == [
-        ["pytest"],
-        ["ruff"],
-    ]
+    path.write_text("[server]\nport = 8383\n")
+    before = path.stat()
+    stamp = service._config_stamp()
+    path.write_text('[server]\nport = 8383\nlocal_models = ["sous-local"]\n')
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert path.stat().st_mtime_ns == before.st_mtime_ns  # the mtime is back
+    assert service._config_stamp() != stamp
+    assert service.status_version()[2] == service._config_stamp()
 
 
-def test_the_build_reads_the_task_store_only_when_it_changed(svc, monkeypatch):
-    """Ten documents a second during a turn opened twenty SQLite connections
-    a second for counts and a listing that change only when a task does."""
-    import sqlite3
+def test_the_lifespan_runs_the_idle_sweep(tmp_path: Path):
+    cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
+    engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
+    app = create_server(engines, cfg, upstream=FakeUpstream().upstream())
+    assert isinstance(app, Starlette)
 
-    service, store, root = svc
-    opened: list[str] = []
-    real_connect = sqlite3.connect
+    async def inner() -> None:
+        async with app.router.lifespan_context(app):
+            assert any(t.name == "sous-idle-sweep" for t in threading.enumerate())
+        assert not any(t.name == "sous-idle-sweep" for t in threading.enumerate())
 
-    def counting(path, *args, **kwargs):
-        opened.append(str(path))
-        return real_connect(path, *args, **kwargs)
-
-    monkeypatch.setattr(sqlite3, "connect", counting)
-    service.status_document(recent=False)
-    assert len(opened) == 1, "the narrow build reads the counts and nothing else"
-    service.status_document(recent=True)
-    assert len(opened) == 2, "the wide build adds the listing, once"
-    service.status_document(recent=True)
-    service.status_document(recent=False)
-    assert len(opened) == 2, "a build with no task change opened a connection"
-    out = service.delegate_task("t", "do it", str(root))
-    opened.clear()
-    doc = service.status_document(recent=True)
-    assert opened, "a task change did not reach the build"
-    assert doc["queue"]["queued"] == 1
-    assert [t["id"] for t in doc["recent_tasks"]] == [out["task_id"]]
-
-
-def test_a_running_tasks_seconds_keep_moving_between_task_changes(svc, monkeypatch):
-    """What is cached is the rows, never the summaries: a running task's
-    `seconds` is the clock minus its start, and a cached summary froze it."""
-    from types import SimpleNamespace
-
-    from sous import server as server_module
-
-    service, store, root = svc
-    out = service.delegate_task("t", "do it", str(root))
-    task = store.claim_next()
-    assert task is not None and task.id == out["task_id"]
-    started = task.started_at
-    assert started is not None, "claim_next stamps started_at"
-    # The module's own `time`, not the stdlib's: the store and the registry
-    # keep their real clocks.
-    monkeypatch.setattr(server_module, "time", SimpleNamespace(time=lambda: started + 5.0))
-    assert service.status_document(recent=True)["recent_tasks"][0]["seconds"] == 5
-    monkeypatch.setattr(server_module, "time", SimpleNamespace(time=lambda: started + 9.0))
-    assert service.status_document(recent=True)["recent_tasks"][0]["seconds"] == 9
-
-
-def test_the_allowlist_is_reparsed_only_when_the_config_file_changed(svc, monkeypatch):
-    """An edit still takes effect on the next build — the file's mtime and
-    size are the key — but ten builds a second no longer parse TOML ten
-    times."""
-    from sous import server as server_module
-
-    service, _, _ = svc
-    parses: list[Path] = []
-    real = server_module.current_allowlist
-
-    def counting(path):
-        parses.append(path)
-        return real(path)
-
-    monkeypatch.setattr(server_module, "current_allowlist", counting)
-    assert service.status_document(recent=False)["config"]["allowlist"] == [["pytest"]]
-    service.status_document(recent=False)
-    assert len(parses) == 1
-    path = service.config.config_path
-    path.write_text('[commands]\nallowlist = ["pytest", "ruff"]\n')
-    stat = path.stat()
-    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
-    assert service.status_document(recent=False)["config"]["allowlist"] == [
-        ["pytest"],
-        ["ruff"],
-    ]
-    assert len(parses) == 2
+    anyio.run(inner)

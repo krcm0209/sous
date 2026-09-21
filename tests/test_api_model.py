@@ -1,6 +1,6 @@
-"""The gateway route in front of a real (tiny) model: the event stream is
+"""The endpoint route in front of a real (tiny) model: the event stream is
 well-formed end to end, counts are real, and a second, longer request reuses
-the prompt cache through the gateway-owned session."""
+the prompt cache through the endpoint-owned session."""
 
 import asyncio
 import json
@@ -9,11 +9,11 @@ from pathlib import Path
 
 import httpx
 import pytest
-from mcp.server import MCPServer
+from starlette.applications import Starlette
 
+from sous.api.routes import mount_endpoint
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
-from sous.gateway.routes import mount_gateway
 
 pytestmark = pytest.mark.model
 
@@ -48,18 +48,15 @@ def _events(text: str) -> list[tuple[str, dict]]:
 def test_real_model_streams_a_well_formed_turn_and_reuses_the_cache(tmp_path: Path):
     from sous.engine.lm import LMEngine
 
-    cfg = SousConfig(
-        data_dir=tmp_path / "data", config_path=tmp_path / "config.toml", gateway_enabled=True
-    )
+    cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: LMEngine(TINY, prompt_cache=True))
-    # Same construction as tests/test_gateway_routes.py::_gateway_app: it hands
-    # back the mounted Gateway so its real MLX GenerationSession can be closed
+    # Same construction as tests/test_api_routes.py::_endpoint_app: it hands
+    # back the mounted Endpoint so its real MLX GenerationSession can be closed
     # below. ASGITransport drives no lifespan, so create_server(...).app()
-    # alone never runs Gateway.close() — the session's thread would stay
+    # alone never runs Endpoint.close() — the session's thread would stay
     # parked and never reach release_mlx_thread_state() (see CLAUDE.md).
-    mcp = MCPServer("test")
-    gateway = mount_gateway(mcp, engines, cfg)
-    app = mcp.streamable_http_app()
+    endpoint = mount_endpoint(engines, cfg)
+    app = Starlette(routes=endpoint.routes())
     tool = {
         "name": "echo",
         "description": "Echo a word back",
@@ -87,7 +84,7 @@ def test_real_model_streams_a_well_formed_turn_and_reuses_the_cache(tmp_path: Pa
         indices = [d["index"] for e, d in events if e == "content_block_start"]
         assert indices == list(range(len(indices)))
 
-        # Turn 2 extends turn 1's conversation: the gateway's long-lived
+        # Turn 2 extends turn 1's conversation: the endpoint's long-lived
         # session keeps the KV cache, so this must be a prefix-cache hit.
         reply_text = "".join(
             d["delta"]["text"]
@@ -118,9 +115,9 @@ def test_real_model_streams_a_well_formed_turn_and_reuses_the_cache(tmp_path: Pa
         assert stats["hits"] >= 1, stats
     finally:
         t0 = time.monotonic()
-        gateway.close()
+        endpoint.close()
         assert time.monotonic() - t0 < 2.5  # bounded: no turn is in flight here
-        assert gateway._runner._session is None
+        assert endpoint._runner._session is None
     engines.get().unload()
 
 
@@ -163,13 +160,10 @@ def test_an_attachment_keeps_the_conversation_warm_and_bit_exact(
     — the render is the same text in the same place, only warm. Then a branch
     of T1 (a summary-shaped last turn) is served from the retained slot and
     is bit-exact against its own cold run too."""
-    cfg = SousConfig(
-        data_dir=tmp_path / "data", config_path=tmp_path / "config.toml", gateway_enabled=True
-    )
+    cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: _engine(model_id, backend))
-    mcp = MCPServer("test")
-    gateway = mount_gateway(mcp, engines, cfg)
-    app = mcp.streamable_http_app()
+    endpoint = mount_endpoint(engines, cfg)
+    app = Starlette(routes=endpoint.routes())
     read_tool = {
         "name": "Read",
         "description": "Read a file",
@@ -232,6 +226,6 @@ def test_an_attachment_keeps_the_conversation_warm_and_bit_exact(
         branch_cold = _post(app, body(branch))
         assert branch_cold.json()["content"] == branch_warm.json()["content"]
     finally:
-        gateway.close()
+        endpoint.close()
         engines.get().unload()
-    assert gateway._runner._session is None
+    assert endpoint._runner._session is None

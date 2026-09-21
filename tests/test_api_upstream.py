@@ -1,7 +1,7 @@
 """The forwarder in isolation: a Starlette app whose only handler calls
 Upstream.forward, driven through httpx's in-process transport, with
 FakeUpstream on the far side. Header and byte fidelity live here; what only a
-real socket shows (incremental relay, hang-ups) is in test_gateway_http.py."""
+real socket shows (incremental relay, hang-ups) is in test_api_http.py."""
 
 import asyncio
 import gzip
@@ -15,7 +15,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
-from sous.gateway.upstream import (
+from sous.api.upstream import (
     TIMEOUT,
     VIA,
     Upstream,
@@ -151,7 +151,7 @@ def test_response_headers_drop_hop_by_hop_and_server_owned_and_add_via():
 def test_forwards_method_path_query_and_body_bytes_verbatim():
     fake = FakeUpstream()
     app = _proxy_app(fake.upstream(), buffered=True)
-    # Deliberately not JSON the gateway would accept: the forwarder must never parse.
+    # Deliberately not JSON the endpoint would accept: the forwarder must never parse.
     body = b'{"model": "claude-opus-5", "n": 1e999, "x": NaN,   "spaced" : true}'
     r = _send(app, "POST", "/v1/messages?beta=true", content=body)
     assert r.status_code == 200

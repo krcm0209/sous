@@ -29,13 +29,12 @@ class QuickChoice:
     drafter_id: str
     block_size: int
     window: int
-    gateway_window: int | None
     changes: dict[str, dict[str, object]] = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
 
 
 def score(row: BenchRow, long: bool | None = None) -> float | None:
-    """Decode at the long context when `long` — the gateway's regime and
+    """Decode at the long context when `long` — the endpoint's regime and
     where the drafter's gain is smallest — else at the short one. With
     `long` unset, whichever the row has, longest first: a reading of one
     row. A ranking across rows must score every row in one unit (see
@@ -69,9 +68,6 @@ def _changes(user: SousConfig, arm: Arm, *, full: bool = False) -> dict[str, dic
     changes: dict[str, dict[str, object]] = {}
     if model:
         changes["model"] = model
-    gateway = arm.fit_gateway_window if arm.fit_gateway_window is not None else arm.gateway_window
-    if user.gateway_enabled and gateway is not None and gateway < user.gateway_max_context_tokens:
-        changes["gateway"] = {"max_context_tokens": gateway}
     return changes
 
 
@@ -124,7 +120,6 @@ def quick_decision(user: SousConfig, arms: list[Arm], rows: list[BenchRow]) -> Q
             drafter_id=arm.drafter_id,
             block_size=arm.block_size,
             window=arm.window,
-            gateway_window=arm.gateway_window,
             changes={},
             reasons=[_no_baseline_reason(current_arm, rows)],
         )
@@ -145,7 +140,6 @@ def quick_decision(user: SousConfig, arms: list[Arm], rows: list[BenchRow]) -> Q
         drafter_id=arm.drafter_id,
         block_size=arm.block_size,
         window=arm.window,
-        gateway_window=arm.gateway_window,
         changes=_changes(user, arm),
         reasons=reasons,
     )

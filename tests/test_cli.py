@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from sous.cli import _BOOTOUT_NOT_LOADED, LABEL, launchd_plist
+from sous.cli import _BOOTOUT_NOT_LOADED, LABEL, launchd_plist, status_lines
+from sous.config import SousConfig
 
 
 def _free_cli_port() -> int:
@@ -32,10 +33,10 @@ def test_plist_is_valid_and_correct():
 
 
 def test_plist_sets_no_environment_variables():
-    """PATH is deliberately NOT baked into the plist: the daemon adopts the
-    user's login-shell PATH at startup (server._login_shell_path), which stays
-    current and works however the daemon was launched. An install-time PATH
-    snapshot here would be a second, staler mechanism that shadows it."""
+    """No environment block at all: the daemon runs no commands of its own,
+    so launchd's bare system PATH is all it needs, and it reads no credential
+    or proxy from its environment — a block would only snapshot the
+    installing shell into the plist."""
     xml = launchd_plist("/Users/x/.local/bin/sous", Path("/Users/x/.sous"))
     data = plistlib.loads(xml.encode())
     assert "EnvironmentVariables" not in data
@@ -64,25 +65,6 @@ def test_status_reports_not_running(tmp_path, capsys, monkeypatch):
     cli.main(["status"])
     out = capsys.readouterr().out
     assert "not running" in out
-
-
-def test_mcp_subcommand_dispatches_to_the_proxy(monkeypatch):
-    """`sous mcp` must reach the proxy and propagate its exit code, so a failed
-    cold start surfaces to the launching client instead of exiting 0."""
-    import sous.proxy
-    from sous.cli import main
-
-    called = {}
-
-    def fake_run():
-        called["ran"] = True
-        return 1
-
-    monkeypatch.setattr(sous.proxy, "run", fake_run)
-    with pytest.raises(SystemExit) as exc:
-        main(["mcp"])
-    assert called.get("ran") is True
-    assert exc.value.code == 1
 
 
 # --- stop / uninstall-launchd -------------------------------------------------
@@ -242,38 +224,6 @@ def test_stop_refuses_a_stale_pid_file(tmp_path, capsys, monkeypatch):
             cli.main(["stop"])
         assert exc.value.code != 0
         assert daemon.poll() is None, "signalled despite a stale lock"
-    finally:
-        daemon.kill()
-
-
-def test_stop_warns_about_all_active_tasks(tmp_path, capsys, monkeypatch):
-    """The warning must cover every state recover_interrupted() will fail.
-
-    list_recent() caps at 20 rows, so a long-running task drops off the list
-    once 20 newer ones are queued, and AWAITING_APPROVAL was missed entirely.
-    """
-    from sous import cli
-    from sous.tasks import TaskStore
-
-    port = _free_cli_port()
-    daemon = _fake_daemon(tmp_path, port)
-    try:
-        store = TaskStore(tmp_path / "tasks.db")
-        old = store.enqueue("long-runner", "x", "/tmp", [], [])
-        store.claim_next()
-        approving = store.enqueue("needs-approval", "x", "/tmp", [], [])
-        store.claim_next()
-        store.request_approval(approving.id, "pytest")
-        for i in range(25):  # push the running task off list_recent()
-            store.enqueue(f"filler{i}", "x", "/tmp", [], [])
-        still_running = store.get(old.id)
-        assert still_running is not None and still_running.state == "running"
-
-        monkeypatch.setattr(cli, "load_config", lambda: _cfg(tmp_path, port))
-        monkeypatch.setattr(cli, "_launchd_loaded", lambda label: False)
-        cli.main(["stop"])
-        out = capsys.readouterr().out
-        assert "running" in out and "awaiting_approval" in out
     finally:
         daemon.kill()
 
@@ -683,156 +633,17 @@ def test_install_launchd_exits_nonzero_when_bootstrap_fails(tmp_path, capsys, mo
     assert plist.exists()  # the plist itself is still written; only the load failed
 
 
-# --- wait ----------------------------------------------------------------------
-
-
-def _wait_store(tmp_path, monkeypatch):
-    from sous import cli
-    from sous.config import SousConfig
-    from sous.tasks import TaskStore
-
-    cfg = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
-    monkeypatch.setattr(cli, "load_config", lambda: cfg)
-    return TaskStore(tmp_path / "tasks.db")
-
-
-def _enqueue(store):
-    return store.enqueue(
-        title="t", instructions="x", project_root="/", context_files=[], verify_commands=[]
-    )
-
-
-def test_wait_returns_immediately_for_a_finished_task(tmp_path, capsys, monkeypatch):
-    from sous import cli
-
-    store = _wait_store(tmp_path, monkeypatch)
-    t = _enqueue(store)
-    store.claim_next()
-    store.finish(t.id, "completed", {"summary": "s"})
-    cli.main(["wait", t.id])
-    out = capsys.readouterr().out
-    assert "done" in out and "completed" in out
-
-
-def test_wait_blocks_until_approval_is_requested(tmp_path, capsys, monkeypatch):
-    """The point of `wait`: agents park it in a background shell instead of
-    tight-polling task_status or reading tasks.db by hand — so it must wake on
-    awaiting_approval (a human is needed NOW), not only on terminal states."""
-    from sous import cli
-
-    store = _wait_store(tmp_path, monkeypatch)
-    t = _enqueue(store)
-    store.claim_next()
-
-    def approve_later():
-        time.sleep(0.3)
-        store.request_approval(t.id, "git diff")
-
-    flipper = threading.Thread(target=approve_later)
-    started = time.monotonic()
-    flipper.start()
-    try:
-        cli.main(["wait", t.id, "--interval", "0.05"])
-    finally:
-        flipper.join()
-    elapsed = time.monotonic() - started
-    out = capsys.readouterr().out
-    assert "awaiting_approval" in out
-    assert "git diff" in out, "the pending command is the thing the human must see"
-    assert elapsed >= 0.3, f"returned in {elapsed:.2f}s — never actually waited"
-
-
-def test_wait_unknown_task_exits_2(tmp_path, capsys, monkeypatch):
-    from sous import cli
-
-    _wait_store(tmp_path, monkeypatch)
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["wait", "nope"])
-    assert exc.value.code == 2
-
-
-def test_wait_timeout_exits_1(tmp_path, capsys, monkeypatch):
-    """A queued task that never advances must not hang the caller forever when
-    a timeout was asked for — and the timeout must be exit 1, distinct from
-    unknown-task (2), so scripts can tell 'still running' from 'gone'."""
-    from sous import cli
-
-    store = _wait_store(tmp_path, monkeypatch)
-    t = _enqueue(store)  # stays queued: nothing ever claims it
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["wait", t.id, "--timeout", "0.3", "--interval", "0.05"])
-    assert exc.value.code == 1
-    assert "queued" in capsys.readouterr().out
-
-
-def test_wait_timeout_is_not_quantized_by_interval(tmp_path, capsys, monkeypatch):
-    """A 0.3s timeout must expire near 0.3s even with the default 2s interval —
-    each sleep has to be capped to the remaining budget, or the deadline check
-    only runs on interval boundaries (and a task finishing inside the overrun
-    would be reported as success AFTER the caller's deadline)."""
-    from sous import cli
-
-    store = _wait_store(tmp_path, monkeypatch)
-    t = _enqueue(store)  # stays queued
-    started = time.monotonic()
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["wait", t.id, "--timeout", "0.3"])  # interval left at default
-    elapsed = time.monotonic() - started
-    assert exc.value.code == 1
-    assert elapsed < 1.0, f"timed out after {elapsed:.2f}s — quantized to the interval"
-
-
-def test_wait_rejects_degenerate_intervals_and_timeouts(tmp_path, capsys, monkeypatch):
-    """--interval 0 recreates the tight-polling this command exists to prevent,
-    a negative interval raises out of time.sleep, and a NaN timeout never
-    expires — all three must be argparse usage errors (exit 2), not runtime
-    misbehavior."""
-    from sous import cli
-
-    store = _wait_store(tmp_path, monkeypatch)
-    t = _enqueue(store)
-    store.claim_next()
-    store.finish(t.id, "completed", {"summary": "s"})  # even a done task: reject first
-    for argv in (
-        ["wait", t.id, "--interval", "0", "--timeout", "0.2"],
-        ["wait", t.id, "--interval", "-1", "--timeout", "0.2"],
-        ["wait", t.id, "--timeout", "nan"],
-        ["wait", t.id, "--interval", "nan", "--timeout", "0.2"],
-        ["wait", t.id, "--timeout", "-5"],
-    ):
-        with pytest.raises(SystemExit) as exc:
-            cli.main(argv)
-        assert exc.value.code == 2, argv
-
-
-def test_wait_timeout_zero_is_an_immediate_probe(tmp_path, capsys, monkeypatch):
-    """--timeout 0 is the defined non-blocking form: one state check, then
-    report — exit 0 if the task already needs attention, exit 1 otherwise."""
-    from sous import cli
-
-    store = _wait_store(tmp_path, monkeypatch)
-    pending = _enqueue(store)
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["wait", pending.id, "--timeout", "0"])
-    assert exc.value.code == 1
-    done = _enqueue(store)
-    store.claim_next()  # claims `pending`... order: claim_next takes oldest queued
-    store.claim_next()
-    store.finish(done.id, "completed", {"summary": "s"})
-    cli.main(["wait", done.id, "--timeout", "0"])
-    assert "done" in capsys.readouterr().out
-
-
 # --- sous claude ---------------------------------------------------------------------
 
 
 _DEFAULT_STATUS = object()
 
 
-def _status(**gateway) -> dict:
-    """The keys of `GET /sous/status` — `SousService.status_document()`,
-    less the recent turns and tasks — of which the launcher reads
-    `config.gateway` for its checks and `engine.model_id` for its one line."""
+def _status(**config) -> dict:
+    """The keys of `GET /sous/status` — `Daemon.status_document()`,
+    less the recent turns — of which the launcher reads `config.local_models`
+    and `config.max_context_tokens` for its checks and `engine.model_id` for
+    its one line."""
     return {
         "engine": {
             "model_id": "mlx-community/Qwen3.8-27B-4bit",
@@ -841,35 +652,31 @@ def _status(**gateway) -> dict:
             "holders": 0,
         },
         "config": {
-            "gateway": {
-                "enabled": True,
-                "local_models": ["sous-local"],
-                "max_context_tokens": 131072,
-                "upstream_url": "https://api.anthropic.com",
-                **gateway,
-            }
+            "model_id": "org/m",
+            "idle_unload_minutes": 30,
+            "port": 8383,
+            "local_models": ["sous-local"],
+            "max_context_tokens": 131072,
+            "upstream_url": "https://api.anthropic.com",
+            "generation_timeout_minutes": 30,
+            **config,
         },
     }
 
 
 def _claude_setup(tmp_path, monkeypatch, *, status=_DEFAULT_STATUS, **overrides):
-    """A gateway-enabled config file, a `claude` on PATH, a daemon that answers
-    `GET /sous/status`, and an execve that records instead of replacing the
+    """A config file, a `claude` on PATH, a daemon that answers `GET
+    /sous/status`, and an execve that records instead of replacing the
     process."""
     import os
 
     from sous import cli
     from sous.config import SousConfig
 
-    # Popped rather than passed alongside **overrides: a test overriding
-    # gateway_enabled would otherwise collide with a literal keyword of the
-    # same name below and raise "got multiple values for keyword argument".
-    gateway_enabled = overrides.pop("gateway_enabled", True)
     cfg = SousConfig(
         server_port=8383,
         data_dir=tmp_path,
         config_path=tmp_path / "c.toml",
-        gateway_enabled=gateway_enabled,
         **overrides,
     )
     monkeypatch.setattr(cli, "load_config", lambda: cfg)
@@ -1031,20 +838,6 @@ def test_claude_warns_about_an_inherited_tier_variable_but_still_launches(
     assert calls[0][2]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "sous-local"
 
 
-def test_claude_refuses_when_the_running_daemon_has_the_gateway_off(tmp_path, capsys, monkeypatch):
-    """The file says enabled; the daemon says off. The daemon's startup
-    snapshot is the truth — a file edited since it started changes nothing
-    until it restarts."""
-    from sous import cli
-
-    _, calls, _ = _claude_setup(tmp_path, monkeypatch, status=_status(enabled=False))
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["claude"])
-    assert exc.value.code == 1 and calls == []
-    err = capsys.readouterr().err
-    assert "[gateway]" in err and "restart" in err
-
-
 def test_claude_refuses_when_no_daemon_answers(tmp_path, capsys, monkeypatch):
     from sous import cli
 
@@ -1069,8 +862,8 @@ def test_claude_uses_the_daemons_values_and_says_so_when_the_file_disagrees(
         tmp_path,
         monkeypatch,
         status=_status(local_models=["sous-fast"], max_context_tokens=131072),
-        gateway_local_models=("sous-local",),
-        gateway_max_context_tokens=65536,
+        local_models=("sous-local",),
+        max_context_tokens=65536,
     )
     cli.main(["claude"])
     [(_exe, _argv, env)] = calls
@@ -1167,7 +960,7 @@ def test_daemon_status_reads_sous_status_over_http(tmp_path):
 def test_loopback_calls_ignore_a_configured_proxy(tmp_path, monkeypatch):
     """The daemon is loopback; a stray HTTP_PROXY/ALL_PROXY (no matching
     no_proxy) must never route _daemon_status or _hold through it, or see
-    the hold body — same rule as gateway/upstream.py's trust_env=False."""
+    the hold body — same rule as api/upstream.py's trust_env=False."""
     from sous import cli
 
     monkeypatch.setenv("HTTP_PROXY", "http://10.255.255.1:9")
@@ -1235,15 +1028,42 @@ def test_daemon_status_names_a_404_from_something_that_is_not_sous(tmp_path, cap
 
 
 def test_daemon_status_reports_a_listener_that_does_not_answer(tmp_path, capsys):
+    """A 500 from the daemon holding the lock is a daemon that did not
+    answer; the same 500 with nothing holding the lock is another service
+    on the port, and the advice is the port's, not a restart."""
     from sous import cli
 
     fake = _FakeSousHTTP(None, status_code=500)
+    lock = _held_daemon_lock(tmp_path)
     try:
         assert cli._daemon_status(fake.port, tmp_path) is None
+        err = capsys.readouterr().err
+        assert "did not answer /sous/status" in err and "500" in err
+        lock.close()
+        with pytest.raises(SystemExit) as exc:
+            cli._daemon_status(fake.port, tmp_path)
     finally:
         fake.close()
-    err = capsys.readouterr().err
-    assert "did not answer /sous/status" in err and "500" in err
+    assert exc.value.code == 1
+    assert "not a sous daemon" in capsys.readouterr().err
+
+
+def test_daemon_status_treats_someone_elses_json_as_no_answer(tmp_path, capsys):
+    """A 200 JSON object without the config block is not the document:
+    read as one it would be a traceback at the first field."""
+    from sous import cli
+
+    fake = _FakeSousHTTP(None, raw=b'{"config": 5}')
+    lock = _held_daemon_lock(tmp_path)
+    try:
+        assert cli._daemon_status(fake.port, tmp_path) is None
+        assert "not the status document" in capsys.readouterr().err
+        lock.close()
+        with pytest.raises(SystemExit):
+            cli._daemon_status(fake.port, tmp_path)
+    finally:
+        fake.close()
+    assert "not a sous daemon" in capsys.readouterr().err
 
 
 def test_daemon_status_is_none_when_nothing_listens(tmp_path):
@@ -1253,15 +1073,22 @@ def test_daemon_status_is_none_when_nothing_listens(tmp_path):
 
 
 def test_a_status_that_is_not_json_is_a_daemon_that_does_not_answer(tmp_path, capsys):
-    """Something else on the port — a 200 that is not the document."""
+    """A 200 that is not the document: from the daemon holding the lock, a
+    daemon that did not answer; from a port nothing holds the lock for,
+    something else entirely, and the advice is the port's."""
     from sous import cli
 
     fake = _FakeSousHTTP(None, raw=b"<html>nope</html>")
+    lock = _held_daemon_lock(tmp_path)
     try:
         assert cli._daemon_status(fake.port, tmp_path) is None
+        assert "did not answer /sous/status" in capsys.readouterr().err
+        lock.close()
+        with pytest.raises(SystemExit):
+            cli._daemon_status(fake.port, tmp_path)
     finally:
         fake.close()
-    assert "did not answer /sous/status" in capsys.readouterr().err
+    assert "not a sous daemon" in capsys.readouterr().err
 
 
 def test_a_reply_past_the_size_cap_is_a_daemon_that_does_not_answer(tmp_path, capsys):
@@ -1375,7 +1202,7 @@ def test_claude_launches_even_when_the_hold_is_refused(tmp_path, capsys, monkeyp
 def test_claude_does_not_hold_when_a_check_fails(tmp_path, capsys, monkeypatch):
     from sous import cli
 
-    _, calls, holds = _claude_setup(tmp_path, monkeypatch, status=_status(enabled=False))
+    _, calls, holds = _claude_setup(tmp_path, monkeypatch, status=_status(local_models=[]))
     with pytest.raises(SystemExit):
         cli.main(["claude"])
     assert holds == [] and calls == []
@@ -1398,7 +1225,7 @@ def test_claude_does_not_hold_for_an_invocation_that_exits_at_once(
 
 
 @pytest.mark.slow
-def test_daemon_status_reads_the_real_daemons_gateway_config(tmp_path):
+def test_daemon_status_reads_the_real_daemons_config(tmp_path):
     """The launcher's one source of truth, against the real server: a plain
     GET /sous/status on the daemon's port, and None when nothing is
     listening."""
@@ -1411,7 +1238,6 @@ def test_daemon_status_reads_the_real_daemons_gateway_config(tmp_path):
     from sous.config import SousConfig
     from sous.engine.base import EngineManager
     from sous.server import create_server, uvicorn_config
-    from sous.tasks import TaskStore
     from tests.fake_engine import FakeEngine
 
     @contextlib.contextmanager
@@ -1429,20 +1255,21 @@ def test_daemon_status_reads_the_real_daemons_gateway_config(tmp_path):
             server.should_exit = True
             thread.join(20)
 
-    cfg = SousConfig(
-        data_dir=tmp_path / "data", config_path=tmp_path / "c.toml", gateway_enabled=True
-    )
+    cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "c.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
-    app = create_server(TaskStore(tmp_path / "tasks.db"), engines, cfg).streamable_http_app()
+    app = create_server(engines, cfg)
     port = _free_cli_port()
     with serve(app, port):
         status = _daemon_status(port, tmp_path)
     assert status is not None
-    assert status["config"]["gateway"] == {
-        "enabled": True,
+    assert status["config"] == {
+        "model_id": "mlx-community/Qwen3.8-27B-4bit",
+        "idle_unload_minutes": 30,
+        "port": 8383,
         "local_models": ["sous-local"],
         "max_context_tokens": 131072,
         "upstream_url": "https://api.anthropic.com",
+        "generation_timeout_minutes": 30,
     }
     # Nothing listening on that port any more.
     assert _daemon_status(port, tmp_path) is None
@@ -1463,13 +1290,13 @@ def test_claude_skips_the_hold_for_an_exit_at_once_flag_anywhere_before_a_double
     assert holds == [8383] and len(calls) == 2
 
 
-def test_claude_refuses_a_status_document_without_the_gateway_values(tmp_path, capsys, monkeypatch):
+def test_claude_refuses_a_status_document_without_the_served_values(tmp_path, capsys, monkeypatch):
     """A 200 that is an object but not the document: a KeyError traceback
     would name nothing the user can act on."""
     from sous import cli
 
     status = _status()
-    del status["config"]["gateway"]["local_models"]
+    del status["config"]["local_models"]
     _, calls, holds = _claude_setup(tmp_path, monkeypatch, status=status)
     with pytest.raises(SystemExit) as exc:
         cli.main(["claude"])
@@ -1517,10 +1344,8 @@ def _document(**overrides) -> dict:
     doc = {
         "engine": {"loaded": True, "loading": False, "holders": 0, "prompt_cache": {"slots": 5}},
         "inflight": [],
-        "queue": {"queued": 0, "running": 0},
         "config": {},
         "recent_turns": [],
-        "recent_tasks": [],
     }
     doc.update(overrides)
     return doc
@@ -1834,3 +1659,230 @@ def test_restart_hint_names_launchds_kickstart_or_the_two_commands():
 
     assert restart_hint(managed=False) == "sous stop, then sous serve"
     assert restart_hint(managed=True) == f"launchctl kickstart -k gui/{os.getuid()}/{LABEL}"
+
+
+def test_status_lines_show_the_engine_the_turn_and_the_recent_ring():
+    doc = {
+        "engine": {
+            "loaded": True,
+            "loading": False,
+            "unloading": False,
+            "model_id": "org/m",
+            "idle_seconds": 12.0,
+            "holders": 1,
+        },
+        "inflight": [
+            {"id": "msg_1", "model": "sous-local", "phase": "decode", "started_at": 100.0}
+        ],
+        "config": {"port": 8383},
+        # Newest first, as the registry keeps it: seven turns, the newest a
+        # refusal whose summary carries an error and none of the served fields.
+        "recent_turns": [
+            {
+                "id": "msg_7",
+                "model": "sous-local",
+                "status": 529,
+                "error": "EndpointBusy",
+                "seconds": 0.0021456,
+            },
+            *(
+                {
+                    "id": f"msg_{n}",
+                    "model": "sous-local",
+                    "status": 200,
+                    "stop_reason": "tool_use",
+                    "cache": "hit",
+                    "input_tokens": 66262,
+                    "output_tokens": 50,
+                    "seconds": 4.9123,
+                }
+                for n in range(6, -1, -1)
+            ),
+        ],
+    }
+    lines = status_lines(doc, now=130.0)
+    assert lines[0] == "sous daemon: listening on 127.0.0.1:8383"
+    assert lines[1] == "  engine: org/m loaded · holders 1 · idle 12s"
+    assert lines[2] == "  turn msg_1 sous-local decode 00:30"
+    assert lines[3] == "  recent turns:"
+    assert lines[4] == "    msg_7 sous-local status=529 error=EndpointBusy 0.0s"
+    assert lines[5] == (
+        "    msg_6 sous-local status=200 stop=tool_use cache=hit in=66262 out=50 4.9s"
+    )
+    assert [line.split()[0] for line in lines[4:]] == ["msg_7", "msg_6", "msg_5", "msg_4", "msg_3"]
+
+
+def test_status_lines_give_a_long_idle_span_in_hours():
+    doc = {
+        "engine": {"loaded": True, "model_id": "org/m", "idle_seconds": 10842.4, "holders": 1},
+        "inflight": [],
+        "config": {"port": 8383},
+    }
+    assert status_lines(doc, now=0.0)[1] == "  engine: org/m loaded · holders 1 · idle 3h 00m"
+
+
+def test_status_lines_for_an_idle_unloaded_daemon():
+    doc = {
+        "engine": {
+            "loaded": False,
+            "loading": False,
+            "unloading": False,
+            "model_id": "org/m",
+            "idle_seconds": None,
+            "holders": 0,
+        },
+        "inflight": [],
+        "config": {"port": 8383},
+        "recent_turns": [],
+    }
+    assert status_lines(doc, now=0.0) == [
+        "sous daemon: listening on 127.0.0.1:8383",
+        "  engine: org/m unloaded · holders 0",
+        "  turns in flight: none",
+    ]
+
+
+def test_status_prints_the_document_when_the_daemon_answers(monkeypatch, capsys, tmp_path):
+    from sous import cli
+
+    doc = {
+        "engine": {"loaded": False, "model_id": "org/m", "holders": 0},
+        "inflight": [],
+        "config": {"port": 8383},
+        "recent_turns": [],
+    }
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: SousConfig(
+            server_port=8383, data_dir=tmp_path, config_path=tmp_path / "config.toml"
+        ),
+    )
+    monkeypatch.setattr(cli, "_port_open", lambda port: True)
+    monkeypatch.setattr(
+        cli, "_sous_request", lambda port, method, path, json=None: (200, json_dumps(doc))
+    )
+    cli.main(["status"])
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "sous daemon: listening on 127.0.0.1:8383"
+    assert out[1] == "  engine: org/m unloaded · holders 0"
+
+
+def test_status_refuses_a_200_that_is_not_the_status_document(monkeypatch, capsys, tmp_path):
+    from sous import cli
+
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: SousConfig(
+            server_port=8383, data_dir=tmp_path, config_path=tmp_path / "config.toml"
+        ),
+    )
+    monkeypatch.setattr(cli, "_port_open", lambda port: True)
+    monkeypatch.setattr(cli, "_launchd_loaded", lambda _label: False)
+    # Someone else's JSON, a JSON array, HTML, an object with the right keys
+    # but not their shape: none is the document, and which advice follows
+    # depends only on whether a daemon holds the lock.
+    for raw in (b'{"ok": true}', b"[1, 2]", b"<html>hi</html>", b'{"engine": 5, "config": 5}'):
+        monkeypatch.setattr(
+            cli, "_sous_request", lambda port, method, path, json=None, r=raw: (200, r)
+        )
+        monkeypatch.setattr(cli, "_lock_is_held", lambda _data_dir: False)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["status"])
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "is not a sous daemon" in out and "[server].port" in out
+        assert "restart" not in out
+        monkeypatch.setattr(cli, "_lock_is_held", lambda _data_dir: True)
+        with pytest.raises(SystemExit):
+            cli.main(["status"])
+        out = capsys.readouterr().out
+        assert "not the status document" in out and "restart it" in out
+
+
+def test_status_tells_a_foreign_listener_from_a_daemon_that_predates_the_route(
+    monkeypatch, capsys, tmp_path
+):
+    """A 404 means 'restart' only from the process holding daemon.lock; from
+    anything else the advice is to free the port or move off it."""
+    from sous import cli
+
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: SousConfig(
+            server_port=8383, data_dir=tmp_path, config_path=tmp_path / "config.toml"
+        ),
+    )
+    monkeypatch.setattr(cli, "_port_open", lambda port: True)
+    monkeypatch.setattr(cli, "_sous_request", lambda port, method, path, json=None: (404, b""))
+    monkeypatch.setattr(cli, "_launchd_loaded", lambda _label: False)
+    for held, expected in ((False, "is not a sous daemon"), (True, "restart it")):
+        monkeypatch.setattr(cli, "_lock_is_held", lambda _data_dir, h=held: h)
+        with pytest.raises(SystemExit):
+            cli.main(["status"])
+        assert expected in capsys.readouterr().out
+
+
+def test_status_names_launchds_restart_when_launchd_manages_the_daemon(
+    monkeypatch, capsys, tmp_path
+):
+    """A listener that will not answer the document has to be restarted, and
+    the command that does it depends on who started the daemon."""
+    from sous import cli
+
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: SousConfig(
+            server_port=8383, data_dir=tmp_path, config_path=tmp_path / "config.toml"
+        ),
+    )
+    monkeypatch.setattr(cli, "_port_open", lambda port: True)
+    monkeypatch.setattr(cli, "_sous_request", lambda port, method, path, json=None: (503, b""))
+    monkeypatch.setattr(cli, "_lock_is_held", lambda _data_dir: True)
+    for managed in (True, False):
+        monkeypatch.setattr(cli, "_launchd_loaded", lambda _label, m=managed: m)
+        with pytest.raises(SystemExit):
+            cli.main(["status"])
+        assert cli.restart_hint(managed=managed) in capsys.readouterr().out
+
+
+def test_status_lines_skip_entries_that_are_not_the_documents_shape():
+    """A squatter on the port can answer anything; a wrong element in the
+    rings is skipped, not a traceback."""
+    from sous.cli import status_lines
+
+    document = {
+        "engine": 5,
+        "config": "no",
+        "inflight": 3,
+        "recent_turns": [1, {"id": "msg_a", "status": 200, "seconds": 1.0, "error": None}],
+    }
+    lines = status_lines(document, now=0.0)
+    assert lines[0] == "sous daemon: listening on 127.0.0.1:?"
+    assert "  turns in flight: none" in lines
+    assert lines[-1].startswith("    msg_a")
+    # Dict blocks with the wrong field types: skipped field by field.
+    document = {
+        "engine": {"loaded": True, "idle_seconds": "x"},
+        "config": {"port": 8383},
+        "inflight": [{"id": "msg_b", "started_at": "nope"}],
+    }
+    lines = status_lines(document, now=0.0)
+    assert "idle" not in lines[1]
+    assert lines[2] == "  turn msg_b ? queued"
+
+
+def json_dumps(doc: dict) -> bytes:
+    return json.dumps(doc).encode()
+
+
+def test_wait_and_mcp_are_no_longer_commands(capsys):
+    from sous import cli
+
+    for verb in ("wait", "mcp"):
+        with pytest.raises(SystemExit):
+            cli.main([verb])
+        assert "invalid choice" in capsys.readouterr().err

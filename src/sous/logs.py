@@ -2,11 +2,10 @@
 
 `<iso-utc-ms>Z LEVEL name: message` — the timestamp launchd's log never
 had, the level the filename `daemon.err.log` falsely promised, and the
-logger name (`sous.gateway`, `sous.engine`, `mcp.…`, `uvicorn.error`) that
-says which part spoke. Installed on the root logger, replacing the
-`RichHandler` the MCP SDK's `configure_logging("INFO")` puts there from
-`MCPServer.__init__` — that handler wraps every record at 80 columns, which
-made the log ungreppable.
+logger name (`sous.api`, `sous.engine`, `httpx`, `uvicorn.error`) that
+says which part spoke. Installed on the root logger in place of a bare
+`RichHandler`, which wraps every record at 80 columns and made the log
+ungreppable.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ SOUS_HANDLER_NAME = "sous-daemon-log"
 
 
 class UTCFormatter(logging.Formatter):
-    """`2026-09-10T19:26:14.025Z INFO sous.gateway: …` — UTC, milliseconds,
+    """`2026-09-10T19:26:14.025Z INFO sous.api: …` — UTC, milliseconds,
     Python's level names. Exception and stack info are appended the way
     logging always formats them."""
 
@@ -37,9 +36,9 @@ class UTCFormatter(logging.Formatter):
 def format_line(
     level: str, name: str, message: str, created: float | None = None, msecs: float | None = None
 ) -> str:
-    """The line shape, for the formatter and for the one place that cannot
-    log: the SIGTERM handler in server.py, which runs asynchronously to
-    whatever thread holds logging's lock and must print instead."""
+    """The line shape, kept apart from the formatter so a caller that cannot
+    go through logging (a signal handler runs asynchronously to whatever
+    thread holds logging's lock) can print the same line."""
     now = time.time() if created is None else created
     millis = int((now % 1) * 1000) if msecs is None else int(msecs)
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
@@ -71,14 +70,16 @@ class StderrHandler(logging.StreamHandler):
 def configure_daemon_logging() -> None:
     """Install the daemon's handler on the root logger, once.
 
-    Idempotent, so `create_server` can call it every time it assembles the
-    app (tests build many). Removes any earlier copy of this handler and the
-    SDK's RichHandler (matched by class name: rich is a transitive dependency
-    and this module must not import it). Sets the root level to INFO when it
-    is unset or higher — the SDK sets INFO too, but this must not depend on
-    call order. Library logger *levels* are untouched: the gateway pins
-    sse-starlette/httpx/httpcore above where they log bodies and URLs, and
-    a handler swap must never loosen that."""
+    Idempotent: `main()` calls it exactly once, before anything else logs,
+    but one pytest process runs many tests that each need it installed —
+    some by calling `main()`, some through an autouse fixture that calls
+    this directly — so a second call must replace the existing handler,
+    never stack another one beside it. Removes any earlier copy of this
+    handler and any stray `RichHandler` (matched by class name: rich is a
+    transitive dependency and this module must not import it). Sets the
+    root level to INFO when it is unset or higher. Library logger *levels*
+    are untouched: the endpoint pins sse-starlette/httpx/httpcore above where
+    they log bodies and URLs, and a handler swap must never loosen that."""
     root = logging.getLogger()
     for handler in list(root.handlers):
         if handler.get_name() == SOUS_HANDLER_NAME or type(handler).__name__ == "RichHandler":

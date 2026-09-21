@@ -1,4 +1,4 @@
-"""One gateway turn on the shared engine: serialized, drained, session reuse."""
+"""One endpoint turn on the shared engine: serialized, drained, session reuse."""
 
 import threading
 import time
@@ -6,17 +6,17 @@ from pathlib import Path
 
 import pytest
 
-import sous.gateway.turn as turn
-from sous.config import SousConfig
-from sous.engine.base import Delta, EngineManager, GenerationStalled, ManagedEngine, ReplaySafe
-from sous.gateway.turn import (
+import sous.api.turn as turn
+from sous.api.turn import (
     CountResult,
-    GatewayBusy,
+    EndpointBusy,
     PromptTooLong,
     TurnAbandoned,
     TurnResult,
     TurnRunner,
 )
+from sous.config import SousConfig
+from sous.engine.base import Delta, EngineManager, GenerationStalled, ManagedEngine, ReplaySafe
 from sous.inflight import Inflight
 from tests.fake_engine import ChunkedFakeEngine, FakeEngine
 
@@ -24,7 +24,7 @@ from tests.fake_engine import ChunkedFakeEngine, FakeEngine
 @pytest.fixture(autouse=True)
 def _keep_main_thread_mlx_state(monkeypatch):
     # The runner releases mlx thread state unconditionally, which is right on
-    # the gateway pool thread it runs on in production (that thread frees
+    # the endpoint pool thread it runs on in production (that thread frees
     # arrays — see turn.py). These tests run it synchronously on the main
     # pytest thread, whose mlx stream state other test files own — a real
     # release there tears that state down under them and fails every later
@@ -53,7 +53,6 @@ class RecordingSink:
 
 
 def _cfg(tmp_path: Path, **overrides) -> SousConfig:
-    overrides.setdefault("gateway_enabled", True)
     return SousConfig(
         data_dir=tmp_path / "data",
         config_path=tmp_path / "config.toml",
@@ -167,8 +166,8 @@ def test_a_reloaded_engine_gets_a_fresh_session(tmp_path: Path):
 
 def test_a_running_turn_pins_the_engine_against_the_idle_unload(tmp_path: Path):
     """count_tokens runs before anything takes _gen_lock and takes seconds on
-    a real 80K prompt. The worker sweeps unload_if_idle() from its own thread
-    every 0.5s, so with a 0-minute idle threshold it would free the weights
+    a real 80K prompt. The idle sweep calls unload_if_idle() from its own
+    thread, so with a 0-minute idle threshold it would free the weights
     mid-count and the turn would then generate on an unloaded engine."""
     counting = threading.Event()
     gate = threading.Event()
@@ -224,7 +223,7 @@ def test_turns_are_serialized(tmp_path: Path):
     assert len(inner.generate_threads) == 2
 
 
-def test_busy_gateway_gives_up_after_the_timeout(tmp_path: Path):
+def test_busy_endpoint_gives_up_after_the_timeout(tmp_path: Path):
     entered = threading.Event()
 
     class Announcing(ChunkedFakeEngine):
@@ -236,11 +235,11 @@ def test_busy_gateway_gives_up_after_the_timeout(tmp_path: Path):
     runner, _ = _runner(tmp_path, inner)
     t = threading.Thread(target=runner.run, args=(MSGS, [], 100, RecordingSink()))
     t.start()
-    assert entered.wait(5)  # t holds the gateway lock and is generating
+    assert entered.wait(5)  # t holds the endpoint lock and is generating
     # Config is minutes-granular; the waiter needs a sub-second bound. Set it
     # only now, after t captured the long timeout for its own generation.
     runner._timeout = 0.2
-    with pytest.raises(GatewayBusy):
+    with pytest.raises(EndpointBusy):
         runner.run(MSGS, [], 100, RecordingSink())
     t.join(5)
     assert inner.finished.wait(5)
@@ -270,7 +269,7 @@ def test_a_stall_drops_the_session_and_the_next_turn_gets_a_new_one(tmp_path: Pa
 
 def test_a_stall_retires_the_dropped_sessions_thread_not_everything(tmp_path: Path):
     """The stall retires the abandoned session's own thread, so its late
-    publish drops itself — and only its slots go. A worker task's slots
+    publish drops itself — and only its slots go. Another owner's slots
     belong to a thread this turn knows nothing about and must survive."""
     gate = threading.Event()
     generated = threading.Event()
@@ -342,7 +341,7 @@ def test_a_turn_queued_while_closing_refuses_to_start(tmp_path: Path):
     inner = FakeEngine(["never"])
     runner, _ = _runner(tmp_path, inner)
     runner._closing = True
-    with pytest.raises(GatewayBusy, match="shutting down"):
+    with pytest.raises(EndpointBusy, match="shutting down"):
         runner.run(MSGS, [], 100, RecordingSink())
     assert inner.calls == []
     assert not runner._lock.locked()
@@ -433,8 +432,8 @@ def test_cache_hit_is_reported_from_the_sessions_own_counters(tmp_path: Path):
     assert (first.cache_hit, first.forked, first.reused_tokens) == (False, False, 0)
     assert (second.cache_hit, second.forked, second.reused_tokens) == (True, False, 900)
     assert (third.cache_hit, third.forked, third.reused_tokens) == (True, True, 4000)
-    # Every read named the gateway session's thread: exact per-turn deltas,
-    # unaffected by a worker task's counters or resets.
+    # Every read named the endpoint session's thread: exact per-turn deltas,
+    # unaffected by another owner's counters or resets.
     session_thread = inner.generate_threads[0]
     assert inner.stats_owners and all(o is session_thread for o in inner.stats_owners)
 
@@ -471,7 +470,7 @@ class _SlowCount(ChunkedFakeEngine):
 
 class _Gated(ChunkedFakeEngine):
     """Sets `entered` from inside generate(), i.e. once the caller holds the
-    gateway lock — the handshake test_busy_gateway_gives_up_after_the_timeout
+    endpoint lock — the handshake test_busy_endpoint_gives_up_after_the_timeout
     already uses instead of a sleep that races the scheduler."""
 
     def __init__(self, script, delay):
@@ -608,7 +607,7 @@ def test_gauge_fields_are_read_directly_not_as_deltas(tmp_path: Path):
     assert 2.9 <= result.tokenize_seconds < 3.5
 
 
-def test_queue_seconds_is_the_wait_for_the_gateway_lock(tmp_path: Path):
+def test_queue_seconds_is_the_wait_for_the_endpoint_lock(tmp_path: Path):
     inner = _Gated(["slow|turn", "fast"], delay=0.1)
     runner, _ = _runner(tmp_path, inner)
     results: dict[str, TurnResult] = {}
@@ -667,8 +666,8 @@ def test_load_seconds_includes_waiting_out_another_threads_load(tmp_path: Path):
 
 
 def test_a_turn_reports_its_wait_for_the_engine_lock(tmp_path: Path):
-    """A delegated task's generation holds the engine's lock; a gateway turn
-    behind it waits inside generate(), past the gateway lock and every phase
+    """An abandoned generation holds the engine's lock; an endpoint turn
+    behind it waits inside generate(), past the endpoint lock and every phase
     timer — the one place that wait can be seen is the session thread."""
     runner, engines = _runner(tmp_path, FakeEngine(["ok", "again"]))
     managed = engines.get()
@@ -698,7 +697,7 @@ def test_a_turn_abandoned_while_waiting_out_another_threads_load_never_generates
     """get() parks a turn behind a load another thread is running — minutes
     when a hold started it — and the client can leave meanwhile. The check
     before get() cannot see that; the one after it must, or a generation
-    nobody reads holds the gateway's one slot ahead of every live turn."""
+    nobody reads holds the endpoint's one slot ahead of every live turn."""
     inner = FakeEngine(["a"])
     loading, release = threading.Event(), threading.Event()
 
@@ -826,9 +825,9 @@ def test_a_failed_turn_leaves_the_registry_too(tmp_path: Path):
 def test_a_turn_refused_at_the_lock_leaves_the_registry(tmp_path: Path):
     live = Inflight()
     engines = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: FakeEngine([]))
-    runner = TurnRunner(engines, _cfg(tmp_path, gateway_generation_timeout_minutes=1), live)
+    runner = TurnRunner(engines, _cfg(tmp_path, generation_timeout_minutes=1), live)
     runner._timeout = 0.05
-    with runner._lock, pytest.raises(GatewayBusy):
+    with runner._lock, pytest.raises(EndpointBusy):
         runner.run(MSGS, [], 4096, RecordingSink(), turn_id="msg_1")
     assert live.snapshot()["inflight"] == []
 
@@ -858,7 +857,7 @@ def test_a_turn_without_an_id_never_touches_the_registry(tmp_path: Path):
 
 
 def test_the_prefill_probe_reads_the_owners_counters_against_the_turns_baseline():
-    from sous.gateway.turn import _prefill_plan
+    from sous.api.turn import _prefill_plan
 
     inner = FakeEngine([])
     engine = ManagedEngine(inner)
@@ -887,8 +886,8 @@ def test_the_probe_answers_nothing_before_this_turns_take_against_a_real_cache(m
     every turn after a session's first."""
     from typing import cast
 
+    from sous.api.turn import _prefill_plan
     from sous.engine.promptcache import PrefixCache
-    from sous.gateway.turn import _prefill_plan
     from tests.test_promptcache import FULL_1, FULL_2, STABLE_1, STABLE_2, FakeHooks
 
     class Shim:  # what ManagedEngine forwards: one owner's counters

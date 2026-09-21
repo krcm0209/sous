@@ -1,8 +1,8 @@
 """What the local model is doing right now, and what it just did.
 
-A registry of in-flight gateway turns keyed by the `msg_` id the client
+A registry of in-flight turns keyed by the `msg_` id the client
 already holds, plus the last fifty completed turns' summaries: what
-`/sous/status`, `/sous/events` and the MCP `server_status` tool read. Every
+`/sous/status` and `/sous/events` serve. Every
 write is a dict update under one lock, microseconds long — `progress` runs
 on the engine's session thread from inside the decode loop, where nothing
 may block or raise — so no method raises for an unknown id and none takes
@@ -201,7 +201,7 @@ class Inflight:
 
     def _ordered(self) -> list[_Turn]:
         """Lock held by the caller. The turn on the pass first — the one past
-        `queued` that most recently moved, since the runner holds the gateway
+        `queued` that most recently moved, since the runner holds the endpoint
         lock from `loading` on and registration order says nothing about who
         won that lock — then the queue in arrival order."""
         running = [t for t in self._turns.values() if t.phase != "queued"]

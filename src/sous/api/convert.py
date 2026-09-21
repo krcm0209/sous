@@ -59,7 +59,7 @@ _OMITTED = "[{kind} omitted: sous serves text only]"
 
 
 class RequestError(Exception):
-    """A request the gateway rejects, in Anthropic's error vocabulary."""
+    """A request the endpoint rejects, in Anthropic's error vocabulary."""
 
     def __init__(self, status: int, error_type: str, message: str):
         super().__init__(message)

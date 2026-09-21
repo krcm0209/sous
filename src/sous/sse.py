@@ -1,5 +1,5 @@
 """The frame conventions the daemon's two event streams share — the
-gateway's `POST /v1/messages` and the monitor's `GET /sous/events` — so the
+endpoint's `POST /v1/messages` and the monitor's `GET /sous/events` — so the
 two are one shape on the wire: one separator, one keepalive interval, one
 ping frame."""
 

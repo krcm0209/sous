@@ -7,13 +7,13 @@ TINY = "mlx-community/Qwen3-0.6B-4bit"  # ~350 MB
 
 def test_lm_engine_generates_and_counts():
     from sous.engine.lm import LMEngine
-    from sous.protocol import WORKER_TOOLS
+    from sous.tune.payload import TOOLS
 
     e = LMEngine(TINY)
     msgs = [{"role": "user", "content": "Say the word banana and nothing else."}]
-    out = e.generate(msgs, WORKER_TOOLS, max_tokens=64)
+    out = e.generate(msgs, TOOLS, max_tokens=64)
     assert isinstance(out, str) and len(out) > 0
-    assert e.count_tokens(msgs, WORKER_TOOLS) > 0
+    assert e.count_tokens(msgs, TOOLS) > 0
     e.unload()
 
 
@@ -58,18 +58,18 @@ def test_lm_snapshot_restore_is_bit_exact():
 
 def test_lm_engine_reuses_across_turns():
     from sous.engine.lm import LMEngine
-    from sous.protocol import WORKER_TOOLS
+    from sous.tune.payload import TOOLS
 
-    # Explicitly on: the shipped default is off until the worker stops running
-    # each generation on its own thread, and this test is about reuse itself.
+    # Explicitly on: the constructor defaults it off, and this test is about
+    # reuse itself.
     e = LMEngine(TINY, prompt_cache=True)
     msgs = [{"role": "user", "content": "Say the word banana and nothing else."}]
-    first = e.generate(msgs, WORKER_TOOLS, max_tokens=32)
+    first = e.generate(msgs, TOOLS, max_tokens=32)
     msgs = msgs + [
         {"role": "assistant", "content": first},
         {"role": "user", "content": "Now say kiwi and nothing else."},
     ]
-    e.generate(msgs, WORKER_TOOLS, max_tokens=32)
+    e.generate(msgs, TOOLS, max_tokens=32)
     stats = e.prompt_cache_stats()
     assert stats["hits"] == 1, stats
     assert stats["reused_tokens"] > 0
@@ -79,12 +79,12 @@ def test_lm_engine_reuses_across_turns():
 def test_lm_engine_streams_deltas_that_reassemble_the_reply():
     from sous.engine.base import Delta
     from sous.engine.lm import LMEngine
-    from sous.protocol import WORKER_TOOLS
+    from sous.tune.payload import TOOLS
 
     e = LMEngine(TINY)
     seen: list[Delta] = []
     msgs = [{"role": "user", "content": "Count from one to five."}]
-    out = e.generate(msgs, WORKER_TOOLS, max_tokens=32, on_delta=seen.append)
+    out = e.generate(msgs, TOOLS, max_tokens=32, on_delta=seen.append)
     assert "".join(d.text for d in seen) == out
     assert [d.output_tokens for d in seen] == sorted(d.output_tokens for d in seen)
     assert seen[-1].finish_reason in ("stop", "length")

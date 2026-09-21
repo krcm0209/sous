@@ -1,23 +1,20 @@
-"""The suite runner drives sous's own worker loop: the sandbox and the
-allowlist are real, approvals are denied, and every number in a run is read
-back from the store, the transcript and the engine's deltas."""
+"""The suite runner drives the suite's own loop over a scratch copy of the
+project: the tools are real, a disallowed command is denied and counted, and
+every number in a run is read back from the transcript and the engine's
+deltas."""
 
 import json
 import os
 import sys
 import threading
-import time
 from pathlib import Path
-from typing import cast
 
 from sous.config import SousConfig
 from sous.engine.base import ManagedEngine, ReplaySafe
-from sous.tasks import TaskStore
 from sous.tune.arms import Arm
 from sous.tune.bench import BenchRow
 from sous.tune.suite import load_tasks
 from sous.tune.suite.runner import (
-    SUITE_ALLOWLIST,
     CountingEngine,
     SuiteRun,
     estimate_seconds,
@@ -44,7 +41,6 @@ def _arm(tmp_path, **over):
         model_id="org/m",
         speculative_draft_id="",
         max_context_tokens=8192,
-        approval_timeout_minutes=1,
         **over,
     )
     return Arm(
@@ -54,7 +50,6 @@ def _arm(tmp_path, **over):
         drafter_id="",
         block_size=0,
         window=8192,
-        gateway_window=None,
         tier="t",
         current=True,
     )
@@ -95,16 +90,6 @@ def test_interpreter_first_prepends_the_interpreters_directory_and_restores(monk
     assert os.environ["PATH"] == "/usr/bin"
 
 
-def test_the_suite_allowlist_is_the_shipped_one_plus_unittest():
-    from sous.config import DEFAULT_ALLOWLIST
-
-    assert SUITE_ALLOWLIST[: len(DEFAULT_ALLOWLIST)] == tuple(DEFAULT_ALLOWLIST)
-    assert SUITE_ALLOWLIST[len(DEFAULT_ALLOWLIST) :] == (
-        "python -m unittest",
-        "python3 -m unittest",
-    )
-
-
 def test_a_counting_engine_reads_the_deltas_through_a_replay_safe_callback():
     inner = FakeEngine(["one two three", "four"])
     counting = CountingEngine(inner)
@@ -128,7 +113,8 @@ def test_run_one_grades_a_solved_task_and_reads_every_metric_from_the_run(tmp_pa
     assert run.output_tokens == counting.output_tokens > 0
     assert run.malformed == 0 and run.repetitions == 0 and run.approvals_denied == 0
     assert run.error is None and run.seconds >= 0
-    assert run.transcript_path and Path(run.transcript_path).is_file()
+    assert run.transcript_path == str(tmp_path / "s" / "transcript.jsonl")
+    assert Path(run.transcript_path).is_file()
     written = (tmp_path / "s" / "project" / "rpn.py").read_text()
     assert written == (task.solution / "rpn.py").read_text()
     assert run.key == (*_arm(tmp_path).key, False, False)
@@ -136,7 +122,7 @@ def test_run_one_grades_a_solved_task_and_reads_every_metric_from_the_run(tmp_pa
 
 def test_a_command_outside_the_allowlist_is_denied_and_counted(tmp_path):
     task = _task()
-    denied = CALL.format(name="run_command", args='{"command": "echo hi"}')
+    denied = CALL.format(name="run_command", args='{"command": "rm -rf /"}')
     allowed = CALL.format(name="run_command", args='{"command": "python -m unittest discover"}')
     inner = FakeEngine([denied, allowed, FINISH])
     counting = CountingEngine(inner)
@@ -147,7 +133,7 @@ def test_a_command_outside_the_allowlist_is_denied_and_counted(tmp_path):
     transcript_path = Path(run.transcript_path)  # ty: ignore[invalid-argument-type]
     lines = [json.loads(l) for l in transcript_path.read_text().splitlines()]  # noqa: E741
     tools = [e for e in lines if e.get("event") == "tool"]
-    assert "command denied" in tools[0]["result"]
+    assert tools[0]["result"] == "command denied (not allowlisted): rm -rf /"
     assert tools[1]["result"].startswith("exit code")
     assert run.grade == 0.0  # nothing was implemented
 
@@ -161,39 +147,6 @@ def test_an_engine_failure_is_a_failed_run_with_a_zero_grade(tmp_path):
     assert run.state == "failed" and not run.completed
     assert run.error and "engine error" in run.error
     assert run.grade == 0.0 and run.turns == 0
-
-
-def test_the_denier_survives_a_store_error_and_records_it():
-    from sous.tune.suite import runner
-
-    class BustedStore:
-        def get(self, task_id):
-            raise RuntimeError("busy")
-
-    with runner._Denier(cast(TaskStore, BustedStore()), "t", 0.01) as d:
-        time.sleep(0.05)
-        assert d._thread.is_alive()
-    assert d.error == "RuntimeError: busy"
-    assert d.denied == 0
-
-
-def test_a_denier_failure_marks_the_run_as_an_error(tmp_path, monkeypatch):
-    from sous.tune.suite import runner
-
-    class FailingDenier(runner._Denier):
-        def __enter__(self):
-            super().__enter__()
-            self.error = "RuntimeError: busy"
-            return self
-
-    monkeypatch.setattr(runner, "_Denier", FailingDenier)
-    task = _task()
-    counting = CountingEngine(FakeEngine([FINISH]))
-    run = run_one(
-        task, 0, _arm(tmp_path), ManagedEngine(counting), counting, tmp_path / "s", python=PYTHON
-    )
-    assert run.state == "error"
-    assert run.error == "approval denier failed: RuntimeError: busy"
 
 
 def test_run_suite_loads_once_runs_what_is_not_done_records_in_order_and_releases(tmp_path):
@@ -229,7 +182,7 @@ def test_run_suite_loads_once_runs_what_is_not_done_records_in_order_and_release
 
 
 def test_the_next_run_waits_for_an_abandoned_generation(tmp_path, monkeypatch):
-    """run_task can give up on a stalled generation (budget-exhausted) at
+    """run_loop can give up on a stalled generation (budget-exhausted) at
     its own wall-clock deadline while the engine's session thread keeps
     decoding under ManagedEngine._gen_lock until it hits its token cap. The
     next run's own budget clock must not start against a locked engine."""
@@ -242,7 +195,7 @@ def test_the_next_run_waits_for_an_abandoned_generation(tmp_path, monkeypatch):
     def run_one_then_hold(task, index, arm, engine, counting, scratch, **kwargs):
         result = real_run_one(task, index, arm, engine, counting, scratch, **kwargs)
         if index == 0:
-            # run_one has already returned (as run_task does on budget
+            # run_one has already returned (as run_loop does on budget
             # exhaustion), but the engine's session thread is simulated as
             # still decoding underneath, holding the lock a while longer.
             engine._gen_lock.acquire()

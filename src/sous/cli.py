@@ -1,4 +1,4 @@
-"""sous CLI: serve / status / top / statusline / wait / stop / mcp / claude / install- and
+"""sous CLI: serve / status / top / statusline / stop / claude / install- and
 uninstall-launchd."""
 
 from __future__ import annotations
@@ -7,7 +7,6 @@ import argparse
 import contextlib
 import fcntl
 import json
-import math
 import os
 import plistlib
 import shutil
@@ -50,9 +49,9 @@ _LSP_OFF = ["--disallowedTools", "LSP"]
 _NO_HOLD_FLAGS = ("--help", "-h", "--version", "-v")
 # Model load plus a long prefill: minutes, not the SDK's default.
 _API_TIMEOUT_MS = "3000000"
-# Nothing about /sous/status or /sous/hold is slow: one reads the task
-# store, the engine's counters and the turn registry (a millisecond), the
-# other registers a pid; neither waits for the model.
+# Nothing about /sous/status or /sous/hold is slow: one reads the engine's
+# counters and the turn registry (a millisecond), the other registers a
+# pid; neither waits for the model.
 _STATUS_TIMEOUT_SECONDS = 15.0
 # The status document is tens of KB with its ring of recent turns and a hold
 # reply is three fields; a reply past this is not the daemon's.
@@ -90,11 +89,11 @@ def claude_env(
     max_context_tokens: int,
     base: Mapping[str, str],
 ) -> dict[str, str]:
-    """The inherited environment plus the five variables the gateway needs.
+    """The inherited environment plus the five variables Claude Code needs.
 
-    The gateway values are the RUNNING daemon's (see _daemon_status), not the
-    config file's: pinning subagents to an id the daemon does not serve would
-    send every one of them upstream.
+    They are the RUNNING daemon's values (see _daemon_status), not the config
+    file's: pinning subagents to an id the daemon does not serve would send
+    every one of them upstream.
 
     CLAUDE_CODE_MAX_CONTEXT_TOKENS is honoured only for non-claude-* ids, so
     it sizes the local subagent's window and leaves the main loop alone.
@@ -129,7 +128,7 @@ def _sous_request(port: int, method: str, path: str, json: dict | None = None) -
 
     deadline = time.monotonic() + _STATUS_TIMEOUT_SECONDS
     # 127.0.0.1 is loopback: a proxy variable must never route or see this
-    # call — same rule as gateway/upstream.py's trust_env=False.
+    # call — same rule as api/upstream.py's trust_env=False.
     with (
         httpx.Client(timeout=_STATUS_TIMEOUT_SECONDS, trust_env=False) as client,
         client.stream(method, f"http://127.0.0.1:{port}{path}", json=json) as reply,
@@ -168,9 +167,9 @@ def _daemon_status(port: int, data_dir: Path) -> dict | None:
 
     The config FILE is not the truth: the daemon loads it once at startup and
     holds that snapshot for its whole life, so an edit since then — a changed
-    `local_models`, a wider `max_context_tokens`, `enabled` flipped — is a
-    setting the running gateway does not have. /sous/status is where the
-    daemon reports the gateway config it is actually serving.
+    `local_models`, a wider `max_context_tokens` — is a setting the running
+    daemon does not have. /sous/status is where it reports the configuration
+    it is actually serving.
     """
     import httpx
 
@@ -182,21 +181,28 @@ def _daemon_status(port: int, data_dir: Path) -> dict | None:
         # The type only: an httpx message can carry the URL it was building.
         _no_status_answer(port, type(exc).__name__)
         return None
-    if status == 404:
-        if _lock_is_held(data_dir):
-            print(_PREDATES_MESSAGE, file=sys.stderr)
-        else:
-            print(
-                f"sous claude: 127.0.0.1:{port} is not a sous daemon (nothing holds "
-                f"{data_dir / 'daemon.lock'}); stop what listens there, or change [server].port",
-                file=sys.stderr,
-            )
-        raise SystemExit(1)
     body = _json_object(raw) if status == 200 else None
-    if body is None:
-        _no_status_answer(port, f"status {status}")
-        return None
-    return body
+    if body is not None and not isinstance(body.get("config"), dict):
+        # Someone else's JSON object: read as the document it would be a
+        # traceback at the first field.
+        body = None
+    if body is not None:
+        return body
+    # Whatever the answer was, the lock says whether a daemon is there at
+    # all: nothing holding it means the port is another service's, and a
+    # restart would only collide with it.
+    if not _lock_is_held(data_dir):
+        print(
+            f"sous claude: 127.0.0.1:{port} is not a sous daemon (nothing holds "
+            f"{data_dir / 'daemon.lock'}); stop what listens there, or change [server].port",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if status == 404:
+        print(_PREDATES_MESSAGE, file=sys.stderr)
+        raise SystemExit(1)
+    _no_status_answer(port, f"status {status}" if status != 200 else "not the status document")
+    return None
 
 
 def _hold_warning(why: str) -> None:
@@ -233,12 +239,12 @@ def _hold(port: int) -> dict | None:
 
 
 def _cmd_claude(user_args: list[str]) -> None:
-    """Replace this process with Claude Code pointed at the gateway.
+    """Replace this process with Claude Code pointed at the daemon.
 
-    Every gateway value Claude Code is given comes from the running daemon;
+    Every served value Claude Code is given comes from the running daemon;
     the config file supplies the port to reach it on, the path to name in an
-    error message, and the two gateway values compared against the daemon's
-    for the drift note — never the values themselves.
+    error message, and the two values compared against the daemon's for the
+    drift note — never the values themselves.
     """
     config = load_config()
     exe = shutil.which("claude")
@@ -262,17 +268,8 @@ def _cmd_claude(user_args: list[str]) -> None:
                 file=sys.stderr,
             )
         raise SystemExit(1)
-    gateway = status.get("config", {}).get("gateway", {})
-    if not gateway.get("enabled"):
-        print(
-            f"sous claude: the running daemon has the gateway off (config edited without a "
-            f"restart?); set [gateway].enabled = true in {config.config_path} and restart "
-            "the daemon",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
-    local_models = gateway.get("local_models")
-    max_context_tokens = gateway.get("max_context_tokens")
+    local_models = status.get("config", {}).get("local_models")
+    max_context_tokens = status.get("config", {}).get("max_context_tokens")
     if (
         not isinstance(local_models, list)
         or not local_models
@@ -291,8 +288,8 @@ def _cmd_claude(user_args: list[str]) -> None:
     drifted = [
         key
         for key, running, on_disk in (
-            ("local_models", list(local_models), list(config.gateway_local_models)),
-            ("max_context_tokens", max_context_tokens, config.gateway_max_context_tokens),
+            ("local_models", list(local_models), list(config.local_models)),
+            ("max_context_tokens", max_context_tokens, config.max_context_tokens),
         )
         if running != on_disk
     ]
@@ -350,10 +347,10 @@ def launchd_plist(sous_executable: str, log_dir: Path) -> str:
     # plistlib handles XML escaping — a path containing & or < must still
     # produce a plist launchctl can parse (string formatting silently
     # produced invalid XML while install-launchd reported success).
-    # No EnvironmentVariables.PATH here on purpose: the daemon adopts the
-    # user's login-shell PATH itself at startup (server._login_shell_path),
-    # which works identically however it was launched — an install-time
-    # snapshot in the plist would just be a second, staler mechanism.
+    # No EnvironmentVariables block on purpose: the daemon runs no commands
+    # of its own, so launchd's bare system PATH is all it needs, and it reads
+    # no credential or proxy from its environment (api/upstream.py) — a block
+    # here would only snapshot the installing shell into the plist.
     return plistlib.dumps(
         {
             "Label": LABEL,
@@ -362,8 +359,8 @@ def launchd_plist(sous_executable: str, log_dir: Path) -> str:
             "KeepAlive": True,
             # Both streams to one file, in write order. The stderr file was
             # named daemon.err.log and held everything the daemon said — Python
-            # logging, the gateway's lines, warnings, the SDK's handler all
-            # write to stderr — while daemon.log held the banner. One file,
+            # logging, the daemon's own lines, warnings, every library's
+            # handler all write to stderr — while daemon.log held the banner. One file,
             # and the level on every line (sous.logs) says what is an error.
             "StandardOutPath": f"{log_dir}/daemon.log",
             "StandardErrorPath": f"{log_dir}/daemon.log",
@@ -372,20 +369,131 @@ def launchd_plist(sous_executable: str, log_dir: Path) -> str:
     ).decode()
 
 
+def status_lines(document: dict, now: float) -> list[str]:
+    """`sous status` from the status document: the engine, the turns in
+    flight and the last five served, newest first. `now` is only for a
+    turn's elapsed time, like statusline_text."""
+    engine = document.get("engine")
+    engine = engine if isinstance(engine, dict) else {}
+    config = document.get("config")
+    config = config if isinstance(config, dict) else {}
+    if engine.get("loading"):
+        state = "loading"
+    elif engine.get("unloading"):
+        state = "unloading"
+    elif engine.get("loaded"):
+        state = "loaded"
+    else:
+        state = "unloaded"
+    engine_parts = [
+        f"engine: {engine.get('model_id', '?')} {state}",
+        f"holders {engine.get('holders') or 0}",
+    ]
+    idle = engine.get("idle_seconds")
+    if state == "loaded" and isinstance(idle, int | float):
+        engine_parts.append(f"idle {_span(idle)}")
+    lines = [
+        f"sous daemon: listening on 127.0.0.1:{config.get('port', '?')}",
+        "  " + " · ".join(engine_parts),
+    ]
+    # Shape-checked entry by entry: whatever answered on the port is read
+    # here, and a wrong element must not become a traceback.
+    inflight = [t for t in _entries(document.get("inflight")) if isinstance(t, dict)]
+    if inflight:
+        for turn in inflight:
+            since = turn.get("started_at")
+            age = f" {_clock(now - since)}" if isinstance(since, int | float) else ""
+            lines.append(
+                f"  turn {turn.get('id', '?')} {turn.get('model', '?')} "
+                f"{turn.get('phase', 'queued')}{age}"
+            )
+    else:
+        lines.append("  turns in flight: none")
+    # The ring is newest first already.
+    recent = [s for s in _entries(document.get("recent_turns")) if isinstance(s, dict)][:5]
+    if recent:
+        lines.append("  recent turns:")
+        lines.extend("    " + _recent_turn_text(s) for s in recent)
+    return lines
+
+
+def _entries(value: object) -> list:
+    return value if isinstance(value, list) else []
+
+
+def _recent_turn_text(s: dict) -> str:
+    seconds = s.get("seconds")
+    took = f"{seconds:.1f}s" if isinstance(seconds, int | float) else "-"
+    head = f"{s.get('id', '?')} {s.get('model', '?')} status={s.get('status', '?')}"
+    if s.get("error"):
+        # A refused, abandoned or failed turn: its summary carries the error
+        # and none of the served fields.
+        return f"{head} error={s['error']} {took}"
+    return (
+        f"{head} stop={s.get('stop_reason') or '-'} cache={s.get('cache') or '-'} "
+        f"in={s.get('input_tokens', '-')} out={s.get('output_tokens', '-')} {took}"
+    )
+
+
 def _cmd_status() -> None:
     config = load_config()
-    try:
-        with socket.create_connection(("127.0.0.1", config.server_port), timeout=1):
-            print(f"sous daemon: listening on 127.0.0.1:{config.server_port}")
-    except OSError:
+    if not _port_open(config.server_port):
         print(f"sous daemon: not running (port {config.server_port})")
         print("start it with: sous serve   (or: sous install-launchd)")
         return
-    from sous.tasks import TaskStore
+    import httpx
 
-    store = TaskStore(config.data_dir / "tasks.db")
-    for t in store.list_recent(limit=10):
-        print(f"  {t.id}  {t.state:<18} {t.title}")
+    try:
+        status, raw = _sous_request(config.server_port, "GET", "/sous/status")
+    except httpx.HTTPError as e:
+        print(
+            f"sous daemon: port {config.server_port} did not answer /sous/status "
+            f"({type(e).__name__}); is it sous?"
+        )
+        raise SystemExit(1) from None
+    document = _json_object(raw) if status == 200 else None
+    if document is not None and not (
+        isinstance(document.get("engine"), dict) and isinstance(document.get("config"), dict)
+    ):
+        # A JSON object without the engine block is some other service on the
+        # port; read as a document it would print a confident report about a
+        # daemon that isn't there.
+        document = None
+    if document is None:
+        # Whatever the answer was — a 404, a 503, HTML, someone else's JSON —
+        # the lock says whether there is a daemon to restart: nothing holding
+        # it means the port is another service's, and a restart would only
+        # collide with it.
+        if not _lock_is_held(config.data_dir):
+            print(
+                f"sous daemon: 127.0.0.1:{config.server_port} is not a sous daemon (nothing "
+                f"holds {config.data_dir / 'daemon.lock'}); stop what listens there, or "
+                "change [server].port"
+            )
+            raise SystemExit(1)
+        answer = (
+            "/sous/status with something that is not the status document"
+            if status == 200
+            else f"{status} to /sous/status"
+        )
+        print(
+            f"sous daemon: port {config.server_port} answered {answer}; "
+            f"restart it ({restart_hint(managed=_launchd_loaded(LABEL))})"
+        )
+        raise SystemExit(1)
+    for line in status_lines(document, now=time.time()):
+        print(line)
+
+
+def _span(seconds: float) -> str:
+    """`48s`, `4m 12s`, `1h 03m`: the idle span, in the shape `sous top` gives
+    it (span_text lives in tui.py, which this module must not import)."""
+    seconds = max(0, int(seconds))
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds}s"
 
 
 def _clock(seconds: float) -> str:
@@ -448,7 +556,7 @@ def _statusline_fetch(port: int) -> str | None:
         if not sys.stdin.isatty():
             sys.stdin.read()
     # No proxy, whatever the environment says: 127.0.0.1 is loopback, the
-    # same rule as the launcher's httpx client and the gateway's forwarder.
+    # same rule as the launcher's httpx client and the daemon's forwarder.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     url = f"http://127.0.0.1:{port}/sous/status"
     try:
@@ -500,45 +608,6 @@ def _cmd_top() -> None:
     raise SystemExit(run_top(config.server_port))
 
 
-def _cmd_wait(task_id: str, timeout: float | None, interval: float) -> None:
-    """Block until the task needs attention, so agents can park this in a
-    background shell instead of tight-polling task_status — or, worse, reading
-    tasks.db by hand (observed in the wild; the schema is not a contract).
-
-    Wakes on awaiting_approval as well as the terminal states: an approval
-    request needs a human NOW, and a wait that slept through it would let the
-    request time out into an auto-deny.
-    """
-    config = load_config()
-    from sous.tasks import FINISHED_STATES, TaskState, TaskStore
-
-    store = TaskStore(config.data_dir / "tasks.db")
-    deadline = (time.monotonic() + timeout) if timeout is not None else None
-    while True:
-        t = store.get(task_id)
-        if t is None:
-            print(f"sous: unknown task {task_id}")
-            raise SystemExit(2)
-        if t.state in FINISHED_STATES or t.state == TaskState.AWAITING_APPROVAL:
-            line = f"state={t.state}"
-            if t.outcome:
-                line += f" outcome={t.outcome}"
-            if t.state == TaskState.AWAITING_APPROVAL and t.pending_command:
-                line += f" pending_command={t.pending_command}"
-            print(line)
-            return
-        # Cap each sleep to the remaining budget: sleeping a full interval and
-        # only then checking would quantize the deadline to interval boundaries
-        # — and a task finishing inside that overrun would be reported as a
-        # success AFTER the caller's timeout. (--timeout 0 thereby becomes the
-        # non-blocking probe: one state check, then report.)
-        remaining = None if deadline is None else deadline - time.monotonic()
-        if remaining is not None and remaining <= 0:
-            print(f"state={t.state} (timeout)")
-            raise SystemExit(1)
-        time.sleep(interval if remaining is None else min(interval, remaining))
-
-
 def _plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 
@@ -566,7 +635,7 @@ def _await_port_closed(port: int, seconds: float) -> bool:
 
 # How long install-launchd waits for the daemon it just unloaded to let go of
 # the lock. Past the port closing, that daemon still runs uvicorn's graceful
-# bound (server.GRACEFUL_SHUTDOWN_SECONDS), the gateway runner's close and the
+# bound (server.GRACEFUL_SHUTDOWN_SECONDS), the turn runner's close and the
 # teardown of a resident model — well past _UNLOAD_GRACE_SECONDS.
 _DAEMON_EXIT_SECONDS = 30.0
 
@@ -688,20 +757,6 @@ def _cmd_stop() -> None:
         print(f"  something else is on port {config.server_port}; not signalling a stale pid")
         raise SystemExit(1)
 
-    from sous.tasks import TaskState, TaskStore
-
-    # count_by_state aggregates every row; list_recent() caps at 20 and would
-    # miss a long-running task once newer ones are queued past it.
-    counts = TaskStore(config.data_dir / "tasks.db").count_by_state()
-    interrupted = {
-        state: n
-        for state, n in counts.items()
-        if state in (TaskState.RUNNING, TaskState.AWAITING_APPROVAL) and n
-    }
-    if interrupted:
-        summary = ", ".join(f"{n} {state}" for state, n in sorted(interrupted.items()))
-        print(f"sous: {summary}; these will be reported failed when the daemon restarts")
-
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -714,7 +769,6 @@ def _cmd_stop() -> None:
         print(f"sous daemon: sent SIGTERM to {pid} but port {config.server_port} is still open")
         raise SystemExit(1)
     print(f"sous daemon: stopped (pid {pid})")
-    print("any running `sous mcp` bridges will exit on their own")
 
 
 def _cmd_uninstall_launchd() -> None:
@@ -875,26 +929,6 @@ def _cmd_install_launchd() -> None:
         raise SystemExit(1) from None
 
 
-def _arg_interval(text: str) -> float:
-    """A zero interval recreates the tight-polling `wait` exists to prevent, a
-    negative one raises out of time.sleep, and NaN poisons the sleep math —
-    reject all three as usage errors instead of misbehaving at runtime."""
-    value = float(text)
-    if not math.isfinite(value) or value <= 0:
-        raise argparse.ArgumentTypeError("interval must be a positive finite number of seconds")
-    return value
-
-
-def _arg_timeout(text: str) -> float:
-    """NaN never compares past the deadline (the wait would ignore an explicit
-    timeout and block forever); negatives are nonsense. Zero is allowed and
-    defined: an immediate, non-blocking probe."""
-    value = float(text)
-    if not math.isfinite(value) or value < 0:
-        raise argparse.ArgumentTypeError("timeout must be a non-negative finite number of seconds")
-    return value
-
-
 def _positive_int(text: str) -> int:
     """0 or fewer suite runs per task would measure nothing while still
     reporting a clean exit: reject it as a usage error before the suite
@@ -915,25 +949,15 @@ def main(argv: list[str] | None = None) -> None:
         return
     parser = argparse.ArgumentParser(prog="sous", description="local MLX sous-chef for Claude")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("serve", help="run the daemon (MCP over HTTP on 127.0.0.1)")
-    status = sub.add_parser("status", help="check the daemon and recent tasks")
+    sub.add_parser("serve", help="run the daemon (the endpoint on 127.0.0.1)")
+    status = sub.add_parser("status", help="the daemon, its engine and the recent turns")
     status.add_argument("--watch", action="store_true", help="the live terminal (sous top)")
     sub.add_parser(
         "statusline",
         help="one line for Claude Code's statusLine setting (reads and ignores its stdin JSON)",
     )
     sub.add_parser("top", help="watch the pass live: the order on it, the line, the recent orders")
-    wait = sub.add_parser("wait", help="block until a task finishes or requests a command approval")
-    wait.add_argument("task_id")
-    wait.add_argument(
-        "--timeout",
-        type=_arg_timeout,
-        default=None,
-        help="give up after N seconds, exit 1 (0 = non-blocking probe)",
-    )
-    wait.add_argument("--interval", type=_arg_interval, default=2.0, help="poll every N seconds")
     sub.add_parser("stop", help="stop the daemon (unmanaged daemons only)")
-    sub.add_parser("mcp", help="bridge stdio to the daemon (for stdio-only MCP clients)")
     sub.add_parser("install-launchd", help="install start-at-login LaunchAgent")
     sub.add_parser("uninstall-launchd", help="remove the start-at-login LaunchAgent")
     tune = sub.add_parser(
@@ -958,28 +982,20 @@ def main(argv: list[str] | None = None) -> None:
     # main(), before argparse ever sees it, so there is no `claude` branch below.
     sub.add_parser(
         "claude",
-        help="launch Claude Code against the gateway: subagents local, main loop upstream "
-        "(every following argument passes through to claude)",
+        help="launch Claude Code with its subagents served locally and the main loop "
+        "upstream (every following argument passes through to claude)",
     )
     args = parser.parse_args(raw)
     if args.command == "serve":
         from sous.server import main as serve_main
 
         serve_main()
-    elif args.command == "mcp":
-        # Attribute lookup, not `from ... import run`: the exit code has to
-        # reach the launching client, and this stays patchable for tests.
-        import sous.proxy
-
-        raise SystemExit(sous.proxy.run())
     elif args.command == "status":
         _cmd_top() if args.watch else _cmd_status()
     elif args.command == "top":
         _cmd_top()
     elif args.command == "statusline":
         _cmd_statusline()
-    elif args.command == "wait":
-        _cmd_wait(args.task_id, args.timeout, args.interval)
     elif args.command == "stop":
         _cmd_stop()
     elif args.command == "install-launchd":

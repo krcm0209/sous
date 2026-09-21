@@ -1,6 +1,6 @@
 """A recording stand-in for api.anthropic.com behind httpx's in-process ASGI
 transport. Shared by the forwarder's own tests and the routing tests; the
-real-socket tests in test_gateway_http.py serve a Starlette app of their own
+real-socket tests in test_api_http.py serve a Starlette app of their own
 under uvicorn instead, because this transport buffers whole responses."""
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
-from sous.gateway.upstream import Upstream
+from sous.api.upstream import Upstream
 
 METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
