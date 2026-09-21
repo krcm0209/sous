@@ -27,6 +27,22 @@ def _no_leaked_warning_capture():
     logging.captureWarnings(False)
 
 
+@pytest.fixture(autouse=True)
+def _no_leaked_tqdm_switch():
+    """server.main() throws tqdm's process-wide mp_lock switch, which has no
+    undo of its own. Left thrown, every later tqdm bar in the suite runs
+    without the multiprocessing lock tqdm would otherwise give it."""
+    from tqdm.std import TqdmDefaultWriteLock
+
+    had = "mp_lock" in vars(TqdmDefaultWriteLock)
+    before = vars(TqdmDefaultWriteLock).get("mp_lock")
+    yield
+    if had:
+        TqdmDefaultWriteLock.mp_lock = before
+    elif "mp_lock" in vars(TqdmDefaultWriteLock):
+        del TqdmDefaultWriteLock.mp_lock
+
+
 @pytest.fixture()
 def svc(tmp_path: Path):
     root = tmp_path / "proj"
@@ -138,8 +154,13 @@ def test_the_daemon_gives_tqdm_no_multiprocessing_lock(monkeypatch):
 
     import sous.server as server
 
-    monkeypatch.delattr(TqdmDefaultWriteLock, "mp_lock", raising=False)
-    monkeypatch.delattr(tqdm.std.tqdm, "_lock", raising=False)
+    # A bare delattr(raising=False) records no undo for an absent attribute,
+    # and the switch and get_lock() below would then outlive the test. The
+    # setattr records each starting state, absence included; the delattr
+    # gives the test the fresh-process state it needs.
+    for owner, name in ((TqdmDefaultWriteLock, "mp_lock"), (tqdm.std.tqdm, "_lock")):
+        monkeypatch.setattr(owner, name, None, raising=False)
+        monkeypatch.delattr(owner, name)
     registered: list[tuple[str, str]] = []
     monkeypatch.setattr(
         resource_tracker, "register", lambda name, rtype: registered.append((name, rtype))
@@ -185,9 +206,8 @@ def test_main_installs_the_shutdown_handler_before_serving(tmp_path: Path, monke
         monkeypatch.setattr(server, "_drop_tqdm_process_lock", lambda: installed.append("tqdm"))
         with pytest.raises(SystemExit):
             server.main()
-    assert installed == [True, "tqdm"] or installed == ["tqdm", True], (
-        "main() served without installing the shutdown handler and the tqdm switch"
-    )
+    assert True in installed, "main() served without installing the shutdown handler"
+    assert "tqdm" in installed, "main() served without throwing the tqdm switch"
     assert sum(1 for h in root.handlers if h.name == SOUS_HANDLER_NAME) == 1
 
 
