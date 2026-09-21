@@ -12,7 +12,7 @@ import time
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from sous.config import SousConfig
 
@@ -788,22 +788,25 @@ class EngineManager:
         self._bump()
         return engine
 
-    def _free(self, engine: ManagedEngine, reason: str) -> None:
+    def _free(self, engine: ManagedEngine, reason: Literal["idle", "requested"]) -> None:
         """Outside the lock — the weights come off the GPU over seconds. The
         line is the unload's only trace besides the status document, and the
         sweep's is the one nobody asked for."""
         started = time.monotonic()
         try:
             engine.unload()
+            # Before the finally wakes anyone: a get() waiting out the unload
+            # starts the next load at once, and the status document reports
+            # the model gone, so a line written after either could trail them.
+            _logger.info(
+                f"model_unload seconds={time.monotonic() - started:.1f} "
+                f"model={engine.model_id} reason={reason}"
+            )
         finally:
             with self._changed:
                 self._unloading = False
                 self._bump()
                 self._changed.notify_all()
-        _logger.info(
-            f"model_unload seconds={time.monotonic() - started:.1f} "
-            f"model={engine.model_id} reason={reason}"
-        )
 
     def unload_if_idle(self) -> bool:
         with self._changed:

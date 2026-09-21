@@ -124,6 +124,32 @@ def test_an_unload_logs_its_duration_and_reason(caplog):
     assert lines[1].endswith(" model=fake/model reason=requested")
 
 
+def test_the_unload_line_lands_before_the_unload_is_over(caplog):
+    """A get() waiting out the unload starts the next load the moment it
+    ends, and the status document reports the model gone from then on; a
+    line written after that could trail both in the log."""
+    import logging
+
+    mgr, _ = _manager(idle_minutes=0)
+    mgr.get()
+    unloading: list[bool] = []
+
+    class Probe(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.getMessage().startswith("model_unload"):
+                unloading.append(mgr.status()["unloading"])
+
+    logger = logging.getLogger("sous.engine")
+    probe = Probe()
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        logger.addHandler(probe)
+        try:
+            assert mgr.unload_now()["unloaded"]
+        finally:
+            logger.removeHandler(probe)
+    assert unloading == [True]
+
+
 def _positional_factory(model_id: str) -> FakeEngine:
     """An engine that reports which side owns the rotary positions, the way
     the VLM backend does."""
