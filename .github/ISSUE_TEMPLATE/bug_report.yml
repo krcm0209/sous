@@ -5,9 +5,9 @@ body:
   - type: markdown
     attributes:
       value: >-
-        Found a way out of the sandbox — writing outside `project_root`,
-        running a non-allowlisted command, leaking secrets past the env
-        scrub? Please close this and use
+        Found the daemon reachable from off the loopback interface, a
+        credential forwarded anywhere but `[server].upstream_url`, or a
+        request body or header value in a log? Please close this and use
         [private reporting](https://github.com/krcm0209/sous/security/advisories/new)
         instead. See [SECURITY.md](https://github.com/krcm0209/sous/blob/main/SECURITY.md).
 
@@ -24,11 +24,11 @@ body:
   - type: input
     id: version
     attributes:
-      label: Which commit are you running?
+      label: Which version are you running?
       description: >-
-        sous has no released versions yet, so the commit identifies the build:
-        run `git rev-parse --short HEAD` in the checkout you installed from.
-      placeholder: "02278fb"
+        `uv tool list` shows it for a PyPI install; from a checkout, run
+        `git rev-parse --short HEAD` in the checkout you installed from.
+      placeholder: "0.7.0"
     validations:
       required: true
 
@@ -59,7 +59,7 @@ body:
       options:
         - The default (mlx-community/Qwen3.8-27B-4bit)
         - A different MLX model
-        - Not applicable — the bug does not involve the worker
+        - Not applicable — the bug does not involve the local model
     validations:
       required: true
 
@@ -74,8 +74,8 @@ body:
     attributes:
       label: What happened
       description: >-
-        What you delegated, what you expected, and what sous did instead.
-        Include the exact task instructions if the worker misbehaved.
+        What the subagent was asked, what you expected, and what sous did
+        instead. Include the subagent's prompt if the local model misbehaved.
     validations:
       required: true
 
@@ -84,26 +84,21 @@ body:
     attributes:
       label: Steps to reproduce
       placeholder: |
-        1. sous serve
-        2. Ask Claude to delegate: "..."
+        1. sous claude
+        2. Ask Claude Code to run a subagent: "..."
         3. ...
     validations:
       required: true
 
-  - type: markdown
-    attributes:
-      value: >-
-        **Before pasting a transcript:** every worker turn is journaled, so
-        transcripts routinely contain files from the project sous was working
-        in. Please redact anything you would not publish.
-
   - type: textarea
-    id: transcript
+    id: log
     attributes:
-      label: Transcript excerpt (optional)
+      label: Daemon log excerpt (optional)
       description: >-
-        Relevant lines from `~/.sous/tasks/<id>/transcript.jsonl`. The report
-        of a failed task includes its `transcript_path`.
+        Relevant lines from `~/.sous/daemon.log`: the `POST /v1/messages` line
+        for the turn and anything at WARNING or above around it. The log
+        carries no prompt text or tool input by design — if yours does, report
+        that privately instead of here.
       render: text
 
   - type: textarea
@@ -111,6 +106,6 @@ body:
     attributes:
       label: Relevant config (optional)
       description: >-
-        The parts of `~/.sous/config.toml` that matter — usually
-        `[commands] allowlist` for anything involving command execution.
+        The parts of `~/.sous/config.toml` that matter — `[model]` for
+        anything involving the local model, `[server]` for forwarding.
       render: toml

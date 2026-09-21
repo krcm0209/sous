@@ -70,7 +70,7 @@ def all_trimmable(cache: Sequence[Any]) -> bool:
     Asks `is_trimmable()` rather than testing for a `trim` attribute:
     RotatingKVCache owns a `trim` but reports False once its window has
     wrapped, and trimming it then would desync its ring index. Re-asked every
-    turn for the same reason — the answer can change mid-task.
+    turn for the same reason — the answer can change mid-conversation.
     """
     if not cache:
         return False
@@ -85,7 +85,7 @@ def snapshot(cache: Sequence[Any], copy_array: Callable) -> tuple[list, int]:
     whose state does not grow with sequence length. That asymmetry is why a
     hybrid cache forks for a fixed cost instead of a copy of the whole KV.
 
-    Returns the snapshot and the bytes copied, for the task report.
+    Returns the snapshot and the bytes copied, for the turn's accounting.
     """
     out: list = []
     nbytes = 0
@@ -99,7 +99,7 @@ def snapshot(cache: Sequence[Any], copy_array: Callable) -> tuple[list, int]:
         # that stays true: a future non-trimmable cache with real meta_state
         # would otherwise restore wrongly and silently, and the warm-retry
         # path even absorbs this raise into a cold run rather than failing
-        # the task, so this check is cheap insurance, not a new failure mode.
+        # the turn, so this check is cheap insurance, not a new failure mode.
         meta_state = getattr(c, "meta_state", "")
         assert not meta_state, (
             f"{type(c).__name__}.meta_state is non-empty; snapshot()/restore() "
@@ -134,7 +134,7 @@ def trim_to(cache: Sequence[Any], n_tokens: int) -> None:
 
 # A header shorter than this is not worth a fork slot: prefilling it costs
 # under a second on the default model, and a fork is a full second copy of its
-# KV. The worker's ~2K-token system prompt never qualifies; a Claude Code
+# KV. A ~2K-token system prompt never qualifies; a Claude Code
 # subagent's ~50K one always does.
 FORK_MIN_TOKENS = 4096
 # A sanity bound on the slot count. Finished subagent conversations are what
@@ -278,7 +278,7 @@ def auto_cache_budget(*, working_set: int, active: int, reserve_bytes: int) -> i
     return max(0, working_set - active - reserve_bytes - CACHE_BUDGET_SLACK)
 
 
-# Per-turn readings for the gateway's turn line, reset by begin_turn() at the
+# Per-turn readings for the endpoint's turn line, reset by begin_turn() at the
 # top of every generate() and again when a failed warm attempt retries cold.
 TURN_GAUGES = frozenset(
     {
@@ -296,10 +296,11 @@ _GAUGES = frozenset({"snapshot_bytes", "miss_lcp"}) | TURN_GAUGES
 
 
 def without_turn_gauges(stats: dict) -> dict:
-    """`stats` for an MCP-facing report. The per-turn gauges mean something
-    only on the turn line: in a task's report they are its last generate()
-    beside task-long counters, daemon-wide a max over every owner — numbers
-    no reader can use, paid for in the frontier model's tokens."""
+    """The `prompt_cache` block every status document carries, with the
+    per-turn gauges dropped. They mean something only on the turn line, where
+    they describe that turn: daemon-wide they are a max over every owner ever
+    seen, beside counters that span every turn — numbers no reader can use,
+    paid for in the frontier model's tokens."""
     return {k: v for k, v in stats.items() if k not in TURN_GAUGES}
 
 
@@ -493,8 +494,8 @@ class PrefixCache:
         self.reserve_bytes = reserve_bytes
         # Held only across list and dict work, plus the deallocation a drop
         # triggers — never across prefill or decode. reset() must never wait
-        # on a generation (its caller may be the worker's finally while a
-        # stalled generation still runs), and freeing a cache is bounded, so
+        # on a generation (its caller may be the turn runner's stall path
+        # while that generation still runs), and freeing a cache is bounded, so
         # with this discipline it never does.
         self._lock = threading.Lock()
         self._slots: list[Slot] = []
@@ -502,8 +503,8 @@ class PrefixCache:
         # Counters of owners already retired or swept, so the daemon-wide view
         # keeps their history without keeping their Thread objects.
         self._history = PromptCacheStats()
-        # Owners whose late publishes are refused: a task's session thread
-        # after the task ended, a gateway session after a stall. Weak, so a
+        # Owners whose late publishes are refused: a session thread dropped
+        # after a stall. Weak, so a
         # thread that is truly gone costs nothing to remember.
         self._retired: weakref.WeakSet[threading.Thread] = weakref.WeakSet()
         self._epoch = 0
@@ -583,7 +584,7 @@ class PrefixCache:
         fit would empty the map of everything evictable for nothing.
 
         `require`, when given, must still be in the map, else False before any
-        eviction: the lock was released after the take, and the gateway can
+        eviction: the lock was released after the take, and the endpoint can
         retire the owner meanwhile (`reset(owner)` for a generation it
         abandoned as stalled), emptying its slots. That turn's publish will
         be refused, and a copy for it is not worth making room for.
@@ -687,7 +688,7 @@ class PrefixCache:
 
     def _publish(self, slot: Slot, epoch: int, protect: Sequence[Slot] = ()) -> bool:
         """Add `slot` unless the world moved on: a full reset since the turn
-        began, or the owner retired (its task ended) while it generated.
+        began, or the owner retired (its session was dropped) while it generated.
 
         The caps are applied under the same lock as the append — nothing must
         ever observe the map over budget — but the pressure pass runs after
@@ -802,18 +803,18 @@ class PrefixCache:
         into history), and the owner is retired so a generation still running
         on it cannot publish afterwards. Without: everything, and the epoch
         bump makes every in-flight publish from any thread drop itself —
-        unload uses this form; the worker and the gateway's stall path retire
+        unload uses this form; the endpoint's stall path retires
         an owner instead.
 
         Takes only the bookkeeping lock, never the generation lock: the caller
-        may be the worker's finally while a stalled generation still holds
-        that one, and waiting there would wedge the next task.
+        may be the turn runner recovering from a stall while that generation
+        still holds the other one, and waiting there would wedge the next turn.
         """
         with self._lock:
             if owner is None:
                 # `_retired` is deliberately kept: a retired owner stays
-                # retired for the rest of its life. Every owner is a per-task
-                # session thread or a dropped gateway session — never reused,
+                # retired for the rest of its life. Every owner is a session
+                # thread the endpoint has dropped — never reused,
                 # so there is nothing to un-retire and much to get wrong.
                 self._epoch += 1
                 self._slots = []
@@ -910,7 +911,7 @@ class PrefixCache:
         if reuse_length(stable_ids, full_ids) == 0:
             stats.misses += 1
             # Nothing was looked up, so the gauge must not keep an earlier
-            # miss's reading for the gateway to log as this turn's.
+            # miss's reading for the endpoint to log as this turn's.
             stats.miss_lcp = 0
             warnings.warn(
                 "sous prompt cache: full prompt is not the stable render "
@@ -921,8 +922,8 @@ class PrefixCache:
 
         with self._lock:
             # Owner-filtered: the arrays live only on the publishing thread's
-            # mlx streams (issue #34), so a different session thread (a worker
-            # task vs the gateway's long-lived one) gets a cold miss rather
+            # mlx streams (issue #34), so a different session thread (one the
+            # endpoint replaced after a stall, say) gets a cold miss rather
             # than a warm run doomed to the cross-thread mlx failure.
             slot = self._take(owner, stable_ids)
             # The miss diagnostic is measured against the same slots lookup
@@ -1087,9 +1088,8 @@ class PrefixCache:
                     f"warm generation failed after streaming {emitted} delta(s) "
                     f"({retry_reason}); not retrying cold, which would replay the turn"
                 )
-            # An optimization bug must never fail a task; decide_context sets
-            # the same rule for auto sizing. Only a warm attempt is retried, so
-            # a genuine engine error still surfaces at once.
+            # An optimization bug must never fail a turn. Only a warm attempt
+            # is retried, so a genuine engine error still surfaces at once.
             stats.cold_retries += 1
             # The per-turn gauges describe the attempt that produced the text:
             # left alone they would add the failed warm attempt to the retry

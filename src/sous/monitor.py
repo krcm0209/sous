@@ -1,6 +1,6 @@
 """The daemon's own loopback routes under /sous/: what `sous claude`, `sous
-top` and `sous statusline` speak to the daemon. Mounted before the gateway's
-routes and whatever the gateway flag says, so a path under /sous — the bare
+top` and `sous statusline` speak to the daemon. Mounted before the endpoint's
+routes, so a path under /sous — the bare
 /sous included — is answered here or 404s here for every method the routes
 register (a verb none of them lists gets Starlette's own 405 first), and is
 never forwarded to the upstream."""
@@ -15,13 +15,13 @@ import time
 from collections.abc import AsyncIterator, Callable
 
 from anyio.to_thread import run_sync
-from mcp.server import MCPServer
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
+from starlette.routing import BaseRoute, Route
 
+from sous.api.convert import RequestError, _invalid
 from sous.engine.base import EngineManager, release_mlx_thread_state
-from sous.gateway.convert import RequestError, _invalid
 from sous.loopback import ALL_METHODS, check_loopback
 from sous.sse import PING as _PING
 from sous.sse import PING_INTERVAL_SECONDS as EVENT_PING_SECONDS
@@ -32,41 +32,32 @@ _logger = logging.getLogger("sous.monitor")
 # A hold body is two numbers; anything larger is not one.
 HOLD_BODY_LIMIT = 1024
 # The event stream polls the composite version the service hands it — the
-# in-flight registry, the engine manager, the task store and the config
-# file's stamp — this often: a burst of changes inside one tick is one
-# event, and a change is on the wire within a tick. Ten a second is what a
-# terminal can show and what a token-per-delta feed produces at the default
-# model's decode speed.
+# in-flight registry's version, the engine manager's and the config file's
+# stamp — this often: a burst of changes inside one tick is one event, and
+# a change is on the wire within a tick. Ten a second is what a terminal
+# can show and what a token-per-delta feed produces at the default model's
+# decode speed.
 EVENT_TICK_SECONDS = 0.1
-# While a turn is in flight, a delegated task is running or a load or an
-# unload is under way the document also goes out this often unchanged: the
-# terminal reads a silent stream during a turn as a stalled daemon, a
-# prefill runs for a minute without a registry change, a task's clock and
-# the cache counters it moves are in the document while the worker writes
-# the store once per tool call, and an unload frees the weights over
-# seconds with `memory_gb` the only sign of it. Idle there is no heartbeat
-# at all — a load, a hold and a task change bump a version of their own,
-# and the idle clock is the terminal's to run.
+# While a turn is in flight or a load or an unload is under way the
+# document also goes out this often unchanged: the terminal reads a silent
+# stream during a turn as a stalled daemon, a prefill can run for a minute
+# without a registry change while still moving the cache counters in the
+# document, and an unload frees the weights over seconds with `memory_gb`
+# the only sign of it. Idle there is no heartbeat at all — a load and a
+# hold each bump a version of their own, and the idle clock is the
+# terminal's to run.
 EVENT_HEARTBEAT_SECONDS = 1.0
-# Idle — no turn in flight, no delegated task running, no load or unload
-# under way — nothing on the registry moves without a turn starting, so the poll slows to
-# this: a new order is on screen within half a second, and the loop costs a
-# fifth of the 10 Hz one. Busy, the fast tick is what puts a token delta on
-# the wire in time.
+# Idle — no turn in flight, no load or unload under way — nothing on the
+# registry moves without a turn starting, so the poll slows to this: a new
+# order is on screen within half a second, and the loop costs a fifth of
+# the 10 Hz one. Busy, the fast tick is what puts a token delta on the wire
+# in time.
 EVENT_IDLE_TICK_SECONDS = 0.5
 
 
 def _busy(document: dict) -> bool:
-    # A delegated task counts: the worker never writes the registry, and
-    # `running` includes a task awaiting approval, whose clock runs too.
     engine = document.get("engine") or {}
-    queue = document.get("queue") or {}
-    return bool(
-        document.get("inflight")
-        or queue.get("running")
-        or engine.get("loading")
-        or engine.get("unloading")
-    )
+    return bool(document.get("inflight") or engine.get("loading") or engine.get("unloading"))
 
 
 async def _status_events(
@@ -74,8 +65,8 @@ async def _status_events(
 ) -> AsyncIterator[ServerSentEvent]:
     """The document now, then again whenever `version()` moved since the
     last one went out — checked every tick — and, only while the last
-    document showed a turn, a running task, a load or an unload, at least
-    once a heartbeat regardless.
+    document showed a turn, a load or an unload, at least once a heartbeat
+    regardless.
     Built on a worker thread each time. Nothing is buffered for a client
     that is gone: the response cancels this generator on disconnect, and
     the tick's sleep is where that lands. A failure building or encoding
@@ -181,24 +172,23 @@ async def _served(route: str, fn: Callable[..., dict], *args: object) -> Respons
         return _refused(RequestError(500, "api_error", type(e).__name__))
 
 
-def mount_monitor(
-    mcp: MCPServer,
+def monitor_routes(
     engines: EngineManager,
     status: Callable[[], dict],
     version: Callable[[], object],
-) -> None:
-    """Register GET /sous/status, GET /sous/events, POST /sous/hold,
-    POST /sous/unload and a 404 for every other /sous/ path. `status` builds
-    the full status document (recent turns and tasks included); `version` is
-    what the event stream polls — a value that differs from the last one
-    whenever the document would. The status, hold and unload handlers hand
-    their work to a thread — status() reads the task store, hold() and
-    unload() take the engine manager's lock, and neither belongs on the event
-    loop — and the event stream builds each of its documents the same way."""
+) -> list[BaseRoute]:
+    """GET /sous/status, GET /sous/events, POST /sous/hold, POST /sous/unload
+    and a 404 for every other /sous/ path, in the order they must be mounted.
+    `status` builds the full status document (recent turns included);
+    `version` is what the event stream polls — a value that differs from the
+    last one whenever the document would. The status, hold and unload
+    handlers hand their work to a thread — status() reads the engine, the
+    registry and the config, hold() and unload() take the engine manager's
+    lock, and neither belongs on the event loop — and the event stream
+    builds each of its documents the same way."""
     # sse-starlette logs every frame it sends at DEBUG — the status document,
-    # verbatim, up to ten times a second — and the gateway's own pin of this
-    # logger only runs when the gateway is mounted. /sous/events is mounted
-    # unconditionally, so the no-bodies-in-logs rule cannot depend on that.
+    # verbatim, up to ten times a second. Pinned here as well as by the
+    # endpoint: each route builder must be safe to mount on its own.
     logging.getLogger("sse_starlette").setLevel(logging.INFO)
 
     def _unload() -> dict:
@@ -257,14 +247,14 @@ def mount_monitor(
             return _refused(e)
         return _refused(RequestError(404, "not_found_error", "no such route"))
 
-    mcp.custom_route("/sous/status", methods=["GET"])(sous_status)
-    mcp.custom_route("/sous/events", methods=["GET"])(sous_events)
-    mcp.custom_route("/sous/hold", methods=["POST"])(sous_hold)
-    mcp.custom_route("/sous/unload", methods=["POST"])(sous_unload)
-    # Registered after the real routes and before the gateway mounts its
-    # catch-all (the SDK keeps registration order), so no path under /sous
-    # can reach the upstream with the gateway on. The bare /sous needs its
-    # own entry: `/sous/{path:path}` does not match it, and the gateway's
-    # `/{path:path}` would.
-    mcp.custom_route("/sous", methods=list(ALL_METHODS))(sous_unknown)
-    mcp.custom_route("/sous/{path:path}", methods=list(ALL_METHODS))(sous_unknown)
+    return [
+        Route("/sous/status", sous_status, methods=["GET"]),
+        Route("/sous/events", sous_events, methods=["GET"]),
+        Route("/sous/hold", sous_hold, methods=["POST"]),
+        Route("/sous/unload", sous_unload, methods=["POST"]),
+        # After the real routes and before the endpoint's catch-all, so no
+        # path under /sous can reach the upstream. The bare /sous needs its
+        # own entry: `/sous/{path:path}` does not match it.
+        Route("/sous", sous_unknown, methods=list(ALL_METHODS)),
+        Route("/sous/{path:path}", sous_unknown, methods=list(ALL_METHODS)),
+    ]

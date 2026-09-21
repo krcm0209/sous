@@ -1,5 +1,5 @@
-"""The daemon's own loopback routes under /sous/: reachable with the gateway
-off, never forwarded with it on, guarded like the gateway's routes."""
+"""The daemon's own loopback routes under /sous/: never forwarded to the
+upstream, guarded like the endpoint's own routes."""
 
 import asyncio
 import json
@@ -14,14 +14,13 @@ import pytest
 from starlette.requests import Request
 
 from sous import monitor
+from sous.api.convert import RequestError
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
-from sous.gateway.convert import RequestError
 from sous.inflight import Inflight
 from sous.monitor import HOLD_BODY_LIMIT
 from sous.monitor import _hold_body as _parse_hold_body
 from sous.server import create_server
-from sous.tasks import TaskStore
 from tests.fake_engine import FakeEngine
 from tests.fake_upstream import FakeUpstream
 
@@ -29,18 +28,15 @@ from tests.fake_upstream import FakeUpstream
 def _app(
     tmp_path: Path,
     *,
-    gateway_enabled: bool = False,
     upstream=None,
     alive=None,
     inflight=None,
     factory=None,
-    store=None,
     idle_minutes=None,
 ):
     cfg = SousConfig(
         data_dir=tmp_path / "data",
         config_path=tmp_path / "config.toml",
-        gateway_enabled=gateway_enabled,
         **({} if idle_minutes is None else {"idle_unload_minutes": idle_minutes}),
     )
     engines = EngineManager(
@@ -48,12 +44,9 @@ def _app(
         engine_factory=factory or (lambda mid: FakeEngine([])),
         holder_alive=alive or (lambda pid, ct: True),
     )
-    # The version counter is per instance, so a test that writes to the store
-    # must write through the app's own, the way `inflight=` hands in a registry.
-    store = store or TaskStore(tmp_path / "tasks.db")
     upstream = upstream or FakeUpstream().upstream()
-    server = create_server(store, engines, cfg, upstream=upstream, inflight=inflight)
-    return server.streamable_http_app(), engines
+    app = create_server(engines, cfg, upstream=upstream, inflight=inflight)
+    return app, engines
 
 
 def _request(app, method: str, path: str, body=None, headers=None) -> httpx.Response:
@@ -98,14 +91,17 @@ def test_status_is_the_full_status_document(tmp_path: Path):
     assert doc["engine"]["loading"] is False
     assert doc["engine"]["holders"] == 0
     assert "memory_gb" in doc["engine"]
-    assert doc["inflight"] == [] and doc["recent_turns"] == [] and doc["recent_tasks"] == []
-    assert doc["config"]["gateway"] == {
-        "enabled": False,
+    assert doc["inflight"] == [] and doc["recent_turns"] == []
+    assert doc["config"] == {
+        "model_id": "mlx-community/Qwen3.8-27B-4bit",
+        "idle_unload_minutes": 30,
+        "port": 8383,
         "local_models": ["sous-local"],
         "max_context_tokens": 131072,
         "upstream_url": "https://api.anthropic.com",
+        "generation_timeout_minutes": 30,
     }
-    assert set(doc) == {"engine", "inflight", "queue", "config", "recent_turns", "recent_tasks"}
+    assert set(doc) == {"engine", "inflight", "config", "recent_turns"}
 
 
 def test_hold_registers_the_caller_and_preloads(tmp_path: Path):
@@ -192,8 +188,8 @@ def test_routes_are_loopback_guarded(tmp_path: Path):
 
 def test_anything_else_under_sous_is_404_and_never_forwarded(tmp_path: Path):
     fake = FakeUpstream()
-    app, _ = _app(tmp_path, gateway_enabled=True, upstream=fake.upstream())
-    # `/sous` without the slash would full-match the gateway's catch-all
+    app, _ = _app(tmp_path, upstream=fake.upstream())
+    # `/sous` without the slash would full-match the endpoint's catch-all
     # and be forwarded with the client's credentials; a method the real
     # routes do not take falls through to the 404 too.
     for method, path in (
@@ -210,18 +206,9 @@ def test_anything_else_under_sous_is_404_and_never_forwarded(tmp_path: Path):
     assert _request(app, "HEAD", "/sous/status").status_code == 200
     assert _request(app, "POST", "/sous/hold", _hold_body()).status_code == 200
     assert fake.requests == []
-    # The gateway's own catch-all still forwards what is not ours.
+    # The endpoint's own catch-all still forwards what is not ours.
     assert _request(app, "GET", "/api/hello").status_code == 200
     assert [s["path"] for s in fake.requests] == ["/api/hello"]
-
-
-def test_routes_are_up_with_the_gateway_off(tmp_path: Path):
-    app, _ = _app(tmp_path, gateway_enabled=False)
-    assert _request(app, "GET", "/sous/status").status_code == 200
-    assert _request(app, "POST", "/sous/hold", _hold_body()).status_code == 200
-    assert _request(app, "GET", "/sous/nope").status_code == 404
-    assert _request(app, "GET", "/sous").status_code == 404
-    assert _request(app, "GET", "/api/hello").status_code == 404  # no gateway, no forwarding
 
 
 def test_a_failing_status_or_hold_is_an_error_body_not_a_bare_500(
@@ -232,15 +219,15 @@ def test_a_failing_status_or_hold_is_an_error_body_not_a_bare_500(
     route speaks, and names its type in the log."""
     import logging
 
-    from sous.server import SousService
+    from sous.server import Daemon
 
-    def failing_status(self, *, recent):
-        raise RuntimeError("tasks.db is locked")
+    def failing_status(self):
+        raise RuntimeError("the prompt cache is locked")
 
     def failing_hold(self, pid, create_time):
         raise RuntimeError("no thread")
 
-    monkeypatch.setattr(SousService, "status_document", failing_status)
+    monkeypatch.setattr(Daemon, "status_document", failing_status)
     monkeypatch.setattr(EngineManager, "hold", failing_hold)
     app, _ = _app(tmp_path)
     with caplog.at_level(logging.ERROR, logger="sous.monitor"):
@@ -259,18 +246,14 @@ def test_a_failing_status_or_hold_is_an_error_body_not_a_bare_500(
     ]
 
 
-def test_status_carries_the_recent_ring_the_gateway_writes(tmp_path: Path):
-    """create_server builds one registry for the gateway and the status
-    routes: a turn the gateway served shows up in /sous/status."""
+def test_status_carries_the_recent_ring_the_endpoint_writes(tmp_path: Path):
+    """create_server builds one registry for the endpoint and the status
+    routes: a turn the endpoint served shows up in /sous/status."""
     from tests.fake_engine import FakeEngine as _Fake
 
-    cfg = SousConfig(
-        data_dir=tmp_path / "data", config_path=tmp_path / "config.toml", gateway_enabled=True
-    )
+    cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
     engines = EngineManager(cfg, engine_factory=lambda mid: _Fake(["reply"]))
-    app = create_server(
-        TaskStore(tmp_path / "tasks.db"), engines, cfg, upstream=FakeUpstream().upstream()
-    ).streamable_http_app()
+    app = create_server(engines, cfg, upstream=FakeUpstream().upstream())
     body = {
         "model": "sous-local",
         "max_tokens": 16,
@@ -375,7 +358,7 @@ def test_events_start_with_the_full_document(tmp_path: Path):
     assert status == [200]
     event, doc = frames[0]
     assert event == "status"
-    assert set(doc) == {"engine", "inflight", "queue", "config", "recent_turns", "recent_tasks"}
+    assert set(doc) == {"engine", "inflight", "config", "recent_turns"}
     assert doc["engine"]["loaded"] is False
 
 
@@ -434,12 +417,11 @@ def test_an_idle_stream_polls_on_the_idle_tick_and_a_busy_one_on_the_fast_tick(
         return await real_sleep(delay, *args, **kwargs)
 
     monkeypatch.setattr(monitor.asyncio, "sleep", recording_sleep)
-    store = TaskStore(tmp_path / "tasks.db")
     registry = Inflight()
-    app, _ = _app(tmp_path, store=store, inflight=registry)
+    app, engines = _app(tmp_path, inflight=registry)
 
     def change() -> None:
-        store.enqueue("t", "do it", str(tmp_path), [], [])
+        engines.touch()
 
     _collect_events(app, want=2, during=change)
     assert 0.6 in delays and 0.01 not in delays, delays
@@ -460,22 +442,6 @@ def test_events_beat_once_a_second_while_a_turn_is_in_flight(tmp_path: Path, mon
     started = time.monotonic()
     _, frames = _collect_events(app, want=3)
     assert len([e for e, _ in frames if e == "status"]) >= 3
-    assert time.monotonic() - started < 2.0
-
-
-def test_events_beat_while_a_delegated_task_is_running(tmp_path: Path, monkeypatch):
-    """The worker writes the store once per tool call, but the task's own
-    clock and the cache counters it moves are in the document: a running
-    task keeps the heartbeat the way a gateway turn does."""
-    monkeypatch.setattr(monitor, "EVENT_HEARTBEAT_SECONDS", 0.2)
-    store = TaskStore(tmp_path / "tasks.db")
-    app, _ = _app(tmp_path, store=store)
-    store.enqueue("t", "do it", str(tmp_path), [], [])
-    assert store.claim_next() is not None
-    started = time.monotonic()
-    _, frames = _collect_events(app, want=3)
-    statuses = [d for e, d in frames if e == "status"]
-    assert len(statuses) >= 3 and all(d["queue"]["running"] == 1 for d in statuses)
     assert time.monotonic() - started < 2.0
 
 
@@ -560,17 +526,12 @@ def test_events_beat_while_an_unload_is_under_way(tmp_path: Path, monkeypatch):
     assert all(s["unloading"] and not s["loaded"] and not s["loading"] for s in statuses[:2])
 
 
-def test_a_load_a_hold_a_release_a_task_change_and_an_unload_each_reach_the_client(
-    tmp_path: Path, monkeypatch
-):
+def test_a_load_a_hold_a_release_and_an_unload_each_reach_the_client(tmp_path: Path, monkeypatch):
     """None of these is a registry change; each used to ride the heartbeat."""
     monkeypatch.setattr(monitor, "EVENT_HEARTBEAT_SECONDS", 60.0)
     monkeypatch.setattr(monitor, "EVENT_IDLE_TICK_SECONDS", 0.05)
     alive = {"ok": True}
-    store = TaskStore(tmp_path / "tasks.db")
-    app, engines = _app(
-        tmp_path, alive=lambda pid, started: alive["ok"], store=store, idle_minutes=0
-    )
+    app, engines = _app(tmp_path, alive=lambda pid, started: alive["ok"], idle_minutes=0)
 
     def load() -> None:
         engines.get()
@@ -593,11 +554,6 @@ def test_a_load_a_hold_a_release_a_task_change_and_an_unload_each_reach_the_clie
 
     _, frames = _collect_events(app, want=2, during=release)
     assert [d["engine"]["holders"] for e, d in frames if e == "status"][-1] == 0
-
-    _, frames = _collect_events(
-        app, want=2, during=lambda: store.enqueue("t", "do it", str(tmp_path), [], [])
-    )
-    assert [d["queue"]["queued"] for e, d in frames if e == "status"] == [0, 1]
 
     time.sleep(0.01)  # idle_unload_minutes=0 still needs the clock to have moved
     _, frames = _collect_events(app, want=2, during=engines.unload_if_idle)
@@ -649,16 +605,16 @@ def test_events_refuse_a_cross_site_fetch_and_serve_a_typed_url(tmp_path: Path):
 
 
 def test_events_document_is_built_off_the_event_loop(tmp_path: Path, monkeypatch):
-    from sous.server import SousService
+    from sous.server import Daemon
 
     threads: set[str] = set()
-    original = SousService.status_document
+    original = Daemon.status_document
 
-    def recording(self, *, recent):
+    def recording(self):
         threads.add(threading.current_thread().name)
-        return original(self, recent=recent)
+        return original(self)
 
-    monkeypatch.setattr(SousService, "status_document", recording)
+    monkeypatch.setattr(Daemon, "status_document", recording)
     app, _ = _app(tmp_path)
     _collect_events(app, want=1)
     assert threads and "MainThread" not in threads
@@ -672,12 +628,12 @@ def test_a_failing_status_build_ends_the_events_stream_not_a_traceback(
     uvicorn and never a message that could name a path."""
     import logging
 
-    from sous.server import SousService
+    from sous.server import Daemon
 
-    def failing_status(self, *, recent):
-        raise RuntimeError("tasks.db is locked")
+    def failing_status(self):
+        raise RuntimeError("the prompt cache is locked")
 
-    monkeypatch.setattr(SousService, "status_document", failing_status)
+    monkeypatch.setattr(Daemon, "status_document", failing_status)
     app, _ = _app(tmp_path)
     with caplog.at_level(logging.ERROR, logger="sous.monitor"):
         status, frames = _collect_events(app, want=0)
@@ -696,12 +652,12 @@ def test_a_failing_version_read_ends_the_events_stream_the_same_way(
     failed build, never leave through uvicorn with its message."""
     import logging
 
-    from sous.server import SousService
+    from sous.server import Daemon
 
     def failing_version(self):
         raise RuntimeError("stat: /nowhere/config.toml")
 
-    monkeypatch.setattr(SousService, "status_version", failing_version)
+    monkeypatch.setattr(Daemon, "status_version", failing_version)
     app, _ = _app(tmp_path)
     with caplog.at_level(logging.ERROR, logger="sous.monitor"):
         status, frames = _collect_events(app, want=0)
@@ -718,11 +674,9 @@ def test_a_document_json_cannot_encode_ends_the_stream_too(tmp_path: Path, monke
     uvicorn from inside the generator."""
     import logging
 
-    from sous.server import SousService
+    from sous.server import Daemon
 
-    monkeypatch.setattr(
-        SousService, "status_document", lambda self, *, recent: {"engine": object()}
-    )
+    monkeypatch.setattr(Daemon, "status_document", lambda self: {"engine": object()})
     app, _ = _app(tmp_path)
     with caplog.at_level(logging.ERROR, logger="sous.monitor"):
         status, frames = _collect_events(app, want=0)
@@ -741,12 +695,12 @@ def test_a_non_finite_number_ends_the_stream_as_status_refuses_it(
     one route and a `NaN` token no other parser reads on the other."""
     import logging
 
-    from sous.server import SousService
+    from sous.server import Daemon
 
     monkeypatch.setattr(
-        SousService,
+        Daemon,
         "status_document",
-        lambda self, *, recent: {"engine": {"memory_gb": float("nan")}},
+        lambda self: {"engine": {"memory_gb": float("nan")}},
     )
     app, _ = _app(tmp_path)
     with caplog.at_level(logging.ERROR, logger="sous.monitor"):
@@ -761,14 +715,16 @@ def test_a_non_finite_number_ends_the_stream_as_status_refuses_it(
 
 
 def test_mounting_the_monitor_pins_sse_starlette_above_debug(tmp_path: Path, monkeypatch):
-    """/sous/events is mounted whether or not the gateway is, and sse-starlette
-    logs every frame it sends at DEBUG — the pin must not depend on the
-    gateway's own copy of it, which only runs when the gateway is mounted."""
+    """sse-starlette logs every frame it sends at DEBUG and /sous/events sends
+    one per change — the monitor pins the logger on its own mount rather than
+    leaning on the endpoint's copy of the pin."""
     import logging
 
     logger = logging.getLogger("sse_starlette")
     monkeypatch.setattr(logger, "level", logging.NOTSET)
-    _app(tmp_path, gateway_enabled=False)
+    cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
+    engines = EngineManager(cfg, engine_factory=lambda mid: FakeEngine([]))
+    monitor.monitor_routes(engines, lambda: {}, lambda: 0)
     assert logger.level == logging.INFO
 
 

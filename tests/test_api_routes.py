@@ -1,7 +1,7 @@
-"""The gateway's HTTP surface, in-process through the ASGI app create_server
+"""The endpoint's HTTP surface, in-process through the ASGI app create_server
 builds. httpx's ASGITransport buffers a response, so streaming tests read the
 whole SSE body after the fact; timing-sensitive behaviour lives in
-test_gateway_http.py against a real server."""
+test_api_http.py against a real server."""
 
 import asyncio
 import concurrent.futures
@@ -11,23 +11,32 @@ import logging
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
-from mcp.server import MCPServer
 from sse_starlette import EventSourceResponse
+from starlette.applications import Starlette
 from starlette.requests import Request
 
+from sous.api.routes import MAX_BODY_DEPTH, Endpoint, mount_endpoint
+from sous.api.turn import TurnAbandoned
 from sous.config import SousConfig
 from sous.engine.base import EngineManager
-from sous.gateway.routes import MAX_BODY_DEPTH, Gateway, mount_gateway
-from sous.gateway.turn import TurnAbandoned
+from sous.logs import configure_daemon_logging
 from sous.server import create_server
-from sous.tasks import TaskStore
 from tests.fake_engine import ChunkedFakeEngine, FakeEngine
 from tests.fake_upstream import FakeUpstream
+
+
+@pytest.fixture(autouse=True)
+def _daemon_logging():
+    """Many tests below read stderr (capsys) for the daemon's own log line
+    shape. create_server no longer installs that handler as a side effect —
+    main() does, once, before it ever calls create_server — so a test run
+    that never went through main() first needs this to see it."""
+    configure_daemon_logging()
+
 
 READ_TOOL = {
     "name": "Read",
@@ -41,35 +50,31 @@ XML_CALL = (
 
 
 def _app(tmp_path: Path, engine, upstream=None, **overrides):
-    """The daemon's app with the gateway on. Every forward goes to `upstream`
+    """The daemon's app. Every forward goes to `upstream`
     (a FakeUpstream's .upstream()) — never to the network; a fresh, unobserved
     fake when the test does not care what was forwarded."""
-    overrides.setdefault("gateway_enabled", True)
-    cfg = SousConfig(
-        data_dir=tmp_path / "data",
-        config_path=tmp_path / "config.toml",
-        **overrides,
-    )
-    store = TaskStore(tmp_path / "tasks.db")
-    engines = EngineManager(cfg, engine_factory=lambda mid: engine)
-    upstream = upstream or FakeUpstream().upstream()
-    return create_server(store, engines, cfg, upstream=upstream).streamable_http_app()
-
-
-def _gateway_app(tmp_path: Path, engine, upstream=None, **overrides) -> tuple[Gateway, object]:
-    """Like _app, but hands back the Gateway too — create_server drops
-    mount_gateway's return value, and Gateway.close() tests need it."""
-    overrides.setdefault("gateway_enabled", True)
     cfg = SousConfig(
         data_dir=tmp_path / "data",
         config_path=tmp_path / "config.toml",
         **overrides,
     )
     engines = EngineManager(cfg, engine_factory=lambda mid: engine)
-    mcp = MCPServer("test")
     upstream = upstream or FakeUpstream().upstream()
-    gateway = mount_gateway(mcp, engines, cfg, upstream=upstream)
-    return gateway, mcp.streamable_http_app()
+    return create_server(engines, cfg, upstream=upstream)
+
+
+def _endpoint_app(tmp_path: Path, engine, upstream=None, **overrides) -> tuple[Endpoint, object]:
+    """Like _app, but hands back the Endpoint too — create_server drops
+    mount_endpoint's return value, and Endpoint.close() tests need it."""
+    cfg = SousConfig(
+        data_dir=tmp_path / "data",
+        config_path=tmp_path / "config.toml",
+        **overrides,
+    )
+    engines = EngineManager(cfg, engine_factory=lambda mid: engine)
+    upstream = upstream or FakeUpstream().upstream()
+    endpoint = mount_endpoint(engines, cfg, upstream=upstream)
+    return endpoint, Starlette(routes=endpoint.routes())
 
 
 def _request(app, method: str, path: str, body=None, headers=None) -> httpx.Response:
@@ -91,26 +96,6 @@ def _request(app, method: str, path: str, body=None, headers=None) -> httpx.Resp
 
 def _post(app, body, path="/v1/messages", headers=None) -> httpx.Response:
     return _request(app, "POST", path, body, headers)
-
-
-@contextlib.asynccontextmanager
-async def _lifespan(app) -> AsyncIterator[None]:
-    """Drives the app's ASGI lifespan around a block. httpx's ASGITransport
-    does not (a real server does), and the MCP transport's session manager
-    starts nowhere else — without it /mcp only ever raises."""
-    receive: asyncio.Queue = asyncio.Queue()
-    send: asyncio.Queue = asyncio.Queue()
-    task = asyncio.create_task(
-        app({"type": "lifespan", "asgi": {"version": "3.0"}}, receive.get, send.put)
-    )
-    await receive.put({"type": "lifespan.startup"})
-    assert (await send.get())["type"] == "lifespan.startup.complete"
-    try:
-        yield
-    finally:
-        await receive.put({"type": "lifespan.shutdown"})
-        assert (await send.get())["type"] == "lifespan.shutdown.complete"
-        await task
 
 
 def _body(**overrides) -> dict:
@@ -141,6 +126,20 @@ def _events(text: str) -> list[tuple[str, dict]]:
 # --- probes and routing -------------------------------------------------------------
 
 
+def test_mcp_is_answered_locally_not_forwarded(tmp_path: Path):
+    """0.6 served the MCP transport at /mcp. A Claude Code that still has the
+    `claude mcp add sous` entry sends JSON-RPC there, and that body must never
+    reach the upstream."""
+    fake = FakeUpstream()
+    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
+    body = b'{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}'
+    for path in ("/mcp", "/mcp/", "/mcp/anything"):
+        r = _request(app, "POST", path, body=body)
+        assert r.status_code == 404
+        assert "claude mcp remove sous" in r.json()["error"]["message"]
+    assert fake.requests == []
+
+
 def test_hello_is_forwarded_upstream(tmp_path: Path):
     """Claude Code probes /api/hello at startup (gate 1, O3). Phase 1 answered
     it locally; with routing in place the real API answers, through sous."""
@@ -156,17 +155,10 @@ def test_hello_is_forwarded_upstream(tmp_path: Path):
     ]
 
 
-def test_routes_are_absent_when_the_gateway_is_disabled(tmp_path: Path):
-    app = _app(tmp_path, FakeEngine([]), gateway_enabled=False)
-    assert _request(app, "HEAD", "/api/hello").status_code == 404
-    assert _post(app, _body()).status_code == 404
-    assert _request(app, "GET", "/sous/status").status_code == 200  # the daemon's own routes stay
-
-
 def test_a_non_local_model_is_forwarded_byte_for_byte(tmp_path: Path):
-    """The routing predicate: anything not in [gateway].local_models is the
+    """The routing predicate: anything not in [server].local_models is the
     upstream's request. The body goes up exactly as received (whitespace and
-    all — the gateway must never re-serialize what it forwards) and the
+    all — the endpoint must never re-serialize what it forwards) and the
     credential travels with it."""
     fake = FakeUpstream()
     app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
@@ -191,13 +183,13 @@ def test_a_non_local_model_is_forwarded_byte_for_byte(tmp_path: Path):
 
 
 def test_configured_local_models_are_all_served(tmp_path: Path):
-    app = _app(tmp_path, FakeEngine(["ok"]), gateway_local_models=("sous-local", "sous-fast"))
+    app = _app(tmp_path, FakeEngine(["ok"]), local_models=("sous-local", "sous-fast"))
     assert _post(app, _body(model="sous-fast")).status_code == 200
 
 
 def test_host_header_must_be_loopback(tmp_path: Path):
-    """Custom routes skip the /mcp transport's Host check; a page whose hostname
-    re-resolves to 127.0.0.1 must not get to drive the local model."""
+    """Starlette's routes carry no Host check of their own; a page whose
+    hostname re-resolves to 127.0.0.1 must not get to drive the local model."""
     app = _app(tmp_path, FakeEngine([]))
     for host in ("evil.example:8383", "evil.example"):
         r = _post(app, _body(), headers={"host": host})
@@ -210,7 +202,7 @@ def test_host_header_must_be_loopback(tmp_path: Path):
 def test_a_foreign_origin_is_rejected_before_the_model_is_touched(tmp_path: Path):
     """A cross-origin fetch with Content-Type: text/plain is a CORS simple
     request: no preflight, and a perfectly legitimate loopback Host. The page
-    never reads the reply, but the turn it starts would hold the gateway lock,
+    never reads the reply, but the turn it starts would hold the endpoint lock,
     the engine lock and the cache slot for a whole generation."""
     inner = FakeEngine(["never", "never"])
     app = _app(tmp_path, inner)
@@ -241,7 +233,7 @@ def test_a_malformed_origin_is_rejected_not_raised(tmp_path: Path):
 def test_loopback_and_absent_origins_pass(tmp_path: Path):
     """Absent Origin is the normal case — Claude Code, httpx and curl send
     none — and a page served from the daemon's own loopback origin is the
-    gateway's own client."""
+    endpoint's own client."""
     app = _app(tmp_path, FakeEngine([]))
     for origin in (
         "http://127.0.0.1",
@@ -368,7 +360,7 @@ def test_unconvertible_content_length_values_never_raise(tmp_path: Path):
     digit to str.isdigit but not to int(); either used to escape the header
     check as a bare ValueError before the shaped-error handling."""
     inner = FakeEngine(["ok"])
-    gateway, app = _gateway_app(tmp_path, inner)
+    endpoint, app = _endpoint_app(tmp_path, inner)
     r = _post(app, _body(), headers={"content-length": "9" * 5000})
     assert r.status_code == 413 and r.json()["error"]["type"] == "request_too_large"
 
@@ -397,7 +389,7 @@ def test_unconvertible_content_length_values_never_raise(tmp_path: Path):
             ],
             "query_string": b"",
         }
-        return await gateway.messages(Request(scope, receive))
+        return await endpoint.messages(Request(scope, receive))
 
     response = asyncio.run(go())
     assert response.status_code == 200  # the header is ignored, not a 500
@@ -405,7 +397,7 @@ def test_unconvertible_content_length_values_never_raise(tmp_path: Path):
 
 
 def test_oversized_bodies_are_413_by_header_and_by_actual_size(tmp_path: Path, monkeypatch):
-    import sous.gateway.routes as routes
+    import sous.api.routes as routes
 
     app = _app(tmp_path, FakeEngine([]))
     r = _post(app, _body(), headers={"content-length": str(routes.MAX_REQUEST_BYTES + 1)})
@@ -678,7 +670,7 @@ def test_count_tokens(tmp_path: Path):
 
 
 def _turn_lines(text: str) -> list[str]:
-    return [line for line in text.splitlines() if "sous.gateway: POST /v1/messages" in line]
+    return [line for line in text.splitlines() if "sous.api: POST /v1/messages" in line]
 
 
 def test_every_failure_line_ends_with_seconds(tmp_path: Path, capsys):
@@ -799,23 +791,23 @@ def test_turns_pool_has_exactly_max_pending_turns_workers(tmp_path: Path):
     pool's size to MAX_PENDING_TURNS explicitly rather than leaving it to
     ThreadPoolExecutor's own default (min(32, os.cpu_count() + 4)), which
     would make queue_s's completeness depend on the host's core count."""
-    import sous.gateway.routes as routes
+    import sous.api.routes as routes
 
-    gateway, _app = _gateway_app(tmp_path, FakeEngine([]))
-    assert gateway._turns._max_workers == routes.MAX_PENDING_TURNS
+    endpoint, _app = _endpoint_app(tmp_path, FakeEngine([]))
+    assert endpoint._turns._max_workers == routes.MAX_PENDING_TURNS
 
 
 def test_a_full_queue_answers_529_with_an_anthropic_shaped_body(tmp_path: Path, monkeypatch):
     """Drives the 529 path directly, both streaming and non-streaming:
-    pre-acquiring gateway._pending simulates a turn pool already at
+    pre-acquiring endpoint._pending simulates a turn pool already at
     MAX_PENDING_TURNS without needing real concurrency — that timing (an
     immediate 529, then a released slot once the holding turn completes)
-    lives in test_gateway_http.py against a real server."""
-    import sous.gateway.routes as routes
+    lives in test_api_http.py against a real server."""
+    import sous.api.routes as routes
 
     monkeypatch.setattr(routes, "MAX_PENDING_TURNS", 1)
-    gateway, app = _gateway_app(tmp_path, FakeEngine([]))
-    assert gateway._pending.acquire(blocking=False)  # occupy the one slot this config allows
+    endpoint, app = _endpoint_app(tmp_path, FakeEngine([]))
+    assert endpoint._pending.acquire(blocking=False)  # occupy the one slot this config allows
     r = _post(app, _body(stream=False))
     assert r.status_code == 529
     assert r.json() == {
@@ -841,14 +833,14 @@ class _CountingEngine(FakeEngine):
 
 def test_a_full_count_queue_answers_529_and_releases_its_slot(tmp_path: Path, monkeypatch):
     """Mirrors test_a_full_queue_answers_529_with_an_anthropic_shaped_body for
-    count_tokens: pre-acquiring gateway._pending_counts simulates the counts
+    count_tokens: pre-acquiring endpoint._pending_counts simulates the counts
     pool already at MAX_PENDING_COUNTS without needing real concurrency."""
-    import sous.gateway.routes as routes
+    import sous.api.routes as routes
 
     monkeypatch.setattr(routes, "MAX_PENDING_COUNTS", 1)
     inner = _CountingEngine([])
-    gateway, app = _gateway_app(tmp_path, inner)
-    assert gateway._pending_counts.acquire(blocking=False)  # occupy the one slot allowed
+    endpoint, app = _endpoint_app(tmp_path, inner)
+    assert endpoint._pending_counts.acquire(blocking=False)  # occupy the one slot allowed
     body = {"model": "sous-local", "messages": [{"role": "user", "content": "hi"}]}
     r = _post(app, body, path="/v1/messages/count_tokens")
     assert r.status_code == 529
@@ -858,12 +850,12 @@ def test_a_full_count_queue_answers_529_and_releases_its_slot(tmp_path: Path, mo
     }
     assert inner.count_calls == 0  # the engine was never reached
 
-    gateway._pending_counts.release()  # the slot a real turn would have released
+    endpoint._pending_counts.release()  # the slot a real turn would have released
     r = _post(app, body, path="/v1/messages/count_tokens")
     assert r.status_code == 200
     assert r.json() == {"input_tokens": inner.count_tokens([{"role": "user", "content": "hi"}], [])}
     # a normal count releases its own slot, back to the configured cap
-    assert gateway._pending_counts._value == 1
+    assert endpoint._pending_counts._value == 1
 
 
 # --- logging discipline --------------------------------------------------------------------
@@ -881,7 +873,7 @@ def test_log_lines_carry_metadata_only(tmp_path: Path, capsys):
     )
     assert r.status_code == 200
     err = capsys.readouterr().err
-    assert "sous.gateway: POST /v1/messages" in err
+    assert "sous.api: POST /v1/messages" in err
     assert "model=sous-local" in err and "stream=1" in err and "input_tokens=" in err
     assert secret_text not in err
     assert secret_token not in err and "oauth-2025-04-20" not in err
@@ -1023,15 +1015,15 @@ def test_an_attachment_and_a_summary_call_leave_the_conversation_warm(tmp_path: 
     assert inner.calls[2][: len(inner.calls[1])] == inner.calls[1]
 
 
-def _gateway_records(caplog) -> list[logging.LogRecord]:
-    return [r for r in caplog.records if r.name == "sous.gateway"]
+def _endpoint_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == "sous.api"]
 
 
 def test_a_served_turn_logs_at_info(tmp_path: Path, caplog):
     app = _app(tmp_path, FakeEngine(["ok"]))
-    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+    with caplog.at_level(logging.INFO, logger="sous.api"):
         assert _post(app, _body()).status_code == 200
-    turn = [r for r in _gateway_records(caplog) if "POST /v1/messages" in r.getMessage()]
+    turn = [r for r in _endpoint_records(caplog) if "POST /v1/messages" in r.getMessage()]
     assert turn and turn[-1].levelno == logging.INFO
 
 
@@ -1039,9 +1031,9 @@ def test_a_refused_request_logs_at_warning(tmp_path: Path, caplog):
     """4xx and 529 are refusals sous chose — a client's malformed body, or
     back-pressure the SDKs retry — not failures."""
     app = _app(tmp_path, FakeEngine([]))
-    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+    with caplog.at_level(logging.INFO, logger="sous.api"):
         assert _post(app, _body(max_tokens=0)).status_code == 400
-    assert [r.levelno for r in _gateway_records(caplog)] == [logging.WARNING]
+    assert [r.levelno for r in _endpoint_records(caplog)] == [logging.WARNING]
 
 
 def test_a_failure_sous_produced_logs_at_error(tmp_path: Path, caplog):
@@ -1050,9 +1042,9 @@ def test_a_failure_sous_produced_logs_at_error(tmp_path: Path, caplog):
             raise RuntimeError("engine exploded")
 
     app = _app(tmp_path, Boom([]))
-    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+    with caplog.at_level(logging.INFO, logger="sous.api"):
         assert _post(app, _body()).status_code == 500
-    assert logging.ERROR in [r.levelno for r in _gateway_records(caplog)]
+    assert logging.ERROR in [r.levelno for r in _endpoint_records(caplog)]
 
 
 def test_a_streamed_failure_logs_the_id_its_client_already_has(tmp_path: Path, caplog):
@@ -1065,10 +1057,10 @@ def test_a_streamed_failure_logs_the_id_its_client_already_has(tmp_path: Path, c
             raise RuntimeError("engine exploded")
 
     app = _app(tmp_path, Boom([]))
-    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+    with caplog.at_level(logging.INFO, logger="sous.api"):
         r = _post(app, _body(stream=True))
     (started,) = [data for event, data in _events(r.text) if event == "message_start"]
-    (record,) = [rec for rec in _gateway_records(caplog) if "error=" in rec.getMessage()]
+    (record,) = [rec for rec in _endpoint_records(caplog) if "error=" in rec.getMessage()]
     assert f"id={started['message']['id']} " in record.getMessage()
     assert record.levelno == logging.ERROR  # status=200 on the line, a failure all the same
 
@@ -1080,20 +1072,20 @@ def test_a_turn_whose_client_left_mid_stream_still_logs_its_outcome(
     """A disconnect cancels the SSE consumer at queue.get(), but a started turn
     drains to completion regardless; its line must not go down with the
     consumer that used to be the only thing writing it."""
+    from sous.api.convert import parse_messages_request
+    from sous.api.response import TurnAssembler, new_message_id
+    from sous.api.turn import TurnResult
     from sous.engine.base import Delta
-    from sous.gateway.convert import parse_messages_request
-    from sous.gateway.response import TurnAssembler, new_message_id
-    from sous.gateway.turn import TurnResult
     from sous.protocol import ToolSet
 
-    gateway, _ = _gateway_app(tmp_path, FakeEngine([]))
+    endpoint, _ = _endpoint_app(tmp_path, FakeEngine([]))
     chat = parse_messages_request(_body(stream=True))
     assembler = TurnAssembler(new_message_id(), chat.model, ToolSet.from_tools([], strict=False))
 
     async def scenario() -> threading.Event:
         queue: asyncio.Queue = asyncio.Queue()
         abandoned = threading.Event()
-        stream = gateway._stream(chat, assembler, queue, abandoned, time.monotonic())
+        stream = endpoint._stream(chat, assembler, queue, abandoned, time.monotonic())
         await anext(stream)  # the opening ping
         queue.put_nowait(("started", 5))
         await anext(stream)  # message_start
@@ -1109,14 +1101,14 @@ def test_a_turn_whose_client_left_mid_stream_still_logs_its_outcome(
         else:
             queue.put_nowait(("error", RuntimeError("engine exploded")))
         for _ in range(50):
-            if not gateway._drains:
+            if not endpoint._drains:
                 break
             await asyncio.sleep(0.01)
         return abandoned
 
-    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+    with caplog.at_level(logging.INFO, logger="sous.api"):
         assert asyncio.run(scenario()).is_set()
-    (record,) = _gateway_records(caplog)
+    (record,) = _endpoint_records(caplog)
     line = record.getMessage()
     assert f"id={assembler.message_id} " in line and "stream=1 status=200" in line
     if outcome == "done":
@@ -1127,17 +1119,17 @@ def test_a_turn_whose_client_left_mid_stream_still_logs_its_outcome(
 
 def test_a_full_queue_logs_at_warning_not_error(tmp_path: Path, monkeypatch, caplog):
     """529 is the one 5xx that is back-pressure, not a fault."""
-    import sous.gateway.routes as routes
+    import sous.api.routes as routes
 
     monkeypatch.setattr(routes, "MAX_PENDING_TURNS", 0)
     app = _app(tmp_path, FakeEngine([]))
-    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+    with caplog.at_level(logging.INFO, logger="sous.api"):
         assert _post(app, _body()).status_code == 529
-    assert [r.levelno for r in _gateway_records(caplog)] == [logging.WARNING]
+    assert [r.levelno for r in _endpoint_records(caplog)] == [logging.WARNING]
 
 
 def test_status_level_splits_refusals_from_failures():
-    from sous.gateway.routes import _status_level
+    from sous.api.routes import _status_level
 
     assert _status_level(400) == _status_level(413) == _status_level(529) == logging.WARNING
     assert _status_level(500) == _status_level(502) == _status_level(504) == logging.ERROR
@@ -1149,21 +1141,21 @@ def test_an_unreachable_upstream_logs_at_error_but_a_forwarded_status_at_info(
     """502/504 the forwarder synthesizes are sous's failures; a 5xx the real
     upstream answered is the upstream's verdict and stays INFO — the same
     number, told apart by the marker `_error` sets, never by status."""
-    from sous.gateway.upstream import Upstream
+    from sous.api.upstream import Upstream
 
     unreachable = Upstream("https://127.0.0.1:9")  # the discard port: refused at once
     app = _app(tmp_path, FakeEngine([]), upstream=unreachable)
-    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+    with caplog.at_level(logging.INFO, logger="sous.api"):
         r = _post(app, _body(model="claude-opus-5"))
     assert r.status_code == 502
-    upstream_lines = [r for r in _gateway_records(caplog) if "upstream POST" in r.getMessage()]
+    upstream_lines = [r for r in _endpoint_records(caplog) if "upstream POST" in r.getMessage()]
     assert [r.levelno for r in upstream_lines] == [logging.ERROR]
 
     caplog.clear()
     app = _app(tmp_path, FakeEngine([]))  # FakeUpstream answers 200
-    with caplog.at_level(logging.INFO, logger="sous.gateway"):
+    with caplog.at_level(logging.INFO, logger="sous.api"):
         assert _post(app, _body(model="claude-opus-5")).status_code == 200
-    upstream_lines = [r for r in _gateway_records(caplog) if "upstream POST" in r.getMessage()]
+    upstream_lines = [r for r in _endpoint_records(caplog) if "upstream POST" in r.getMessage()]
     assert [r.levelno for r in upstream_lines] == [logging.INFO]
 
 
@@ -1172,7 +1164,7 @@ def test_mounting_pins_the_noisy_library_loggers(tmp_path: Path, monkeypatch):
     logger's level — the no-bodies rule rests on these three pins."""
     for name in ("sse_starlette", "httpx", "httpcore"):
         monkeypatch.setattr(logging.getLogger(name), "level", logging.DEBUG)
-    _app(tmp_path, FakeEngine([]))  # create_server → configure_daemon_logging → mount_gateway
+    _app(tmp_path, FakeEngine([]))  # create_server → mount_endpoint, which pins these three
     assert logging.getLogger("sse_starlette").level == logging.INFO
     assert logging.getLogger("httpx").level == logging.WARNING
     assert logging.getLogger("httpcore").level == logging.WARNING
@@ -1180,7 +1172,7 @@ def test_mounting_pins_the_noisy_library_loggers(tmp_path: Path, monkeypatch):
 
 def test_mounting_pins_the_sse_logger_above_debug(tmp_path: Path, monkeypatch):
     """sse-starlette logs every frame it sends at DEBUG — the model's reply,
-    verbatim. Mounting the gateway pins that logger, so the no-bodies rule does
+    verbatim. Mounting the endpoint pins that logger, so the no-bodies rule does
     not depend on the daemon happening to run at INFO."""
     logger = logging.getLogger("sse_starlette")
     monkeypatch.setattr(logger, "level", logging.DEBUG)
@@ -1217,7 +1209,7 @@ def test_a_dropped_tool_type_cannot_forge_a_log_line(tmp_path: Path, capsys):
     write whatever line the client chose into the daemon log. Short enough here
     to survive the length cap, so the escaping is what has to stop it."""
     app = _app(tmp_path, FakeEngine(["ok"]))
-    forged = "x\nsous.gateway: POST /v1/messages status=200"
+    forged = "x\nsous.api: POST /v1/messages status=200"
     body = _body(tools=[{"type": forged, "name": "web_search"}])
     assert _post(app, body).status_code == 200
     err = capsys.readouterr().err
@@ -1248,19 +1240,19 @@ def test_a_non_string_tool_type_is_a_400_and_never_reaches_the_log(tmp_path: Pat
 
 
 def test_close_after_a_completed_turn_stops_the_session_and_the_pools(tmp_path: Path):
-    gateway, app = _gateway_app(tmp_path, FakeEngine(["ok"]))
+    endpoint, app = _endpoint_app(tmp_path, FakeEngine(["ok"]))
     assert _post(app, _body(stream=False)).status_code == 200
-    session = gateway._runner._session
+    session = endpoint._runner._session
     assert session is not None and session._thread.is_alive()
     t0 = time.monotonic()
-    gateway.close()
+    endpoint.close()
     elapsed = time.monotonic() - t0
     assert elapsed < 2.5  # promptly: nothing here is a running generation to wait out
     assert not session._thread.is_alive()
-    assert gateway._turns._shutdown and gateway._counts._shutdown
+    assert endpoint._turns._shutdown and endpoint._counts._shutdown
     # close() is the sync half; the upstream client needs the async one, and
     # leaving it open leaks a connection pool for the rest of the session.
-    asyncio.run(gateway._upstream.aclose())
+    asyncio.run(endpoint._upstream.aclose())
 
 
 def test_close_does_not_touch_a_running_turns_session(tmp_path: Path):
@@ -1275,20 +1267,20 @@ def test_close_does_not_touch_a_running_turns_session(tmp_path: Path):
             return super().generate(messages, tools, max_tokens, on_delta)
 
     inner = Announcing(["slow|slow|slow"], delay=0.3)
-    gateway, app = _gateway_app(tmp_path, inner)
+    endpoint, app = _endpoint_app(tmp_path, inner)
     turn = threading.Thread(target=lambda: _post(app, _body(stream=False)), daemon=True)
     turn.start()
     assert entered.wait(5)  # the turn holds TurnRunner._lock and is generating
-    session_before = gateway._runner._session
+    session_before = endpoint._runner._session
     assert session_before is not None
     t0 = time.monotonic()
-    gateway.close(timeout=0.5)  # must not raise
+    endpoint.close(timeout=0.5)  # must not raise
     elapsed = time.monotonic() - t0
     assert elapsed < 1.0
-    assert gateway._runner._session is session_before  # untouched: the lock was busy
+    assert endpoint._runner._session is session_before  # untouched: the lock was busy
     turn.join(10)
     assert inner.finished.wait(5)
-    asyncio.run(gateway._upstream.aclose())
+    asyncio.run(endpoint._upstream.aclose())
 
 
 def test_a_stream_never_iterated_still_drains_and_releases_its_slot(tmp_path: Path):
@@ -1298,10 +1290,10 @@ def test_a_stream_never_iterated_still_drains_and_releases_its_slot(tmp_path: Pa
     (client gone before sse-starlette's first __anext__, or its task group
     cancelled first), a submission living inside that generator's body would
     never run and the slot would leak forever."""
-    import sous.gateway.routes as routes
+    import sous.api.routes as routes
 
     inner = FakeEngine(["ok"])
-    gateway, _app = _gateway_app(tmp_path, inner)
+    endpoint, _app = _endpoint_app(tmp_path, inner)
     body = json.dumps(_body(stream=True)).encode()
 
     async def go():
@@ -1322,13 +1314,13 @@ def test_a_stream_never_iterated_still_drains_and_releases_its_slot(tmp_path: Pa
             "query_string": b"",
         }
         request = Request(scope, receive)
-        response = await gateway.messages(request)
+        response = await endpoint.messages(request)
         assert isinstance(response, EventSourceResponse)
         # Never iterate/call response: this is the never-iterated case.
         deadline = time.monotonic() + 5
-        while gateway._pending._value != routes.MAX_PENDING_TURNS and time.monotonic() < deadline:
+        while endpoint._pending._value != routes.MAX_PENDING_TURNS and time.monotonic() < deadline:
             await asyncio.sleep(0.01)
-        assert gateway._pending._value == routes.MAX_PENDING_TURNS
+        assert endpoint._pending._value == routes.MAX_PENDING_TURNS
 
     asyncio.run(go())
     assert len(inner.calls) == 1  # the turn drained even though nobody read it
@@ -1367,34 +1359,34 @@ def test_cancelling_a_non_streaming_request_keeps_its_slot_until_the_turn_ends(t
     after task.cancel(), because the release was tied to the asyncio wrapper
     future (which a cancelled task completes immediately) instead of to the
     concurrent.futures.Future backing the still-running generation."""
-    import sous.gateway.routes as routes
+    import sous.api.routes as routes
 
     inner = ChunkedFakeEngine(["a|b|c"], delay=0.5)  # ~1.5s to drain, 3 pieces
-    gateway, _app = _gateway_app(tmp_path, inner)
+    endpoint, _app = _endpoint_app(tmp_path, inner)
 
     async def go():
         request = _hand_built_request(_body(stream=False))
-        task = asyncio.create_task(gateway.messages(request))
+        task = asyncio.create_task(endpoint.messages(request))
 
         deadline = time.monotonic() + 5
         while not inner.generate_threads and time.monotonic() < deadline:
             await asyncio.sleep(0.01)
         assert inner.generate_threads  # generation has actually started
 
-        assert gateway._pending._value == routes.MAX_PENDING_TURNS - 1
+        assert endpoint._pending._value == routes.MAX_PENDING_TURNS - 1
 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
         # Still held: the turn is still draining on the executor thread.
-        assert gateway._pending._value == routes.MAX_PENDING_TURNS - 1
+        assert endpoint._pending._value == routes.MAX_PENDING_TURNS - 1
 
         await asyncio.to_thread(inner.finished.wait, 10)
         deadline = time.monotonic() + 5
-        while gateway._pending._value != routes.MAX_PENDING_TURNS and time.monotonic() < deadline:
+        while endpoint._pending._value != routes.MAX_PENDING_TURNS and time.monotonic() < deadline:
             await asyncio.sleep(0.01)
-        assert gateway._pending._value == routes.MAX_PENDING_TURNS
+        assert endpoint._pending._value == routes.MAX_PENDING_TURNS
         assert len(inner.calls) == 1  # the turn ran to completion, draining
 
     asyncio.run(go())
@@ -1410,25 +1402,25 @@ def test_cancelling_a_queued_non_streaming_request_cancels_the_turn(tmp_path: Pa
     this test does not discriminate old code from new; it pins the contract
     so the queued case cannot regress while the running case above (the one
     that was broken) is the discriminating test."""
-    import sous.gateway.routes as routes
+    import sous.api.routes as routes
 
     inner = FakeEngine(["never"])
-    gateway, _app = _gateway_app(tmp_path, inner)
+    endpoint, _app = _endpoint_app(tmp_path, inner)
 
     # Saturate the turn pool with a single worker occupied by a blocking
     # dummy job, so the request's own turn sits queued -- not started -- in
     # the pool, which is the only state cf.cancel() can actually cancel.
-    gateway._turns.shutdown(wait=False, cancel_futures=True)
-    gateway._turns = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    endpoint._turns.shutdown(wait=False, cancel_futures=True)
+    endpoint._turns = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     dummy_release = threading.Event()
-    gateway._turns.submit(dummy_release.wait, 5)
+    endpoint._turns.submit(dummy_release.wait, 5)
 
     async def go():
         request = _hand_built_request(_body(stream=False))
-        task = asyncio.create_task(gateway.messages(request))
+        task = asyncio.create_task(endpoint.messages(request))
         await asyncio.sleep(0.05)  # give the loop a tick to submit and queue
 
-        assert gateway._pending._value == routes.MAX_PENDING_TURNS - 1
+        assert endpoint._pending._value == routes.MAX_PENDING_TURNS - 1
 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1437,9 +1429,9 @@ def test_cancelling_a_queued_non_streaming_request_cancels_the_turn(tmp_path: Pa
         dummy_release.set()  # let the pool's occupying job finish
 
         deadline = time.monotonic() + 5
-        while gateway._pending._value != routes.MAX_PENDING_TURNS and time.monotonic() < deadline:
+        while endpoint._pending._value != routes.MAX_PENDING_TURNS and time.monotonic() < deadline:
             await asyncio.sleep(0.01)
-        assert gateway._pending._value == routes.MAX_PENDING_TURNS
+        assert endpoint._pending._value == routes.MAX_PENDING_TURNS
         assert inner.calls == []  # the turn was cancelled before it ever ran
 
     asyncio.run(go())
@@ -1476,7 +1468,7 @@ def test_a_configured_id_that_itself_ends_in_brackets_matches_exactly(tmp_path: 
         tmp_path,
         FakeEngine(["ok", "ok"]),
         upstream=fake.upstream(),
-        gateway_local_models=("sous-local", "model[prod]"),
+        local_models=("sous-local", "model[prod]"),
     )
     for served in ("model[prod]", "model[prod][1m]"):
         r = _post(app, _body(model=served))
@@ -1487,7 +1479,7 @@ def test_a_configured_id_that_itself_ends_in_brackets_matches_exactly(tmp_path: 
     assert [json.loads(s["body"])["model"] for s in fake.requests] == ["model"]
 
 
-def test_bodies_the_gateway_cannot_claim_are_the_upstreams_to_judge(tmp_path: Path):
+def test_bodies_the_endpoint_cannot_claim_are_the_upstreams_to_judge(tmp_path: Path):
     """Not JSON, not an object, no string model, strict-decoder rejects: none
     of these can name a local model, so the upstream answers in its own words."""
     fake = FakeUpstream()
@@ -1547,46 +1539,6 @@ def test_everything_else_streams_through_with_method_query_and_body(tmp_path: Pa
     assert _request(app, "GET", "/").headers["via"] == "1.1 sous"
 
 
-def test_the_catch_all_does_not_shadow_the_mcp_transport(tmp_path: Path):
-    """The SDK mounts custom routes after /mcp, so the MCP transport answers
-    its own path — never the upstream. Its JSON-RPC refusal of a session-less
-    ping is the proof: the fake upstream answers 200 {"upstream": true}."""
-    fake = FakeUpstream()
-    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
-
-    async def go():
-        async with _lifespan(app):
-            transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(
-                transport=transport, base_url="http://127.0.0.1:8383"
-            ) as client:
-                return await client.post("/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1})
-
-    r = asyncio.run(go())
-    assert r.status_code == 400
-    assert r.json()["jsonrpc"] == "2.0"
-    assert "via" not in r.headers
-    assert fake.requests == []
-
-
-def test_the_catch_all_redirects_the_mcp_path_with_a_trailing_slash(tmp_path: Path):
-    """The SDK's Route("/mcp") is exact, so before the catch-all existed
-    Starlette's redirect_slashes answered POST /mcp/ with a 307. The catch-all
-    matches it too, and forwarding it would put an MCP client's JSON-RPC body
-    (paths, file contents) on the wire to Anthropic — so the redirect stays."""
-    fake = FakeUpstream()
-    app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
-    body = b'{"jsonrpc": "2.0", "method": "ping", "id": 1}'
-    r = _request(app, "POST", "/mcp/", body=body)
-    assert r.status_code == 307
-    assert r.headers["location"].endswith("/mcp")
-    assert "via" not in r.headers
-    r = _request(app, "POST", "/mcp//?x=1", body=body)
-    assert r.status_code == 307
-    assert r.headers["location"].endswith("/mcp?x=1")
-    assert fake.requests == []
-
-
 def test_forwarded_requests_are_loopback_only_too(tmp_path: Path):
     fake = FakeUpstream()
     app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
@@ -1619,7 +1571,7 @@ def test_forwarded_requests_are_loopback_only_too(tmp_path: Path):
 def test_an_oversized_body_is_refused_before_forwarding(tmp_path: Path):
     """The 32 MiB cap is Anthropic's own, so refusing here changes nothing the
     client would see — and a forwarded body is buffered, so it must be bounded."""
-    import sous.gateway.routes as routes
+    import sous.api.routes as routes
 
     fake = FakeUpstream()
     app = _app(tmp_path, FakeEngine([]), upstream=fake.upstream())
@@ -1634,13 +1586,12 @@ def test_an_oversized_body_is_refused_before_forwarding(tmp_path: Path):
 
 @contextlib.contextmanager
 def _root_stderr_logging():
-    """The logging setup the real daemon runs with. MCPServer.__init__ calls
-    the SDK's configure_logging("INFO"), which basicConfig's a RichHandler onto
-    the *root* logger — so anything any library logs lands on the daemon's
-    stderr next to sous' own print() lines. Under pytest the logging plugin has
-    already attached a root handler, so that basicConfig no-ops and a
-    capsys-only assertion cannot see the leak at all. Built inside the test so
-    the handler binds to capsys' replacement stderr; DEBUG because that is
+    """The logging setup the real daemon runs with: a handler on the *root*
+    logger, so anything any library logs lands on the daemon's stderr next
+    to sous' own print() lines. Built inside the test (rather than calling
+    configure_daemon_logging() itself) so the handler binds to capsys'
+    replacement stderr and is removed again after, instead of leaking a
+    second root handler into the rest of the suite; DEBUG because that is
     where httpcore logs response header values."""
     handler = logging.StreamHandler(sys.stderr)
     root = logging.getLogger()
@@ -1669,15 +1620,14 @@ def test_forwarding_logs_one_bounded_metadata_line_and_never_a_body_header_or_qu
         _post(app, json.dumps(_body(model="m" * 65)).encode())
         _post(app, b"not json")
     err = capsys.readouterr().err
-    lines = [line for line in err.splitlines() if "sous.gateway: upstream" in line]
+    lines = [line for line in err.splitlines() if "sous.api: upstream" in line]
     assert (
-        "sous.gateway: upstream POST /v1/messages model=claude-opus-5 status=200 seconds="
-        in lines[0]
+        "sous.api: upstream POST /v1/messages model=claude-opus-5 status=200 seconds=" in lines[0]
     )
-    assert "sous.gateway: upstream GET /api/oauth/usage model=- status=200 seconds=" in lines[1]
-    assert "sous.gateway: upstream POST /v1/messages model=- status=200" in lines[2]
-    assert "sous.gateway: upstream POST /v1/messages model=- status=200" in lines[3]
-    assert "sous.gateway: upstream POST /v1/messages model=- status=200" in lines[4]
+    assert "sous.api: upstream GET /api/oauth/usage model=- status=200 seconds=" in lines[1]
+    assert "sous.api: upstream POST /v1/messages model=- status=200" in lines[2]
+    assert "sous.api: upstream POST /v1/messages model=- status=200" in lines[3]
+    assert "sous.api: upstream POST /v1/messages model=- status=200" in lines[4]
     assert len(lines) == 5
     for canary in ("BODY-CANARY", "HEADER-CANARY", "QUERY-CANARY", "x y", "m" * 65):
         assert canary not in err, canary
@@ -1685,8 +1635,8 @@ def test_forwarding_logs_one_bounded_metadata_line_and_never_a_body_header_or_qu
 
 def test_aclose_shuts_the_upstream_client_too(tmp_path: Path):
     upstream = FakeUpstream().upstream()
-    gateway, _ = _gateway_app(tmp_path, FakeEngine([]), upstream=upstream)
-    asyncio.run(gateway.aclose())
+    endpoint, _ = _endpoint_app(tmp_path, FakeEngine([]), upstream=upstream)
+    asyncio.run(endpoint.aclose())
     assert upstream._client.is_closed
 
 
@@ -1697,7 +1647,7 @@ def test_a_claimed_model_id_cannot_forge_or_bloat_a_log_line(tmp_path: Path, cap
     reach a log line unbounded, the way a forwarded id already can't."""
     fake = FakeUpstream()
     app = _app(tmp_path, FakeEngine(["ok", "ok"]), upstream=fake.upstream())
-    forged = "sous-local[\nsous.gateway: FORGED status=200]"
+    forged = "sous-local[\nsous.api: FORGED status=200]"
     oversized = "sous-local[" + "A" * 100 + "]"
     for raw_id in (forged, oversized):
         r = _post(app, _body(model=raw_id))
@@ -1707,7 +1657,7 @@ def test_a_claimed_model_id_cannot_forge_or_bloat_a_log_line(tmp_path: Path, cap
     assert fake.requests == []
     err = capsys.readouterr().err
     assert "FORGED" not in err
-    lines = [line for line in err.splitlines() if "sous.gateway:" in line]
+    lines = [line for line in err.splitlines() if "sous.api:" in line]
     assert lines, "expected at least one log line"
     for line in lines:
         # The attributed turn line is ~410 chars with its prefix; the cap is
@@ -1822,13 +1772,13 @@ def test_the_turn_line_diagnoses_a_miss(tmp_path: Path, capsys):
     ],
 )
 def test_lcp_region_places_the_divergence(lcp, lo, hi, region):
-    from sous.gateway.routes import _lcp_region
+    from sous.api.routes import _lcp_region
 
     assert _lcp_region(lcp, lo, hi) == region
 
 
 def test_rates_and_optional_fields_print_a_dash_when_undefined():
-    from sous.gateway.routes import _opt, _per_second
+    from sous.api.routes import _opt, _per_second
 
     assert _per_second(100, 0.0) is None and _per_second(100, 4.0) == 25.0
     assert _opt(None) == "-" and _opt(1.234) == "1.2" and _opt(_per_second(59, 4.0)) == "14.8"
@@ -1913,8 +1863,8 @@ def test_a_moved_turn_slot_prints_took_turn_moved(tmp_path: Path, capsys):
 # --- the registry and the recent ring --------------------------------------------
 
 
-def _recent(gateway: Gateway) -> list[dict]:
-    return gateway._inflight.snapshot()["recent_turns"]
+def _recent(endpoint: Endpoint) -> list[dict]:
+    return endpoint._inflight.snapshot()["recent_turns"]
 
 
 def test_a_served_turn_is_recorded_with_the_lines_fields(tmp_path: Path):
@@ -1932,11 +1882,11 @@ def test_a_served_turn_is_recorded_with_the_lines_fields(tmp_path: Path):
         return original(messages, tools, max_tokens, on_delta)
 
     inner.generate = generate  # ty: ignore[invalid-assignment]
-    gateway, app = _gateway_app(tmp_path, inner)
+    endpoint, app = _endpoint_app(tmp_path, inner)
     r = _post(app, _body(stream=True))
     started = [d for e, d in _events(r.text) if e == "message_start"]
     message_id = started[0]["message"]["id"]
-    (turn,) = _recent(gateway)
+    (turn,) = _recent(endpoint)
     assert turn["id"] == message_id and turn["model"] == "sous-local"
     assert turn["status"] == 200 and turn["error"] is None and turn["stream"] is True
     assert turn["cache"] == "hit" and turn["took"] == "turn@100"
@@ -1954,16 +1904,16 @@ def test_a_served_turn_is_recorded_with_the_lines_fields(tmp_path: Path):
         "decode_tps", "seconds", "tools_hash", "system_hash",
     }  # fmt: skip
     _post(app, _body(stream=False))
-    ids = [t["id"] for t in _recent(gateway)]
+    ids = [t["id"] for t in _recent(endpoint)]
     assert len(ids) == 2 and ids[1] == message_id  # newest first
 
 
 def test_a_miss_is_recorded_with_its_lcp_and_bounds(tmp_path: Path):
     inner = FakeEngine(["reply"])
     inner.stats = dict(_ALL_GAUGES, misses=1, miss_lcp=62851, bound_lo=62298, bound_hi=62856)
-    gateway, app = _gateway_app(tmp_path, inner)
+    endpoint, app = _endpoint_app(tmp_path, inner)
     _post(app, _body())
-    (turn,) = _recent(gateway)
+    (turn,) = _recent(endpoint)
     assert turn["cache"] == "miss" and turn["took"] == "none"
     assert turn["lcp"] == 62851 and turn["lcp_region"] == "system"
     assert turn["bounds"] == [62298, 62856]
@@ -1974,32 +1924,32 @@ def test_failed_and_refused_turns_are_recorded_with_their_error(tmp_path: Path, 
         def generate(self, messages, tools, max_tokens, on_delta=None):
             raise RuntimeError("engine down")
 
-    gateway, app = _gateway_app(tmp_path, Boom([]))
+    endpoint, app = _endpoint_app(tmp_path, Boom([]))
     _post(app, _body(stream=False))
     _post(app, _body(stream=True))
-    recent = _recent(gateway)
+    recent = _recent(endpoint)
     assert [(t["status"], t["error"], t["stream"]) for t in recent] == [
         (200, "api_error", True),  # the stream's headers had gone out
         (500, "api_error", False),
     ]
     assert all(t["id"].startswith("msg_") and t["seconds"] >= 0 for t in recent)
     assert all("stop_reason" not in t for t in recent)
-    monkeypatch.setattr("sous.gateway.routes.MAX_PENDING_TURNS", 0)
-    gateway, app = _gateway_app(tmp_path, FakeEngine(["never"]))
+    monkeypatch.setattr("sous.api.routes.MAX_PENDING_TURNS", 0)
+    endpoint, app = _endpoint_app(tmp_path, FakeEngine(["never"]))
     assert _post(app, _body()).status_code == 529
-    (refused,) = _recent(gateway)
+    (refused,) = _recent(endpoint)
     assert (refused["status"], refused["error"]) == (529, "overloaded_error")
 
 
 def test_an_abandoned_stream_is_recorded_as_499(tmp_path: Path, monkeypatch):
-    gateway, app = _gateway_app(tmp_path, FakeEngine(["never"]))
+    endpoint, app = _endpoint_app(tmp_path, FakeEngine(["never"]))
 
     def gone(*args, **kwargs):
         raise TurnAbandoned
 
-    monkeypatch.setattr(gateway._runner, "run", gone)
+    monkeypatch.setattr(endpoint._runner, "run", gone)
     _post(app, _body(stream=True))
-    (turn,) = _recent(gateway)
+    (turn,) = _recent(endpoint)
     assert (turn["status"], turn["error"], turn["stream"]) == (499, "abandoned", True)
 
 
@@ -2008,9 +1958,9 @@ def test_the_turn_line_is_printed_from_the_recorded_summary(tmp_path: Path, caps
     disagree, so the line is formatted from the summary the ring keeps."""
     inner = FakeEngine(["reply"])
     inner.stats = dict(_ALL_GAUGES)
-    gateway, app = _gateway_app(tmp_path, inner)
+    endpoint, app = _endpoint_app(tmp_path, inner)
     _post(app, _body())
-    (turn,) = _recent(gateway)
+    (turn,) = _recent(endpoint)
     (line,) = [ln for ln in _turn_lines(capsys.readouterr().err) if "status=200" in ln]
     fields = _fields(line)
     assert fields["id"] == turn["id"] and fields["cache"] == turn["cache"]
@@ -2020,12 +1970,12 @@ def test_the_turn_line_is_printed_from_the_recorded_summary(tmp_path: Path, caps
 
 def test_the_registry_sees_a_streamed_turn_under_its_message_id(tmp_path: Path):
     inner = FakeEngine(["reply"])
-    gateway, app = _gateway_app(tmp_path, inner)
+    endpoint, app = _endpoint_app(tmp_path, inner)
     seen: list[dict] = []
     original = inner.generate
 
     def generate(messages, tools, max_tokens, on_delta=None):
-        seen.extend(gateway._inflight.snapshot()["inflight"])
+        seen.extend(endpoint._inflight.snapshot()["inflight"])
         return original(messages, tools, max_tokens, on_delta)
 
     inner.generate = generate  # ty: ignore[invalid-assignment]
@@ -2035,4 +1985,4 @@ def test_the_registry_sees_a_streamed_turn_under_its_message_id(tmp_path: Path):
     assert entry["id"] == started[0]["message"]["id"]
     assert entry["phase"] == "prefill" and entry["stream"] is True
     assert entry["model"] == "sous-local" and entry["max_tokens"] == 4096
-    assert gateway._inflight.snapshot()["inflight"] == []
+    assert endpoint._inflight.snapshot()["inflight"] == []

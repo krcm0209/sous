@@ -216,10 +216,9 @@ def apply_changes(config_path: Path, new_text: str, run_id: str) -> Path | None:
 
 def restart_note(changes: dict[str, dict[str, object]], *, managed: bool) -> str | None:
     """`server.py` reads the config once at startup and builds one
-    EngineManager closed over every [model]/[gateway] value; only the
-    allowlist is re-read at runtime. So every key `sous tune --quick` can
-    write — not just the model id or int8_prefill — needs a restart before
-    the daemon acts on it."""
+    EngineManager closed over every [model] value; nothing is re-read at
+    runtime. So every key `sous tune --quick` can write — not just the model
+    id or int8_prefill — needs a restart before the daemon acts on it."""
     from sous.cli import restart_hint
 
     keys = [key for section in changes.values() for key in section]

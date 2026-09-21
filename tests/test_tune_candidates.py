@@ -1,6 +1,6 @@
 from datetime import date
 
-from sous.config import GATEWAY_MIN_CONTEXT_TOKENS
+from sous.config import MIN_CONTEXT_TOKENS
 from sous.tune.candidates import (
     Checkpoint,
     describe,
@@ -141,8 +141,8 @@ def test_fit_refuses_when_the_drafters_size_is_unknown():
     assert f.fits is False and "drafter size unknown" in f.detail
 
 
-def test_fit_floor_for_the_gateway_is_claude_codes_minimum():
-    assert GATEWAY_MIN_CONTEXT_TOKENS == 48 * 1024
+def test_the_fit_floor_is_claude_codes_minimum():
+    assert MIN_CONTEXT_TOKENS == 48 * 1024
 
 
 def test_drafter_compatibility_refuses_a_vocabulary_mismatch():

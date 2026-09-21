@@ -1,4 +1,4 @@
-"""Score = 1 if the worker's tests pass on the pristine module, times the
+"""Score = 1 if the model's tests pass on the pristine module, times the
 share of five mutants — one per documented behaviour — those tests catch.
 No tests, or tests that fail on the real module, score zero."""
 
@@ -48,7 +48,7 @@ def _fails(tests, project: Path) -> bool:
 def grade(project: Path, tests) -> tuple[float, str]:
     passed, total, detail = tests(project, project / "tests")
     if total == 0 or passed < total:
-        return 0.0, f"the worker's tests on the pristine module: {detail}"
+        return 0.0, f"the model's tests on the pristine module: {detail}"
     caught = []
     for name, source in MUTANTS.items():
         with tempfile.TemporaryDirectory() as td:

@@ -204,7 +204,7 @@ def test_a_later_probe_answer_supersedes_the_first_and_restarts_the_phase_clock(
 
 
 def test_the_turn_past_queued_leads_the_list_whatever_the_arrival_order():
-    """Turns admitted together wait on the gateway lock in registration
+    """Turns admitted together wait on the endpoint lock in registration
     order, but the lock is not a queue: whichever it wakes is the turn on
     the pass, and a reader takes the first entry as that turn."""
     reg, clock = _registry()

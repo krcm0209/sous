@@ -1,8 +1,8 @@
 """`python -m sous.tune.suite.unittests DIR`: run the unittest modules under
 DIR and print the counts as one JSON line. The grader runs this in a
-subprocess with the worker's project as the working directory — `python -m`
+subprocess with the candidate's project as the working directory — `python -m`
 puts that directory first on sys.path, so the hidden tests import the
-worker's modules by name — and a project that hangs or crashes takes the
+candidate's modules by name — and a project that hangs or crashes takes the
 subprocess with it, never the tune."""
 
 from __future__ import annotations

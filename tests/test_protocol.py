@@ -1,31 +1,12 @@
 import pytest
 
-from sous.protocol import WORKER_TOOLS, ParseError, ToolCall, parse_tool_calls
-
-EXPECTED_TOOLS = {
-    "read_file",
-    "write_file",
-    "edit_file",
-    "list_dir",
-    "glob",
-    "grep",
-    "run_command",
-    "finish",
-}
-
-
-def test_worker_tools_names_and_shape():
-    names = {t["function"]["name"] for t in WORKER_TOOLS}
-    assert names == EXPECTED_TOOLS
-    for t in WORKER_TOOLS:
-        assert t["type"] == "function"
-        assert "description" in t["function"]
-        assert t["function"]["parameters"]["type"] == "object"
+from sous.protocol import ParseError, ToolCall, parse_tool_calls
+from sous.tune.payload import TOOLSET
 
 
 def test_parse_single_call():
     text = 'On it.\n<tool_call>\n{"name": "read_file", "arguments": {"path": "a.py"}}\n</tool_call>'
-    [call] = parse_tool_calls(text)
+    [call] = parse_tool_calls(text, TOOLSET)
     assert call == ToolCall("read_file", {"path": "a.py"})
 
 
@@ -34,32 +15,32 @@ def test_parse_multiple_calls():
         '<tool_call>{"name": "glob", "arguments": {"pattern": "**/*.py"}}</tool_call>'
         '<tool_call>{"name": "list_dir", "arguments": {}}</tool_call>'
     )
-    calls = parse_tool_calls(text)
+    calls = parse_tool_calls(text, TOOLSET)
     assert [c.name for c in calls] == ["glob", "list_dir"]
 
 
 def test_no_calls_returns_empty():
-    assert parse_tool_calls("I think we should refactor.") == []
+    assert parse_tool_calls("I think we should refactor.", TOOLSET) == []
 
 
 def test_malformed_json_raises():
     with pytest.raises(ParseError):
-        parse_tool_calls('<tool_call>{"name": "glob", "arguments":</tool_call>')
+        parse_tool_calls('<tool_call>{"name": "glob", "arguments":</tool_call>', TOOLSET)
 
 
 def test_unknown_tool_raises():
     with pytest.raises(ParseError):
-        parse_tool_calls('<tool_call>{"name": "rm_rf", "arguments": {}}</tool_call>')
+        parse_tool_calls('<tool_call>{"name": "rm_rf", "arguments": {}}</tool_call>', TOOLSET)
 
 
 def test_non_dict_arguments_raises():
     with pytest.raises(ParseError):
-        parse_tool_calls('<tool_call>{"name": "glob", "arguments": "x"}</tool_call>')
+        parse_tool_calls('<tool_call>{"name": "glob", "arguments": "x"}</tool_call>', TOOLSET)
 
 
 def test_missing_name_raises():
     with pytest.raises(ParseError):
-        parse_tool_calls('<tool_call>{"arguments": {}}</tool_call>')
+        parse_tool_calls('<tool_call>{"arguments": {}}</tool_call>', TOOLSET)
 
 
 def test_write_file_with_closing_tag_in_content():
@@ -68,7 +49,7 @@ def test_write_file_with_closing_tag_in_content():
         '<tool_call>{"name": "write_file", "arguments": '
         '{"path": "a.txt", "content": "abc</tool_call>def"}}</tool_call>'
     )
-    [call] = parse_tool_calls(text)
+    [call] = parse_tool_calls(text, TOOLSET)
     assert call.name == "write_file"
     assert call.arguments["content"] == "abc</tool_call>def"
 
@@ -80,7 +61,7 @@ def test_two_calls_first_with_closing_tag_in_arguments():
         '{"path": "x.py", "old": "foo</tool_call>", "new": "bar"}}</tool_call>'
         '<tool_call>{"name": "read_file", "arguments": {"path": "y.py"}}</tool_call>'
     )
-    calls = parse_tool_calls(text)
+    calls = parse_tool_calls(text, TOOLSET)
     assert len(calls) == 2
     assert calls[0].name == "edit_file"
     assert calls[0].arguments["old"] == "foo</tool_call>"
@@ -93,7 +74,7 @@ def test_write_file_with_opening_tag_in_content():
         '<tool_call>{"name": "write_file", "arguments": '
         '{"path": "a.txt", "content": "prefix <tool_call> suffix"}}</tool_call>'
     )
-    [call] = parse_tool_calls(text)
+    [call] = parse_tool_calls(text, TOOLSET)
     assert call.name == "write_file"
     assert call.arguments["content"] == "prefix <tool_call> suffix"
 
@@ -104,7 +85,7 @@ def test_call_with_both_opening_and_closing_tags_in_content():
         '<tool_call>{"name": "write_file", "arguments": '
         '{"path": "test.txt", "content": "start <tool_call>data</tool_call> end"}}</tool_call>'
     )
-    [call] = parse_tool_calls(text)
+    [call] = parse_tool_calls(text, TOOLSET)
     assert call.name == "write_file"
     assert call.arguments["content"] == "start <tool_call>data</tool_call> end"
 
@@ -116,7 +97,7 @@ def test_two_calls_first_with_opening_tag_in_arguments():
         '{"path": "x.py", "old": "foo <tool_call> bar", "new": "baz"}}</tool_call>'
         '<tool_call>{"name": "read_file", "arguments": {"path": "y.py"}}</tool_call>'
     )
-    calls = parse_tool_calls(text)
+    calls = parse_tool_calls(text, TOOLSET)
     assert len(calls) == 2
     assert calls[0].name == "edit_file"
     assert calls[0].arguments["old"] == "foo <tool_call> bar"
@@ -156,7 +137,7 @@ def test_xml_real_model_fixture_parses():
     """The exact text the real model emitted must parse to one ToolCall,
     with the multi-line content preserved byte-for-byte (internal blank
     lines intact, only the template's single wrapping newlines removed)."""
-    calls = parse_tool_calls(QWEN_XML_REAL)
+    calls = parse_tool_calls(QWEN_XML_REAL, TOOLSET)
     assert calls == [
         ToolCall("write_file", {"path": "/tmp/x/shapes.py", "content": QWEN_XML_REAL_CONTENT})
     ]
@@ -179,7 +160,7 @@ def test_xml_trailing_blank_line_in_content_preserved():
         "</function>\n"
         "</tool_call>"
     )
-    [call] = parse_tool_calls(text)
+    [call] = parse_tool_calls(text, TOOLSET)
     assert call.arguments["content"] == "line1\nline2\n"
 
 
@@ -192,7 +173,7 @@ def test_xml_integer_parameter_coerced_to_int():
         "</function>\n"
         "</tool_call>"
     )
-    [call] = parse_tool_calls(text)
+    [call] = parse_tool_calls(text, TOOLSET)
     assert call.arguments["offset"] == 5
     assert isinstance(call.arguments["offset"], int)
     assert not isinstance(call.arguments["offset"], bool)
@@ -208,7 +189,7 @@ def test_xml_uncoercible_integer_raises():
         "</tool_call>"
     )
     with pytest.raises(ParseError):
-        parse_tool_calls(text)
+        parse_tool_calls(text, TOOLSET)
 
 
 def test_xml_two_adjacent_calls_in_order():
@@ -219,7 +200,7 @@ def test_xml_two_adjacent_calls_in_order():
         "<tool_call>\n<function=list_dir>\n"
         "</function>\n</tool_call>"
     )
-    calls = parse_tool_calls(text)
+    calls = parse_tool_calls(text, TOOLSET)
     assert [c.name for c in calls] == ["glob", "list_dir"]
     assert calls[0].arguments == {"pattern": "**/*.py"}
     assert calls[1].arguments == {}
@@ -230,19 +211,19 @@ def test_mixed_json_and_xml_calls_both_parse():
         '<tool_call>{"name": "read_file", "arguments": {"path": "a.py"}}</tool_call>\n'
         "<tool_call>\n<function=list_dir>\n</function>\n</tool_call>"
     )
-    calls = parse_tool_calls(text)
+    calls = parse_tool_calls(text, TOOLSET)
     assert calls == [ToolCall("read_file", {"path": "a.py"}), ToolCall("list_dir", {})]
 
 
 def test_xml_unknown_tool_raises():
     with pytest.raises(ParseError):
-        parse_tool_calls("<tool_call>\n<function=rm_rf>\n</function>\n</tool_call>")
+        parse_tool_calls("<tool_call>\n<function=rm_rf>\n</function>\n</tool_call>", TOOLSET)
 
 
 def test_xml_prose_before_call_ignored():
     """The template permits reasoning text before the tool call."""
     text = "I will write the shapes module now.\n\n" + QWEN_XML_REAL
-    [call] = parse_tool_calls(text)
+    [call] = parse_tool_calls(text, TOOLSET)
     assert call.name == "write_file"
     assert call.arguments["content"] == QWEN_XML_REAL_CONTENT
 
@@ -256,24 +237,24 @@ def test_xml_embedded_tool_call_tags_in_value_not_rescanned():
         "<parameter=content>\nstart <tool_call>data</tool_call> end\n</parameter>\n"
         "</function>\n</tool_call>"
     )
-    [call] = parse_tool_calls(text)
+    [call] = parse_tool_calls(text, TOOLSET)
     assert call.arguments["content"] == "start <tool_call>data</tool_call> end"
 
 
 def test_xml_unterminated_parameter_raises():
     text = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n"
     with pytest.raises(ParseError):
-        parse_tool_calls(text)
+        parse_tool_calls(text, TOOLSET)
 
 
 def test_tool_call_with_unrecognized_payload_raises():
     with pytest.raises(ParseError):
-        parse_tool_calls("<tool_call>garbage</tool_call>")
+        parse_tool_calls("<tool_call>garbage</tool_call>", TOOLSET)
 
 
 # --- request-scoped tool sets (gateway) ----------------------------------------
 
-from sous.protocol import WORKER_TOOLSET, ToolSet  # noqa: E402 — grouped with its tests
+from sous.protocol import ToolSet  # noqa: E402 — grouped with its tests
 
 CLIENT_TOOLS = [
     {
@@ -322,13 +303,6 @@ CLIENT_TOOLS = [
         },
     },
 ]
-
-
-def test_default_toolset_is_the_strict_worker_set():
-    assert WORKER_TOOLSET.names == EXPECTED_TOOLS
-    assert WORKER_TOOLSET.strict is True
-    assert WORKER_TOOLSET.param_types["read_file"]["offset"] == "integer"
-    assert WORKER_TOOLSET.param_types["list_dir"] == {"path": "string"}
 
 
 def test_request_scoped_toolset_accepts_client_tool_names():
@@ -409,7 +383,7 @@ def test_xml_wrong_json_shape_for_array_parameter_raises():
 
 def test_json_call_with_non_string_name_raises():
     with pytest.raises(ParseError):
-        parse_tool_calls('<tool_call>{"name": 5, "arguments": {}}</tool_call>')
+        parse_tool_calls('<tool_call>{"name": 5, "arguments": {}}</tool_call>', TOOLSET)
 
 
 # --- non-finite numbers (NaN/Infinity are not valid JSON) ----------------------
@@ -452,18 +426,20 @@ def test_json_call_with_an_overflowing_literal_raises(call):
     # 1e999 is a plain numeric literal to the scanner — parse_constant never
     # sees it — yet float("1e999") is inf, as unserialisable as Infinity.
     with pytest.raises(ParseError):
-        parse_tool_calls(call)
+        parse_tool_calls(call, TOOLSET)
 
 
 def test_json_call_with_nan_argument_raises():
     with pytest.raises(ParseError):
-        parse_tool_calls('<tool_call>{"name": "finish", "arguments": {"x": NaN}}</tool_call>')
+        parse_tool_calls(
+            '<tool_call>{"name": "finish", "arguments": {"x": NaN}}</tool_call>', TOOLSET
+        )
 
 
 def test_json_call_with_infinity_nested_in_array_argument_raises():
     with pytest.raises(ParseError):
         parse_tool_calls(
-            '<tool_call>{"name": "finish", "arguments": {"x": [1, Infinity]}}</tool_call>'
+            '<tool_call>{"name": "finish", "arguments": {"x": [1, Infinity]}}</tool_call>', TOOLSET
         )
 
 
@@ -554,7 +530,7 @@ def test_a_nullable_parameter_still_coerces_a_real_value():
 
 
 def test_null_for_a_non_nullable_parameter_still_raises():
-    """The worker's fail-loudly contract: a schema that does not allow null
+    """The strict fail-loudly contract: a schema that does not allow null
     must not silently hand the executor a None."""
     ts = ToolSet.from_tools(NULLABLE_TOOLS, strict=False)
     text = (
@@ -659,7 +635,7 @@ def test_json_call_with_an_argument_past_the_depth_cap_raises_parse_error():
     nested = "[" * n + "]" * n
     call = '<tool_call>{"name": "finish", "arguments": {"x": ' + nested + "}}</tool_call>"
     with pytest.raises(ParseError):
-        parse_tool_calls(call)
+        parse_tool_calls(call, TOOLSET)
 
 
 def test_json_call_with_an_argument_exactly_at_the_depth_cap_parses():
@@ -670,7 +646,7 @@ def test_json_call_with_an_argument_exactly_at_the_depth_cap_parses():
     n = _MAX_ARGUMENT_DEPTH - 2
     nested = "[" * n + "]" * n
     call = '<tool_call>{"name": "finish", "arguments": {"x": ' + nested + "}}</tool_call>"
-    [call_obj] = parse_tool_calls(call)
+    [call_obj] = parse_tool_calls(call, TOOLSET)
     assert call_obj.name == "finish"
 
 
@@ -680,7 +656,7 @@ def test_json_call_with_nested_dicts_past_the_depth_cap_raises_parse_error():
     nested = '{"a":' * n + "1" + "}" * n
     call = '<tool_call>{"name": "finish", "arguments": {"x": ' + nested + "}}</tool_call>"
     with pytest.raises(ParseError):
-        parse_tool_calls(call)
+        parse_tool_calls(call, TOOLSET)
 
 
 def test_json_call_with_a_5000_digit_integer_argument_raises_parse_error():
@@ -689,7 +665,7 @@ def test_json_call_with_a_5000_digit_integer_argument_raises_parse_error():
     json.JSONDecodeError."""
     call = '<tool_call>{"name": "finish", "arguments": {"x": ' + "1" * 5000 + "}}</tool_call>"
     with pytest.raises(ParseError):
-        parse_tool_calls(call)
+        parse_tool_calls(call, TOOLSET)
 
 
 def test_xml_object_parameter_past_the_depth_cap_raises_parse_error():
@@ -722,4 +698,4 @@ def test_xml_integer_parameter_with_5000_digits_still_raises_parse_error():
         "</tool_call>"
     )
     with pytest.raises(ParseError):
-        parse_tool_calls(text)
+        parse_tool_calls(text, TOOLSET)

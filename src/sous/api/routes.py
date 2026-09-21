@@ -1,10 +1,10 @@
-"""The gateway's HTTP surface: Anthropic-shaped routes on the daemon's app.
+"""The endpoint's HTTP surface: Anthropic-shaped routes on the daemon's app.
 
 Never logs a request body or a header value. Never executes a tool: tool_use
-blocks go back to Claude Code, whose permission system runs them (toolexec.py
-is not in this path). Requests for any other model — and every path it has no
-route for — are forwarded to [gateway].upstream_url by gateway/upstream.py,
-byte for byte.
+blocks go back to Claude Code, whose permission mode is the boundary around
+what the local model asks for. Requests for any other model — and every path
+it has no route for — are forwarded to [server].upstream_url by
+api/upstream.py, byte for byte.
 """
 
 from __future__ import annotations
@@ -21,28 +21,28 @@ import threading
 import time
 from collections.abc import AsyncIterator
 
-from mcp.server import MCPServer
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.requests import ClientDisconnect, Request
-from starlette.responses import JSONResponse, RedirectResponse, Response
+from starlette.responses import JSONResponse, Response
+from starlette.routing import BaseRoute, Route
 
-from sous.config import SousConfig
-from sous.engine.base import Delta, EngineManager, GenerationStalled
-from sous.gateway.convert import (
+from sous.api.convert import (
     ChatRequest,
     RequestError,
     parse_count_tokens_request,
     parse_messages_request,
 )
-from sous.gateway.response import TurnAssembler, new_message_id
-from sous.gateway.turn import (
-    GatewayBusy,
+from sous.api.response import TurnAssembler, new_message_id
+from sous.api.turn import (
+    EndpointBusy,
     PromptTooLong,
     TurnAbandoned,
     TurnResult,
     TurnRunner,
 )
-from sous.gateway.upstream import SynthesizedError, Upstream
+from sous.api.upstream import SynthesizedError, Upstream
+from sous.config import SousConfig
+from sous.engine.base import Delta, EngineManager, GenerationStalled
 from sous.inflight import Inflight
 from sous.loopback import ALL_METHODS, check_loopback
 from sous.protocol import ToolSet
@@ -50,8 +50,8 @@ from sous.sse import PING as _PING
 from sous.sse import PING_INTERVAL_SECONDS
 from sous.sse import SEP as _SEP
 
-# Anthropic's own request cap. The MCP transport's 4 MiB limit wraps only the
-# /mcp handler; custom routes get nothing unless they enforce it themselves.
+# Anthropic's own request cap. Starlette enforces no request-body limit of
+# its own, so a route here gets none unless it checks this itself.
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 # A schema a real client sends nests a handful of levels. Beyond this the
 # body is hostile or broken either way, and — same reasoning as protocol.py's
@@ -62,12 +62,12 @@ MAX_REQUEST_BYTES = 32 * 1024 * 1024
 MAX_BODY_DEPTH = 128
 # The turn pool's executor queue is unbounded: without this, a burst beyond
 # _turns' worker count sits in that queue holding its parsed request while
-# GatewayBusy's timeout has not even started — an untimed wait instead of a
+# EndpointBusy's timeout has not even started — an untimed wait instead of a
 # real 529. Bounds memory held by queued/draining requests and gives Claude
 # Code's hybrid mode (a handful of subagents at once) a 529 both official
 # SDKs already retry with backoff, instead of hanging until the client gives
 # up. Counts turns running, queued on TurnRunner._lock, or draining after a
-# disconnect (see Gateway._stream) — not just requests in the executor queue.
+# disconnect (see Endpoint._stream) — not just requests in the executor queue.
 MAX_PENDING_TURNS = 8
 # Same failure mode as MAX_PENDING_TURNS, one pool over: count_tokens' executor
 # queue is unbounded too, and each queued count holds its parsed body (up to
@@ -91,15 +91,7 @@ _MODEL_SUFFIX_RE = re.compile(r"\[[^\[\]]*\]$")
 _LOG_ID_CHARS = 64
 _LOG_PATH_CHARS = 80
 
-# Where the SDK mounts the MCP transport: `streamable_http_path`, whose default
-# is "/mcp" in mcp/server/mcpserver/server.py's streamable_http_app (server.py
-# calls it without overriding). It is an exact Route, so a trailing slash never
-# matched it — Starlette's redirect_slashes used to answer /mcp/ with a 307,
-# and the catch-all below now matches it instead. See Gateway.passthrough.
-_MCP_PATH = "/mcp"
-
-
-_logger = logging.getLogger("sous.gateway")
+_logger = logging.getLogger("sous.api")
 
 
 def _log(message: str, level: int = logging.INFO) -> None:
@@ -185,7 +177,7 @@ def _classify(exc: Exception) -> tuple[int, str, str]:
     """(status, error type, message) for a failure while turning."""
     if isinstance(exc, PromptTooLong):
         return 400, "invalid_request_error", str(exc)
-    if isinstance(exc, GatewayBusy):
+    if isinstance(exc, EndpointBusy):
         return 529, "overloaded_error", str(exc)
     if isinstance(exc, GenerationStalled):
         return 500, "api_error", str(exc)
@@ -308,7 +300,7 @@ def _depth_exceeds(value: object, limit: int) -> bool:
     this would reintroduce the exact stack-size dependence the cap exists to
     remove. Kept local to routes.py rather than shared with protocol.py's
     _check_depth: two tiny iterative loops are cheaper than a cross-module
-    dependency between the gateway and the protocol parser. `value` itself is
+    dependency between the endpoint and the protocol parser. `value` itself is
     depth 1 when it is a container; a scalar never adds depth."""
     worklist: list[tuple[object, int]] = [(value, 1)]
     while worklist:
@@ -409,7 +401,7 @@ class _NullSink:
     def delta(self, delta: Delta) -> None: ...
 
 
-class Gateway:
+class Endpoint:
     def __init__(
         self,
         engines: EngineManager,
@@ -442,20 +434,20 @@ class Gateway:
         # test driving admission to zero (BoundedSemaphore(0) refuses every
         # turn outright): the pool itself still needs at least one thread.
         self._turns = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, MAX_PENDING_TURNS), thread_name_prefix="sous-gateway-turn"
+            max_workers=max(1, MAX_PENDING_TURNS), thread_name_prefix="sous-api-turn"
         )
         # count_tokens never takes TurnRunner._lock, so it must never queue
         # behind a turn parked waiting on that lock inside a saturated _turns
         # pool. A dedicated pool also keeps it off asyncio's default executor
         # — a count can load the model, seconds of work on a large prompt.
         self._counts = concurrent.futures.ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="sous-gateway-count"
+            max_workers=2, thread_name_prefix="sous-api-count"
         )
         # Read here, not at class-definition time, so tests can monkeypatch
         # the module constant before building the app.
         self._pending = threading.BoundedSemaphore(MAX_PENDING_TURNS)
         self._pending_counts = threading.BoundedSemaphore(MAX_PENDING_COUNTS)
-        self._upstream = upstream or Upstream(config.gateway_upstream_url)
+        self._upstream = upstream or Upstream(config.upstream_url)
         # The event loop holds its tasks weakly; these log a turn whose client
         # left mid-stream (_stream), and must outlive the request that made them.
         self._drains: set[asyncio.Task] = set()
@@ -479,22 +471,41 @@ class Gateway:
         self.close()
         await self._upstream.aclose()
 
+    def routes(self) -> list[BaseRoute]:
+        return [
+            Route("/v1/messages", self.messages, methods=["POST"]),
+            Route("/v1/messages/count_tokens", self.count_tokens, methods=["POST"]),
+            # 0.6 served the MCP transport here. A Claude Code still holding
+            # that `claude mcp add` entry must be told so, not have its
+            # JSON-RPC bodies forwarded to the upstream by the catch-all.
+            Route("/mcp", self.mcp_removed, methods=list(ALL_METHODS)),
+            Route("/mcp/{path:path}", self.mcp_removed, methods=list(ALL_METHODS)),
+            # Matched last: a method the two routes above do not take
+            # (GET /v1/messages) falls through to the upstream's own answer.
+            Route("/{path:path}", self.passthrough, methods=list(ALL_METHODS)),
+        ]
+
+    async def mcp_removed(self, request: Request) -> Response:
+        try:
+            check_loopback(request)
+        except RequestError as e:
+            return JSONResponse(e.body(), status_code=e.status)
+        _log("refused a request to /mcp: the MCP server went in 0.7.0 (claude mcp remove sous)")
+        e = RequestError(
+            404,
+            "not_found_error",
+            "sous no longer serves an MCP server; run `claude mcp remove sous`",
+        )
+        return JSONResponse(e.body(), status_code=e.status)
+
     async def passthrough(self, request: Request) -> Response:
-        """Everything the gateway has no route of its own for — /api/hello,
+        """Everything the endpoint has no route of its own for — /api/hello,
         /api/oauth/usage, event logging, whatever Claude Code adds next —
         streams through to the upstream untouched."""
         try:
             check_loopback(request)
         except RequestError as e:
             return JSONResponse(e.body(), status_code=e.status)
-        # /mcp/ is the MCP transport's path, not the upstream's: forwarding it
-        # would put an MCP client's JSON-RPC body on the wire to Anthropic.
-        # Give back exactly what Starlette's redirect_slashes gave before this
-        # catch-all shadowed it — a 307, which preserves the method and body.
-        path = request.url.path
-        if path != _MCP_PATH and path.rstrip("/") == _MCP_PATH:
-            query = request.url.query
-            return RedirectResponse(f"{_MCP_PATH}?{query}" if query else _MCP_PATH, status_code=307)
         return await self._forward(request, None, "-")
 
     def _route(self, raw: bytes) -> tuple[object | None, str]:
@@ -512,7 +523,7 @@ class Gateway:
             return None, "-"
         # Exact first, then suffix-stripped: a configured id may itself end in
         # brackets, and stripping alone would make it permanently unroutable.
-        local = self._config.gateway_local_models
+        local = self._config.local_models
         if model in local or _MODEL_SUFFIX_RE.sub("", model, count=1) in local:
             return body, model
         return None, _log_token(model, _LOG_ID_CHARS)
@@ -898,38 +909,27 @@ class Gateway:
         _log(_turn_line(summary))
 
 
-def mount_gateway(
-    mcp: MCPServer,
+def mount_endpoint(
     engines: EngineManager,
     config: SousConfig,
     *,
     upstream: Upstream | None = None,
     inflight: Inflight | None = None,
-) -> Gateway:
-    """Register the Anthropic-compatible routes on the daemon's Starlette app.
-    custom_route adds bare routes: no auth (loopback only, like /mcp), no
-    body limit (enforced above), no DNS-rebinding check (the /mcp transport's
-    settings do not reach here)."""
+) -> Endpoint:
+    """Build the Endpoint that serves the Anthropic-compatible routes, after
+    pinning the loggers that would otherwise leak a request or response
+    body. Call `.routes()` on the result to mount it on the app."""
     # sse-starlette logs every frame it sends at DEBUG — the model's reply,
     # verbatim. The daemon runs at INFO, but the no-bodies-in-logs rule must not
     # depend on that: pin the library's logger above DEBUG where the frames are
-    # made. Here rather than at import, because server.py imports this module
-    # unconditionally and a disabled gateway must not reconfigure a logger.
+    # made. Here rather than at import: importing this module (the CLI, a
+    # test) must not reconfigure a logger; building the endpoint may.
     logging.getLogger("sse_starlette").setLevel(logging.INFO)
     # Same rule, one layer down: httpx logs "HTTP Request: <method> <full URL>"
     # at INFO — the upstream URL including its query string — and httpcore
     # logs response header values verbatim at DEBUG. Neither is hypothetical
-    # at INFO: MCPServer.__init__ calls the SDK's configure_logging("INFO"),
-    # which basicConfig's a stderr handler onto the root logger, so both reach
-    # the daemon log unless pinned above where they say those things.
+    # at INFO: configure_daemon_logging() sets the root level to INFO, so both
+    # reach the daemon log unless pinned above where they say those things.
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    gateway = Gateway(engines, config, upstream, inflight)
-    mcp.custom_route("/v1/messages", methods=["POST"])(gateway.messages)
-    mcp.custom_route("/v1/messages/count_tokens", methods=["POST"])(gateway.count_tokens)
-    # Registered last and matched last: the SDK appends custom routes after
-    # its /mcp mount, so this can never shadow the MCP transport — and a
-    # method the two routes above do not take (GET /v1/messages) falls
-    # through to here and gets the upstream's own answer for it.
-    mcp.custom_route("/{path:path}", methods=list(ALL_METHODS))(gateway.passthrough)
-    return gateway
+    return Endpoint(engines, config, upstream, inflight)

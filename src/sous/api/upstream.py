@@ -1,4 +1,4 @@
-"""Forwarding of everything the gateway does not serve itself.
+"""Forwarding of everything the endpoint does not serve itself.
 
 A transparent HTTP/1.1 proxy to one fixed origin: the bytes the client sent
 are the bytes the upstream gets, end-to-end headers travel unmodified (in
@@ -42,7 +42,7 @@ _HOP_BY_HOP = frozenset(
 # upstream's copies would send both.
 _SERVER_OWNED = frozenset({b"date", b"server"})
 # RFC 9110 §7.6.3. On every response this module produces — relayed or its
-# own error — so a client (the `sous claude` launcher) can tell "the gateway
+# own error — so a client (the `sous claude` launcher) can tell "the endpoint
 # forwarded this" from "the daemon has no such route". Never added to a
 # request: nothing that could make the upstream treat a proxied request
 # differently goes up.
@@ -107,7 +107,7 @@ def _target_path(request: Request) -> bytes:
 class SynthesizedError(JSONResponse):
     """An Anthropic-shaped error the forwarder made itself (unreachable
     upstream, timeout, client gone) — as opposed to a status the upstream
-    answered, which is forwarded verbatim. The gateway's log line tells the
+    answered, which is forwarded verbatim. The endpoint's log line tells the
     two apart by this class (isinstance, not an attribute check), never by
     the number: a 502 can be either."""
 

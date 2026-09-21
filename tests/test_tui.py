@@ -30,7 +30,6 @@ def _doc(
     loaded=True,
     loading=False,
     recent=None,
-    tasks=None,
     behind=(),
     idle_seconds=252.0,
 ):
@@ -55,14 +54,12 @@ def _doc(
             },
         },
         "inflight": ([turn] if turn else []) + list(behind),
-        "queue": {"queued": 2, "running": 1},
         "config": {
             "model_id": "mlx-community/Qwen3.8-27B-4bit",
             "idle_unload_minutes": 30,
-            "gateway": {"enabled": True, "max_context_tokens": 262144},
+            "max_context_tokens": 262144,
         },
         "recent_turns": recent or [],
-        "recent_tasks": tasks or [],
     }
 
 
@@ -132,20 +129,6 @@ RECENT = [
     _summary(4, error="overloaded_error", status=529),
     _summary(5, error="abandoned", status=499),
 ]
-TASKS = [
-    {
-        "id": "a",
-        "state": "running",
-        "title": "rename Delta callback across engine tests",
-        "seconds": 41,
-    },
-    {
-        "id": "b",
-        "state": "done",
-        "title": "add a regression test for the pressure valve",
-        "seconds": 72,
-    },
-]
 
 
 # --- words, strings and fractions -----------------------------------------------------
@@ -153,7 +136,6 @@ TASKS = [
 
 def test_clock_span_and_number_text():
     assert tui.clock_text(41.34) == "00:41" and tui.clock_text(41.3, tenths=True) == "00:41.3"
-    assert tui.task_time(794) == "13:14" and tui.task_time(3725) == "62:05"
     assert tui.clock_text(-3) == "00:00" and tui.clock_text(3725) == "62:05"
     assert tui.span_text(252) == "4m 12s" and tui.span_text(48) == "48s"
     assert tui.span_text(3 * 3600 + 5 * 60) == "3h 05m"
@@ -428,7 +410,7 @@ def test_the_slip_shows_the_turn_from_the_document():
             started_at=BASE - 7,
             input_tokens=8912,
         )
-        await _deliver(feed, pilot, _doc(_turn(), recent=RECENT, tasks=TASKS, behind=[behind]))
+        await _deliver(feed, pilot, _doc(_turn(), recent=RECENT, behind=[behind]))
         slip = app.query_one(tui.Slip)
         assert slip.display and slip.border_title == "ORDER № msg_f4cfe7"
         assert slip.has_class("phase-decode") and slip.border_subtitle == "tear here"
@@ -451,22 +433,12 @@ def test_the_slip_shows_the_turn_from_the_document():
         assert line.startswith("  LINE IS OPEN  loaded") and "hold 1" in line
         assert "REHEAT  41 hit    DRAWER 18 fork" in _plain(app, "#line-body")
         body = _plain(app, "#line-body")
-        assert " TASKS  ON RAIL 2 · COOKING 1" in body
         assert " ORDERS ORDER UP 3 · DROPPED IT 1" in body
         assert "        WALKED OUT 1" in body
         assert app.query_one("#line-chef", tui.Chef).mood == "decode"
         assert "HI-SCORE 10.5 tok/s" in app.query_one(tui.Strip).render().plain
         assert app.query_one(tui.Rail).row_count == 5
-        assert _plain(app, "#tasks").startswith(" TASK  COOKING 0:41  rename Delta callback")
         assert _plain(app, "#footer") == tui.KEYS
-        long_job = {
-            "id": "c",
-            "state": "running",
-            "title": "the whole test suite",
-            "seconds": 794,
-        }
-        await _deliver(feed, pilot, _doc(_turn(), tasks=[long_job]))
-        assert _plain(app, "#tasks").startswith(" TASK  COOKING 13:14  the whole test suite")
         # Two-digit tallies (a plausible count on the book's 50-turn ring)
         # must still fit THE LINE's body at 100 columns without wrapping.
         big_recent = (
@@ -836,7 +808,7 @@ def test_a_dropped_feed_redials_and_a_daemon_that_never_answered_exits_one(monke
 def test_resize_reflows_to_every_breakpoint():
     async def test(app, pilot, feed, clock):
         behind = _turn(id="msg_64f2b36f3e4a528198cee4ea", phase="queued", started_at=BASE - 7)
-        await _deliver(feed, pilot, _doc(_turn(), recent=RECENT, tasks=TASKS, behind=[behind]))
+        await _deliver(feed, pilot, _doc(_turn(), recent=RECENT, behind=[behind]))
         rail = app.query_one(tui.Rail)
         assert tuple(rail._widths) == tui.RAIL_COLUMNS and rail._widths["why"] == 29
         # A why longer than its column is cut with an ellipsis: `529
@@ -847,7 +819,7 @@ def test_resize_reflows_to_every_breakpoint():
         assert app.screen.has_class("compact")
         assert not app.query_one("#line-body").display and not app.query_one("#order").display
         assert app.query_one(tui.Stub).size.height == 1
-        assert app.query_one("#tasks").display and app.query_one(tui.Rail).size.height == 4
+        assert app.query_one(tui.Rail).size.height == 5
         assert tuple(rail._widths) == tui.RAIL_COLUMNS_COMPACT
         assert _plain(app, "#legend") == tui.LEGEND_STRIP_COMPACT
         assert _plain(app, "#footer") == tui.KEYS_COMPACT
@@ -1235,7 +1207,6 @@ def test_the_pass_renders_as_committed(monkeypatch, request):
             _doc(
                 _turn(),
                 recent=snapshot_recent,
-                tasks=TASKS,
                 behind=[behind],
                 idle_seconds=6.0,
             ),

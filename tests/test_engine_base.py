@@ -70,7 +70,7 @@ def test_no_unload_when_fresh():
 
 
 def test_a_lease_holds_off_the_idle_unload():
-    """A gateway turn holds the engine across count_tokens and generate, and
+    """An endpoint turn holds the engine across count_tokens and generate, and
     only the latter takes _gen_lock. Without a lease the unload sweep would
     free the weights under the tokenizer pass."""
     mgr, created = _manager(idle_minutes=0)
@@ -137,7 +137,7 @@ def test_get_logs_no_positions_for_an_engine_without_them(caplog):
 
 def test_get_loads_on_a_thread_of_its_own_that_releases_its_mlx_state(monkeypatch):
     """The caller's thread never touches mlx: the factory runs on a loader
-    thread that releases its streams before it exits. A gateway pool thread
+    thread that releases its streams before it exits. An endpoint pool thread
     outlives its turn and releases unconditionally, and a load on it left it
     unable to touch mlx again — every cold start after the first on that
     thread failed."""
@@ -161,7 +161,7 @@ def test_get_loads_on_a_thread_of_its_own_that_releases_its_mlx_state(monkeypatc
 
 
 def test_a_thread_that_released_between_two_cold_loads_can_load_again():
-    """The gateway pool thread's life, on real mlx: load, release, idle
+    """The endpoint pool thread's life, on real mlx: load, release, idle
     unload, load again. Before the load had a thread of its own the second
     load raised "There is no Stream(gpu, 0) in current thread"."""
     mx = pytest.importorskip("mlx.core")
@@ -185,7 +185,7 @@ def test_a_thread_that_released_between_two_cold_loads_can_load_again():
         except Exception as exc:  # noqa: BLE001 — the failure is the assertion
             outcome.append(exc)
 
-    thread = threading.Thread(target=pool_thread, name="sous-gateway-turn_0")
+    thread = threading.Thread(target=pool_thread, name="sous-api-turn_0")
     thread.start()
     thread.join(10)
     assert outcome == ["ok"]
@@ -317,9 +317,9 @@ def test_a_failed_load_releases_the_threads_waiting_on_it():
 
 
 def test_unload_if_idle_is_refused_at_once_during_a_load():
-    """Refused, and refused without waiting: the sweep runs on the worker's
-    thread every poll, and parking it behind a load for minutes is the
-    stall the lock change removes."""
+    """Refused, and refused without waiting: the sweep ticks on its own
+    thread, and parking it behind a load for minutes is the stall the lock
+    change removes."""
     mgr, factory = _gated_manager(idle_minutes=0)
     loader = threading.Thread(target=mgr.get, daemon=True)
     loader.start()
@@ -496,7 +496,7 @@ def test_hold_starts_exactly_one_preload_whose_load_releases_its_mlx_state(monke
 
 
 def test_a_hold_during_another_threads_load_starts_no_preload():
-    """The worker or a gateway turn may already be loading; a hold then only
+    """An endpoint turn may already be loading; a hold then only
     registers itself and reports the load in progress."""
     mgr, factory = _gated_manager()
     loader = threading.Thread(target=mgr.get, daemon=True)
@@ -1116,7 +1116,7 @@ def test_default_factory_passes_int8_prefill_to_both_engines(monkeypatch):
     monkeypatch.setattr(vlm, "VLMEngine", RecordingVLM)
     monkeypatch.setattr(lm, "LMEngine", RecordingLM)
     monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"vision_config": {}})
-    monkeypatch.setattr("sous.context.kv_bytes_per_token", lambda cfg: 1024)
+    monkeypatch.setattr("sous.engine.window.kv_bytes_per_token", lambda cfg: 1024)
     base._default_factory("m", 0.7, 0.8, 20, True, cache_budget=0, int8_prefill=True)
     assert seen["vlm"]["int8_prefill"] is True
     monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"model_type": "qwen3_5"})
@@ -1234,7 +1234,7 @@ def test_lm_engine_enables_int8_prefill_on_the_loaded_model(monkeypatch):
     assert engine.int8_prefill_status["state"] == "unavailable"
 
 
-# ---- streaming deltas (gateway) ---------------------------------------------
+# ---- streaming deltas (endpoint) ---------------------------------------------
 
 
 def test_session_relays_deltas_on_the_session_thread():
@@ -1325,7 +1325,7 @@ def _hammer_ids(engine, tokenizer: _RecordingTokenizer) -> None:
 
 
 def test_lm_tokenization_is_serialized(monkeypatch):
-    """ManagedEngine.count_tokens deliberately skips _gen_lock, and the gateway
+    """ManagedEngine.count_tokens deliberately skips _gen_lock, and the endpoint
     made that a second caller: a turn tokenizes on a pool thread while Claude
     Code's count_tokens arrives mid-turn. HF's fast tokenizer mutates shared
     Rust state on every encode, so the two must not overlap."""
@@ -1338,7 +1338,7 @@ def test_lm_tokenization_is_serialized(monkeypatch):
 
 
 def test_vlm_tokenization_is_serialized(monkeypatch):
-    """Same contract on the backend the gateway actually runs."""
+    """Same contract on the backend the endpoint actually runs."""
     from sous.engine.vlm import VLMEngine
 
     tokenizer = _RecordingTokenizer()
@@ -1373,8 +1373,7 @@ def test_status_leaves_out_the_per_turn_gauges(tmp_path):
 
 
 def test_default_factory_threads_the_cache_budget_and_reserve(monkeypatch):
-    """The reserve is one full window of KV at the model's per-token cost, for
-    the larger of the worker's and the gateway's windows."""
+    """The reserve is one full window of KV at the model's per-token cost."""
     from sous.engine import base, lm
 
     seen = {}
@@ -1446,7 +1445,7 @@ def test_measure_cache_budget_reads_mlxs_numbers(monkeypatch):
 
 @pytest.mark.parametrize("info", [{}, "raise"])
 def test_measure_cache_budget_degrades_to_a_single_slot_when_mlx_cannot_answer(monkeypatch, info):
-    """An mlx API change must not brick delegation and the gateway: every other
+    """An mlx API change must not brick the endpoint: every other
     reader of these numbers degrades, and so does this one."""
     from sous.engine import base
 
@@ -1472,7 +1471,7 @@ def _fake_mlx(monkeypatch, *, info) -> None:
     monkeypatch.setitem(sys.modules, "mlx.core", core)
 
 
-def test_engine_manager_passes_the_configured_budget_and_the_larger_window(tmp_path, monkeypatch):
+def test_engine_manager_passes_the_configured_budget_and_window(tmp_path, monkeypatch):
     from sous.engine import base
 
     seen = {}
@@ -1482,20 +1481,14 @@ def test_engine_manager_passes_the_configured_budget_and_the_larger_window(tmp_p
         return FakeEngine([])
 
     monkeypatch.setattr(base, "_default_factory", factory)
-    cfg = _cfg(
-        tmp_path,
-        prompt_cache_gb=1.5,
-        max_context_tokens=32768,
-        gateway_enabled=True,
-        gateway_max_context_tokens=131072,
-    )
+    cfg = _cfg(tmp_path, prompt_cache_gb=1.5, max_context_tokens=131072)
     EngineManager(cfg).get()
     assert seen["cache_budget"] == int(1.5 * (1 << 30))
     assert seen["reserve_tokens"] == 131072
     seen.clear()
-    EngineManager(_cfg(tmp_path, gateway_enabled=False, max_context_tokens=32768)).get()
+    EngineManager(_cfg(tmp_path, max_context_tokens=65536)).get()
     assert seen["cache_budget"] is None  # auto
-    assert seen["reserve_tokens"] == 32768
+    assert seen["reserve_tokens"] == 65536
 
 
 def test_kernel_memory_pressure_reads_the_kernels_level_or_none():
@@ -1536,9 +1529,9 @@ def test_a_zombie_holder_counts_as_gone():
 
 
 def test_status_and_hold_never_report_a_session_that_has_ended():
-    """Only the idle sweep pruned, and the worker sweeps only between tasks:
-    for a whole delegated task /sous/status counted sessions that had ended,
-    and a new hold's reply counted them too."""
+    """Only the idle sweep pruned, and it ticks every few seconds: between
+    ticks /sous/status counted sessions that had ended, and a new hold's
+    reply counted them too."""
     mgr, created, live, clock = _held_manager()
     live.live.add((11, 1.0))
     mgr.hold(11, 1.0)
@@ -1768,9 +1761,7 @@ def test_default_engine_factory_maps_every_model_value_onto_the_backend(monkeypa
         speculative_draft_id="z/d",
         speculative_block_size=2,
         prompt_cache_gb=1.5,
-        max_context_tokens=4096,
-        gateway_enabled=True,
-        gateway_max_context_tokens=65536,
+        max_context_tokens=65536,
         int8_prefill=True,
     )
     base.default_engine_factory(cfg)("org/m")
@@ -1795,3 +1786,126 @@ def test_engine_manager_without_a_factory_uses_the_default_one(monkeypatch, tmp_
     cfg = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", model_id="org/m")
     base.EngineManager(cfg)._factory("org/m")
     assert calls == [("org/m", "org/m")]
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
+def test_the_idle_sweep_unloads_an_idle_model_on_its_own_thread():
+    mgr, created, live, clock = _held_manager(idle_minutes=1)
+    mgr.get()
+    assert mgr.status()["loaded"]
+    clock.now += 61
+    mgr.start_idle_sweep(interval_s=0.01)
+    try:
+        assert _wait_until(lambda: not mgr.status()["loaded"])
+        assert any(t.name == "sous-idle-sweep" for t in threading.enumerate())
+    finally:
+        mgr.stop_idle_sweep()
+    assert not any(t.name == "sous-idle-sweep" for t in threading.enumerate())
+
+
+def test_the_idle_sweep_keeps_a_fresh_model_and_starts_once():
+    mgr, created, live, clock = _held_manager(idle_minutes=30)
+    mgr.get()
+    mgr.start_idle_sweep(interval_s=0.01)
+    mgr.start_idle_sweep(interval_s=0.01)
+    try:
+        time.sleep(0.05)
+        assert mgr.status()["loaded"]
+        assert sum(t.name == "sous-idle-sweep" for t in threading.enumerate()) == 1
+    finally:
+        mgr.stop_idle_sweep()
+    mgr.stop_idle_sweep()  # idempotent when nothing runs
+
+
+def test_the_idle_sweep_releases_its_mlx_state_once_on_exit(monkeypatch):
+    import sous.engine.base as base
+
+    released: list[str] = []
+    monkeypatch.setattr(base, "release_mlx_thread_state", lambda: released.append("x"))
+    mgr, created, live, clock = _held_manager(idle_minutes=30)
+    mgr.start_idle_sweep(interval_s=0.01)
+    time.sleep(0.03)
+    mgr.stop_idle_sweep()
+    assert released == ["x"]
+
+
+def test_the_idle_sweep_releases_after_the_unload_on_its_own_thread(monkeypatch):
+    """The release is only worth anything after the thread has freed mlx
+    arrays: one ordered, thread-tagged record of the unload and the release."""
+    import sous.engine.base as base
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        base,
+        "release_mlx_thread_state",
+        lambda: events.append("release:" + threading.current_thread().name),
+    )
+    mgr, created, live, clock = _held_manager(idle_minutes=1)
+    mgr.get()
+    events.clear()  # the load thread's own release
+    engine = created[0]
+    real_unload = engine.unload
+
+    def unload() -> None:
+        events.append("unload:" + threading.current_thread().name)
+        real_unload()
+
+    engine.unload = unload
+    clock.now += 61
+    mgr.start_idle_sweep(interval_s=0.01)
+    try:
+        assert _wait_until(lambda: not mgr.status()["loaded"])
+    finally:
+        mgr.stop_idle_sweep()
+    assert events == ["unload:sous-idle-sweep", "release:sous-idle-sweep"]
+
+
+def test_a_refused_sweep_thread_is_forgotten_so_the_next_start_runs(monkeypatch):
+    real_start = threading.Thread.start
+    refused: list[str] = []
+
+    def start(self: threading.Thread) -> None:
+        if self.name == "sous-idle-sweep" and not refused:
+            refused.append(self.name)
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    mgr, created, live, clock = _held_manager(idle_minutes=30)
+    mgr.start_idle_sweep(interval_s=0.01)
+    assert refused
+    assert not any(t.name == "sous-idle-sweep" for t in threading.enumerate())
+    mgr.stop_idle_sweep()  # nothing to join, nothing raised
+    mgr.start_idle_sweep(interval_s=0.01)
+    try:
+        assert sum(t.name == "sous-idle-sweep" for t in threading.enumerate()) == 1
+    finally:
+        mgr.stop_idle_sweep()
+
+
+def test_a_stop_that_outlasts_its_bound_keeps_the_sweep_on_the_books():
+    """A sweep caught mid-unload past the join bound is still the sweep: a
+    start meanwhile must not put a second one beside it."""
+    slow = _SlowUnloadEngine()
+    mgr, created, live, clock = _held_manager(idle_minutes=1, factory=lambda _mid: slow)
+    mgr.get()
+    clock.now += 61
+    mgr.start_idle_sweep(interval_s=0.01)
+    try:
+        assert slow.unloading.wait(2)
+        mgr.stop_idle_sweep(timeout=0.05)
+        assert sum(t.name == "sous-idle-sweep" for t in threading.enumerate()) == 1
+        mgr.start_idle_sweep(interval_s=0.01)
+        assert sum(t.name == "sous-idle-sweep" for t in threading.enumerate()) == 1
+    finally:
+        slow.release.set()
+        mgr.stop_idle_sweep()
+    assert not any(t.name == "sous-idle-sweep" for t in threading.enumerate())

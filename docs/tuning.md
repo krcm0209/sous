@@ -11,7 +11,7 @@ A task is a directory under `src/sous/tune/suite/tasks/<name>/`:
 ```
 task.toml     title, category, instructions, context_files, verify_commands,
               max_turns (default 16), max_minutes (default 10)
-project/      the fixture the worker sees, copied to a scratch root per run
+project/      the fixture the candidate sees, copied to a scratch root per run
 grade/        hidden: test_*.py unittest modules, or a grade.py
 solution/     the complete solved project, used only by CI to prove the grader
 ```
@@ -28,17 +28,18 @@ Rules the loader and CI enforce (`tests/test_tune_suite.py`):
   migrated file — and put the "nothing else changed" assertions inside those
   same tests rather than in tests of their own.
 - Standard library only, in the fixture, the grader and the solution: an end
-  user's machine has nothing else, and the worker's allowlist is the shipped
-  one plus `python -m unittest`.
-- A task must never require deleting, moving or renaming a file: the worker's tools
-  read, write and edit files and run allowlisted commands, and neither `rm` nor `mv`
-  is allowlisted. Ask for a rewrite, or say "leave the old file in place".
-- Allowlisting `python -m unittest` runs the worker's own code on your
-  machine, like every other test runner in the shipped allowlist; the
-  sandbox confines the worker's file tools, not what its tests execute.
-- Hidden `test_*.py` modules run in a subprocess with the worker's project as
+  user's machine has nothing else, and the suite loop runs only a task's
+  verify commands and the test runners (`python -m unittest`,
+  `python -m pytest`, their `python3` spellings and bare `pytest`).
+- A task must never require deleting, moving or renaming a file: the suite's tools
+  read, write and edit files and run those commands; there is no `rm` or `mv`.
+  Ask for a rewrite, or say "leave the old file in place".
+- Running `python -m unittest` executes the candidate's own code on your
+  machine, like every test runner would; the suite's tools confine file edits
+  to the scratch copy, not what its tests execute.
+- Hidden `test_*.py` modules run in a subprocess with the candidate's project as
   the working directory (`python -m sous.tune.suite.unittests grade/`), so they
-  import the worker's modules by bare name; import inside the test methods so
+  import the candidate's modules by bare name; import inside the test methods so
   a missing module fails that test rather than the whole module.
 - A `grade.py` defines `grade(project: Path, tests) -> tuple[float, str]`,
   where `tests(cwd, tests_dir=None)` runs unittest modules (`tests_dir`

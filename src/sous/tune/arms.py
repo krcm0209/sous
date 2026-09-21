@@ -1,12 +1,12 @@
 """One arm is one configuration the bench measures: a model, a drafter or
-none, a block size, and the windows it fits at."""
+none, a block size, and the window it fits at."""
 
 from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
 
-from sous.config import GATEWAY_MIN_CONTEXT_TOKENS, SousConfig
+from sous.config import MIN_CONTEXT_TOKENS, SousConfig
 from sous.tune.candidates import Candidate, Checkpoint, Fit, drafter_compatible, fit
 
 # The verify depths worth measuring: 2 and 3 pay on this family's GQA ratio,
@@ -25,14 +25,12 @@ class Arm:
     # lowered for its heaviest drafter, so no block size is measured at a
     # window another block size could not run at.
     window: int
-    gateway_window: int | None
     tier: str
     current: bool
     # The window this arm alone fits at — its own drafter or none — which is
     # what a proposal writes: the drafterless arm must not carry the
     # reservation made for a drafter its configuration never loads.
     fit_window: int | None = None
-    fit_gateway_window: int | None = None
     # The quality-affecting dimensions the winner stage measures, mirrored
     # from `config` so a row can be keyed without reading the config back.
     int8_prefill: bool = False
@@ -58,13 +56,6 @@ class Arm:
         """What identifies an arm across suite runs and a resume: the bench
         key plus the two settings only the suite may change."""
         return (*self.key, self.int8_prefill, self.greedy)
-
-    @property
-    def serving_window(self) -> int:
-        """The longest context the daemon would serve with this configuration
-        — what the engine reserves KV for, and what a long-context
-        measurement must fit in."""
-        return max(self.window, self.gateway_window or 0)
 
 
 @dataclass(frozen=True)
@@ -112,7 +103,6 @@ def _arm(
     drafter_id: str,
     block: int,
     f: Fit,
-    gateway_window: int | None,
     own: Fit,
     *,
     current: bool | None = None,
@@ -123,9 +113,6 @@ def _arm(
         speculative_draft_id=drafter_id,
         speculative_block_size=block if drafter_id else user.speculative_block_size,
         max_context_tokens=min(user.max_context_tokens, f.window),
-        gateway_max_context_tokens=(
-            gateway_window if gateway_window is not None else user.gateway_max_context_tokens
-        ),
     )
     if current is None:
         current = (
@@ -140,13 +127,9 @@ def _arm(
         drafter_id=drafter_id,
         block_size=block if drafter_id else 0,
         window=min(user.max_context_tokens, f.window),
-        gateway_window=gateway_window,
         tier=cand.tier,
         current=current,
         fit_window=min(user.max_context_tokens, own.window),
-        fit_gateway_window=(
-            min(user.gateway_max_context_tokens, own.window) if user.gateway_enabled else None
-        ),
         int8_prefill=user.int8_prefill,
         greedy=user.temperature == 0,
     )
@@ -163,11 +146,8 @@ def quick_arms(
     configuration among them. All arms of a model share one window: the one
     the fit yields with the model's heaviest drafter, so a block size is never
     measured at a window another block size could not run at."""
-    window = max(
-        user.max_context_tokens,
-        user.gateway_max_context_tokens if user.gateway_enabled else 0,
-    )
-    floor = GATEWAY_MIN_CONTEXT_TOKENS if user.gateway_enabled else user.context_min_tokens
+    window = user.max_context_tokens
+    floor = MIN_CONTEXT_TOKENS
     arms: list[Arm] = []
     refusals: list[Refusal] = []
     for cand in _with_current(user, candidates):
@@ -207,9 +187,6 @@ def quick_arms(
         if not f.fits:
             refusals.append(Refusal(cand.id, "", f.detail))
             continue
-        gateway_window = None
-        if user.gateway_enabled:
-            gateway_window = min(user.gateway_max_context_tokens, f.window)
         own = fit(target, None, window=window, floor=floor, working_set_bytes=working_set_bytes)
         arms.append(
             _arm(
@@ -218,7 +195,6 @@ def quick_arms(
                 "",
                 0,
                 f,
-                gateway_window,
                 own,
                 current=True if users_drafter_unusable else None,
             )
@@ -238,7 +214,7 @@ def quick_arms(
                 else BLOCK_SIZES
             )
             for block in blocks:
-                arms.append(_arm(user, cand, drafter.id, block, f, gateway_window, own))
+                arms.append(_arm(user, cand, drafter.id, block, f, own))
     return arms, refusals
 
 

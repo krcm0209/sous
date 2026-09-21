@@ -54,7 +54,7 @@ class LMEngine:
         return self._model, self._tokenizer
 
     def _prompt(self, messages: list[dict], tools: list[dict], generation: bool = True) -> str:
-        # enable_thinking=False: sous delegates mechanical prep, not reasoning —
+        # enable_thinking=False: sous serves mechanical prep, not reasoning —
         # a "thinking" model must not spend its turn budget on <think> chain-of-
         # thought instead of emitting the tool call. Inert on templates that
         # don't define the variable (e.g. plain non-thinking models).
@@ -90,8 +90,8 @@ class LMEngine:
         (promptcache.probe_boundaries), which builds their texts rather than
         rendering a message list."""
         # One lock for every tokenization: HF's fast tokenizer mutates shared
-        # Rust state on each encode (set_truncation_and_padding), and since the
-        # gateway there are two callers — a turn on a pool thread and Claude
+        # Rust state on each encode (set_truncation_and_padding), and there are
+        # two callers — a turn on a pool thread and Claude
         # Code's count_tokens, which it sends mid-turn. Not _gen_lock: that
         # would queue a token count behind a whole generation.
         with self._tokenize_lock:
@@ -208,10 +208,9 @@ class LMEngine:
         a subagent type's tool array is byte-identical across sessions and
         projects, so a new `claude` process's first subagent turn starts
         ~45–56K tokens warm instead of prefilling ~57K cold. The header fork
-        serves the same session's next subagent of that type, ~57K warm. The
-        worker's short system prompt never clears the floor, and a render
-        below it cannot contain a boundary above it — so it never pays the
-        probe."""
+        serves the same session's next subagent of that type, ~57K warm. A
+        short system prompt never clears the floor, and a render below it
+        cannot contain a boundary above it — so it never pays the probe."""
         if (
             len(messages) < 2
             or messages[0].get("role") != "system"

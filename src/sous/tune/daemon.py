@@ -52,18 +52,9 @@ def ready_for_tune(
     engine = doc.get("engine") or {}
     if engine.get("holders"):
         return Readiness(False, "a sous claude session holds the model; finish it first")
-    queue = doc.get("queue") or {}
-    running = queue.get("running") or 0
-    # A queued task is claimed on the worker's next poll and loads the model
-    # at once: as much a use of the machine as a running one.
-    queued = queue.get("queued") or 0
     inflight = len(doc.get("inflight") or [])
-    if running or queued or inflight:
-        return Readiness(
-            False,
-            f"the daemon is busy: {running} task(s) running, {queued} queued, "
-            f"{inflight} turn(s) in flight",
-        )
+    if inflight:
+        return Readiness(False, f"the daemon is busy: {inflight} turn(s) in flight")
     if engine.get("loading"):
         # unload_now() would refuse this itself; asking first saves the POST
         # and names the wait.

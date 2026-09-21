@@ -166,6 +166,30 @@ def test_a_hung_test_is_a_timeout_not_a_hang(tmp_path):
     assert "timed out" in detail
 
 
+def test_a_test_that_reads_stdin_gets_eof_not_the_operators_terminal(tmp_path):
+    proj = _project(tmp_path)
+    hidden = _hidden(
+        tmp_path,
+        "import unittest\n\n\nclass T(unittest.TestCase):\n"
+        "    def test_read(self):\n        input()\n",
+    )
+    passed, total, detail = run_tests(proj, hidden, python=Path(sys.executable), timeout=10)
+    assert (passed, total) == (0, 1)
+    assert "test_read" in detail
+
+
+def test_a_test_that_floods_stdout_is_stopped_not_held_in_memory(tmp_path):
+    proj = _project(tmp_path)
+    hidden = _hidden(
+        tmp_path,
+        "import unittest\n\n\nclass T(unittest.TestCase):\n"
+        "    def test_flood(self):\n        while True:\n            print('x' * 4096)\n",
+    )
+    passed, total, detail = run_tests(proj, hidden, python=Path(sys.executable), timeout=30)
+    assert (passed, total) == (0, 0)
+    assert "stopped" in detail and "bytes of output" in detail
+
+
 def _suite_task(tmp_path, grade_py=None):
     d = tmp_path / "task_calc"
     d.mkdir()

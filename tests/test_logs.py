@@ -1,6 +1,6 @@
 """The daemon's one line shape: `<iso-utc-ms>Z LEVEL name: message`, on a
 handler that follows sys.stderr so pytest's capture sees it, installed
-idempotently over whatever the MCP SDK put on the root logger."""
+idempotently over whatever a library put on the root logger."""
 
 import io
 import logging
@@ -26,8 +26,8 @@ LINE = re.compile(
 
 
 class RichHandler(logging.Handler):
-    """Stands in for rich.logging.RichHandler: the installer matches the SDK's
-    handler by class name, and rich is only a transitive dependency here."""
+    """Stands in for rich.logging.RichHandler: the installer matches a stray
+    one by class name, and rich is only a transitive dependency here."""
 
     def emit(self, record: logging.LogRecord) -> None:
         pass

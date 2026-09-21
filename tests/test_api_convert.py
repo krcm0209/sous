@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from sous.gateway.convert import (
+from sous.api.convert import (
     ChatRequest,
     RequestError,
     chat_messages,
