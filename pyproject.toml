@@ -62,6 +62,9 @@ dependencies = [
     # majors, and the render snapshot in tests/snapshots pins one rendering.
     "textual>=8.2,<9",
     "tomlkit>=0.13",
+    # server._drop_tqdm_process_lock imports tqdm.std directly and relies on
+    # its mp_lock switch. The floor is mlx-vlm's own, so it constrains nothing.
+    "tqdm>=4.66.2",
     "uvicorn>=0.31",
 ]
 
