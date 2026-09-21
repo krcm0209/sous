@@ -553,7 +553,7 @@ wheels = [
 
 [[package]]
 name = "mlx-vlm"
-version = "0.7.0"
+version = "0.7.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fastapi" },
@@ -574,9 +574,9 @@ dependencies = [
     { name = "uvicorn" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1e/9e/220a9427b1cf6f4ee381aa475fc47ecbe6d84f4177f0ac28176c3435fbdd/mlx_vlm-0.7.0.tar.gz", hash = "sha256:0bfc3ae1f82cb0a7866bf9f1257d672f6450c5fbd13f22b2d62fddb72b759379", size = 2208403, upload-time = "2026-09-07T15:25:14.497Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/57/62/7fb872fd4c4cb2b8069afde85f08590098d0689efc588eab01bedb2d741b/mlx_vlm-0.7.1.tar.gz", hash = "sha256:b8abd3cc7e3513d9915bf9f6903833c697dc4c3084c2acdc880029c33e331a03", size = 2326562, upload-time = "2026-09-14T18:09:51.229Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/65/2c/3868b7ccb50c3cb975e7387de0b1e642b8896f2504a80d097f109d694eb4/mlx_vlm-0.7.0-py3-none-any.whl", hash = "sha256:5ea0c2b8182c055068cb0da59cb2503c238c428a07daaa0bebc246e8c666f4d3", size = 2787810, upload-time = "2026-09-07T15:25:12.683Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/fc/7fbd894db247582bfa16df9b0b7514a47e9c3971836fc8d3fbd9f6efdbe8/mlx_vlm-0.7.1-py3-none-any.whl", hash = "sha256:d9696bc3a2e961f43b5948a101dc0c966b5989d382e6910c37e2f3d555bc3408", size = 2924465, upload-time = "2026-09-14T18:09:49.737Z" },
 ]
 
 [[package]]
