@@ -788,8 +788,11 @@ class EngineManager:
         self._bump()
         return engine
 
-    def _free(self, engine: ManagedEngine) -> None:
-        """Outside the lock — the weights come off the GPU over seconds."""
+    def _free(self, engine: ManagedEngine, reason: str) -> None:
+        """Outside the lock — the weights come off the GPU over seconds. The
+        line is the unload's only trace besides the status document, and the
+        sweep's is the one nobody asked for."""
+        started = time.monotonic()
         try:
             engine.unload()
         finally:
@@ -797,6 +800,10 @@ class EngineManager:
                 self._unloading = False
                 self._bump()
                 self._changed.notify_all()
+        _logger.info(
+            f"model_unload seconds={time.monotonic() - started:.1f} "
+            f"model={engine.model_id} reason={reason}"
+        )
 
     def unload_if_idle(self) -> bool:
         with self._changed:
@@ -807,7 +814,7 @@ class EngineManager:
             if idle <= self._config.idle_unload_minutes * 60:
                 return False
             engine = self._take()
-        self._free(engine)
+        self._free(engine, "idle")
         return True
 
     def start_idle_sweep(self, interval_s: float = IDLE_SWEEP_SECONDS) -> None:
@@ -878,7 +885,7 @@ class EngineManager:
                 return {"unloaded": False, "reason": reason}
             engine = self._take()
             self._last_used = None
-        self._free(engine)
+        self._free(engine, "requested")
         return {"unloaded": True, "reason": None}
 
     def status(self) -> dict:

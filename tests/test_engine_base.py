@@ -105,6 +105,25 @@ def test_get_logs_the_load_once_with_its_duration(caplog):
     assert lines[0].startswith("model_load seconds=") and lines[0].endswith(" model=fake/model")
 
 
+def test_an_unload_logs_its_duration_and_reason(caplog):
+    """The sweep's unload is the one nobody asked for, so the log is the
+    only place it shows; a requested one says who wanted the memory."""
+    import logging
+
+    mgr, created, live, clock = _held_manager(idle_minutes=1)
+    mgr.get()
+    clock.now += 61
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        assert mgr.unload_if_idle()
+        mgr.get()
+        assert mgr.unload_now()["unloaded"]
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("model_unload")]
+    assert len(lines) == 2
+    assert lines[0].startswith("model_unload seconds=")
+    assert lines[0].endswith(" model=fake/model reason=idle")
+    assert lines[1].endswith(" model=fake/model reason=requested")
+
+
 def _positional_factory(model_id: str) -> FakeEngine:
     """An engine that reports which side owns the rotary positions, the way
     the VLM backend does."""
