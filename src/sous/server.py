@@ -184,6 +184,20 @@ def _acquire_singleton_lock(data_dir: Path) -> IO[bytes]:
     return handle
 
 
+def _drop_tqdm_process_lock() -> None:
+    """tqdm's first bar takes a multiprocessing RLock beside its thread lock:
+    a named semaphore registered with the resource tracker, which mlx-vlm's
+    prefill bar creates in this process on the first VLM turn. The daemon
+    leaves through os._exit (_install_shutdown_handler), so no finalizer ever
+    unlinks it and the tracker reports a leaked semaphore at every exit. An
+    `mp_lock` attribute already present, None included, is tqdm's own way to
+    say "don't make one" — and one process that never forks a bar needs
+    none."""
+    from tqdm.std import TqdmDefaultWriteLock
+
+    TqdmDefaultWriteLock.mp_lock = None
+
+
 def _install_shutdown_handler() -> None:
     """Exit cleanly on SIGTERM/SIGINT instead of the default abrupt kill.
 
@@ -271,6 +285,7 @@ def main() -> None:
     # stderr is None when fd 2 was closed at exec (`sous serve 2>&-`).
     if sys.stderr is None or not sys.stderr.isatty():
         disable_progress_bars()
+    _drop_tqdm_process_lock()
     engines = EngineManager(config)
     _install_shutdown_handler()
     app = create_server(engines, config)

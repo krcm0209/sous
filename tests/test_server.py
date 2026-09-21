@@ -126,6 +126,31 @@ def test_lock_file_records_the_holder_pid(tmp_path: Path):
         holder.close()
 
 
+def test_the_daemon_gives_tqdm_no_multiprocessing_lock(monkeypatch):
+    """tqdm's first bar would otherwise take a multiprocessing RLock — a
+    named semaphore the resource tracker reports as leaked when the daemon
+    leaves through os._exit. With the switch thrown, the first bar's lock is
+    the thread lock alone and nothing is registered."""
+    import multiprocessing.resource_tracker as resource_tracker
+
+    import tqdm.std
+    from tqdm.std import TqdmDefaultWriteLock
+
+    import sous.server as server
+
+    monkeypatch.delattr(TqdmDefaultWriteLock, "mp_lock", raising=False)
+    monkeypatch.delattr(tqdm.std.tqdm, "_lock", raising=False)
+    registered: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        resource_tracker, "register", lambda name, rtype: registered.append((name, rtype))
+    )
+    server._drop_tqdm_process_lock()
+    lock = tqdm.std.tqdm.get_lock()
+    assert TqdmDefaultWriteLock.mp_lock is None
+    assert lock.locks == [TqdmDefaultWriteLock.th_lock]
+    assert registered == []
+
+
 def test_main_installs_the_shutdown_handler_before_serving(tmp_path: Path, monkeypatch):
     """The handler is useless if main() never installs it, and its body is
     untestable in-process (it ends in os._exit) — so pinning this one-line
@@ -157,9 +182,12 @@ def test_main_installs_the_shutdown_handler_before_serving(tmp_path: Path, monke
         cfg.config_path.write_text("")
         monkeypatch.setattr(server, "load_config", lambda: cfg)
         monkeypatch.setattr(server, "_install_shutdown_handler", lambda: installed.append(True))
+        monkeypatch.setattr(server, "_drop_tqdm_process_lock", lambda: installed.append("tqdm"))
         with pytest.raises(SystemExit):
             server.main()
-    assert installed, "main() served without installing the shutdown handler"
+    assert installed == [True, "tqdm"] or installed == ["tqdm", True], (
+        "main() served without installing the shutdown handler and the tqdm switch"
+    )
     assert sum(1 for h in root.handlers if h.name == SOUS_HANDLER_NAME) == 1
 
 
