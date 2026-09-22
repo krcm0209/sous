@@ -71,6 +71,11 @@ def persist_cache(
         if kind == "kv":
             if c.keys is None or c.values is None:
                 raise ForkUnsupported(f"layer {i}: an empty KVCache cannot be persisted")
+            if c.offset != len(ids):
+                # A mismatched offset would only surface later, as a
+                # restore-time verification strike against a file that was
+                # never a valid snapshot of `ids` to begin with.
+                raise ForkUnsupported(f"layer {i}: offset {c.offset} != {len(ids)} ids")
             meta[f"c{i}_kind"] = "kv"
             meta[f"c{i}_offset"] = str(int(c.offset))
             arrays[f"c{i}_k"] = c.keys

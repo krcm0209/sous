@@ -1546,9 +1546,18 @@ def test_default_engine_factory_hands_the_engine_a_directory_only_for_the_daemon
 def test_weights_identity_for_reads_the_cached_config_without_the_network(monkeypatch, tmp_path):
     from sous.engine import base
 
-    snap = tmp_path / "models--x" / "snapshots" / "abc123"
+    # The real Hub cache layout: snapshots/<sha>/config.json is a SYMLINK
+    # into blobs/<hash>, never a file of its own. weights_identity must read
+    # the sha from the snapshot path itself, never from a resolved one —
+    # resolving would land in blobs/ and this test would then see that
+    # directory's name instead of "abc123".
+    root = tmp_path / "models--x"
+    blob = root / "blobs" / ("0" * 40)
+    blob.parent.mkdir(parents=True)
+    blob.write_text("{}")
+    snap = root / "snapshots" / "abc123"
     snap.mkdir(parents=True)
-    (snap / "config.json").write_text("{}")
+    (snap / "config.json").symlink_to(blob)
     seen = {}
 
     def fake_download(repo_id, filename, **kw):

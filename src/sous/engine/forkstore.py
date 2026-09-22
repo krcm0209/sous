@@ -415,6 +415,9 @@ class ForkStore:
     # ---- bookkeeping (lock held by the caller) -------------------------------
 
     def _recount_locked(self) -> None:
+        # forks counts only this identity key's files; bytes sums every
+        # key's, because the budget (and the LRU that enforces it) spans
+        # every key directory under root, not just the current model's.
         self.forks = sum(1 for e in self._entries.values() if e.key == self.key)
         self.bytes = sum(e.size for e in self._entries.values())
 
@@ -480,12 +483,7 @@ class ForkStore:
             entry = self._entries.get(path)
         if entry is None:
             return
-        try:
-            os.utime(path, None)
-            with self._lock:
-                self._entries[path] = dataclasses.replace(entry, mtime=time.time())
-        except OSError:
-            pass
+        self.touch_entry(entry)
 
     def persist(
         self,

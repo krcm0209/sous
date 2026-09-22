@@ -134,6 +134,15 @@ def test_persist_refuses_an_unsupported_layer(tmp_path: Path):
         forkio.persist_cache([cache_mod.RotatingKVCache(max_size=8)], tmp_path / "x", [1], META)
 
 
+def test_persist_refuses_a_kv_cache_whose_offset_does_not_match_the_ids(tmp_path: Path):
+    """An offset that disagrees with the ids being persisted would only
+    surface later, as a restore-time verification strike against a file
+    that was never a valid snapshot of those ids to begin with."""
+    kv, _ = _kv((700, 300))  # offset 1000
+    with pytest.raises(forkio.ForkUnsupported):
+        forkio.persist_cache([kv], tmp_path / "x", IDS[:999], {**META, "n_tokens": "999"})
+
+
 def test_a_path_without_the_suffix_gets_one_from_mlx(tmp_path: Path):
     """mx.save_safetensors appends .safetensors to a name that lacks it; the
     store's temp names carry it already, and this pins why they must."""

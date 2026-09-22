@@ -362,8 +362,9 @@ class PromptCacheStats:
     prefilled_tokens: int = 0  # stable tokens this turn had to prefill
     took_len: int = 0  # length of the slot _take returned; 0 on a miss
     # What kind of slot that was, as the turn line names it: "turn" (copied
-    # and left in place), "turn-moved" (removed, its arrays adopted), "fork";
-    # "" on a miss, and after a cold retry, which took no slot in the end.
+    # and left in place), "turn-moved" (removed, its arrays adopted), "fork",
+    # "disk" (a prefix read off the store); "" on a miss, and after a cold
+    # retry, which took no slot in the end.
     took_kind: str = ""
     bound_lo: int = 0  # the probe's lower boundary (tools), 0 when absent
     bound_hi: int = 0  # the probe's upper boundary (header), 0 when absent
@@ -371,7 +372,7 @@ class PromptCacheStats:
     prefill_seconds: float = 0.0  # every hooks.prefill, plus fork copies and the snapshot
     decode_seconds: float = 0.0  # hooks.decode, plus the restore
     persist_seconds: float = 0.0  # writing the live cache at a boundary; never prefill time
-    restore_seconds: float = 0.0  # reading a fork off disk; never prefill time
+    restore_seconds: float = 0.0  # time spent attempting a restore, charged on a skip too
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -719,7 +720,7 @@ class PrefixCache:
         that slow may run under the bookkeeping lock that reset() promises
         never to wait behind. Takes the lock itself, for the scan.
         """
-        if self.max_bytes <= 0 and self._store is None:
+        if self.max_bytes <= 0 and (self._store is None or self._store.state != "active"):
             return []
         if isinstance(fork_at, Sequence):
             candidates = list(fork_at)
@@ -907,7 +908,7 @@ class PrefixCache:
     def stats(self, owner: threading.Thread | None = None) -> dict:
         """Counters plus `slots`, `resident_bytes` and `disk`: for one owner
         thread, or daemon-wide (every live owner plus the history of retired
-        ones)."""
+        ones). `disk` is the store's own, the same for every owner."""
         disk = self._store.status() if self._store is not None else dict(DISK_OFF)
         with self._lock:
             self._sweep()

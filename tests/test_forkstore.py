@@ -620,7 +620,10 @@ def test_a_verification_failure_deletes_the_file_and_three_in_a_row_disable(tmp_
         assert not e.path.exists() and s.state == "active"
     e = s.longest_prefix(IDS[:301])
     assert e is not None
-    with pytest.warns(UserWarning, match="fork restore failed"):
+    with (
+        pytest.warns(UserWarning, match="fork restore failed"),
+        pytest.warns(UserWarning, match="disabled"),
+    ):
         assert s.restore(e, bad) is False
     assert s.state == "unavailable" and "3 consecutive" in (s.reason or "")
     assert s.longest_prefix(IDS[:401]) is None

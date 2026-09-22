@@ -322,11 +322,11 @@ weights (`[model].idle_unload_minutes` drops it with the model): measured
 on the maintainer's log, keeping it on disk too would have saved about
 eight seconds in nine days for a second 3.5 GiB write per cold turn. A
 file is used only when its ids are exactly a prefix of the render, whole
-or not at all, and only by a daemon whose backend, mlx and mlx-vlm
-versions, GPU, weights snapshot, engine sources, positions owner and int8
-state match the ones that wrote it; anything else is a natural miss and
-ages out of the budget below. Two subagents still run one at a time;
-batching is a later phase.
+or not at all, and only by a daemon whose backend, mlx and backend
+(mlx-vlm or mlx-lm) versions, GPU, weights snapshot, engine sources,
+positions owner and int8 state match the ones that wrote it; anything else
+is a natural miss and ages out of the budget below. Two subagents still
+run one at a time; batching is a later phase.
 
 Usage is split the way Anthropic's is. `cache_read_input_tokens` is what
 the turn served from a resident cache slot and `input_tokens` the rest, so a
@@ -615,7 +615,10 @@ load, capped at 16 GiB — four to five forks of the default model; a write
 is skipped, with one warning, when it would leave the volume with less
 than 10 GiB (or 5 %) free. The daemon logs the directory, the budget and
 what it found at every load; `sous status` and `sous top` show the count
-and bytes, or the reason the store is off. `rm -rf ~/.sous/forks` is the
+and bytes, or the reason the store is off — the count is this model's
+forks, while the byte total (and the budget it is measured against) spans
+every key directory under `~/.sous/forks/`, one per model and backend
+combination that has ever written there. `rm -rf ~/.sous/forks` is the
 eraser, safe under a running daemon. Exclude the directory from Time
 Machine: its files are worthless the moment the weights or a version
 change, and churn with every new tool array. Requires `prompt_cache =
