@@ -521,3 +521,26 @@ def test_release_gives_up_on_a_generation_that_never_ends(tmp_path, monkeypatch)
         managed._gen_lock.release()
     assert error == "unload refused: a generation is in flight"
     assert not engine.unloaded
+
+
+def test_a_bench_arm_gets_no_fork_store(monkeypatch, tmp_path):
+    import sous.tune.bench as bench_mod
+
+    factory, engines = _fake()
+    seen = {}
+
+    def fake_default_engine_factory(config, **kw):
+        seen.update(kw)
+        return factory
+
+    monkeypatch.setattr(bench_mod, "default_engine_factory", fake_default_engine_factory)
+    row = bench_arm(
+        _arm(tmp_path),
+        factory=None,
+        repeat=1,
+        peak_memory=lambda: 4096,
+        reset_peak=lambda: None,
+        active_memory=lambda: 100,
+        out=lambda *a, **k: None,
+    )
+    assert row.ok and seen == {"forks": False}

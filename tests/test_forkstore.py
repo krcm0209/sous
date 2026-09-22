@@ -667,3 +667,41 @@ def test_oversize_and_free_space_warnings_are_separate(tmp_path: Path):
     # flags, it fires independently.
     with pytest.warns(UserWarning, match="free space"):
         assert s.persist(IDS[:100], "tools", fake_write(200, IDS[:100])) is False
+
+
+def test_fork_key_fields_carry_everything_that_changes_the_kv(monkeypatch):
+    from sous.engine.forkstore import FORK_LAYOUT, fork_key_fields
+
+    monkeypatch.setenv("MLX_ENABLE_TF32", "1")
+    monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
+    f = fork_key_fields(
+        backend="vlm",
+        backend_version="0.7.1",
+        weights="sha",
+        gpu="applegpu_g16s",
+        positions="engine",
+        int8_status={"state": "active", "reason": None, "routed": 336},
+    )
+    assert f["backend"] == "vlm" and f["backend_version"] == "0.7.1"
+    assert f["mlx"] and f["weights"] == "sha" and f["gpu"] == "applegpu_g16s"
+    assert f["epoch"] == engine_epoch() and f["layout"] == str(FORK_LAYOUT)
+    assert f["positions"] == "engine" and f["int8"] == "active:336"
+    assert f["env"] == "MLX_ENABLE_TF32=1"
+    off = fork_key_fields(
+        backend="lm",
+        backend_version="0.31.3",
+        weights="sha",
+        gpu="g",
+        positions="model",
+        int8_status={"state": "unavailable", "reason": "no tensor units", "routed": 0},
+    )
+    assert off["int8"] == "off"  # off and unavailable ran the same numerics
+    monkeypatch.delenv("MLX_ENABLE_TF32")
+    assert "env" not in fork_key_fields(
+        backend="lm",
+        backend_version="x",
+        weights="w",
+        gpu="g",
+        positions="model",
+        int8_status={"state": "off", "reason": None, "routed": 0},
+    )

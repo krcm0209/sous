@@ -10,6 +10,7 @@ from typing import Any, cast
 
 from sous.engine import forkio
 from sous.engine.base import Delta, OnDelta
+from sous.engine.forkstore import ForkStore, fork_key_fields
 from sous.engine.promptcache import FORK_MIN_TOKENS, PrefixCache, PromptMemo, probe_boundaries
 
 
@@ -62,6 +63,9 @@ class VLMEngine:
         cache_budget: int | None = None,
         reserve_bytes: int = 0,
         int8_prefill: bool = False,
+        fork_dir: Path | None = None,
+        fork_budget: int | None = None,
+        weights_identity: str = "",
     ):
         from mlx_vlm import load
 
@@ -96,12 +100,24 @@ class VLMEngine:
                     stacklevel=2,
                 )
             _pin_block_size(self._draft, draft_block_size)
+        # Forks on disk, when the factory handed us a directory: built after
+        # the drafter and int8 have settled, since the key reads both. Tests
+        # and sous tune never pass one, so nothing they build touches ~/.sous.
+        self.fork_store: ForkStore | None = None
+        if fork_dir is not None and prompt_cache:
+            self.fork_store = ForkStore(
+                fork_dir, self._fork_key_fields(weights_identity), fork_budget
+            )
         # Measured after load AND after the drafter, so the weights of both are
         # inside `active` and the budget is what the machine actually has left.
         if cache_budget is None:
             cache_budget = measure_cache_budget(reserve_bytes)
         self._cache = PrefixCache(
-            self, enabled=prompt_cache, max_bytes=cache_budget, reserve_bytes=reserve_bytes
+            self,
+            enabled=prompt_cache,
+            max_bytes=cache_budget,
+            reserve_bytes=reserve_bytes,
+            store=self.fork_store,
         )
 
     @staticmethod
@@ -128,6 +144,20 @@ class VLMEngine:
         none was asked for or the one asked for failed to load, which the
         engine survives with a warning rather than an error."""
         return self._draft_id
+
+    def _fork_key_fields(self, weights: str) -> dict[str, str]:
+        from importlib.metadata import version
+
+        import mlx.core as mx
+
+        return fork_key_fields(
+            backend="vlm",
+            backend_version=version("mlx-vlm"),
+            weights=weights,
+            gpu=str(mx.device_info().get("architecture", "")),
+            positions=self.positions,
+            int8_status=self.int8_prefill_status,
+        )
 
     def _loaded(self) -> tuple:
         """The (model, processor) pair, or a clear error if already unloaded.

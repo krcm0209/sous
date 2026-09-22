@@ -1444,6 +1444,103 @@ def test_default_factory_threads_the_cache_budget_and_reserve(monkeypatch):
     assert seen["cache_budget"] == 7
 
 
+def test_default_factory_threads_fork_settings_and_the_weights_identity(monkeypatch, tmp_path):
+    from sous.engine import base, lm
+
+    seen = {}
+
+    class FakeLM:
+        def __init__(self, model_id, **kw):
+            seen.update(kw)
+
+    monkeypatch.setattr(lm, "LMEngine", FakeLM)
+    monkeypatch.setattr(
+        base,
+        "fetch_model_config",
+        lambda mid: {
+            "model_type": "qwen3",
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+        },
+    )
+    monkeypatch.setattr(base, "weights_identity_for", lambda mid: f"weights-of-{mid}")
+    base._default_factory(
+        "m",
+        prompt_cache=True,
+        cache_budget=7,
+        reserve_tokens=1000,
+        fork_dir=tmp_path / "forks",
+        fork_budget=5,
+    )
+    assert seen["fork_dir"] == tmp_path / "forks" and seen["fork_budget"] == 5
+    assert seen["weights_identity"] == "weights-of-m"
+    seen.clear()
+    base._default_factory("m", prompt_cache=True, cache_budget=7, reserve_tokens=1000)
+    assert seen["fork_dir"] is None and seen["weights_identity"] == ""
+
+
+def test_default_factory_keeps_forks_off_disk_when_the_kv_cost_is_unknown(monkeypatch, tmp_path):
+    from sous.engine import base, lm
+
+    seen = {}
+
+    class FakeLM:
+        def __init__(self, model_id, **kw):
+            seen.update(kw)
+
+    monkeypatch.setattr(lm, "LMEngine", FakeLM)
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"model_type": "qwen3"})
+    monkeypatch.setattr(base, "weights_identity_for", lambda mid: "w")
+    with pytest.warns(UserWarning, match="forks are not persisted"):
+        base._default_factory(
+            "m", prompt_cache=True, cache_budget=0, reserve_tokens=1000, fork_dir=tmp_path
+        )
+    assert seen["fork_dir"] is None
+
+
+def test_default_engine_factory_hands_the_engine_a_directory_only_for_the_daemon(
+    monkeypatch, tmp_path
+):
+    from sous.engine import base
+
+    seen = {}
+
+    def fake_default_factory(model_id, *args, **kwargs):
+        seen.update(kwargs)
+        return FakeEngine([])
+
+    monkeypatch.setattr(base, "_default_factory", fake_default_factory)
+    cfg = _cfg(tmp_path)
+    base.default_engine_factory(cfg)("m")
+    assert seen["fork_dir"] == cfg.data_dir / "forks" and seen["fork_budget"] is None
+    base.default_engine_factory(cfg, forks=False)("m")
+    assert seen["fork_dir"] is None
+    base.default_engine_factory(_cfg(tmp_path, prompt_cache_disk_gb=0.0))("m")
+    assert seen["fork_dir"] is None
+    base.default_engine_factory(_cfg(tmp_path, prompt_cache=False))("m")
+    assert seen["fork_dir"] is None
+    base.default_engine_factory(_cfg(tmp_path, prompt_cache_disk_gb=2.0))("m")
+    assert seen["fork_dir"] == cfg.data_dir / "forks" and seen["fork_budget"] == 2 << 30
+
+
+def test_weights_identity_for_reads_the_cached_config_without_the_network(monkeypatch, tmp_path):
+    from sous.engine import base
+
+    snap = tmp_path / "models--x" / "snapshots" / "abc123"
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text("{}")
+    seen = {}
+
+    def fake_download(repo_id, filename, **kw):
+        seen.update(kw)
+        return str(snap / filename)
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_download)
+    assert base.weights_identity_for("x") == "abc123"
+    assert seen["local_files_only"] is True
+
+
 def _mystery_lm(monkeypatch) -> dict:
     """_default_factory against a model whose KV cost per token is unknown."""
     from sous.engine import base, lm
@@ -1818,6 +1915,8 @@ def test_default_engine_factory_maps_every_model_value_onto_the_backend(monkeypa
         "cache_budget": int(1.5 * (1 << 30)),
         "reserve_tokens": 65536,
         "int8_prefill": True,
+        "fork_dir": None,
+        "fork_budget": None,
     }
 
 

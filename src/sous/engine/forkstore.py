@@ -130,6 +130,49 @@ def key_name(fields: Mapping[str, str]) -> str:
     return hashlib.blake2b(canonical.encode(), digest_size=16).hexdigest()
 
 
+_NUMERIC_ENV = ("MLX_ENABLE_TF32", "MLX_SDPA_BLOCKS")
+
+
+def fork_key_fields(
+    *,
+    backend: str,
+    backend_version: str,
+    weights: str,
+    gpu: str,
+    positions: str,
+    int8_status: Mapping[str, Any],
+) -> dict[str, str]:
+    """Everything that changes the KV arrays behind identical token ids, and
+    nothing else: the backend and its package, mlx, the GPU, the weights,
+    the engine sources (epoch) and the file layout, which side supplies the
+    rotary positions, whether int8 prefill actually ran (`off` and
+    `unavailable` are the same numerics), and the two mlx-core environment
+    switches that change matmul precision and attention accumulation. The
+    template, tokenizer, sampling, drafter and window are deliberately
+    absent: ids are compared exactly, and none of them touches a prefill."""
+    from importlib.metadata import version
+
+    fields = {
+        "backend": backend,
+        "backend_version": backend_version,
+        "mlx": version("mlx"),
+        "gpu": gpu,
+        "weights": weights,
+        "epoch": engine_epoch(),
+        "layout": str(FORK_LAYOUT),
+        "positions": positions,
+        "int8": (
+            f"active:{int8_status.get('routed', 0)}"
+            if int8_status.get("state") == "active"
+            else "off"
+        ),
+    }
+    env = ";".join(f"{k}={os.environ[k]}" for k in _NUMERIC_ENV if k in os.environ)
+    if env:
+        fields["env"] = env
+    return fields
+
+
 @functools.cache
 def engine_epoch() -> str:
     """A hash of the engine sources that decide ids -> KV, read once.
