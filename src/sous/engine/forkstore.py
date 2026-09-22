@@ -307,6 +307,10 @@ class ForkStore:
         self._writing: set[str] = set()
         self._restoring: dict[Path, int] = {}
         self._failures = 0
+        # Consecutive generic (non-OSError) persist failures: a cache the
+        # format cannot cover fails identically on every cold turn, and this
+        # is what retires the store rather than writing a temp file forever.
+        self._write_failures = 0
         self._oversize_warned = False
         self._floor_warned = False
         # Writer failures already reported, by exception type: a cache the
@@ -464,12 +468,19 @@ class ForkStore:
         ids: Sequence[int],
         boundary: str,
         write: Callable[[Path, dict[str, str]], None],
+        *,
+        expected_bytes: int,
     ) -> bool:
         """Write `ids`' cache through `write(temp_path, metadata)` unless a
         file for it exists (then touch it), a write of it is in flight, the
-        store is off, or the write would breach the free-space floor. Room
-        is made first — never from a file being restored — and the file is
-        indexed only after os.replace. Never raises."""
+        store is off, or the caller's own `expected_bytes` estimate would
+        breach the budget or the free-space floor — checked before `write`
+        ever runs, so a refused write never touches disk. Room is made from
+        that same estimate — never from a file being restored — before the
+        write, and the file is indexed only after os.replace. The real size
+        is checked against the budget once more after the write, belt and
+        braces against an under-estimate; the floor is not re-checked there,
+        since the pre-check already reserved it. Never raises."""
         if self.state != "active":
             return False
         n, dig = len(ids), digest(ids)
@@ -485,11 +496,35 @@ class ForkStore:
         if known:
             self.touch(ids)
             return False
-        temp = temp_name(final, self._pid())
-        from importlib.metadata import version
-
+        temp: Path | None = None
         try:
-            self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if expected_bytes > self.budget:
+                if not self._oversize_warned:
+                    self._oversize_warned = True
+                    warnings.warn(
+                        f"sous fork store: not persisting a {expected_bytes / GIB:.1f} GiB "
+                        f"fork larger than the budget ({self.budget / GIB:.1f} GiB)",
+                        stacklevel=2,
+                    )
+                return False
+            # rm -rf ~/.sous/forks under a running daemon must not wedge the
+            # next write: restore the promised layout before touching disk.
+            self._ensure_dirs()
+            usage = self._disk_usage(self.root)
+            if usage.free - expected_bytes < floor_bytes(usage.total):
+                if not self._floor_warned:
+                    self._floor_warned = True
+                    warnings.warn(
+                        "sous fork store: not persisting a fork — the write would leave "
+                        f"less than {floor_bytes(usage.total) / GIB:.0f} GiB of free space",
+                        stacklevel=2,
+                    )
+                return False
+            with self._lock:
+                self._evict_locked(expected_bytes)
+            temp = temp_name(final, self._pid())
+            from importlib.metadata import version
+
             metadata = {
                 "format": FORMAT,
                 "layout": str(FORK_LAYOUT),
@@ -512,27 +547,16 @@ class ForkStore:
                         stacklevel=2,
                     )
                 return False
-            usage = self._disk_usage(self.root)
-            if usage.free - size < floor_bytes(usage.total):
-                temp.unlink(missing_ok=True)
-                if not self._floor_warned:
-                    self._floor_warned = True
-                    warnings.warn(
-                        "sous fork store: not persisting a fork — the write would leave "
-                        f"less than {floor_bytes(usage.total) / GIB:.0f} GiB of free space",
-                        stacklevel=2,
-                    )
-                return False
-            with self._lock:
-                self._evict_locked(size)
             os.replace(temp, final)
             st = final.stat()
             with self._lock:
                 self._entries[final] = Entry(final, self.key, n, dig, st.st_size, st.st_mtime)
                 self._recount_locked()
+            self._write_failures = 0
             return True
         except OSError as e:
-            temp.unlink(missing_ok=True)
+            if temp is not None:
+                temp.unlink(missing_ok=True)
             warnings.warn(
                 f"sous fork store: fork persist failed ({type(e).__name__}: {e.strerror})",
                 stacklevel=2,
@@ -541,12 +565,17 @@ class ForkStore:
                 self._disable(f"{os.strerror(e.errno)} ({errno_mod.errorcode[e.errno]})")
             return False
         except Exception as e:  # noqa: BLE001 — an optimization never fails a turn
-            temp.unlink(missing_ok=True)
+            if temp is not None:
+                temp.unlink(missing_ok=True)
             kind = type(e).__name__
-            if kind not in self._warned_writers:
+            self._write_failures += 1
+            if self._write_failures >= MAX_FAILURES:
+                self._disable(f"{MAX_FAILURES} consecutive persist failures")
+            elif kind not in self._warned_writers:
                 self._warned_writers.add(kind)
                 warnings.warn(
-                    f"sous fork store: fork persist failed ({kind}); not persisting again",
+                    f"sous fork store: fork persist failed ({kind}); will retry on "
+                    "the next cold turn",
                     stacklevel=2,
                 )
             return False

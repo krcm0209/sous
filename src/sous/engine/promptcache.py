@@ -479,7 +479,12 @@ class StoreHooks(Protocol):
     def has(self, ids: Sequence[int]) -> bool: ...
     def longest_prefix(self, stable_ids: Sequence[int]) -> Any: ...
     def persist(
-        self, ids: Sequence[int], boundary: str, write: Callable[[Path, dict[str, str]], None]
+        self,
+        ids: Sequence[int],
+        boundary: str,
+        write: Callable[[Path, dict[str, str]], None],
+        *,
+        expected_bytes: int,
     ) -> bool: ...
     def restore(self, entry: Any, load: Callable[[Path, Any], None]) -> bool: ...
     def touch(self, ids: Sequence[int]) -> None: ...
@@ -960,8 +965,16 @@ class PrefixCache:
         hooks = self._hooks
         started = _clock()
         try:
+            # The padded buffers ARE what gets written (persist_cache saves
+            # the whole capacity, not the trimmed offset slice): slot_bytes
+            # plus the ids tensor (int32) plus a fixed allowance for the
+            # safetensors header.
+            expected_bytes = slot_bytes(cache) + 4 * len(ids) + (64 << 10)
             if self._store.persist(
-                ids, boundary, lambda path, metadata: hooks.persist(cache, path, ids, metadata)
+                ids,
+                boundary,
+                lambda path, metadata: hooks.persist(cache, path, ids, metadata),
+                expected_bytes=expected_bytes,
             ):
                 stats.persists += 1
         except Exception as e:  # noqa: BLE001 — an optimization must never fail a turn

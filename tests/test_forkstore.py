@@ -266,7 +266,7 @@ def test_construction_disables_the_store_when_the_root_cannot_be_written(tmp_pat
         s = store(tmp_path)
     assert s.state == "unavailable" and s.reason
     assert s.longest_prefix(IDS) is None
-    assert s.persist(IDS[:100], "tools", fake_write(8)) is False
+    assert s.persist(IDS[:100], "tools", fake_write(8), expected_bytes=8) is False
 
 
 def test_construction_logs_one_line_naming_the_directory_budget_and_contents(tmp_path, caplog):
@@ -289,7 +289,7 @@ def test_persist_writes_via_temp_then_replace_and_indexes_the_file(tmp_path: Pat
         seen.append((path, dict(metadata)))
         fake_write(64, IDS[:100])(path, metadata)
 
-    assert s.persist(IDS[:100], "tools", write) is True
+    assert s.persist(IDS[:100], "tools", write, expected_bytes=64) is True
     temp, metadata = seen[0]
     assert temp.name.endswith(".4242.tmp.safetensors") and not temp.exists()
     final = tmp_path / "forks" / s.key / file_name(100, digest(IDS[:100]))
@@ -303,23 +303,43 @@ def test_persist_writes_via_temp_then_replace_and_indexes_the_file(tmp_path: Pat
 
 def test_persist_skips_a_digest_already_on_disk_and_touches_it(tmp_path: Path):
     s = store(tmp_path)
-    assert s.persist(IDS[:100], "tools", fake_write(64, IDS[:100]))
+    assert s.persist(IDS[:100], "tools", fake_write(64, IDS[:100]), expected_bytes=64)
     final = tmp_path / "forks" / s.key / file_name(100, digest(IDS[:100]))
     os.utime(final, (1, 1))
     calls = []
-    assert s.persist(IDS[:100], "tools", lambda p, m: calls.append(p)) is False
+    assert s.persist(IDS[:100], "tools", lambda p, m: calls.append(p), expected_bytes=64) is False
     assert calls == []
     assert final.stat().st_mtime > 1  # a resident fork's file must not be the oldest
 
 
 def test_persist_refuses_when_the_write_would_breach_the_free_space_floor(tmp_path: Path):
     s = store(tmp_path, free=10 * GIB + 100, total=100 * GIB)  # floor is 10 GiB
+    calls: list[Path] = []
+
+    def write(path: Path, metadata: dict[str, str]) -> None:
+        calls.append(path)
+        fake_write(200, IDS[:100])(path, metadata)
+
     with pytest.warns(UserWarning, match="free space"):
-        assert s.persist(IDS[:100], "tools", fake_write(200, IDS[:100])) is False
+        assert s.persist(IDS[:100], "tools", write, expected_bytes=200) is False
+    assert calls == []  # the writer never ran: the estimate alone refused it
+    assert list((tmp_path / "forks" / s.key).glob("*.tmp.safetensors")) == []
     assert s.state == "active"  # a skip, not a disable
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # the second refusal is silent
-        assert s.persist(IDS[:200], "tools", fake_write(200, IDS[:200])) is False
+        assert s.persist(IDS[:200], "tools", write, expected_bytes=200) is False
+    assert calls == []
+
+
+def test_persist_allows_a_write_that_leaves_exactly_the_floor_free(tmp_path: Path):
+    """The old check read free space after creating the temp file, so the
+    file it was about to write already counted against its own floor check
+    once. The pre-check must not double it: free space exactly at
+    floor + expected is enough room, not a breach."""
+    total = 100 * GIB
+    expected = 200
+    s = store(tmp_path, free=floor_bytes(total) + expected, total=total)
+    assert s.persist(IDS[:100], "tools", fake_write(expected, IDS[:100]), expected_bytes=expected)
 
 
 def test_a_writer_that_raises_leaves_no_temp_and_warns(tmp_path: Path):
@@ -330,7 +350,7 @@ def test_a_writer_that_raises_leaves_no_temp_and_warns(tmp_path: Path):
         raise RuntimeError("boom")
 
     with pytest.warns(UserWarning, match="fork persist failed"):
-        assert s.persist(IDS[:100], "tools", write) is False
+        assert s.persist(IDS[:100], "tools", write, expected_bytes=8) is False
     assert list((tmp_path / "forks" / s.key).glob("*.safetensors")) == []
     assert s.state == "active"
 
@@ -343,12 +363,34 @@ def test_a_repeated_writer_failure_warns_only_once(tmp_path: Path):
     def write(path: Path, metadata: dict[str, str]) -> None:
         raise ValueError("layer class RotatingKVCache cannot be persisted")
 
-    with pytest.warns(UserWarning, match="not persisting again"):
-        assert s.persist(IDS[:100], "tools", write) is False
+    with pytest.warns(UserWarning, match="will retry on the next cold turn"):
+        assert s.persist(IDS[:100], "tools", write, expected_bytes=8) is False
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        assert s.persist(IDS[:200], "tools", write) is False
+        assert s.persist(IDS[:200], "tools", write, expected_bytes=8) is False
     assert s.state == "active"
+
+
+def test_three_consecutive_generic_writer_failures_disable_the_store(tmp_path: Path):
+    """Unlike the free-space and budget refusals, a generic writer failure
+    (an allocation error, a layer class the format cannot cover) is not
+    latched by itself — three of them in a row are what retires the store,
+    so it does not delete itself one cold turn at a time forever."""
+    s = store(tmp_path)
+
+    def write(path: Path, metadata: dict[str, str]) -> None:
+        raise RuntimeError("boom")
+
+    with pytest.warns(UserWarning, match="fork persist failed"):
+        assert s.persist(IDS[:100], "tools", write, expected_bytes=8) is False
+    assert s.state == "active"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # same kind, already warned once
+        assert s.persist(IDS[:200], "tools", write, expected_bytes=8) is False
+    assert s.state == "active"
+    with pytest.warns(UserWarning, match="disabled"):
+        assert s.persist(IDS[:300], "tools", write, expected_bytes=8) is False
+    assert s.state == "unavailable" and "3 consecutive" in (s.reason or "")
 
 
 @pytest.mark.parametrize("errno_name", ["ENOSPC", "EACCES", "EROFS", "EDQUOT"])
@@ -360,15 +402,18 @@ def test_a_disk_error_disables_the_store(tmp_path: Path, errno_name: str):
     def write(path: Path, metadata: dict[str, str]) -> None:
         raise OSError(getattr(errno, errno_name), "disk")
 
-    with pytest.warns(UserWarning, match="fork persist failed"):
-        assert s.persist(IDS[:100], "tools", write) is False
+    with (
+        pytest.warns(UserWarning, match="fork persist failed"),
+        pytest.warns(UserWarning, match="disabled"),
+    ):
+        assert s.persist(IDS[:100], "tools", write, expected_bytes=8) is False
     assert s.state == "unavailable" and errno_name.lower() in (s.reason or "").lower()
 
 
 def test_a_missing_directory_is_recreated_before_a_write(tmp_path: Path):
     s = store(tmp_path)
     shutil.rmtree(tmp_path / "forks")
-    assert s.persist(IDS[:100], "tools", fake_write(64, IDS[:100])) is True
+    assert s.persist(IDS[:100], "tools", fake_write(64, IDS[:100]), expected_bytes=64) is True
     assert s.state == "active" and s.forks == 1
 
 
@@ -378,10 +423,10 @@ def test_a_concurrent_writer_of_the_same_digest_skips(tmp_path: Path):
 
     def write(path: Path, metadata: dict[str, str]) -> None:
         # Re-enter for the same ids while this write is in flight: skipped.
-        inner.append(s.persist(IDS[:100], "tools", fake_write(8, IDS[:100])))
+        inner.append(s.persist(IDS[:100], "tools", fake_write(8, IDS[:100]), expected_bytes=8))
         fake_write(64, IDS[:100])(path, metadata)
 
-    assert s.persist(IDS[:100], "tools", write) is True
+    assert s.persist(IDS[:100], "tools", write, expected_bytes=64) is True
     assert inner == [False] and s.forks == 1
 
 
@@ -396,25 +441,34 @@ def test_persist_evicts_least_recently_used_across_keys_to_nine_tenths_of_the_bu
         pid_alive=lambda p: False,
         pid=lambda: 1,
     )
-    assert other.persist(a, "tools", fake_write(300, a))
+    assert other.persist(a, "tools", fake_write(300, a), expected_bytes=300)
     old = next((tmp_path / "forks" / other.key).glob("*.safetensors"))
     os.utime(old, (1, 1))
     size = old.stat().st_size
     # Three files fit under nine tenths of this budget; a fourth does not.
+    # expected_bytes=size (a real file's, as above) so the pre-check's
+    # eviction sees the same numbers the post-write check used to.
     s = store(tmp_path, budget=int(size * 3.6))
-    assert s.persist(b, "tools", fake_write(300, b))
-    assert s.persist(c, "tools", fake_write(300, c))
+    assert s.persist(b, "tools", fake_write(300, b), expected_bytes=size)
+    assert s.persist(c, "tools", fake_write(300, c), expected_bytes=size)
     assert old.exists() and s.evictions == 0
-    assert s.persist(d, "tools", fake_write(300, d))
+    assert s.persist(d, "tools", fake_write(300, d), expected_bytes=size)
     assert not old.exists()  # the oldest across keys went first
     assert s.evictions == 1 and s.status()["evictions"] == 1 and s.forks == 3
 
 
 def test_a_fork_larger_than_the_whole_budget_is_not_written(tmp_path: Path):
     s = store(tmp_path, budget=100)
+    calls: list[Path] = []
+
+    def write(path: Path, metadata: dict[str, str]) -> None:
+        calls.append(path)
+        fake_write(300, IDS[:10])(path, metadata)
+
     with pytest.warns(UserWarning, match="larger than the budget"):
-        assert s.persist(IDS[:10], "tools", fake_write(300, IDS[:10])) is False
+        assert s.persist(IDS[:10], "tools", write, expected_bytes=300) is False
     assert s.forks == 0 and s.state == "active"
+    assert calls == []  # the writer never ran: the estimate alone refused it
     assert list((tmp_path / "forks" / s.key).glob("*.safetensors")) == []
 
 
@@ -423,8 +477,8 @@ def test_a_fork_larger_than_the_whole_budget_is_not_written(tmp_path: Path):
 
 def test_longest_prefix_wants_a_strict_prefix_and_prefers_the_longest(tmp_path: Path):
     s = store(tmp_path)
-    assert s.persist(IDS[:100], "tools", fake_write(8, IDS[:100]))
-    assert s.persist(IDS[:200], "tools", fake_write(8, IDS[:200]))
+    assert s.persist(IDS[:100], "tools", fake_write(8, IDS[:100]), expected_bytes=8)
+    assert s.persist(IDS[:200], "tools", fake_write(8, IDS[:200]), expected_bytes=8)
     e = s.longest_prefix(IDS[:300])
     assert e is not None and e.n == 200 and e.digest == digest(IDS[:200])
     mid = s.longest_prefix(IDS[:200])
@@ -435,7 +489,7 @@ def test_longest_prefix_wants_a_strict_prefix_and_prefers_the_longest(tmp_path: 
 
 def test_the_index_is_rebuilt_from_the_directory_at_construction(tmp_path: Path):
     s = store(tmp_path)
-    assert s.persist(IDS[:100], "tools", fake_write(8, IDS[:100]))
+    assert s.persist(IDS[:100], "tools", fake_write(8, IDS[:100]), expected_bytes=8)
     again = store(tmp_path)
     assert again.forks == 1 and again.has(IDS[:100])
     e = again.longest_prefix(IDS[:200])
@@ -474,8 +528,8 @@ def test_construction_sweeps_dead_writers_temp_files_and_keeps_live_ones(tmp_pat
 def test_construction_enforces_the_budget_over_every_key(tmp_path: Path):
     big = store(tmp_path, budget=10 * GIB)
     a, b = IDS[:10], [*IDS[:9], 1001]
-    assert big.persist(a, "tools", fake_write(300, a))
-    assert big.persist(b, "tools", fake_write(300, b))
+    assert big.persist(a, "tools", fake_write(300, a), expected_bytes=300)
+    assert big.persist(b, "tools", fake_write(300, b), expected_bytes=300)
     size = next((tmp_path / "forks" / big.key).glob("*.safetensors")).stat().st_size
     small = store(tmp_path, budget=size + size // 2)  # room for one
     assert small.forks == 1 and small.evictions == 1
@@ -486,7 +540,7 @@ def test_construction_enforces_the_budget_over_every_key(tmp_path: Path):
 
 def test_restore_calls_the_loader_with_the_path_and_header_and_touches(tmp_path: Path):
     s = store(tmp_path)
-    assert s.persist(IDS[:100], "tools", fake_write(64, IDS[:100]))
+    assert s.persist(IDS[:100], "tools", fake_write(64, IDS[:100]), expected_bytes=64)
     e = s.longest_prefix(IDS[:200])
     assert e is not None
     os.utime(e.path, (1, 1))
@@ -503,7 +557,7 @@ def test_restore_calls_the_loader_with_the_path_and_header_and_touches(tmp_path:
 def test_a_verification_failure_deletes_the_file_and_three_in_a_row_disable(tmp_path: Path):
     s = store(tmp_path)
     for n in (100, 200, 300, 400):
-        assert s.persist(IDS[:n], "tools", fake_write(8, IDS[:n]))
+        assert s.persist(IDS[:n], "tools", fake_write(8, IDS[:n]), expected_bytes=8)
 
     def bad(path: Path, header: Header) -> None:
         raise ForkFileError("ids mismatch")
@@ -524,7 +578,7 @@ def test_a_verification_failure_deletes_the_file_and_three_in_a_row_disable(tmp_
 
 def test_a_memory_or_io_failure_keeps_the_file(tmp_path: Path):
     s = store(tmp_path)
-    assert s.persist(IDS[:100], "tools", fake_write(8, IDS[:100]))
+    assert s.persist(IDS[:100], "tools", fake_write(8, IDS[:100]), expected_bytes=8)
     e = s.longest_prefix(IDS[:200])
     assert e is not None
     for exc in (MemoryError(), RuntimeError("no stream"), OSError("io")):
@@ -540,7 +594,7 @@ def test_a_memory_or_io_failure_keeps_the_file(tmp_path: Path):
 def test_a_successful_restore_resets_the_failure_streak(tmp_path: Path):
     s = store(tmp_path)
     for n in (100, 200, 300):
-        assert s.persist(IDS[:n], "tools", fake_write(8, IDS[:n]))
+        assert s.persist(IDS[:n], "tools", fake_write(8, IDS[:n]), expected_bytes=8)
 
     def bad(path: Path, header: Header) -> None:
         raise ForkFileError("bad")
@@ -553,7 +607,7 @@ def test_a_successful_restore_resets_the_failure_streak(tmp_path: Path):
     e = s.longest_prefix(IDS[:301])
     assert e is not None
     assert s.restore(e, lambda p, h: None) is True
-    assert s.persist(IDS[:400], "tools", fake_write(8, IDS[:400]))
+    assert s.persist(IDS[:400], "tools", fake_write(8, IDS[:400]), expected_bytes=8)
     e = s.longest_prefix(IDS[:401])
     assert e is not None
     with pytest.warns(UserWarning):
@@ -563,7 +617,7 @@ def test_a_successful_restore_resets_the_failure_streak(tmp_path: Path):
 
 def test_a_file_deleted_under_the_store_is_a_plain_miss(tmp_path: Path):
     s = store(tmp_path)
-    assert s.persist(IDS[:100], "tools", fake_write(8, IDS[:100]))
+    assert s.persist(IDS[:100], "tools", fake_write(8, IDS[:100]), expected_bytes=8)
     e = s.longest_prefix(IDS[:200])
     assert e is not None
     e.path.unlink()
@@ -576,7 +630,7 @@ def test_a_file_deleted_under_the_store_is_a_plain_miss(tmp_path: Path):
 def test_a_file_being_restored_is_never_evicted(tmp_path: Path):
     a, b = IDS[:10], [*IDS[:9], 1001]
     s = store(tmp_path, budget=10 * GIB)
-    assert s.persist(a, "tools", fake_write(300, a))
+    assert s.persist(a, "tools", fake_write(300, a), expected_bytes=300)
     e = s.longest_prefix(IDS[:11])
     assert e is not None
     os.utime(e.path, (1, 1))
@@ -586,7 +640,7 @@ def test_a_file_being_restored_is_never_evicted(tmp_path: Path):
         # A write that needs room while this file is being read takes it
         # from any other file, never from under the reader — and overshoots
         # rather than refuse when there is nothing else.
-        assert s.persist(b, "tools", fake_write(300, b)) is True
+        assert s.persist(b, "tools", fake_write(300, b), expected_bytes=300) is True
         assert path.exists()
 
     assert s.restore(e, load) is True
@@ -595,7 +649,7 @@ def test_a_file_being_restored_is_never_evicted(tmp_path: Path):
 
 def test_touch_refreshes_the_mtime_of_a_stored_prefix(tmp_path: Path):
     s = store(tmp_path)
-    assert s.persist(IDS[:100], "tools", fake_write(8, IDS[:100]))
+    assert s.persist(IDS[:100], "tools", fake_write(8, IDS[:100]), expected_bytes=8)
     e = s.longest_prefix(IDS[:200])
     assert e is not None
     os.utime(e.path, (1, 1))
@@ -617,7 +671,7 @@ def test_nested_restore_of_same_file_refcounts_eviction_protection(tmp_path: Pat
         pid_alive=lambda p: False,
         pid=lambda: 4242,
     )
-    assert s.persist(a, "tools", fake_write(300, a))
+    assert s.persist(a, "tools", fake_write(300, a), expected_bytes=300)
     e = s.longest_prefix(IDS[:11])
     assert e is not None
     os.utime(e.path, (1, 1))
@@ -635,7 +689,7 @@ def test_nested_restore_of_same_file_refcounts_eviction_protection(tmp_path: Pat
         # A write that needs room: with a set, the count would be 0 and the
         # file could be evicted. With refcounting, the outer restore still
         # holds a count and the file survives.
-        assert s.persist(b, "tools", fake_write(300, b)) is True
+        assert s.persist(b, "tools", fake_write(300, b), expected_bytes=300) is True
         assert path.exists()
 
     assert s.restore(e, outer_load) is True
@@ -658,7 +712,7 @@ def test_oversize_and_free_space_warnings_are_separate(tmp_path: Path):
     )
     # First: a fork too large for the budget warns "larger than the budget".
     with pytest.warns(UserWarning, match="larger than the budget"):
-        assert s.persist(IDS[:10], "tools", fake_write(300, IDS[:10])) is False
+        assert s.persist(IDS[:10], "tools", fake_write(300, IDS[:10]), expected_bytes=300) is False
     # Now raise the budget and set disk free below the floor.
     s.budget = 10 * GIB
     disk.free = 10 * GIB + 100
@@ -666,7 +720,9 @@ def test_oversize_and_free_space_warnings_are_separate(tmp_path: Path):
     # With a shared flag, this warning would be silenced. With separate
     # flags, it fires independently.
     with pytest.warns(UserWarning, match="free space"):
-        assert s.persist(IDS[:100], "tools", fake_write(200, IDS[:100])) is False
+        assert (
+            s.persist(IDS[:100], "tools", fake_write(200, IDS[:100]), expected_bytes=200) is False
+        )
 
 
 def test_fork_key_fields_carry_everything_that_changes_the_kv(monkeypatch):

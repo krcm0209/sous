@@ -426,6 +426,7 @@ class FakeStore:
         self.state = "active"
         self.touched: list[list[int]] = []
         self.persist_calls: list[tuple[list[int], str]] = []
+        self.expected_bytes_calls: list[int] = []
         self.restore_calls: list[int] = []
         self.refuse_persist = False
         self.fail_restore = False
@@ -447,8 +448,9 @@ class FakeStore:
                 best = entry
         return best
 
-    def persist(self, ids, boundary, write) -> bool:
+    def persist(self, ids, boundary, write, *, expected_bytes: int) -> bool:
         self.persist_calls.append((list(ids), boundary))
+        self.expected_bytes_calls.append(expected_bytes)
         if self.state != "active" or self.refuse_persist or self.has(ids):
             return False
         write(Path(f"/fake/{len(ids)}.tmp"), {"n_tokens": str(len(ids)), "boundary": boundary})
