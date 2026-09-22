@@ -9,11 +9,13 @@ from __future__ import annotations
 import gc
 import threading
 import weakref
+from pathlib import Path
 from typing import cast
 
 import pytest
 
 from sous.engine.base import Delta
+from sous.engine.forkstore import Header
 from sous.engine.promptcache import (
     FORK_MIN_TOKENS,
     KERNEL_PRESSURE_WARN,
@@ -410,7 +412,7 @@ class FakeEntry:
 
     def __init__(self, n: int, ids: list[int], size: int):
         self.n, self.ids, self.size = n, list(ids), size
-        self.path = f"/fake/{n}"
+        self.path = Path(f"/fake/{n}")
 
 
 class FakeStore:
@@ -447,7 +449,7 @@ class FakeStore:
         self.persist_calls.append((list(ids), boundary))
         if self.state != "active" or self.refuse_persist or self.has(ids):
             return False
-        write(f"/fake/{len(ids)}.tmp", {"n_tokens": str(len(ids)), "boundary": boundary})
+        write(Path(f"/fake/{len(ids)}.tmp"), {"n_tokens": str(len(ids)), "boundary": boundary})
         self.files[tuple(ids)] = FakeEntry(len(ids), list(ids), self.size)
         return True
 
@@ -455,7 +457,7 @@ class FakeStore:
         self.restore_calls.append(entry.n)
         if self.fail_restore:
             return False
-        load(entry.path, {"n_tokens": str(entry.n)})
+        load(entry.path, Header({"n_tokens": str(entry.n)}, {}, 0))
         return True
 
     def touch(self, ids) -> None:
