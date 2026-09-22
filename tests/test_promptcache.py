@@ -2016,6 +2016,172 @@ def test_a_second_session_starts_from_the_tools_fork_and_its_next_subagent_from_
     assert pc.stats()["fork_hits"] == 2
 
 
+# ---- forks on disk: the write ----------------------------------------------
+
+
+def test_a_cold_turn_persists_the_lowest_boundary_from_the_live_cache_before_the_copy():
+    h = FakeHooks(trimmable=True)
+    s = FakeStore()
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    assert list(s.files) == [tuple(T)]  # the tools boundary only, never the header
+    assert s.persist_calls == [(T, "tools")]
+    ids, offsets = h.persist_calls[0]
+    assert ids == T and offsets == [TOOLS_AT] * 2  # the live cache, at the boundary
+    # the working cache, the prefill to the boundary, the write, THEN the
+    # resident copy's allocation
+    assert h.log[:4] == ["new_cache", "prefill", "persist", "new_cache"]
+    st = pc.stats()
+    assert (st["persists"], st["forks"]) == (1, 2)  # both resident forks still made
+
+
+def test_a_second_turn_skips_the_write_and_touches_the_file():
+    h = FakeHooks(trimmable=True)
+    s = FakeStore()
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    # A different session, same tools: warm from the resident fork, and the
+    # boundary loop no longer enters for the tools boundary at all.
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    assert len(s.persist_calls) == 1
+    assert s.touched == [T]
+    assert pc.stats()["persists"] == 1
+
+
+def test_a_turn_warm_at_its_header_fork_still_touches_the_tools_file():
+    """The tools file belongs to a fork that is resident and never restored,
+    so nothing else refreshes it; without the touch it is the oldest file in
+    the store and the first the LRU takes."""
+    h = FakeHooks(trimmable=True)
+    s = FakeStore()
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    pc.generate(AX2, AX2_FULL, 16, fork_at=BOUNDS_A)  # warm at HA, above the tools boundary
+    assert s.touched == [T]
+
+
+def test_a_single_header_boundary_is_persisted_as_the_header():
+    h = FakeHooks(trimmable=True)
+    s = FakeStore()
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
+    assert s.persist_calls == [(H, "header")]
+
+
+@pytest.mark.parametrize("trimmable", [True, False])
+def test_at_budget_zero_the_file_is_written_and_no_fork_is_resident(trimmable):
+    """A machine that cannot hold a resident fork still gets the disk copy:
+    the probe resolves, the turn stops at the boundary, the live cache is
+    written, and no copy is charged."""
+    h = FakeHooks(trimmable=trimmable)
+    s = FakeStore()
+    pc = PrefixCache(h, max_bytes=0, store=s)
+    resolved = []
+
+    def probe():
+        resolved.append(True)
+        return BOUNDS_A
+
+    pc.generate(AX1, AX1_FULL, 16, fork_at=probe)
+    assert resolved == [True]
+    assert list(s.files) == [tuple(T)]
+    assert [x.kind for x in pc.slots()] == ["turn"]
+    st = pc.stats()
+    assert (st["persists"], st["forks"], st["bound_lo"], st["bound_hi"]) == (
+        1,
+        0,
+        TOOLS_AT,
+        len(HA),
+    )
+    assert h.prefilled[0] == T  # stopped at the boundary to write
+
+
+def test_without_a_store_budget_zero_still_resolves_no_probe():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=0)
+    resolved = []
+
+    def probe():
+        resolved.append(True)
+        return BOUNDS_A
+
+    pc.generate(AX1, AX1_FULL, 16, fork_at=probe)
+    assert resolved == []
+
+
+def test_a_raising_persist_hook_does_not_fail_a_cold_turn():
+    h = FakeHooks(trimmable=True)
+    s = FakeStore()
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+
+    def boom(hooks, cache, path, ids, metadata):
+        raise OSError("disk")
+
+    h.persist_impl = boom
+    assert pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A) == "text"
+    assert pc.stats()["persists"] == 0
+    assert pc.stats()["forks"] == 2  # the resident forks were still taken
+
+
+def test_a_store_that_refuses_counts_nothing():
+    h = FakeHooks(trimmable=True)
+    s = FakeStore()
+    s.refuse_persist = True
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    assert pc.stats()["persists"] == 0 and h.persist_calls == []
+
+
+def test_persist_time_is_its_own_gauge_not_prefill_time(clock):
+    class WritingHooks(TimedHooks):
+        def persist(self, cache, path, ids, metadata):
+            self.clock.advance(3.0)
+            super().persist(cache, path, ids, metadata)
+
+    h = WritingHooks(clock, trimmable=False)
+    pc = PrefixCache(h, max_bytes=ROOMY, store=FakeStore())
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    st = pc.stats()
+    assert st["persist_seconds"] == pytest.approx(3.0)
+    # three prefill segments (to T, to HA, the rest) at 2 s each; the write is not in it
+    assert st["prefill_seconds"] == pytest.approx(6.0)
+    assert st["decode_seconds"] == pytest.approx(5.0)
+
+
+def test_a_retired_owner_still_persists_though_its_fork_is_refused():
+    """Retirement exists because the arrays live on a dead thread's streams;
+    a file has no thread. The stall path's reset must not lose the write."""
+    h = FakeHooks(trimmable=True)
+    s = FakeStore()
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    original = h.prefill
+
+    def prefill(cache, token_ids):
+        original(cache, token_ids)
+        pc.reset(threading.current_thread())  # the endpoint retiring this session
+
+    h.prefill = prefill  # ty: ignore[invalid-assignment]
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    assert list(s.files) == [tuple(T)]
+    assert pc.slots() == []  # every publish refused
+
+
+def test_a_turn_starting_exactly_at_a_boundary_republishes_a_missing_fork():
+    """A fork lost to a pressure eviction, or one a disk restore started at,
+    is rebuilt through the existing charged path: the prefill to the
+    boundary is empty and the copy is taken from the live cache."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    at_header = h.new_cache()
+    h._advance(at_header, len(HA))
+    pc._plant(at_header, HA)  # a turn slot standing exactly at the header boundary
+    pc.generate(AX2, AX2_FULL, 16, fork_at=BOUNDS_A)  # takes it: reuse == len(HA)
+    assert [x.held for x in pc.slots() if x.kind == "fork"] == [HA]
+    assert h.prefilled[0] == []  # an empty stop at the boundary
+    st = pc.stats()
+    assert (st["forks"], st["retained"]) == (1, 1)
+
+
 def test_equal_out_of_range_and_short_boundaries_are_dropped():
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)

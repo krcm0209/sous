@@ -684,15 +684,19 @@ class PrefixCache:
         stable_ids: list[int],
         fork_at: Sequence[int] | Callable[[], Sequence[int]],
         reuse: int,
-    ) -> list[int]:
-        """The boundaries this turn will stop at to leave a fork slot,
-        ascending: those it is itself prefilling past (`reuse < b` — a hit
-        that started at or beyond one holds it inside a cache that cannot
-        rewind), that leave something to prefill after them
-        (`b < len(stable_ids)`), that clear the fork floor, and for which this
-        owner holds no fork with exactly those ids yet. Empty when there is no
-        budget to charge a copy to — and then the probe is not even resolved,
-        so at `max_bytes == 0` (the pre-3a single-slot behaviour) nothing about
+    ) -> list[tuple[int, bool, bool]]:
+        """The boundaries this turn will stop at, ascending, each with what
+        it wants there: a resident copy (`need_slot` — this owner holds no
+        fork with exactly those ids, and there is a budget to charge one to)
+        and/or a file (`need_file` — the store has none for those ids; only
+        the lowest boundary is ever written, the one the next session shares).
+        A boundary is returned when either is true. The candidates are those
+        this turn prefills to (`reuse <= b`: a turn that starts exactly at a
+        boundary — a disk restore, or a fork the valve took — republishes
+        there through the same path, with an empty prefill), that leave
+        something to prefill after them (`b < len(stable_ids)`) and that
+        clear the fork floor. Nothing is resolved when there is neither a
+        budget nor a store: at `max_bytes == 0` without a store nothing about
         the turn changes.
 
         The probe is resolved on warm turns too. With one boundary that was
@@ -710,7 +714,7 @@ class PrefixCache:
         that slow may run under the bookkeeping lock that reset() promises
         never to wait behind. Takes the lock itself, for the scan.
         """
-        if self.max_bytes <= 0:
+        if self.max_bytes <= 0 and self._store is None:
             return []
         if isinstance(fork_at, Sequence):
             candidates = list(fork_at)
@@ -730,21 +734,31 @@ class PrefixCache:
                 return []
             finally:
                 stats.probe_seconds += _clock() - started
-        # The boundaries the probe verified inside this render, ascending —
-        # recorded before the `reuse < b` filter so a warm turn that started
-        # past one still reports where both sit (the log's lcp_region needs
-        # them on the *next* turn's miss line).
         inside = sorted({b for b in candidates if b >= FORK_MIN_TOKENS and b < len(stable_ids)})
         if len(inside) >= 2:
             stats.bound_lo, stats.bound_hi = inside[0], inside[-1]
         elif inside:
             stats.bound_lo, stats.bound_hi = 0, inside[0]
-        wanted = sorted({b for b in inside if reuse < b})
-        if not wanted:
+        wanted = sorted({b for b in inside if reuse <= b})
+        if not inside:
             return []
         with self._lock:
             forks = [s.held for s in self._slots if s.owner is owner and s.kind == "fork"]
-        return [b for b in wanted if stable_ids[:b] not in forks]
+        # The lowest boundary's file, when it exists, is touched on every
+        # turn that passes or starts at or above it: a resident fork's file
+        # is otherwise the oldest in the store and the first the LRU takes.
+        store = self._store if self._store is not None and self._store.state == "active" else None
+        lowest = inside[0]
+        on_disk = store is not None and store.has(stable_ids[:lowest])
+        if on_disk:
+            store.touch(stable_ids[:lowest])
+        out: list[tuple[int, bool, bool]] = []
+        for b in wanted:
+            need_slot = self.max_bytes > 0 and stable_ids[:b] not in forks
+            need_file = store is not None and b == lowest and not on_disk
+            if need_slot or need_file:
+                out.append((b, need_slot, need_file))
+        return out
 
     def _publish(self, slot: Slot, epoch: int, protect: Sequence[Slot] = ()) -> bool:
         """Add `slot` unless the world moved on: a full reset since the turn
@@ -932,6 +946,32 @@ class PrefixCache:
         finally:
             stats.prefill_seconds += _clock() - started
         return copy
+
+    def _persist(self, stats: PromptCacheStats, cache: list, ids: list[int], boundary: str) -> None:
+        """Write the live cache, which stands exactly at `ids`' end, to the
+        store — before any resident copy, so the machine holds the live cache
+        alone across the write, and outside the prefill timer, so the turn
+        line's prefill rate stays true. Charged to nothing: the live cache
+        is the turn's own. Its own handler, because a cold turn's generate
+        re-raises rather than retrying and a disk error must never fail a
+        viable prefill."""
+        if self._store is None:
+            return
+        hooks = self._hooks
+        started = _clock()
+        try:
+            if self._store.persist(
+                ids, boundary, lambda path, metadata: hooks.persist(cache, path, ids, metadata)
+            ):
+                stats.persists += 1
+        except Exception as e:  # noqa: BLE001 — an optimization must never fail a turn
+            warnings.warn(
+                f"sous prompt cache: fork persist failed ({type(e).__name__}); "
+                "continuing without one",
+                stacklevel=2,
+            )
+        finally:
+            stats.persist_seconds += _clock() - started
 
     def generate(
         self,
@@ -1196,14 +1236,26 @@ class PrefixCache:
         entry_reuse = reuse
         stats.prefilled_tokens += anchor - entry_reuse
         published: list[Slot] = []
-        for boundary in self._fork_boundaries(stats, owner, stable_ids, fork_at, reuse):
+        for boundary, need_slot, need_file in self._fork_boundaries(
+            stats, owner, stable_ids, fork_at, reuse
+        ):
             # Stop at the boundary and continue from there: a fork is taken
             # while prefilling past it because no layer can be rewound to it
             # afterwards. Ascending order means no copy is ever wanted behind
-            # a prefix already prefilled.
+            # a prefix already prefilled. An empty segment (a turn that
+            # started exactly here) is a no-op on both backends.
             started = _clock()
             hooks.prefill(cache, list(stable_ids[reuse:boundary]))
             reuse = boundary
+            stats.prefill_seconds += _clock() - started
+            if need_file:
+                # The lowest boundary is the tools boundary when the probe
+                # found two, and the header when it found one.
+                kind = "tools" if stats.bound_lo else "header"
+                self._persist(stats, cache, list(stable_ids[:boundary]), kind)
+            if not need_slot:
+                continue
+            started = _clock()
             # What the cache holds at the boundary is what the copy will hold,
             # so it is also the price — re-read at every stop, since the cache
             # has grown.
