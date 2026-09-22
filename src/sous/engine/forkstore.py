@@ -11,15 +11,23 @@ callables.
 from __future__ import annotations
 
 import array
+import dataclasses
+import errno as errno_mod
 import functools
 import hashlib
 import json
 import logging
+import os
+import shutil
 import struct
-from collections.abc import Mapping, Sequence
+import threading
+import time
+import warnings
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
+from typing import Any
 
 _logger = logging.getLogger("sous.engine")
 
@@ -203,3 +211,365 @@ def auto_budget(free: int) -> int:
 def floor_bytes(total: int) -> int:
     """Free space a write must leave: 10 GiB or 5 % of the volume."""
     return max(FLOOR_MIN, int(total * FLOOR_FRACTION))
+
+
+@dataclass(frozen=True)
+class Entry:
+    """One file in the index: enough to pick it and to charge it."""
+
+    path: Path
+    key: str
+    n: int
+    digest: str
+    size: int
+    mtime: float
+
+
+_DISABLING_ERRNOS = frozenset(
+    {errno_mod.ENOSPC, errno_mod.EDQUOT, errno_mod.EACCES, errno_mod.EROFS}
+)
+
+
+class ForkStore:
+    """One directory per identity key under `root`; the directory is the
+    index. Files are shared across every owner thread — a file has no
+    thread affinity; the arrays a restore allocates belong to the restoring
+    thread — while residency in PrefixCache stays owner-scoped.
+
+    Every method is safe to call from any thread and holds `_lock` only
+    across dict work: never across a write, a read or a status build. A
+    persist or a restore runs on the caller's thread (the owner's, by the
+    caller's discipline) and reports through warnings, never exceptions."""
+
+    def __init__(
+        self,
+        root: Path,
+        key_fields: Mapping[str, str],
+        budget: int | None,
+        *,
+        pid_alive: Callable[[int], bool] | None = None,
+        disk_usage: Callable[[Path], Any] = shutil.disk_usage,
+        pid: Callable[[], int] = os.getpid,
+    ):
+        self.root = root
+        self.key_fields = dict(key_fields)
+        self.key = key_name(self.key_fields)
+        self.dir = root / self.key
+        self._disk_usage = disk_usage
+        self._pid = pid
+        self._pid_alive = pid_alive or _pid_alive
+        self._lock = threading.Lock()
+        # Every key's files, for the budget; only this key's are candidates.
+        self._entries: dict[Path, Entry] = {}
+        self._writing: set[str] = set()
+        self._restoring: set[Path] = set()
+        self._failures = 0
+        self._floor_warned = False
+        # Writer failures already reported, by exception type: a cache the
+        # format cannot cover fails identically on every cold turn.
+        self._warned_writers: set[str] = set()
+        self.state = "active"
+        self.reason: str | None = None
+        self.forks = 0
+        self.bytes = 0
+        self.evictions = 0
+        try:
+            self._ensure_dirs()
+            usage = disk_usage(root)
+            self.budget = auto_budget(usage.free) if budget is None else budget
+            self._scan()
+            with self._lock:
+                self._evict_locked(0)
+                self._recount_locked()
+        except OSError as e:
+            self.budget = 0
+            self._disable(f"{e.strerror or type(e).__name__} at {root}")
+            return
+        _logger.info(
+            f"prompt-cache forks on disk: {root} budget={self.budget / GIB:.1f}GiB "
+            f"found={self.forks} ({self.bytes / GIB:.1f} GiB)"
+        )
+
+    # ---- construction ------------------------------------------------------
+
+    def _ensure_dirs(self) -> None:
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.dir.mkdir(mode=0o700, exist_ok=True)
+        marker = self.root / ".metadata_never_index"
+        if not marker.exists():
+            marker.touch()
+        key_json = self.dir / "key.json"
+        if not key_json.exists():
+            key_json.write_text(json.dumps(self.key_fields, sort_keys=True, indent=2))
+
+    def _scan(self) -> None:
+        """Sizes and mtimes across every key (for the budget), headers for
+        this key only (for lookup), dead writers' temp files unlinked, and
+        this key's files that fail the header check deleted."""
+        entries: dict[Path, Entry] = {}
+        for key_dir in self.root.iterdir():
+            if not key_dir.is_dir():
+                continue
+            for item in key_dir.iterdir():
+                pid = parse_temp_name(item.name)
+                if pid is not None:
+                    if not self._pid_alive(pid):
+                        item.unlink(missing_ok=True)
+                    continue
+                parsed = parse_file_name(item.name)
+                if parsed is None:
+                    continue
+                n, dig = parsed
+                st = item.stat()
+                if key_dir.name == self.key and not self._verify_header(item, n, st.st_size):
+                    item.unlink(missing_ok=True)
+                    continue
+                entries[item] = Entry(item, key_dir.name, n, dig, st.st_size, st.st_mtime)
+        with self._lock:
+            self._entries = entries
+
+    def _verify_header(self, path: Path, n: int, size: int) -> bool:
+        try:
+            header = read_header(path)
+        except ForkFileError:
+            return False
+        meta = header.metadata
+        if meta.get("format") != FORMAT or meta.get("layout") != str(FORK_LAYOUT):
+            return False
+        if meta.get("n_tokens") != str(n) or header.expected_size != size:
+            return False
+        return all(meta.get(k) == v for k, v in self.key_fields.items())
+
+    # ---- bookkeeping (lock held by the caller) -------------------------------
+
+    def _recount_locked(self) -> None:
+        self.forks = sum(1 for e in self._entries.values() if e.key == self.key)
+        self.bytes = sum(e.size for e in self._entries.values())
+
+    def _evict_locked(self, incoming: int) -> None:
+        """LRU by mtime across every key until `incoming` more bytes fit
+        under EVICT_TO of the budget, never a file being restored."""
+        target = int(self.budget * EVICT_TO) if incoming else self.budget
+        while sum(e.size for e in self._entries.values()) + incoming > target:
+            victims = [e for e in self._entries.values() if e.path not in self._restoring]
+            if not victims:
+                return
+            oldest = min(victims, key=lambda e: e.mtime)
+            oldest.path.unlink(missing_ok=True)
+            del self._entries[oldest.path]
+            self.evictions += 1
+
+    def _disable(self, reason: str) -> None:
+        self.state, self.reason = "unavailable", reason
+        warnings.warn(f"sous fork store: disabled ({reason})", stacklevel=3)
+
+    # ---- public ------------------------------------------------------------
+
+    def status(self) -> dict:
+        return {
+            "state": self.state,
+            "reason": self.reason,
+            "forks": self.forks,
+            "bytes": self.bytes,
+            "budget_bytes": self.budget,
+            "evictions": self.evictions,
+        }
+
+    def _path_for(self, n: int, dig: str) -> Path:
+        return self.dir / file_name(n, dig)
+
+    def has(self, ids: Sequence[int]) -> bool:
+        with self._lock:
+            return self._path_for(len(ids), digest(ids)) in self._entries
+
+    def longest_prefix(self, stable_ids: Sequence[int]) -> Entry | None:
+        """The longest stored prefix `stable_ids` strictly extends, by the
+        reuse_length rule (an exact match leaves nothing to decode). One
+        digest per distinct stored length, longest first, stop at the first
+        hit: under 8 ms for eight lengths."""
+        if self.state != "active":
+            return None
+        with self._lock:
+            mine = [e for e in self._entries.values() if e.key == self.key]
+        by_length: dict[int, list[Entry]] = {}
+        for e in mine:
+            if 0 < e.n < len(stable_ids):
+                by_length.setdefault(e.n, []).append(e)
+        for n in sorted(by_length, reverse=True):
+            dig = digest(stable_ids[:n])
+            for e in by_length[n]:
+                if e.digest == dig:
+                    return e
+        return None
+
+    def touch(self, ids: Sequence[int]) -> None:
+        path = self._path_for(len(ids), digest(ids))
+        with self._lock:
+            entry = self._entries.get(path)
+        if entry is None:
+            return
+        try:
+            os.utime(path, None)
+            with self._lock:
+                self._entries[path] = dataclasses.replace(entry, mtime=time.time())
+        except OSError:
+            pass
+
+    def persist(
+        self,
+        ids: Sequence[int],
+        boundary: str,
+        write: Callable[[Path, dict[str, str]], None],
+    ) -> bool:
+        """Write `ids`' cache through `write(temp_path, metadata)` unless a
+        file for it exists (then touch it), a write of it is in flight, the
+        store is off, or the write would breach the free-space floor. Room
+        is made first — never from a file being restored — and the file is
+        indexed only after os.replace. Never raises."""
+        if self.state != "active":
+            return False
+        n, dig = len(ids), digest(ids)
+        final = self._path_for(n, dig)
+        with self._lock:
+            if final in self._entries:
+                known = True
+            elif dig in self._writing:
+                return False
+            else:
+                known = False
+                self._writing.add(dig)
+        if known:
+            self.touch(ids)
+            return False
+        temp = temp_name(final, self._pid())
+        from importlib.metadata import version
+
+        try:
+            self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            metadata = {
+                "format": FORMAT,
+                "layout": str(FORK_LAYOUT),
+                **self.key_fields,
+                "n_tokens": str(n),
+                "boundary": boundary,
+                "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "sous": version("sous-mcp"),
+            }
+            write(temp, metadata)
+            os.chmod(temp, 0o600)
+            size = temp.stat().st_size
+            if size > self.budget:
+                temp.unlink(missing_ok=True)
+                if not self._floor_warned:
+                    self._floor_warned = True
+                    warnings.warn(
+                        f"sous fork store: not persisting a {size / GIB:.1f} GiB fork "
+                        f"larger than the budget ({self.budget / GIB:.1f} GiB)",
+                        stacklevel=2,
+                    )
+                return False
+            usage = self._disk_usage(self.root)
+            if usage.free - size < floor_bytes(usage.total):
+                temp.unlink(missing_ok=True)
+                if not self._floor_warned:
+                    self._floor_warned = True
+                    warnings.warn(
+                        "sous fork store: not persisting a fork — the write would leave "
+                        f"less than {floor_bytes(usage.total) / GIB:.0f} GiB of free space",
+                        stacklevel=2,
+                    )
+                return False
+            with self._lock:
+                self._evict_locked(size)
+            os.replace(temp, final)
+            st = final.stat()
+            with self._lock:
+                self._entries[final] = Entry(final, self.key, n, dig, st.st_size, st.st_mtime)
+                self._recount_locked()
+            return True
+        except OSError as e:
+            temp.unlink(missing_ok=True)
+            warnings.warn(
+                f"sous fork store: fork persist failed ({type(e).__name__}: {e.strerror})",
+                stacklevel=2,
+            )
+            if e.errno in _DISABLING_ERRNOS:
+                self._disable(f"{os.strerror(e.errno)} ({errno_mod.errorcode[e.errno]})")
+            return False
+        except Exception as e:  # noqa: BLE001 — an optimization never fails a turn
+            temp.unlink(missing_ok=True)
+            kind = type(e).__name__
+            if kind not in self._warned_writers:
+                self._warned_writers.add(kind)
+                warnings.warn(
+                    f"sous fork store: fork persist failed ({kind}); not persisting again",
+                    stacklevel=2,
+                )
+            return False
+        finally:
+            with self._lock:
+                self._writing.discard(dig)
+
+    def restore(self, entry: Entry, load: Callable[[Path, Header], None]) -> bool:
+        """Read `entry` through `load(path, header)`. A ForkFileError from
+        the header check or the loader is a verification failure: the file
+        is deleted and three in a row retire the store. Anything else keeps
+        the file (an allocation failure is not corruption). A file that is
+        gone is a plain miss. Never raises."""
+        if self.state != "active":
+            return False
+        with self._lock:
+            if entry.path not in self._entries:
+                return False
+            self._restoring.add(entry.path)
+        try:
+            try:
+                st = entry.path.stat()
+            except FileNotFoundError:
+                self._forget(entry)
+                return False
+            try:
+                header = read_header(entry.path)
+                if header.expected_size != st.st_size:
+                    raise ForkFileError(f"{entry.path.name}: size {st.st_size}")
+                load(entry.path, header)
+            except ForkFileError as e:
+                warnings.warn(f"sous fork store: fork restore failed ({e}); deleted", stacklevel=2)
+                entry.path.unlink(missing_ok=True)
+                self._forget(entry)
+                self._failures += 1
+                if self._failures >= MAX_FAILURES:
+                    self._disable(f"{MAX_FAILURES} consecutive restore failures")
+                return False
+            except Exception as e:  # noqa: BLE001 — keep the file: not corruption
+                warnings.warn(
+                    f"sous fork store: fork restore failed ({type(e).__name__}); kept",
+                    stacklevel=2,
+                )
+                return False
+            self._failures = 0
+            self.touch_entry(entry)
+            return True
+        finally:
+            with self._lock:
+                self._restoring.discard(entry.path)
+
+    def touch_entry(self, entry: Entry) -> None:
+        try:
+            os.utime(entry.path, None)
+            with self._lock:
+                if entry.path in self._entries:
+                    self._entries[entry.path] = dataclasses.replace(entry, mtime=time.time())
+        except OSError:
+            pass
+
+    def _forget(self, entry: Entry) -> None:
+        with self._lock:
+            self._entries.pop(entry.path, None)
+            self._recount_locked()
+
+
+def _pid_alive(pid: int) -> bool:
+    import psutil
+
+    return psutil.pid_exists(pid)
