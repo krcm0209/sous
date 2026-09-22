@@ -435,6 +435,8 @@ class FakeStore:
         return tuple(ids) in self.files
 
     def longest_prefix(self, stable_ids):
+        if self.state != "active":
+            return None
         best = None
         for entry in self.files.values():
             if (
@@ -2945,3 +2947,188 @@ def test_gauges_fold_by_max_like_the_existing_ones():
     a = PromptCacheStats(prefill_seconds=3.0, took_len=10, bound_hi=500)
     a.add(PromptCacheStats(prefill_seconds=1.0, took_len=40, bound_hi=200))
     assert (a.prefill_seconds, a.took_len, a.bound_hi) == (3.0, 40, 500)
+
+
+# ---- forks on disk: the read ------------------------------------------------
+
+
+def test_a_miss_restores_the_stored_tools_fork_into_the_turns_own_cache():
+    h = FakeHooks(trimmable=True)
+    s = stored(T)
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    assert s.restore_calls == [TOOLS_AT] and h.restore_calls == [T]
+    st = pc.stats()
+    assert (st["hits"], st["disk_hits"], st["misses"], st["fork_hits"]) == (1, 1, 0, 0)
+    assert (st["reused_tokens"], st["took_len"], st["took_kind"]) == (TOOLS_AT, TOOLS_AT, "disk")
+    assert st["restores"] == 1
+    # an empty stop at T (to republish it), then only what lies past the prefix
+    assert h.prefilled[:2] == [[], HB[TOOLS_AT:]]
+    assert s.touched == [T]
+    assert h.decoded[-1] == BX1_FULL[len(HB) :]
+    # Residency came back through the boundary loop: the tools fork is
+    # resident again and B's own header fork was published as always.
+    assert sorted(x.held for x in pc.slots() if x.kind == "fork") == sorted([T, HB])
+    assert st["forks"] == 2
+    assert len(s.persist_calls) == 0  # the file already existed: no rewrite
+
+
+def test_the_restored_cache_is_the_working_cache_not_a_planted_slot():
+    """The restored arrays are the turn's own — never charged, never in the
+    map — and the resident copy is made room for through _make_room like
+    every fork: the machine never holds restored + planted + copy."""
+    h = FakeHooks(trimmable=True)
+    s = stored(T)
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    seen: list[int] = []
+    h.on_new_cache = lambda: seen.append(len(pc.slots()))
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    # new_cache for the restore (map empty), then for the resident copy of
+    # T (map still empty: nothing was planted), then for HB's copy.
+    assert seen[:2] == [0, 0]
+
+
+def test_a_restore_at_budget_zero_plants_nothing_and_serves_the_turn():
+    h = FakeHooks(trimmable=True)
+    s = stored(T)
+    pc = PrefixCache(h, max_bytes=0, store=s)
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    st = pc.stats()
+    assert (st["disk_hits"], st["took_kind"], st["forks"]) == (1, "disk", 0)
+    assert [x.kind for x in pc.slots()] == ["turn"]
+
+
+def test_the_longest_stored_prefix_wins():
+    h = FakeHooks(trimmable=True)
+    s = stored(T, HB)
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    assert s.restore_calls == [len(HB)]
+    assert pc.stats()["took_len"] == len(HB)
+
+
+def test_a_resident_fork_is_preferred_over_the_file():
+    h = FakeHooks(trimmable=True)
+    s = stored(T)
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)  # cold: restores T, republishes it
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)  # warm from the resident T
+    assert s.restore_calls == [TOOLS_AT]  # once
+    st = pc.stats()
+    assert (st["disk_hits"], st["fork_hits"]) == (1, 1)
+
+
+def test_a_restore_is_skipped_at_critical_pressure_and_the_file_kept():
+    h = FakeHooks(trimmable=True)
+    h.pressure_value = 4
+    s = stored(T)
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    st = pc.stats()
+    assert (st["misses"], st["restore_skips"], st["disk_hits"]) == (1, 1, 0)
+    assert s.restore_calls == [] and tuple(T) in s.files
+
+
+def test_a_restore_makes_metal_room_by_dropping_resident_slots():
+    class RoomHooks(FakeHooks):
+        pc: PrefixCache
+
+        def headroom(self):
+            # Headroom is short by one slot until the map is empty.
+            return 10 if self.pc.slots() else 10_000
+
+    h = RoomHooks(trimmable=True)
+    s = stored(T, size=100)
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    h.pc = pc
+    pc._plant(h.new_cache(), [7, 7, 7])  # someone else's resident slot
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    st = pc.stats()
+    assert st["disk_hits"] == 1
+    assert st["pressure_evictions"] == 1 and st["evictions"] >= 1
+    assert [7, 7, 7] not in [x.held for x in pc.slots()]
+
+
+def test_a_restore_is_skipped_when_headroom_is_short_and_nothing_can_be_dropped():
+    h = FakeHooks(trimmable=True)
+    h.headroom_value = 10
+    s = stored(T, size=100)
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    st = pc.stats()
+    assert (st["misses"], st["restore_skips"]) == (1, 1) and s.restore_calls == []
+
+
+def test_no_restore_is_attempted_after_a_failed_fork_clone():
+    h = FakeHooks(trimmable=True)
+    s = stored(T)
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    _fail_next_copy(h)
+    with pytest.warns(UserWarning, match="fork clone failed"):
+        pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    assert s.restore_calls == [TOOLS_AT]  # the first turn's, not a second attempt
+    assert pc.stats()["misses"] == 1
+
+
+def test_a_failed_restore_is_a_cold_miss_with_the_counters_untouched():
+    h = FakeHooks(trimmable=True)
+    s = stored(T)
+    s.fail_restore = True
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    st = pc.stats()
+    assert (st["misses"], st["disk_hits"], st["restores"], st["took_kind"]) == (1, 0, 0, "")
+    assert h.prefilled[0] == T and st["reused_tokens"] == 0  # prefilled from zero
+
+
+def test_a_raising_restore_hook_is_a_cold_miss():
+    h = FakeHooks(trimmable=True)
+    s = stored(T)
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+
+    def boom(*a, **k):
+        raise MemoryError()
+
+    h.restore = boom  # ty: ignore[invalid-assignment]
+    # The fake store lets the loader's exception through; the real one
+    # catches it and returns False. Either way the turn goes cold.
+    with pytest.warns(UserWarning, match="fork restore failed"):
+        assert pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B) == "text"
+    assert pc.stats()["misses"] == 1
+
+
+def test_a_restored_turn_whose_generation_fails_retries_cold_and_keeps_the_file():
+    h = FakeHooks(trimmable=True, fail_once=True)
+    s = stored(T)
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    with pytest.warns(UserWarning, match="retrying cold"):
+        assert pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B) == "text"
+    st = pc.stats()
+    assert st["cold_retries"] == 1 and st["restores"] == 1
+    assert (st["took_kind"], st["restore_seconds"]) == ("", 0.0)  # the line describes the retry
+    assert tuple(T) in s.files
+
+
+def test_restore_time_is_its_own_gauge(clock):
+    class ReadingHooks(TimedHooks):
+        def restore(self, path, header, cache, ids):
+            self.clock.advance(1.5)
+            super().restore(path, header, cache, ids)
+
+    h = ReadingHooks(clock, trimmable=False)
+    pc = PrefixCache(h, max_bytes=ROOMY, store=stored(T))
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    st = pc.stats()
+    assert st["restore_seconds"] == pytest.approx(1.5)
+    # an empty stop at T (2 s on the fake clock), to HB, then the rest
+    assert st["prefill_seconds"] == pytest.approx(6.0)
+
+
+def test_a_disabled_store_is_never_consulted():
+    h = FakeHooks(trimmable=True)
+    s = stored(T)
+    s.state = "unavailable"
+    pc = PrefixCache(h, max_bytes=ROOMY, store=s)
+    pc.generate(BX1, BX1_FULL, 16, fork_at=BOUNDS_B)
+    assert pc.stats()["misses"] == 1

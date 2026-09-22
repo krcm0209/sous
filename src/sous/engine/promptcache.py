@@ -973,6 +973,60 @@ class PrefixCache:
         finally:
             stats.persist_seconds += _clock() - started
 
+    def _restore_from_disk(
+        self, stats: PromptCacheStats, stable_ids: list[int]
+    ) -> tuple[list, int] | None:
+        """The longest stored prefix of `stable_ids`, read into a fresh cache
+        on this thread — the turn's own working cache, uncharged, covered by
+        the reserve — or None for a plain miss.
+
+        The one place a whole fork is allocated in one step, so the two
+        readings the valve uses are consulted first: while Metal's headroom
+        is short of the file, drop least-recently-used resident slots (a miss
+        took nothing, so nothing is protected); if it is still short, or the
+        kernel is at critical, skip — the file stays, the turn prefills
+        cold. Residency is not made here: the boundary loop republishes a
+        resident fork at the restored length through its charged path.
+        Runs before the probe is resolved, so a turn warm at a restored
+        tools fork still publishes its own header fork."""
+        store = self._store
+        if store is None or store.state != "active":
+            return None
+        entry = store.longest_prefix(stable_ids)
+        if entry is None:
+            return None
+        hooks = self._hooks
+        started = _clock()
+        try:
+            while (headroom := hooks.headroom()) is not None and headroom < entry.size:
+                with self._lock:
+                    if not self._evictable(()):
+                        break
+                    self._drop_lru((), pressure=True)
+            headroom = hooks.headroom()
+            level = hooks.pressure()
+            if (headroom is not None and headroom < entry.size) or (
+                level is not None and level >= KERNEL_PRESSURE_CRITICAL
+            ):
+                stats.restore_skips += 1
+                return None
+            cache = hooks.new_cache()
+            ids = list(stable_ids[: entry.n])
+            if not store.restore(
+                entry, lambda path, header: hooks.restore(path, header, cache, ids)
+            ):
+                return None
+            stats.restores += 1
+            return cache, entry.n
+        except Exception as e:  # noqa: BLE001 — an optimization must never fail a turn
+            warnings.warn(
+                f"sous prompt cache: fork restore failed ({type(e).__name__}); prefilling cold",
+                stacklevel=2,
+            )
+            return None
+        finally:
+            stats.restore_seconds += _clock() - started
+
     def generate(
         self,
         stable_ids: list[int],
@@ -1068,6 +1122,7 @@ class PrefixCache:
                 self._evict_caps(protect=(slot,) if slot is not None else ())
         warm: list | None = None
         kind = ""
+        clone_failed = False
         if slot is not None and slot.kind == "fork":
             # The slot stays for the next conversation; this turn works on its
             # own copy. Taking that copy is part of the warm optimization, so
@@ -1083,6 +1138,7 @@ class PrefixCache:
                 # `cold_retries` is not the counter for it either — that one
                 # means a warm run that failed after it had started.
                 slot = None
+                clone_failed = True
             else:
                 stats.fork_hits += 1
                 kind = "fork"
@@ -1131,14 +1187,25 @@ class PrefixCache:
             stats.hits += 1
             stats.reused_tokens += reuse
         else:
-            reuse = 0
-            stats.misses += 1
-            # Scanned here, after the clone, so a fork whose copy failed is
-            # measured like any other miss instead of keeping an earlier one's.
-            stats.miss_lcp = max(
-                (common_prefix_length(held, stable_ids) for held in candidates), default=0
-            )
-            warm = hooks.new_cache()
+            # A failed clone was an allocation failure of the size a restore
+            # would ask for again; go straight to the cold path then.
+            restored = None if clone_failed else self._restore_from_disk(stats, stable_ids)
+            if restored is not None:
+                warm, reuse = restored
+                stats.took_len = reuse
+                stats.took_kind = "disk"
+                stats.hits += 1
+                stats.disk_hits += 1
+                stats.reused_tokens += reuse
+            else:
+                reuse = 0
+                stats.misses += 1
+                # Scanned here, after the clone, so a fork whose copy failed is
+                # measured like any other miss instead of keeping an earlier one's.
+                stats.miss_lcp = max(
+                    (common_prefix_length(held, stable_ids) for held in candidates), default=0
+                )
+                warm = hooks.new_cache()
         # Drop this frame's reference to the slot before anything else is
         # allocated: on a moved slot this is what keeps one conversation from
         # ever holding two copies of itself, and on a retained one the map's
