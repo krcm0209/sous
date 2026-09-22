@@ -283,7 +283,16 @@ def _default_factory(
         # The pressure valve is off; the store must not be the one thing
         # allocating a fork at a stroke.
         fork_dir = None
-    weights = weights_identity_for(model_id) if fork_dir is not None else ""
+    weights = ""
+    if fork_dir is not None:
+        try:
+            weights = weights_identity_for(model_id)
+        except Exception as e:  # noqa: BLE001 — a model load must never fail because of this
+            warnings.warn(
+                f"sous: fork store off — weights identity unavailable ({type(e).__name__})",
+                stacklevel=2,
+            )
+            fork_dir = None
     if backend == "vlm":
         # Import the module, not the class, so tests can monkeypatch the
         # engine class on its home module and be seen here.

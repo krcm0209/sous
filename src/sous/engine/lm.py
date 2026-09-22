@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -47,9 +48,13 @@ class LMEngine:
         # pass one, so nothing they build touches ~/.sous.
         self.fork_store: ForkStore | None = None
         if fork_dir is not None and prompt_cache:
-            self.fork_store = ForkStore(
-                fork_dir, self._fork_key_fields(weights_identity), fork_budget
-            )
+            try:
+                self.fork_store = ForkStore(
+                    fork_dir, self._fork_key_fields(weights_identity), fork_budget
+                )
+            except Exception as e:  # noqa: BLE001 — a model load must never fail because of this
+                warnings.warn(f"sous: fork store off ({type(e).__name__})", stacklevel=2)
+                self.fork_store = None
         # Measured after load, so the weights are inside `active`.
         if cache_budget is None:
             cache_budget = measure_cache_budget(reserve_bytes)

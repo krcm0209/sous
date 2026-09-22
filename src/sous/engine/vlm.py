@@ -105,9 +105,13 @@ class VLMEngine:
         # and sous tune never pass one, so nothing they build touches ~/.sous.
         self.fork_store: ForkStore | None = None
         if fork_dir is not None and prompt_cache:
-            self.fork_store = ForkStore(
-                fork_dir, self._fork_key_fields(weights_identity), fork_budget
-            )
+            try:
+                self.fork_store = ForkStore(
+                    fork_dir, self._fork_key_fields(weights_identity), fork_budget
+                )
+            except Exception as e:  # noqa: BLE001 — a model load must never fail because of this
+                warnings.warn(f"sous: fork store off ({type(e).__name__})", stacklevel=2)
+                self.fork_store = None
         # Measured after load AND after the drafter, so the weights of both are
         # inside `active` and the budget is what the machine actually has left.
         if cache_budget is None:

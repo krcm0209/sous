@@ -1560,6 +1560,43 @@ def test_weights_identity_for_reads_the_cached_config_without_the_network(monkey
     assert seen["local_files_only"] is True
 
 
+def test_default_factory_disables_forks_when_weights_identity_is_unavailable(monkeypatch, tmp_path):
+    from sous.engine import base, lm
+
+    seen = {}
+
+    class FakeLM:
+        def __init__(self, model_id, **kw):
+            seen.update(kw)
+
+    monkeypatch.setattr(lm, "LMEngine", FakeLM)
+    monkeypatch.setattr(
+        base,
+        "fetch_model_config",
+        lambda mid: {
+            "model_type": "qwen3",
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+        },
+    )
+
+    def raise_identity(mid):
+        raise OSError("no cached config")
+
+    monkeypatch.setattr(base, "weights_identity_for", raise_identity)
+    with pytest.warns(UserWarning, match="weights identity unavailable"):
+        base._default_factory(
+            "m",
+            prompt_cache=True,
+            cache_budget=7,
+            reserve_tokens=1000,
+            fork_dir=tmp_path / "forks",
+            fork_budget=5,
+        )
+    assert seen["fork_dir"] is None and seen["weights_identity"] == ""
+
+
 def _mystery_lm(monkeypatch) -> dict:
     """_default_factory against a model whose KV cost per token is unknown."""
     from sous.engine import base, lm

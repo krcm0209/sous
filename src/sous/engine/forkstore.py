@@ -323,15 +323,22 @@ class ForkStore:
         self.evictions = 0
         try:
             self._ensure_dirs()
-            usage = disk_usage(root)
-            self.budget = auto_budget(usage.free) if budget is None else budget
             self._scan()
+            usage = disk_usage(root)
+            with self._lock:
+                found = sum(e.size for e in self._entries.values())
+            # `usage.free` already excludes this store's own files (they are
+            # real bytes on disk by the time this reads it); add them back so
+            # a restart derives the same budget the first run did, rather
+            # than a smaller one that evicts what the previous run wrote.
+            self.budget = auto_budget(usage.free + found) if budget is None else budget
             with self._lock:
                 self._evict_locked(0)
                 self._recount_locked()
-        except OSError as e:
+        except Exception as e:  # noqa: BLE001 — a model load must never fail because of this
             self.budget = 0
-            self._disable(f"{e.strerror or type(e).__name__} at {root}")
+            reason = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
+            self._disable(f"{reason or type(e).__name__} at {root}")
             return
         _logger.info(
             f"prompt-cache forks on disk: {root} budget={self.budget / GIB:.1f}GiB "
@@ -353,7 +360,17 @@ class ForkStore:
     def _scan(self) -> None:
         """Sizes and mtimes across every key (for the budget), headers for
         this key only (for lookup), dead writers' temp files unlinked, and
-        this key's files that fail the header check deleted."""
+        this key's files that fail the header check deleted.
+
+        Tolerant per item, so one bad file never disables the whole store: a
+        pid_alive check that cannot answer (a crafted or unreadable pid)
+        leaves the temp file alone rather than guessing whether to delete
+        someone else's in-flight write, and a file stat()-ed out from under
+        the scan (removed mid-scan, racing another thread's eviction) is
+        skipped. Anything else — a header whose JSON recurses past Python's
+        stack, an unreadable key directory — still propagates, since it
+        means the scan itself cannot be trusted; the constructor disables
+        the store for that."""
         entries: dict[Path, Entry] = {}
         for key_dir in self.root.iterdir():
             if not key_dir.is_dir():
@@ -361,14 +378,21 @@ class ForkStore:
             for item in key_dir.iterdir():
                 pid = parse_temp_name(item.name)
                 if pid is not None:
-                    if not self._pid_alive(pid):
+                    try:
+                        alive = self._pid_alive(pid)
+                    except Exception:  # noqa: BLE001 — can't tell; leave it
+                        continue
+                    if not alive:
                         item.unlink(missing_ok=True)
                     continue
                 parsed = parse_file_name(item.name)
                 if parsed is None:
                     continue
                 n, dig = parsed
-                st = item.stat()
+                try:
+                    st = item.stat()
+                except OSError:
+                    continue
                 if key_dir.name == self.key and not self._verify_header(item, n, st.st_size):
                     item.unlink(missing_ok=True)
                     continue

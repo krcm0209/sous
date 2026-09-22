@@ -259,6 +259,23 @@ def test_auto_budget_is_derived_from_free_space(tmp_path: Path):
     assert store(tmp_path, budget=3 * GIB).budget == 3 * GIB
 
 
+def test_the_auto_budget_does_not_ratchet_down_across_restarts(tmp_path: Path):
+    """`disk_usage(root).free` already excludes this store's own files by the
+    time construction reads it, so a restart must add their bytes back
+    before deriving the auto budget — otherwise every restart sees a
+    slightly smaller free space than the one before, computes a smaller
+    budget, and evicts what the previous run wrote."""
+    original_free = 40 * GIB
+    total = 200 * GIB  # keeps the 5% floor (10 GiB) well under 40 GiB free
+    s = store(tmp_path, free=original_free, total=total)
+    assert s.budget == 10 * GIB
+    assert s.persist(IDS[:100], "tools", fake_write(300, IDS[:100]), expected_bytes=300)
+    n = s.bytes
+    # The OS's own free-space reading already reflects these bytes as spent.
+    again = store(tmp_path, free=original_free - n, total=total)
+    assert again.budget == s.budget
+
+
 def test_construction_disables_the_store_when_the_root_cannot_be_written(tmp_path: Path):
     blocker = tmp_path / "forks"
     blocker.write_text("a file where the directory should be")
@@ -523,6 +540,39 @@ def test_construction_sweeps_dead_writers_temp_files_and_keeps_live_ones(tmp_pat
     live.write_bytes(b"x")
     store(tmp_path, pid_alive=lambda pid: pid == 77)
     assert not dead.exists() and live.exists()
+
+
+def test_a_pid_alive_check_that_raises_leaves_the_temp_file_and_stays_active(tmp_path: Path):
+    """A crafted or unreadable pid can make psutil raise instead of
+    answering; the scan must not guess whether to delete someone else's
+    in-flight write, and one bad temp file must not disable the store."""
+    s = store(tmp_path)
+    d = tmp_path / "forks" / s.key
+    temp = d / "1-x.99.tmp.safetensors"
+    temp.write_bytes(b"x")
+
+    def raising_pid_alive(pid: int) -> bool:
+        raise ValueError("crafted pid")
+
+    again = store(tmp_path, pid_alive=raising_pid_alive)
+    assert again.state == "active" and temp.exists()
+
+
+def test_a_file_that_vanishes_during_the_scan_is_skipped_not_disabling(tmp_path: Path, monkeypatch):
+    """A file removed mid-scan (racing another thread's eviction) makes
+    stat() raise; the scan skips just that item rather than disabling."""
+    s = store(tmp_path)
+    assert s.persist(IDS[:100], "tools", fake_write(8, IDS[:100]), expected_bytes=8)
+    real_stat = Path.stat
+
+    def flaky_stat(self: Path, *a, **kw):
+        if self.name.startswith("100-"):
+            raise FileNotFoundError(self)
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+    again = store(tmp_path)
+    assert again.state == "active" and again.forks == 0
 
 
 def test_construction_enforces_the_budget_over_every_key(tmp_path: Path):
