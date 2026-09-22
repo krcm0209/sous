@@ -1268,6 +1268,7 @@ def test_daemon_status_reads_the_real_daemons_config(tmp_path):
         "port": 8383,
         "local_models": ["sous-local"],
         "max_context_tokens": 131072,
+        "prompt_cache_disk_gb": None,
         "upstream_url": "https://api.anthropic.com",
         "generation_timeout_minutes": 30,
     }

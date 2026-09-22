@@ -25,6 +25,7 @@ _KNOWN = {
         "top_k",
         "prompt_cache",
         "prompt_cache_gb",
+        "prompt_cache_disk_gb",
         "speculative_draft_id",
         "speculative_block_size",
         "int8_prefill",
@@ -111,6 +112,11 @@ class SousConfig:
     # a new subagent start from a copy of the ~50K-token header its
     # predecessor already prefilled.
     prompt_cache_gb: float | None = None
+    # Fork slots kept on disk under <data_dir>/forks, in GiB, so a tools fork
+    # survives an idle unload, a restart and a reboot. None means automatic:
+    # a quarter of the volume's free space, capped at 16 GiB (four to five
+    # forks of the default model). 0 keeps nothing on disk.
+    prompt_cache_disk_gb: float | None = None
     data_dir: Path = DEFAULT_DATA_DIR
     config_path: Path = DEFAULT_CONFIG_PATH
 
@@ -348,6 +354,34 @@ def _prompt_cache_gb(model: dict) -> float | None:
     return float(value)
 
 
+def _prompt_cache_disk_gb(model: dict) -> float | None:
+    """[model].prompt_cache_disk_gb: "auto" (None) or a non-negative number
+    of GiB, the prompt_cache_gb shape. Anything else warns and means auto."""
+    value = model.get("prompt_cache_disk_gb", "auto")
+    if value == "auto":
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or not math.isfinite(value * (1 << 30))
+        or value < 0
+    ):
+        warnings.warn(
+            f'sous config: [model].prompt_cache_disk_gb {value!r} must be "auto" or a '
+            'non-negative number of GiB; using "auto"',
+            stacklevel=3,
+        )
+        return None
+    if model.get("prompt_cache") is False and value:
+        warnings.warn(
+            "sous config: [model].prompt_cache_disk_gb has no effect while "
+            "[model].prompt_cache is false",
+            stacklevel=3,
+        )
+    return float(value)
+
+
 def _int8_prefill(model: dict) -> bool:
     """[model].int8_prefill: true or false; anything else warns and means false,
     the same stance as the other [model] knobs (a typo must not turn on a path
@@ -453,6 +487,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         top_k=model.get("top_k", 20),
         prompt_cache=model.get("prompt_cache", True),
         prompt_cache_gb=_prompt_cache_gb(model),
+        prompt_cache_disk_gb=_prompt_cache_disk_gb(model),
         speculative_draft_id=model.get("speculative_draft_id", "z-lab/Qwen3.8-27B-DFlash2"),
         speculative_block_size=_speculative_block_size(model),
         int8_prefill=_int8_prefill(model),
