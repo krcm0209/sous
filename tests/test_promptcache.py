@@ -155,7 +155,9 @@ class FakeMeta:
 
 
 def _empty_stats() -> dict:
-    return {**PromptCacheStats().as_dict(), "slots": 0, "resident_bytes": 0}
+    from sous.engine.promptcache import DISK_OFF
+
+    return {**PromptCacheStats().as_dict(), "slots": 0, "resident_bytes": 0, "disk": dict(DISK_OFF)}
 
 
 # Roomy enough that nothing is ever evicted for size in tests that want to see
@@ -330,8 +332,16 @@ class FakeHooks:
         self.generated = [7, 8, 9]
         self.headroom_value: int | None = None
         self.pressure_value: int | None = None  # the kernel's level: 1 normal, 2 warn, 4 critical
+        # The order of the calls a turn makes, so a test can pin that the
+        # persist runs at the boundary before the resident copy is taken.
+        self.log: list[str] = []
+        self.persist_calls: list[tuple[list[int], list[int]]] = []  # (ids, offsets seen)
+        self.restore_calls: list[list[int]] = []
+        self.evaluated: list[list] = []
+        self.persist_impl = None
 
     def new_cache(self) -> list:
+        self.log.append("new_cache")
         if self.on_new_cache is not None:
             self.on_new_cache()
         if self.trimmable:
@@ -347,10 +357,12 @@ class FakeHooks:
                 c.offset += n
 
     def prefill(self, cache, token_ids):
+        self.log.append("prefill")
         self.prefilled.append(list(token_ids))
         self._advance(cache, len(token_ids))
 
     def decode(self, cache, token_ids, max_tokens, on_delta=None):
+        self.log.append("decode")
         self.on_deltas.append(on_delta)
         if self.fail_once:
             self.fail_once = False
@@ -375,6 +387,97 @@ class FakeHooks:
 
     def pressure(self):
         return self.pressure_value
+
+    def eval_cache(self, cache):
+        self.evaluated.append(cache)
+
+    def persist(self, cache, path, ids, metadata):
+        self.log.append("persist")
+        if self.persist_impl is not None:
+            return self.persist_impl(self, cache, path, ids, metadata)
+        offsets = [c.offset for c in cache if isinstance(c, FakeTrimmable)]
+        self.persist_calls.append((list(ids), offsets))
+
+    def restore(self, path, header, cache, ids):
+        self.log.append("restore")
+        self.restore_calls.append(list(ids))
+        self._advance(cache, len(ids))
+
+
+class FakeEntry:
+    """What the store hands back for a stored prefix: its length, its bytes
+    and a path the fake loader is called with."""
+
+    def __init__(self, n: int, ids: list[int], size: int):
+        self.n, self.ids, self.size = n, list(ids), size
+        self.path = f"/fake/{n}"
+
+
+class FakeStore:
+    """The disk store, in memory: files keyed by their ids. Records every
+    call so a test can see the order and the arguments; `state` and the
+    two failure switches script the store's refusals."""
+
+    def __init__(self, size: int = 4096):
+        self.files: dict[tuple[int, ...], FakeEntry] = {}
+        self.size = size
+        self.state = "active"
+        self.touched: list[list[int]] = []
+        self.persist_calls: list[tuple[list[int], str]] = []
+        self.restore_calls: list[int] = []
+        self.refuse_persist = False
+        self.fail_restore = False
+        self.evictions = 0
+
+    def has(self, ids) -> bool:
+        return tuple(ids) in self.files
+
+    def longest_prefix(self, stable_ids):
+        best = None
+        for entry in self.files.values():
+            if (
+                0 < entry.n < len(stable_ids)
+                and list(stable_ids[: entry.n]) == entry.ids
+                and (best is None or entry.n > best.n)
+            ):
+                best = entry
+        return best
+
+    def persist(self, ids, boundary, write) -> bool:
+        self.persist_calls.append((list(ids), boundary))
+        if self.state != "active" or self.refuse_persist or self.has(ids):
+            return False
+        write(f"/fake/{len(ids)}.tmp", {"n_tokens": str(len(ids)), "boundary": boundary})
+        self.files[tuple(ids)] = FakeEntry(len(ids), list(ids), self.size)
+        return True
+
+    def restore(self, entry, load) -> bool:
+        self.restore_calls.append(entry.n)
+        if self.fail_restore:
+            return False
+        load(entry.path, {"n_tokens": str(entry.n)})
+        return True
+
+    def touch(self, ids) -> None:
+        self.touched.append(list(ids))
+
+    def status(self) -> dict:
+        return {
+            "state": self.state,
+            "reason": None,
+            "forks": len(self.files),
+            "bytes": sum(e.size for e in self.files.values()),
+            "budget_bytes": 1 << 34,
+            "evictions": self.evictions,
+        }
+
+
+def stored(*prefixes: list[int], size: int = 4096) -> FakeStore:
+    """A store already holding files for `prefixes`."""
+    s = FakeStore(size=size)
+    for ids in prefixes:
+        s.files[tuple(ids)] = FakeEntry(len(ids), list(ids), size)
+    return s
 
 
 STABLE_1, FULL_1 = [1, 2, 3, 4], [1, 2, 3, 4, 90, 91]
@@ -887,6 +990,10 @@ def test_stats_as_dict_reports_every_counter():
         pressure_evictions=2,
         retained=2,
         moved=1,
+        persists=1,
+        restores=2,
+        disk_hits=2,
+        restore_skips=1,
     )
     assert s.as_dict() == {
         "hits": 2,
@@ -901,6 +1008,10 @@ def test_stats_as_dict_reports_every_counter():
         "pressure_evictions": 2,
         "retained": 2,
         "moved": 1,
+        "persists": 1,
+        "restores": 2,
+        "disk_hits": 2,
+        "restore_skips": 1,
         "prefilled_tokens": 0,
         "took_len": 0,
         "took_kind": "",
@@ -909,6 +1020,8 @@ def test_stats_as_dict_reports_every_counter():
         "probe_seconds": 0.0,
         "prefill_seconds": 0.0,
         "decode_seconds": 0.0,
+        "persist_seconds": 0.0,
+        "restore_seconds": 0.0,
     }
 
 
@@ -2511,6 +2624,39 @@ def test_begin_turn_resets_exactly_the_turn_gauges():
     assert (after["hits"], after["miss_lcp"]) == (3, 9)
     assert TURN_GAUGES.isdisjoint(without_turn_gauges({**after, "slots": 1}))
     assert without_turn_gauges({**after, "slots": 1})["slots"] == 1
+
+
+def test_persist_and_restore_seconds_are_turn_gauges_and_the_counts_are_not():
+    from sous.engine.promptcache import TURN_GAUGES
+
+    assert {"persist_seconds", "restore_seconds"} <= TURN_GAUGES
+    assert TURN_GAUGES.isdisjoint({"persists", "restores", "disk_hits", "restore_skips"})
+    a = PromptCacheStats(persists=1, restores=2, persist_seconds=3.0)
+    b = PromptCacheStats(persists=1, restores=1, persist_seconds=1.0)
+    a.add(b)
+    assert (a.persists, a.restores, a.persist_seconds) == (2, 3, 3.0)
+
+
+def test_stats_report_the_store_status_or_off():
+    from sous.engine.promptcache import DISK_OFF
+
+    assert PrefixCache(FakeHooks(trimmable=True)).stats()["disk"] == DISK_OFF
+    s = stored(HEADER)
+    pc = PrefixCache(FakeHooks(trimmable=True), store=s)
+    assert pc.stats()["disk"] == s.status()
+    assert pc.stats()["disk"]["forks"] == 1
+
+
+def test_a_fork_copy_is_evaluated_before_it_is_charged():
+    """A copy is lazy until something evaluates it, and the pressure valve
+    reads active memory: an unevaluated fork would hand it headroom that
+    does not exist."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(C1, C1_FULL, 16, fork_at=[FORK])
+    assert len(h.evaluated) == 1  # the fork copy
+    pc.generate(C2, C2_FULL, 16, fork_at=[FORK])
+    assert len(h.evaluated) == 2  # the copy the fork hit took
 
 
 def test_trimmable_reports_the_fused_pass_as_decode(clock):

@@ -5,8 +5,10 @@ from __future__ import annotations
 import threading
 import warnings
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, cast
 
+from sous.engine import forkio
 from sous.engine.base import Delta, OnDelta
 from sous.engine.promptcache import FORK_MIN_TOKENS, PrefixCache, PromptMemo, probe_boundaries
 
@@ -360,6 +362,15 @@ class VLMEngine:
         from sous.engine.base import kernel_memory_pressure
 
         return kernel_memory_pressure()
+
+    def eval_cache(self, cache: list) -> None:
+        forkio.eval_cache(cache)
+
+    def persist(self, cache: list, path: Path, ids: list[int], metadata: dict[str, str]) -> None:
+        forkio.persist_cache(cache, path, ids, metadata)
+
+    def restore(self, path: Path, header: Any, cache: list, ids: list[int]) -> None:
+        forkio.restore_cache(path, header, cache, ids)
 
     # ---- Engine ----------------------------------------------------------
 

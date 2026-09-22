@@ -16,6 +16,7 @@ import warnings
 import weakref
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from sous.engine.base import Delta, OnDelta, ReplaySafe
@@ -290,6 +291,8 @@ TURN_GAUGES = frozenset(
         "probe_seconds",
         "prefill_seconds",
         "decode_seconds",
+        "persist_seconds",
+        "restore_seconds",
     }
 )
 _GAUGES = frozenset({"snapshot_bytes", "miss_lcp"}) | TURN_GAUGES
@@ -302,6 +305,18 @@ def without_turn_gauges(stats: dict) -> dict:
     seen, beside counters that span every turn — numbers no reader can use,
     paid for in the frontier model's tokens."""
     return {k: v for k, v in stats.items() if k not in TURN_GAUGES}
+
+
+# The status document's `prompt_cache.disk` block when no store was built:
+# off by config, or an engine constructed without a directory (every test).
+DISK_OFF: dict = {
+    "state": "off",
+    "reason": None,
+    "forks": 0,
+    "bytes": 0,
+    "budget_bytes": 0,
+    "evictions": 0,
+}
 
 
 # The clock the per-turn timers read. A module attribute rather than a bare
@@ -335,6 +350,12 @@ class PromptCacheStats:
     # `pressure_evictions`) can still take it before one arrives.
     retained: int = 0
     moved: int = 0
+    # Disk forks: files written, files read back, turns served from one,
+    # and restores the memory readings refused (the file stays).
+    persists: int = 0
+    restores: int = 0
+    disk_hits: int = 0
+    restore_skips: int = 0
     # Per-turn gauges, zeroed by begin_turn() at the top of every generate()
     # and assigned as the turn runs, so a turn that bypasses _run (cache off,
     # render not a strict prefix) reports zeros rather than the last turn's.
@@ -349,6 +370,8 @@ class PromptCacheStats:
     probe_seconds: float = 0.0
     prefill_seconds: float = 0.0  # every hooks.prefill, plus fork copies and the snapshot
     decode_seconds: float = 0.0  # hooks.decode, plus the restore
+    persist_seconds: float = 0.0  # writing the live cache at a boundary; never prefill time
+    restore_seconds: float = 0.0  # reading a fork off disk; never prefill time
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -410,7 +433,14 @@ class PromptMemo:
 
 
 class CacheHooks(Protocol):
-    """The five things only an engine can do. Everything else is shared."""
+    """The things only an engine can do. Everything else is shared.
+
+    `eval_cache` materialises a cache's arrays on the calling thread (a fork
+    copy is lazy, and the pressure valve reads active memory). `persist`
+    writes the live working cache at a boundary to `path` — called on the
+    owner thread, holding no lock, never with a Slot; `restore` fills a fresh
+    cache from `path` on the calling thread and evaluates it, raising the
+    store's verification error on any mismatch."""
 
     def new_cache(self) -> list: ...
     def prefill(self, cache: list, token_ids: list[int]) -> None: ...
@@ -431,6 +461,29 @@ class CacheHooks(Protocol):
     # owner thread, no cache lock held, no lock of its own, no thread-state
     # release.
     def pressure(self) -> int | None: ...
+    def eval_cache(self, cache: list) -> None: ...
+    def persist(
+        self, cache: list, path: Path, ids: list[int], metadata: dict[str, str]
+    ) -> None: ...
+    def restore(self, path: Path, header: Any, cache: list, ids: list[int]) -> None: ...
+
+
+class StoreHooks(Protocol):
+    """The disk store as the orchestrator sees it (engine/forkstore.ForkStore
+    in production, a fake in tests). Files are shared across owner threads;
+    the arrays a restore allocates belong to the restoring thread, so
+    residency stays owner-scoped while the file is not."""
+
+    state: str
+
+    def has(self, ids: Sequence[int]) -> bool: ...
+    def longest_prefix(self, stable_ids: Sequence[int]) -> Any: ...
+    def persist(
+        self, ids: Sequence[int], boundary: str, write: Callable[[Path, dict[str, str]], None]
+    ) -> bool: ...
+    def restore(self, entry: Any, load: Callable[[Path, Any], None]) -> bool: ...
+    def touch(self, ids: Sequence[int]) -> None: ...
+    def status(self) -> dict: ...
 
 
 @dataclass
@@ -445,7 +498,8 @@ class Slot:
     its arrays adopted) or "fork" (a copy taken at a shared-prefix boundary;
     copied on every hit, left in place). Which turn slots are one
     conversation at different lengths is read off `held` (`_ancestors`),
-    never recorded."""
+    never recorded. A fork's file on disk, when the store keeps one, is
+    shared across owners; only the arrays are owner-scoped."""
 
     cache: list
     held: list[int]
@@ -473,6 +527,10 @@ class PrefixCache:
     Everything published is charged to `max_bytes`; the in-flight
     turn's own cache never is — `reserve_bytes` (one full window of KV) was
     subtracted from the machine's headroom before `max_bytes` was derived.
+
+    Disk forks (`store`) are the one thing here shared across owners: a file
+    has no thread affinity, and every restore allocates arrays of its own on
+    the restoring thread. The owner rule is about arrays, not content.
     """
 
     def __init__(
@@ -482,6 +540,7 @@ class PrefixCache:
         *,
         max_bytes: int = 0,
         reserve_bytes: int = 0,
+        store: StoreHooks | None = None,
     ):
         # These defaults are the orchestrator's own semantics, not the
         # user-facing ones — both engines always pass them explicitly. The
@@ -492,6 +551,7 @@ class PrefixCache:
         self.enabled = enabled
         self.max_bytes = max_bytes
         self.reserve_bytes = reserve_bytes
+        self._store = store
         # Held only across list and dict work, plus the deallocation a drop
         # triggers — never across prefill or decode. reset() must never wait
         # on a generation (its caller may be the turn runner's stall path
@@ -826,8 +886,10 @@ class PrefixCache:
             self._retired.add(owner)
 
     def stats(self, owner: threading.Thread | None = None) -> dict:
-        """Counters plus `slots` and `resident_bytes`: for one owner thread, or
-        daemon-wide (every live owner plus the history of retired ones)."""
+        """Counters plus `slots`, `resident_bytes` and `disk`: for one owner
+        thread, or daemon-wide (every live owner plus the history of retired
+        ones)."""
+        disk = self._store.status() if self._store is not None else dict(DISK_OFF)
         with self._lock:
             self._sweep()
             if owner is not None:
@@ -843,6 +905,7 @@ class PrefixCache:
                 **total.as_dict(),
                 "slots": len(mine),
                 "resident_bytes": sum(s.nbytes for s in mine),
+                "disk": disk,
             }
 
     def _copy_of(
@@ -860,6 +923,7 @@ class PrefixCache:
         try:
             copy = hooks.new_cache()
             fork_copy(cache, copy, hooks.copy_array)
+            hooks.eval_cache(copy)
         except Exception as e:
             warnings.warn(
                 f"sous prompt cache: {what} ({type(e).__name__}); {fallback}", stacklevel=3
@@ -1156,6 +1220,7 @@ class PrefixCache:
                 if self._make_room(price, protect=published):
                     copy = hooks.new_cache()
                     fork_copy(cache, copy, hooks.copy_array)
+                    hooks.eval_cache(copy)
                     slot = Slot(copy, list(stable_ids[:boundary]), owner, "fork", slot_bytes(copy))
                     if self._publish(slot, epoch, protect=published):
                         stats.forks += 1
