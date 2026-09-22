@@ -149,3 +149,19 @@ def test_eval_cache_materialises_every_layer():
     lazy[1][0] = mx.array(kv.keys)
     forkio.eval_cache(lazy)  # must not raise, and must leave the arrays usable
     assert _equal(lazy[0].keys, kv.keys) and _equal(lazy[1][0], kv.keys)
+
+
+def test_restore_does_not_mutate_cache_on_error(tmp_path: Path):
+    """On ForkFileError, the cache must remain untouched. Validating all
+    layers before applying any assignment ensures a mismatch at layer i
+    does not leave layers 0..i-1 holding unevaluated file arrays."""
+    kv, _ = _kv((8,))
+    ar = _arrays()
+    path = tmp_path / "8-x.safetensors"
+    forkio.persist_cache([kv, ar], path, IDS[:8], {**META, "n_tokens": "8"})
+    header = read_header(path)
+    fresh = [cache_mod.KVCache(), cache_mod.ArraysCache(size=3)]
+    with pytest.raises(ForkFileError):
+        forkio.restore_cache(path, header, fresh, IDS[:8])
+    assert fresh[0].keys is None and fresh[0].offset == 0
+    assert fresh[1][0] is None

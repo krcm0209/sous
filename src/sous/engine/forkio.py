@@ -93,7 +93,8 @@ def restore_cache(path: Path, header: Header, cache: Sequence[Any], ids: Sequenc
     it. A KVCache gets keys, values and then offset from metadata — never
     the state setter, which derives the offset from the padded shape and
     would misposition every token appended afterwards. Raises ForkFileError
-    on any mismatch: the caller deletes the file."""
+    on any mismatch: on error the cache is untouched; the caller deletes
+    the file."""
     import mlx.core as mx
 
     meta = header.metadata
@@ -108,6 +109,7 @@ def restore_cache(path: Path, header: Header, cache: Sequence[Any], ids: Sequenc
         raise ForkFileError(f"{path.name}: no ids tensor")
     if loaded["ids"].tolist() != list(ids):  # ty: ignore[invalid-argument-type]
         raise ForkFileError(f"{path.name}: ids differ")
+    assignments: list[tuple[Any, ...]] = []
     targets: list[Any] = []
     for i, (c, kind) in enumerate(zip(cache, kinds, strict=True)):
         if kind == "kv":
@@ -121,7 +123,7 @@ def restore_cache(path: Path, header: Header, cache: Sequence[Any], ids: Sequenc
                 raise ForkFileError(f"{path.name}: layer {i} incomplete") from e
             if offset != n or keys.shape[2] < n or values.shape[2] < n:
                 raise ForkFileError(f"{path.name}: layer {i} offset {offset} for {n} ids")
-            c.keys, c.values, c.offset = keys, values, offset
+            assignments.append(("kv", c, keys, values, offset))
             targets += [keys, values]
         else:
             try:
@@ -141,5 +143,12 @@ def restore_cache(path: Path, header: Header, cache: Sequence[Any], ids: Sequenc
                     targets.append(states[-1])
                 else:
                     raise ForkFileError(f"{path.name}: layer {i} state {j} missing")
+            assignments.append(("arrays", c, states))
+    for assign in assignments:
+        if assign[0] == "kv":
+            _, c, keys, values, offset = assign
+            c.keys, c.values, c.offset = keys, values, offset
+        else:
+            _, c, states = assign
             c.state = states
     mx.eval(*targets)
