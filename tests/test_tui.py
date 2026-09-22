@@ -159,6 +159,9 @@ def test_every_kitchen_word_is_glued_to_its_literal_or_its_number():
     assert row["cache"] == "DRAWER 53.3k" and row["took"] == "fork@53296"
     assert tui.rail_row(_summary(1, "miss"))["cache"] == "SCRATCH 0"
     assert tui.rail_row(_summary(1))["cache"] == "REHEAT 61.9k"
+    disk = tui.rail_row(_summary(1, "disk", reused_tokens=50312, took="disk@50312"))
+    assert disk["cache"] == "PANTRY 50.3k"
+    assert tui.CACHE_COLOURS["disk"]
     failed = tui.rail_row(_summary(1, error="api_error", status=500))
     assert failed["cache"] == "DROPPED IT" and failed["in"] == "—" and failed["took"] == "none"
     assert failed["why"] == "DROPPED IT · 500 api_error"

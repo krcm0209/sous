@@ -152,7 +152,7 @@ PHASE_COLOURS = {
     "prefill": MUSTARD,
     "decode": PINK,
 }
-CACHE_COLOURS = {"hit": TEAL, "fork": PURPLE, "miss": MUSTARD}
+CACHE_COLOURS = {"hit": TEAL, "fork": PURPLE, "miss": MUSTARD, "disk": PURPLE}
 
 # Decorative glyphs are East-Asian Ambiguous width in some terminals; a
 # start-up measurement swaps the whole set for ASCII rather than let one
