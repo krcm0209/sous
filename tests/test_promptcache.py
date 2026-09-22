@@ -2118,7 +2118,8 @@ def test_a_raising_persist_hook_does_not_fail_a_cold_turn():
         raise OSError("disk")
 
     h.persist_impl = boom
-    assert pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A) == "text"
+    with pytest.warns(UserWarning, match="fork persist failed"):
+        assert pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A) == "text"
     assert pc.stats()["persists"] == 0
     assert pc.stats()["forks"] == 2  # the resident forks were still taken
 
@@ -2130,6 +2131,7 @@ def test_a_store_that_refuses_counts_nothing():
     pc = PrefixCache(h, max_bytes=ROOMY, store=s)
     pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
     assert pc.stats()["persists"] == 0 and h.persist_calls == []
+    assert s.persist_calls == [(T, "tools")]  # asked, and refused
 
 
 def test_persist_time_is_its_own_gauge_not_prefill_time(clock):

@@ -985,7 +985,7 @@ class PrefixCache:
         token counts into `stable_ids`, in any order — or a callable that
         computes them. The callable form is the engines' probe: it renders and
         tokenizes, so it is deferred until `_fork_boundaries` knows there is a
-        budget to fork into at all."""
+        budget to fork into or a store to write to."""
         hooks = self._hooks
         if not self.enabled:
             return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens, on_delta)
