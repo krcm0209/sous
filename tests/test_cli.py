@@ -1743,6 +1743,42 @@ def test_status_lines_for_an_idle_unloaded_daemon():
     ]
 
 
+def test_status_lines_report_forks_on_disk_when_the_store_is_active_or_unavailable():
+    from sous.cli import status_lines
+
+    doc = _document()
+    doc["engine"]["prompt_cache"]["disk"] = {
+        "state": "active",
+        "reason": None,
+        "forks": 3,
+        "bytes": int(9.4 * (1 << 30)),
+        "budget_bytes": 16 << 30,
+        "evictions": 0,
+    }
+    lines = status_lines(doc, now=0.0)
+    assert "  forks on disk: 3 · 9.4 GB" in lines
+    doc["engine"]["prompt_cache"]["disk"] = {
+        "state": "unavailable",
+        "reason": "No space left on device (ENOSPC)",
+        "forks": 0,
+        "bytes": 0,
+        "budget_bytes": 0,
+        "evictions": 0,
+    }
+    assert "  forks on disk: unavailable (No space left on device (ENOSPC))" in status_lines(
+        doc, now=0.0
+    )
+    doc["engine"]["prompt_cache"]["disk"] = {
+        "state": "off",
+        "reason": None,
+        "forks": 0,
+        "bytes": 0,
+        "budget_bytes": 0,
+        "evictions": 0,
+    }
+    assert not [x for x in status_lines(doc, now=0.0) if "forks on disk" in x]
+
+
 def test_status_prints_the_document_when_the_daemon_answers(monkeypatch, capsys, tmp_path):
     from sous import cli
 

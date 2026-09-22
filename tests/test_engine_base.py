@@ -1182,6 +1182,25 @@ def test_status_carries_the_int8_prefill_view_when_the_engine_reports_one(tmp_pa
     assert manager.status()["int8_prefill"] == {"state": "active", "reason": None, "routed": 336}
 
 
+@pytest.mark.parametrize("state", ["off", "active", "unavailable"])
+def test_status_carries_the_disk_block_the_cache_reports(tmp_path, state):
+    inner = FakeEngine([])
+    inner.stats = {
+        "hits": 0,
+        "disk": {
+            "state": state,
+            "reason": None,
+            "forks": 0,
+            "bytes": 0,
+            "budget_bytes": 0,
+            "evictions": 0,
+        },
+    }
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    assert manager.status()["prompt_cache"]["disk"]["state"] == state
+
+
 def test_status_carries_the_positions_view_when_the_engine_reports_one(tmp_path):
     """The load line says which side owns the rotary positions once; the
     status document says it for as long as the model is resident, so an

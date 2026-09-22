@@ -396,6 +396,12 @@ def status_lines(document: dict, now: float) -> list[str]:
         f"sous daemon: listening on 127.0.0.1:{config.get('port', '?')}",
         "  " + " · ".join(engine_parts),
     ]
+    disk = (engine.get("prompt_cache") or {}).get("disk")
+    if isinstance(disk, dict) and disk.get("state") == "active":
+        gb = (disk.get("bytes") or 0) / (1 << 30)
+        lines.append(f"  forks on disk: {disk.get('forks', 0)} · {gb:.1f} GB")
+    elif isinstance(disk, dict) and disk.get("state") == "unavailable":
+        lines.append(f"  forks on disk: unavailable ({disk.get('reason') or '?'})")
     # Shape-checked entry by entry: whatever answered on the port is read
     # here, and a wrong element must not become a traceback.
     inflight = [t for t in _entries(document.get("inflight")) if isinstance(t, dict)]

@@ -190,7 +190,15 @@ def _turn_summary(
     """The turn line's fields as one JSON-ready dict: what the registry keeps
     for the live view and what the line is printed from, so the two can
     never disagree. Counts, durations, hashes and identifiers only."""
-    cache = "fork" if result.forked else "hit" if result.cache_hit else "miss"
+    cache = (
+        "disk"
+        if result.from_disk
+        else "fork"
+        if result.forked
+        else "hit"
+        if result.cache_hit
+        else "miss"
+    )
     lo, hi = result.bounds
     miss = cache == "miss"
     return {
@@ -225,6 +233,8 @@ def _turn_summary(
         "ttft_s": result.ttft_seconds,
         "prefill_s": result.prefill_seconds,
         "decode_s": result.decode_seconds,
+        "persist_s": result.persist_seconds,
+        "restore_s": result.restore_seconds,
         "prefill_tps": _per_second(result.prefilled_tokens, result.prefill_seconds),
         "decode_tps": _per_second(result.output_tokens, result.decode_seconds),
         "seconds": result.seconds,
@@ -251,6 +261,7 @@ def _turn_line(s: dict) -> str:
         f"engine_wait_s={s['engine_wait_s']:.1f} "
         f"tokenize_s={s['tokenize_s']:.1f} ttft_s={_opt(s['ttft_s'])} "
         f"prefill_s={s['prefill_s']:.1f} decode_s={s['decode_s']:.1f} "
+        f"persist_s={s['persist_s']:.1f} restore_s={s['restore_s']:.1f} "
         f"prefill_tps={_opt(s['prefill_tps'])} decode_tps={_opt(s['decode_tps'])} "
         f"seconds={s['seconds']:.1f}{diag} "
         f"tools={s['tools_hash'] or '-'} system={s['system_hash'] or '-'}"

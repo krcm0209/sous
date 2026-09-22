@@ -64,7 +64,7 @@ PHASE_WORDS = {
 }
 DONE_WORD = "ORDER UP"
 STALLED_WORD = "IN THE WINDOW"
-CACHE_WORDS = {"hit": "REHEAT", "fork": "WARM DRAWER", "miss": "SCRATCH"}
+CACHE_WORDS = {"hit": "REHEAT", "fork": "WARM DRAWER", "miss": "SCRATCH", "disk": "PANTRY"}
 RAIL_CACHE_WORDS = {**CACHE_WORDS, "fork": "DRAWER"}  # the rail's column is narrower
 STOP_WORDS = {
     "end_turn": "ORDER UP",
@@ -103,6 +103,7 @@ LEGEND = """\
  DROPPED IT     failed       the turn failed or was refused
  REHEAT         hit          the prompt's prefix reused from a resident shelf
  WARM DRAWER    fork         a copy of another conversation's prefix, held hot
+ PANTRY         disk         a fork read off disk into the turn's own cache
  SCRATCH        miss         nothing reusable; the prompt read cold
  TOSSED         evicted      a shelf dropped to make room
  WALK-IN FULL   pressure     shelves dropped under memory pressure
@@ -278,6 +279,15 @@ def rail_row(turn: dict) -> dict[str, str]:
         "total": seconds_text(turn.get("seconds")),
         "why": why_text(turn),
     }
+
+
+def _disk_suffix(disk: object) -> str:
+    """` · disk 3` when forks are kept on disk; nothing otherwise. The wide
+    panel's line count is fixed and every row must fit 35 columns, so the
+    count rides on the shortest line and the bytes stay with `sous status`."""
+    if not isinstance(disk, dict) or disk.get("state") != "active":
+        return ""
+    return f" · disk {disk.get('forks', 0)}"
 
 
 def turn_tallies(recent: list[dict]) -> tuple[int, int, int]:
@@ -1084,7 +1094,7 @@ class LinePanel(Vertical):
                 f" REHEAT {c.get('hits', 0):>3} hit    DRAWER {c.get('fork_hits', 0):>2} fork",
                 f" SCRATCH {c.get('misses', 0):>2} miss  TOSSED {c.get('evictions', 0):>2} evict",
                 f" WALK-IN FULL {c.get('pressure_evictions', 0)} pressure evict",
-                f" reused {c.get('reused_tokens', 0):,} tok",
+                f" reused {c.get('reused_tokens', 0):,} tok" + _disk_suffix(c.get("disk")),
             ]
             # `size` is the content box: the sprite's three rows come off it.
             # The tickets block needs two more rows than the wide layout

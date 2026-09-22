@@ -51,6 +51,14 @@ def _doc(
                 "evictions": 3,
                 "pressure_evictions": 1,
                 "reused_tokens": 1_820_000,
+                "disk": {
+                    "state": "active",
+                    "reason": None,
+                    "forks": 3,
+                    "bytes": int(9.4 * (1 << 30)),
+                    "budget_bytes": 16 << 30,
+                    "evictions": 0,
+                },
             },
         },
         "inflight": ([turn] if turn else []) + list(behind),
@@ -432,6 +440,7 @@ def test_the_slip_shows_the_turn_from_the_document():
         line = _plain(app, "#line-engine")
         assert line.startswith("  LINE IS OPEN  loaded") and "hold 1" in line
         assert "REHEAT  41 hit    DRAWER 18 fork" in _plain(app, "#line-body")
+        assert " reused 1,820,000 tok · disk 3" in _plain(app, "#line-body")
         body = _plain(app, "#line-body")
         assert " ORDERS ORDER UP 3 · DROPPED IT 1" in body
         assert "        WALKED OUT 1" in body
