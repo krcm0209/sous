@@ -602,3 +602,58 @@ def test_touch_refreshes_the_mtime_of_a_stored_prefix(tmp_path: Path):
     s.touch(IDS[:100])
     assert e.path.stat().st_mtime > 1
     s.touch(IDS[:50])  # unknown: a no-op
+
+
+def test_nested_restore_of_same_file_refcounts_eviction_protection(tmp_path: Path):
+    """Concurrent restores of the same file must both complete; the first
+    to finish does not remove the second's eviction protection."""
+    a, b = IDS[:10], [*IDS[:9], 1001]
+    s = store(tmp_path, budget=10 * GIB)
+    assert s.persist(a, "tools", fake_write(300, a))
+    e = s.longest_prefix(IDS[:11])
+    assert e is not None
+    os.utime(e.path, (1, 1))
+    s.budget = e.size + e.size // 2  # room for one file
+
+    def nested_restore(path: Path, header: Header) -> None:
+        # While the outer restore is in flight, do another restore of the
+        # same file, then persist to seek room. The inner restore should not
+        # shield the file from eviction (it uses the same path), but the
+        # outer restore is still in progress, so the refcount must be >0.
+        inner_saw_file = None
+
+        def inner_load(inner_path: Path, inner_header: Header) -> None:
+            nonlocal inner_saw_file
+            inner_saw_file = inner_path.exists()
+            # A write that needs room while two restores are in flight: the
+            # file under both readers has a refcount of 2, so it survives.
+            assert s.persist(b, "tools", fake_write(300, b)) is True
+            assert path.exists()
+
+        inner_restore_ok = s.restore(e, inner_load)
+        assert inner_restore_ok is True and inner_saw_file is True
+
+    assert s.restore(e, nested_restore) is True
+    assert s.forks == 2
+
+
+def test_oversize_and_free_space_warnings_are_separate(tmp_path: Path):
+    """A fork too large for the budget and one that would breach free space
+    are different operator signals; one must not silence the other."""
+    # Start with a tiny budget; an oversized fork is refused and warns.
+    s = store(tmp_path, budget=100)
+    with pytest.warns(UserWarning, match="larger than the budget"):
+        assert s.persist(IDS[:10], "tools", fake_write(300, IDS[:10])) is False
+    # Now set disk free below floor with a normal-sized fork; free-space
+    # warning should fire independently.
+    s.budget = 1000
+    s_low_disk = ForkStore(
+        tmp_path / "forks",
+        KEY,
+        1000,
+        disk_usage=Disk(100 * GIB, 9 * GIB + 100),  # floor is 10 GiB
+        pid_alive=lambda p: False,
+        pid=lambda: 4242,
+    )
+    with pytest.warns(UserWarning, match="free space"):
+        assert s_low_disk.persist(IDS[:100], "tools", fake_write(200, IDS[:100])) is False

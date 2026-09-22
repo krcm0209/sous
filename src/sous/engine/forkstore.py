@@ -262,8 +262,9 @@ class ForkStore:
         # Every key's files, for the budget; only this key's are candidates.
         self._entries: dict[Path, Entry] = {}
         self._writing: set[str] = set()
-        self._restoring: set[Path] = set()
+        self._restoring: dict[Path, int] = {}
         self._failures = 0
+        self._oversize_warned = False
         self._floor_warned = False
         # Writer failures already reported, by exception type: a cache the
         # format cannot cover fails identically on every cold turn.
@@ -351,7 +352,7 @@ class ForkStore:
         under EVICT_TO of the budget, never a file being restored."""
         target = int(self.budget * EVICT_TO) if incoming else self.budget
         while sum(e.size for e in self._entries.values()) + incoming > target:
-            victims = [e for e in self._entries.values() if e.path not in self._restoring]
+            victims = [e for e in self._entries.values() if self._restoring.get(e.path, 0) == 0]
             if not victims:
                 return
             oldest = min(victims, key=lambda e: e.mtime)
@@ -460,8 +461,8 @@ class ForkStore:
             size = temp.stat().st_size
             if size > self.budget:
                 temp.unlink(missing_ok=True)
-                if not self._floor_warned:
-                    self._floor_warned = True
+                if not self._oversize_warned:
+                    self._oversize_warned = True
                     warnings.warn(
                         f"sous fork store: not persisting a {size / GIB:.1f} GiB fork "
                         f"larger than the budget ({self.budget / GIB:.1f} GiB)",
@@ -521,7 +522,7 @@ class ForkStore:
         with self._lock:
             if entry.path not in self._entries:
                 return False
-            self._restoring.add(entry.path)
+            self._restoring[entry.path] = self._restoring.get(entry.path, 0) + 1
         try:
             try:
                 st = entry.path.stat()
@@ -552,7 +553,11 @@ class ForkStore:
             return True
         finally:
             with self._lock:
-                self._restoring.discard(entry.path)
+                count = self._restoring.get(entry.path, 0)
+                if count > 1:
+                    self._restoring[entry.path] = count - 1
+                else:
+                    self._restoring.pop(entry.path, None)
 
     def touch_entry(self, entry: Entry) -> None:
         try:
