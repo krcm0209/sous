@@ -3,7 +3,7 @@
 # with it, and a note. Bytes, KV cost, quantization layout and drafter
 # compatibility are read from the checkpoint at run time.
 checked = 2026-09-17
-validated_with = "mlx-vlm 0.7.1"
+validated_with = "mlx-vlm 0.7.0"
 trusted_orgs = ["mlx-community", "z-lab"]
 publishers = ["Qwen"]
 
@@ -23,7 +23,7 @@ note = "oMLX mixed precision; one 6-bit layer takes the slow verifier path"
 id = "mlx-community/Qwen3.8-27B-mxfp4"
 tier = "27b-dense"
 drafters = ["z-lab/Qwen3.8-27B-DFlash2"]
-note = "fast exact verifier only from mlx-vlm 0.7.1"
+note = "no affine tile verifier; mlx-vlm 0.7.1+ fuses its fallback into one gather_qmm (0.7.0 looped per position); no int8 prefill"
 
 [[candidate]]
 id = "mlx-community/Qwen3.8-27B-OptiQ-4bit"
