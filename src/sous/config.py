@@ -325,61 +325,46 @@ def _speculative_block_size(model: dict) -> int:
     return value
 
 
-def _prompt_cache_gb(model: dict) -> float | None:
-    """[model].prompt_cache_gb: "auto" (None) or a non-negative number of GiB.
+def _gib_or_auto(model: dict, key: str, *, stacklevel: int = 3) -> float | None:
+    """[model].<key>: "auto" (None) or a non-negative number of GiB.
     Anything else warns and means auto."""
-    value = model.get("prompt_cache_gb", "auto")
+    value = model.get(key, "auto")
     if value == "auto":
         return None
     if (
         isinstance(value, bool)
         or not isinstance(value, int | float)
         # isfinite, not a NaN check: TOML spells inf and -inf too, and an
-        # infinite budget reaches EngineManager as int(inf * (1 << 30)) —
-        # an OverflowError out of engine load rather than a bad budget.
+        # infinite budget reaches the engine as int(inf * (1 << 30)) — an
+        # OverflowError out of engine load rather than a bad budget.
         or not math.isfinite(value)
         # The scaled value has to be finite too, not just the value: 1e308 is
         # a finite float whose product with 1 << 30 is not, so it would reach
-        # EngineManager as the same int(inf) OverflowError. Test what the
-        # engine will actually compute.
+        # the engine as the same int(inf) OverflowError. Test what the engine
+        # will actually compute.
         or not math.isfinite(value * (1 << 30))
         or value < 0
     ):
         warnings.warn(
-            f'sous config: [model].prompt_cache_gb {value!r} must be "auto" or a '
+            f'sous config: [model].{key} {value!r} must be "auto" or a '
             'non-negative number of GiB; using "auto"',
-            stacklevel=3,
+            stacklevel=stacklevel,
         )
         return None
     return float(value)
 
 
 def _prompt_cache_disk_gb(model: dict) -> float | None:
-    """[model].prompt_cache_disk_gb: "auto" (None) or a non-negative number
-    of GiB, the prompt_cache_gb shape. Anything else warns and means auto."""
-    value = model.get("prompt_cache_disk_gb", "auto")
-    if value == "auto":
-        return None
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int | float)
-        or not math.isfinite(value)
-        or not math.isfinite(value * (1 << 30))
-        or value < 0
-    ):
-        warnings.warn(
-            f'sous config: [model].prompt_cache_disk_gb {value!r} must be "auto" or a '
-            'non-negative number of GiB; using "auto"',
-            stacklevel=3,
-        )
-        return None
-    if model.get("prompt_cache") is False and value:
+    """[model].prompt_cache_disk_gb, the prompt_cache_gb shape, plus a warning
+    when the prompt cache it feeds is off."""
+    value = _gib_or_auto(model, "prompt_cache_disk_gb", stacklevel=4)
+    if value and model.get("prompt_cache") is False:
         warnings.warn(
             "sous config: [model].prompt_cache_disk_gb has no effect while "
             "[model].prompt_cache is false",
             stacklevel=3,
         )
-    return float(value)
+    return value
 
 
 def _int8_prefill(model: dict) -> bool:
@@ -486,7 +471,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         top_p=model.get("top_p", 0.8),
         top_k=model.get("top_k", 20),
         prompt_cache=model.get("prompt_cache", True),
-        prompt_cache_gb=_prompt_cache_gb(model),
+        prompt_cache_gb=_gib_or_auto(model, "prompt_cache_gb"),
         prompt_cache_disk_gb=_prompt_cache_disk_gb(model),
         speculative_draft_id=model.get("speculative_draft_id", "z-lab/Qwen3.8-27B-DFlash2"),
         speculative_block_size=_speculative_block_size(model),
