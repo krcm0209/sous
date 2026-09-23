@@ -702,8 +702,8 @@ class PrefixCache:
         there through the same path, with an empty prefill), that leave
         something to prefill after them (`b < len(stable_ids)`) and that
         clear the fork floor. Nothing is resolved when there is neither a
-        budget nor a store: at `max_bytes == 0` without a store nothing about
-        the turn changes.
+        budget nor an active store: at `max_bytes == 0` without one nothing
+        about the turn changes.
 
         The probe is resolved on warm turns too. With one boundary that was
         waste — a turn that started at or past it could not fork there — but
