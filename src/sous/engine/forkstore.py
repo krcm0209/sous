@@ -45,9 +45,9 @@ FLOOR_FRACTION = 0.05
 EVICT_TO = 0.9
 # A 57K-token file's header measured 12.8 KB; anything past this is not ours.
 MAX_HEADER_BYTES = 1 << 20
-# Consecutive verification failures that retire the store for the daemon's
-# life: a store whose files all fail would otherwise delete itself one cold
-# turn at a time.
+# Consecutive verification failures that retire the store until the next
+# model load (the store is built per load): a store whose files all fail
+# would otherwise delete itself one cold turn at a time.
 MAX_FAILURES = 3
 
 # The modules whose bytes decide what KV a token id produces; hashed into
@@ -59,7 +59,8 @@ _EPOCH_FILES = ("vlm.py", "lm.py", "int8prefill.py")
 class ForkFileError(Exception):
     """A file that failed verification: format, size, layer layout, offsets
     or ids. The store deletes it. Anything else raised around a file — an
-    allocation failure, an OSError — keeps the file."""
+    allocation failure, an OSError (a file that cannot be opened or read
+    right now says nothing about its bytes) — keeps the file."""
 
 
 def digest(ids: Sequence[int]) -> str:
@@ -87,7 +88,10 @@ class Header:
 def read_header(path: Path) -> Header:
     """The safetensors header, parsed in pure Python: an 8-byte little-endian
     length and a JSON object. mx.load would do the same and hand back lazy
-    arrays bound to the calling thread's streams; this touches nothing."""
+    arrays bound to the calling thread's streams; this touches nothing.
+    Bytes that are not a whole fork file raise ForkFileError; an OSError
+    (permissions, no free descriptor, the file gone) propagates as itself,
+    so no caller deletes a good file it merely could not open."""
     try:
         with path.open("rb") as f:
             raw = f.read(8)
@@ -118,7 +122,7 @@ def read_header(path: Path) -> Header:
         return Header({str(k): str(v) for k, v in metadata.items()}, tensors, expected)
     except ForkFileError:
         raise
-    except (OSError, ValueError, KeyError, TypeError) as e:
+    except (ValueError, KeyError, TypeError) as e:
         raise ForkFileError(f"{path.name}: unreadable header ({type(e).__name__})") from e
 
 
@@ -287,9 +291,10 @@ class ForkStore:
     thread — while residency in PrefixCache stays owner-scoped.
 
     Every method is safe to call from any thread and holds `_lock` only
-    across dict work: never across a write, a read or a status build. A
-    persist or a restore runs on the caller's thread (the owner's, by the
-    caller's discipline) and reports through warnings, never exceptions."""
+    across dict work: never across a write, a read, a delete or a status
+    build. A persist or a restore runs on the caller's thread (the owner's,
+    by the caller's discipline) and reports through warnings, never
+    exceptions."""
 
     def __init__(
         self,
@@ -313,16 +318,25 @@ class ForkStore:
         self._entries: dict[Path, Entry] = {}
         self._writing: set[str] = set()
         self._restoring: dict[Path, int] = {}
+        # Evicted files out of the index but not yet unlinked: a write of the
+        # same ids in that window would be deleted by the unlink after it.
+        self._unlinking: set[Path] = set()
+        # Files whose unlink failed: back in the index, never picked again.
+        self._undeletable: set[Path] = set()
         self._failures = 0
         # Consecutive persist failures short of a disabling errno: a cache the
         # format cannot cover, or a disk that fails the same way, fails
-        # identically on every cold turn — each one after evicting room for
-        # it — and this is what retires the store rather than doing so forever.
+        # identically on every cold turn, and this is what retires the store
+        # rather than letting it try forever.
         self._write_failures = 0
         self._oversize_warned = False
         self._floor_warned = False
-        # Writer failures already reported, by exception type or errno name.
+        self._unlink_warned = False
+        # Failures already reported, by exception type or errno name: a
+        # writer's, and a restore's that kept its file. The store's own sets,
+        # not the warnings registry, which a filter reset empties.
         self._warned_writers: set[str] = set()
+        self._warned_restores: set[str] = set()
         self.state = "active"
         self.reason: str | None = None
         self.forks = 0
@@ -340,8 +354,9 @@ class ForkStore:
             # than a smaller one that evicts what the previous run wrote.
             self.budget = auto_budget(usage.free + found) if budget is None else budget
             with self._lock:
-                self._evict_locked(0)
+                victims = self._evict_locked(self.budget)
                 self._recount_locked()
+            self._unlink(victims)
         except Exception as e:  # noqa: BLE001 — a model load must never fail because of this
             self.budget = 0
             reason = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
@@ -385,7 +400,14 @@ class ForkStore:
         for key_dir in self.root.iterdir():
             if not key_dir.is_dir():
                 continue
-            for item in key_dir.iterdir():
+            try:
+                items = list(key_dir.iterdir())
+            except FileNotFoundError, NotADirectoryError:
+                # Removed since the root was listed (an rm -rf, which the
+                # write path survives through _ensure_dirs): as gone as a
+                # vanished file.
+                continue
+            for item in items:
                 pid = parse_temp_name(item.name)
                 if pid is not None:
                     try:
@@ -403,24 +425,37 @@ class ForkStore:
                     st = item.stat()
                 except OSError:
                     continue
-                if key_dir.name == self.key and not self._verify_header(item, n, st.st_size):
-                    item.unlink(missing_ok=True)
-                    continue
-                entries[item] = Entry(item, key_dir.name, n, dig, st.st_size, st.st_mtime)
+                size = st.st_size
+                if key_dir.name == self.key:
+                    try:
+                        header = self._verify_header(item, n)
+                    except OSError:
+                        continue  # unreadable now, not bad bytes: next load looks again
+                    if header is None:
+                        item.unlink(missing_ok=True)
+                        continue
+                    # read_header checked the size against a stat of its own;
+                    # the one above may predate a same-digest replacement.
+                    size = header.expected_size
+                entries[item] = Entry(item, key_dir.name, n, dig, size, st.st_mtime)
         with self._lock:
             self._entries = entries
 
-    def _verify_header(self, path: Path, n: int, size: int) -> bool:
+    def _verify_header(self, path: Path, n: int) -> Header | None:
+        """The header when `path` is a fork of this key for `n` ids, None
+        when its bytes say otherwise; an OSError reading it propagates."""
         try:
             header = read_header(path)
         except ForkFileError:
-            return False
+            return None
         meta = header.metadata
         if meta.get("format") != FORMAT or meta.get("layout") != str(FORK_LAYOUT):
-            return False
-        if meta.get("n_tokens") != str(n) or header.expected_size != size:
-            return False
-        return all(meta.get(k) == v for k, v in self.key_fields.items())
+            return None
+        if meta.get("n_tokens") != str(n):
+            return None
+        if not all(meta.get(k) == v for k, v in self.key_fields.items()):
+            return None
+        return header
 
     # ---- bookkeeping (lock held by the caller) -------------------------------
 
@@ -431,18 +466,56 @@ class ForkStore:
         self.forks = sum(1 for e in self._entries.values() if e.key == self.key)
         self.bytes = sum(e.size for e in self._entries.values())
 
-    def _evict_locked(self, incoming: int) -> None:
-        """LRU by mtime across every key until `incoming` more bytes fit
-        under EVICT_TO of the budget, never a file being restored."""
-        target = int(self.budget * EVICT_TO) if incoming else self.budget
-        while sum(e.size for e in self._entries.values()) + incoming > target:
-            victims = [e for e in self._entries.values() if self._restoring.get(e.path, 0) == 0]
-            if not victims:
-                return
-            oldest = min(victims, key=lambda e: e.mtime)
-            oldest.path.unlink(missing_ok=True)
+    def _evict_locked(self, target: int, keep: Path | None = None) -> list[Entry]:
+        """LRU by mtime across every key until the index fits under `target`
+        bytes, never a file being restored, one that would not delete, nor
+        `keep`. The victims leave the index here; the caller unlinks them
+        with `_unlink` once it has released the lock."""
+        victims: list[Entry] = []
+        total = sum(e.size for e in self._entries.values())
+        while total > target:
+            candidates = [
+                e
+                for e in self._entries.values()
+                if e.path != keep
+                and e.path not in self._undeletable
+                and self._restoring.get(e.path, 0) == 0
+            ]
+            if not candidates:
+                break
+            oldest = min(candidates, key=lambda e: e.mtime)
             del self._entries[oldest.path]
-            self.evictions += 1
+            self._unlinking.add(oldest.path)
+            total -= oldest.size
+            victims.append(oldest)
+        return victims
+
+    def _unlink(self, victims: list[Entry]) -> None:
+        """Delete what `_evict_locked` took out of the index, outside the
+        lock. A file that will not go goes back into the index, so the
+        budget still counts its bytes, and is never picked again: the next
+        eviction takes the next oldest instead of counting it as freed."""
+        for victim in victims:
+            failed: OSError | None = None
+            try:
+                victim.path.unlink(missing_ok=True)
+            except OSError as e:
+                failed = e
+            with self._lock:
+                self._unlinking.discard(victim.path)
+                if failed is None:
+                    self.evictions += 1
+                else:
+                    self._entries.setdefault(victim.path, victim)
+                    self._undeletable.add(victim.path)
+                self._recount_locked()
+            if failed is not None and not self._unlink_warned:
+                self._unlink_warned = True
+                kind = errno_mod.errorcode.get(failed.errno or 0, type(failed).__name__)
+                warnings.warn(
+                    f"sous fork store: could not delete an evicted fork ({kind}); kept",
+                    stacklevel=3,
+                )
 
     def _disable(self, reason: str) -> None:
         self.state, self.reason = "unavailable", reason
@@ -507,14 +580,17 @@ class ForkStore:
     ) -> bool:
         """Write `ids`' cache through `write(temp_path, metadata)` unless a
         file for it exists (then touch it), a write of it is in flight, the
-        store is off, or the caller's own `expected_bytes` estimate would
-        breach the budget or the free-space floor — checked before `write`
-        ever runs, so a refused write never touches disk. Room is made from
-        that same estimate — never from a file being restored — before the
-        write, and the file is indexed only after os.replace. The real size
+        store is off, the file is still being evicted, or the caller's own
+        `expected_bytes` estimate would breach the budget or the free-space
+        floor — checked before `write` ever runs, so a refused write never
+        touches disk. The file is indexed only after os.replace. The real size
         is checked against the budget once more after the write, belt and
         braces against an under-estimate; the floor is not re-checked there,
-        since the pre-check already reserved it. Never raises."""
+        since the pre-check already reserved it. Room is made only once the
+        file is in place, by its real size — never from a file being restored
+        — so a write that fails or is refused has cost the store nothing; the
+        budget is exceeded by that one file for the moment, the floor never.
+        Never raises."""
         if self.state != "active":
             return False
         n, dig = len(ids), digest(ids)
@@ -522,7 +598,7 @@ class ForkStore:
         if self._touch(final):
             return False
         with self._lock:
-            if final in self._entries or dig in self._writing:
+            if final in self._entries or dig in self._writing or final in self._unlinking:
                 return False
             self._writing.add(dig)
         temp: Path | None = None
@@ -549,8 +625,6 @@ class ForkStore:
                         stacklevel=2,
                     )
                 return False
-            with self._lock:
-                self._evict_locked(expected_bytes)
             temp = temp_name(final, self._pid())
             metadata = {
                 "format": FORMAT,
@@ -578,8 +652,10 @@ class ForkStore:
             st = final.stat()
             with self._lock:
                 self._entries[final] = Entry(final, self.key, n, dig, st.st_size, st.st_mtime)
+                victims = self._evict_locked(int(self.budget * EVICT_TO), keep=final)
                 self._recount_locked()
             self._write_failures = 0
+            self._unlink(victims)
             return True
         except Exception as e:  # noqa: BLE001 — an optimization never fails a turn
             if temp is not None:
@@ -611,8 +687,9 @@ class ForkStore:
         """Read `entry` through `load(path, header)`. A ForkFileError from
         the header check or the loader is a verification failure: the file
         is deleted and three in a row retire the store. Anything else keeps
-        the file (an allocation failure is not corruption). A file that is
-        gone is a plain miss. Never raises."""
+        the file — an allocation failure, or a file that cannot be opened
+        right now, is not corruption — and warns once per kind of failure. A
+        file that is gone is a plain miss. Never raises."""
         if self.state != "active":
             return False
         with self._lock:
@@ -621,14 +698,14 @@ class ForkStore:
             self._restoring[entry.path] = self._restoring.get(entry.path, 0) + 1
         try:
             try:
-                st = entry.path.stat()
+                # Only to tell a vanished file from a bad one: read_header
+                # checks the size against a stat of its own.
+                entry.path.stat()
             except FileNotFoundError:
                 self._forget(entry)
                 return False
             try:
                 header = read_header(entry.path)
-                if header.expected_size != st.st_size:
-                    raise ForkFileError(f"{entry.path.name}: size {st.st_size}")
                 load(entry.path, header)
             except ForkFileError as e:
                 warnings.warn(f"sous fork store: fork restore failed ({e}); deleted", stacklevel=2)
@@ -639,10 +716,12 @@ class ForkStore:
                     self._disable(f"{MAX_FAILURES} consecutive restore failures")
                 return False
             except Exception as e:  # noqa: BLE001 — keep the file: not corruption
-                warnings.warn(
-                    f"sous fork store: fork restore failed ({type(e).__name__}); kept",
-                    stacklevel=2,
-                )
+                kind = type(e).__name__
+                if kind not in self._warned_restores:
+                    self._warned_restores.add(kind)
+                    warnings.warn(
+                        f"sous fork store: fork restore failed ({kind}); kept", stacklevel=2
+                    )
                 return False
             self._failures = 0
             self.touch_entry(entry)
