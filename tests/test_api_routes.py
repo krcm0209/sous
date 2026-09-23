@@ -1691,6 +1691,9 @@ _ALL_GAUGES = {
     "retained": 0,
     "moved": 0,
     "took_kind": "",
+    "persist_seconds": 0.0,
+    "restore_seconds": 0.0,
+    "disk_hits": 0,
 }
 
 
@@ -1733,10 +1736,48 @@ def test_the_turn_line_attributes_a_hit(tmp_path: Path, capsys):
     assert f["prefill_s"] == "2.0" and f["decode_s"] == "4.0"
     # 6 prefilled tokens / 2.0 s; "second reply here" is 3 words = 3 output tokens / 4.0 s
     assert f["prefill_tps"] == "3.0" and f["decode_tps"] == "0.8"
+    assert f["persist_s"] == "0.0" and f["restore_s"] == "0.0"
     for key in ("load_s", "queue_s", "engine_wait_s", "tokenize_s", "ttft_s", "seconds"):
         assert key in f, key
     assert len(f["tools"]) == 8 and len(f["system"]) == 8
     assert "lcp" not in f and "bounds" not in f
+
+
+def test_the_turn_line_names_a_disk_restore(tmp_path: Path, capsys):
+    inner = FakeEngine(["first", "reply"])
+    inner.stats = dict(_ALL_GAUGES)
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 2:
+            inner.stats = {
+                **_ALL_GAUGES,
+                "hits": 1,
+                "disk_hits": 1,
+                "reused_tokens": 50312,
+                "prefilled_tokens": 574,
+                "took_len": 50312,
+                "took_kind": "disk",
+                "forks": 1,
+                "restore_seconds": 1.4,
+                "persist_seconds": 0.0,
+                "prefill_seconds": 1.5,
+                "decode_seconds": 2.0,
+            }
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    app = _app(tmp_path, inner)
+    assert _post(app, _body(system="Be terse.", tools=[READ_TOOL])).status_code == 200
+    r = _post(app, _body(system="Be terse.", tools=[READ_TOOL]))
+    assert r.status_code == 200
+    f = _fields(_turn_lines(capsys.readouterr().err)[1])
+    assert f["cache"] == "disk" and f["took"] == "disk@50312"
+    assert f["reused_tokens"] == "50312" and f["forks"] == "1"
+    assert f["restore_s"] == "1.4" and f["persist_s"] == "0.0"
+    assert f["prefill_tps"] == "382.7"  # the restore is not in the prefill rate
+    assert "lcp" not in f
 
 
 def test_the_turn_line_diagnoses_a_miss(tmp_path: Path, capsys):
@@ -1900,8 +1941,8 @@ def test_a_served_turn_is_recorded_with_the_lines_fields(tmp_path: Path):
         "ts", "id", "model", "stream", "status", "error", "stop_reason", "cache", "took",
         "input_tokens", "output_tokens", "reused_tokens", "prefilled_tokens", "lcp",
         "lcp_region", "bounds", "forks", "evicted", "pressure", "load_s", "queue_s",
-        "engine_wait_s", "tokenize_s", "ttft_s", "prefill_s", "decode_s", "prefill_tps",
-        "decode_tps", "seconds", "tools_hash", "system_hash",
+        "engine_wait_s", "tokenize_s", "ttft_s", "prefill_s", "decode_s", "persist_s",
+        "restore_s", "prefill_tps", "decode_tps", "seconds", "tools_hash", "system_hash",
     }  # fmt: skip
     _post(app, _body(stream=False))
     ids = [t["id"] for t in _recent(endpoint)]

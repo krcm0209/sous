@@ -68,7 +68,22 @@ goal.
   impossible" read the request body's order, not the render's) — and the
   *header* boundary, the whole system block. Both come from probe pairs
   (`promptcache.probe_boundaries`), never from rendering the system turn
-  alone, which Qwen3.8's template refuses. Warm turns resolve the probe too:
+  alone, which Qwen3.8's template refuses. The lowest boundary is also
+  written to disk (`engine/forkstore.py`, `engine/forkio.py`): the live
+  cache's full padded `keys`/`values` at the boundary, before the resident
+  copy, outside the prefill timer, with its own handler; a miss reads the
+  longest stored prefix into the turn's own cache on its own thread and the
+  boundary loop republishes a resident fork there (`reuse <= b`). Restore a
+  `KVCache` by assigning `keys`, `values`, then `offset` from metadata —
+  never through `state`, whose setter derives the offset from the padded
+  shape and mispositions every appended token — and `mx.eval` the arrays: a
+  lazy array is invisible to the memory the pressure valve reads (fork
+  copies are lazy too; `eval_cache` after every `fork_copy`). Save only
+  evaluated, contiguous buffers: a slice or a transpose is materialised
+  whole on save. Files are shared across owner threads; only arrays are
+  owner-scoped. Only `default_engine_factory` hands an engine a store
+  directory — tests and `sous tune` (`forks=False`) never reach `~/.sous`.
+  Warm turns resolve the probe too:
   a turn that starts at another session's tools fork must still publish its
   own header fork. A `turn` slot is *copied* and left in place by the turn
   that extends it when `_make_room` can hold the copy (Claude Code branches
@@ -139,9 +154,13 @@ goal.
   `tests/test_engine_positions.py` (the real `generate_step` over a stub
   model, in CI: the engine's kwargs must reach the language model over the
   helper's) and a manual `uv run pytest -m model tests/test_engine_vlm.py` on
-  the M5 Pro for the kernels themselves — CI cannot load the models. Slots
-  built before this fix hold mispositioned keys: only a daemon restart drops
-  them.
+  the M5 Pro for the kernels themselves — CI cannot load the models. A fork
+  on disk written by a build with wrong KV would survive a restart, which is
+  why the fork store's identity key hashes the engine sources
+  (`forkstore.engine_epoch`: vlm.py, lm.py, int8prefill.py, kernels/*.metal
+  and *.h) beside the versions, the GPU and the weights snapshot — any
+  change to what a token id produces invalidates every file; `rm -rf
+  ~/.sous/forks` is the manual eraser.
 - Prompt-cache per-turn gauges (`promptcache.TURN_GAUGES`, reset by
   `PromptCacheStats.begin_turn` on every `generate()` and again on a cold
   retry) are assigned per turn and read back directly from the owner-scoped
@@ -267,7 +286,11 @@ request body, header value or query string. Its lines go through `sous.logs`
 (one timestamped, levelled shape on the root handler); `_log_turn` runs on
 the event loop, so nothing that blocks may ever be added to it — do such
 work on the turn's thread. It forwards the client's credentials to
-`[server].upstream_url` and nowhere else, and stores none. `sous claude`
+`[server].upstream_url` and nowhere else, and stores none. The fork store
+(`~/.sous/forks`, 0700/0600) is the one place the daemon keeps
+prompt-derived data at rest: rendered tool-block and system-text token ids
+plus their KV, never a header or a credential; it logs counts and bytes,
+never a token. `sous claude`
 (`cli.py`) never sets `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, a tier
 variable or a permission mode. Do not add confinement, allowlists or approval
 flows to sous: the daemon guards its own HTTP surface (`sous/loopback.py`)

@@ -11,7 +11,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from sous.engine.base import Delta, EngineManager, ReplaySafe, release_mlx_thread_state
+from sous.engine.base import (
+    Delta,
+    EngineManager,
+    ReplaySafe,
+    default_engine_factory,
+    release_mlx_thread_state,
+)
 from sous.tune.arms import Arm
 from sous.tune.payload import TOOLS
 
@@ -329,6 +335,7 @@ def _measure(
 ) -> BenchRow:
     baseline = active_memory()
     reset_peak()
+    factory = factory or default_engine_factory(arm.config, forks=False)
     manager = EngineManager(arm.config, engine_factory=factory)
     loading = time.monotonic()
     engine = manager.get()

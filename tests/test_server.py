@@ -356,6 +356,7 @@ def test_server_status_reports_the_served_config(svc):
         "port": 8383,
         "local_models": ["sous-local"],
         "max_context_tokens": 131072,
+        "prompt_cache_disk_gb": None,
         "upstream_url": "https://api.anthropic.com",
         "generation_timeout_minutes": 30,
     }
@@ -396,6 +397,7 @@ def test_the_status_document_carries_no_task_fields(svc):
         "port",
         "local_models",
         "max_context_tokens",
+        "prompt_cache_disk_gb",
         "upstream_url",
         "generation_timeout_minutes",
     }

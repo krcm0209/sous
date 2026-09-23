@@ -67,6 +67,7 @@ class TurnResult:
     reused_tokens: int
     seconds: float
     forked: bool = False  # the hit was served by copying a fork slot
+    from_disk: bool = False  # the hit was served by a fork read off disk
     # Which kind of slot the hit took, as the cache names it: "turn" (copied
     # and left in place), "turn-moved" (removed and adopted, because the
     # budget could not hold a copy beside the live cache) or "fork"; "" when
@@ -94,6 +95,8 @@ class TurnResult:
     ttft_seconds: float | None = None  # generate() entry → first delta; None if none came
     prefill_seconds: float = 0.0
     decode_seconds: float = 0.0
+    persist_seconds: float = 0.0  # writing a fork at a boundary; in no phase
+    restore_seconds: float = 0.0  # reading a fork off disk; in no phase
     bounds: tuple[int, int] = (0, 0)  # the probe's (tools, header) boundaries; 0 = absent
 
 
@@ -305,6 +308,7 @@ class TurnRunner:
                     finish_reason=final.finish_reason if final else "stop",
                     cache_hit=cache_hit,
                     forked=delta_of("fork_hits") > 0,
+                    from_disk=delta_of("disk_hits") > 0,
                     reused_tokens=delta_of("reused_tokens"),
                     # miss_lcp is a gauge the engine assigns per miss, so
                     # `after` holds this turn's value exactly when this turn
@@ -325,6 +329,8 @@ class TurnRunner:
                     ttft_seconds=None if first_delta_at is None else first_delta_at - generating,
                     prefill_seconds=after.get("prefill_seconds", 0.0),
                     decode_seconds=after.get("decode_seconds", 0.0),
+                    persist_seconds=after.get("persist_seconds", 0.0),
+                    restore_seconds=after.get("restore_seconds", 0.0),
                     bounds=(after.get("bound_lo", 0), after.get("bound_hi", 0)),
                 )
         finally:

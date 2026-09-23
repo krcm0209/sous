@@ -558,3 +558,28 @@ def test_estimate_seconds_scales_with_the_measured_speeds(tmp_path):
     per_run = 8 * (3000 / 300 + 300 / 30)
     assert estimate_seconds([arm], [row], tasks=8, runs=2) == per_run * 16
     assert estimate_seconds([arm], [], tasks=8, runs=2) is None
+
+
+def test_a_suite_arm_gets_no_fork_store(monkeypatch, tmp_path):
+    import sous.tune.suite.runner as runner_mod
+
+    seen = {}
+
+    def fake_default_engine_factory(config, **kw):
+        seen.update(kw)
+        return lambda mid: FakeEngine([FINISH])
+
+    monkeypatch.setattr(runner_mod, "default_engine_factory", fake_default_engine_factory)
+    run_suite(
+        _arm(tmp_path),
+        [_task()],
+        runs=1,
+        done=set(),
+        record=lambda r: None,
+        scratch=tmp_path / "scratch",
+        out=lambda *a: None,
+        factory=None,
+        python=PYTHON,
+        active_memory=lambda: 0,
+    )
+    assert seen == {"forks": False}

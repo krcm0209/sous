@@ -354,7 +354,7 @@ def _run_suite(
     active_memory: Callable[[], int],
 ) -> SuiteOutcome:
     baseline = active_memory()
-    base = factory or default_engine_factory(arm.config)
+    base = factory or default_engine_factory(arm.config, forks=False)
     counters: list[CountingEngine] = []
 
     def wrapped(model_id: str) -> Engine:

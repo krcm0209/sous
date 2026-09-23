@@ -51,6 +51,14 @@ def _doc(
                 "evictions": 3,
                 "pressure_evictions": 1,
                 "reused_tokens": 1_820_000,
+                "disk": {
+                    "state": "active",
+                    "reason": None,
+                    "forks": 3,
+                    "bytes": int(9.4 * (1 << 30)),
+                    "budget_bytes": 16 << 30,
+                    "evictions": 0,
+                },
             },
         },
         "inflight": ([turn] if turn else []) + list(behind),
@@ -151,6 +159,9 @@ def test_every_kitchen_word_is_glued_to_its_literal_or_its_number():
     assert row["cache"] == "DRAWER 53.3k" and row["took"] == "fork@53296"
     assert tui.rail_row(_summary(1, "miss"))["cache"] == "SCRATCH 0"
     assert tui.rail_row(_summary(1))["cache"] == "REHEAT 61.9k"
+    disk = tui.rail_row(_summary(1, "disk", reused_tokens=50312, took="disk@50312"))
+    assert disk["cache"] == "PANTRY 50.3k"
+    assert tui.CACHE_COLOURS["disk"]
     failed = tui.rail_row(_summary(1, error="api_error", status=500))
     assert failed["cache"] == "DROPPED IT" and failed["in"] == "—" and failed["took"] == "none"
     assert failed["why"] == "DROPPED IT · 500 api_error"
@@ -432,6 +443,7 @@ def test_the_slip_shows_the_turn_from_the_document():
         line = _plain(app, "#line-engine")
         assert line.startswith("  LINE IS OPEN  loaded") and "hold 1" in line
         assert "REHEAT  41 hit    DRAWER 18 fork" in _plain(app, "#line-body")
+        assert " reused 1,820,000 tok · disk 3" in _plain(app, "#line-body")
         body = _plain(app, "#line-body")
         assert " ORDERS ORDER UP 3 · DROPPED IT 1" in body
         assert "        WALKED OUT 1" in body

@@ -564,3 +564,107 @@ def test_vlm_a_turn_from_the_tools_fork_matches_its_cold_run_token_for_token():
     assert e.prompt_cache_stats()["misses"] == 1
     assert warm == cold
     e.unload()
+
+
+@pytest.mark.model
+@pytest.mark.parametrize(
+    ("model_id", "is_hybrid"),
+    [
+        pytest.param(TINY_VLM, False, id="pure-attention"),
+        pytest.param(HYBRID_VLM, True, id="linear-attention-hybrid"),
+    ],
+)
+def test_vlm_a_fork_read_off_disk_matches_the_one_it_was_written_from(
+    model_id, is_hybrid, tmp_path
+):
+    """Persist the live cache at a boundary, drop it, restore into a fresh
+    cache: every layer's arrays equal, offsets equal, and one further chunk
+    extends the restored cache exactly as it extends the source — compared
+    on cached keys (every layer on a pure-attention model, the first
+    attention layer on a hybrid, whose deeper layers drift between prefill
+    shapes for reasons that have nothing to do with the file)."""
+    import mlx.core as mx
+    from mlx_vlm.models.cache import make_prompt_cache
+
+    from sous.engine import forkio
+    from sous.engine.forkstore import read_header
+    from sous.engine.vlm import VLMEngine
+
+    e = VLMEngine(model_id, cache_budget=0)
+    model, _ = e._loaded()
+    ids = e._encode("def f(x):\n    return x + 1\n" * 40)
+    header, tail = ids[: len(ids) // 2], ids[len(ids) // 2 :]
+
+    src = make_prompt_cache(model.language_model)
+    e.prefill(src, header)
+    path = tmp_path / f"{len(header)}-x.safetensors"
+    forkio.persist_cache(
+        src,
+        path,
+        header,
+        {
+            "format": "sous-fork-v1",
+            "layout": "1",
+            "n_tokens": str(len(header)),
+            "boundary": "tools",
+        },
+    )
+    restored = make_prompt_cache(model.language_model)
+    forkio.restore_cache(path, read_header(path), restored, header)
+
+    for a, b in zip(restored, src, strict=True):
+        assert int(getattr(a, "offset", 0) or 0) == int(getattr(b, "offset", 0) or 0)
+        for xa, xb in zip(a.state, b.state, strict=True):
+            if xa is None or xb is None:
+                assert xa is None and xb is None
+                continue
+            assert bool(mx.array_equal(xa, xb).item())
+
+    e.prefill(restored, tail)
+    e.prefill(src, tail)
+    attention = [i for i, c in enumerate(src) if getattr(c, "keys", None) is not None]
+    layers = attention[:1] if is_hybrid else attention
+    for i in layers:
+        got = restored[i].keys[..., : restored[i].offset, :].astype(mx.float32)
+        want = src[i].keys[..., : src[i].offset, :].astype(mx.float32)
+        d = mx.max(mx.abs(got - want))
+        mx.eval(d)
+        assert d.item() == 0.0
+    e.unload()
+
+
+@pytest.mark.model
+def test_vlm_engine_serves_a_second_session_from_a_fork_on_disk(tmp_path):
+    """End to end on the real tokenizer and template: a store with a fork
+    written by one engine serves a fresh engine's first turn as cache=disk."""
+    from sous.engine.promptcache import FORK_MIN_TOKENS
+    from sous.engine.vlm import VLMEngine
+
+    # Qwen2-VL's template renders no tools, so the system text carries the
+    # boundary (the header, then — the only boundary, and the one written).
+    tools: list[dict] = []
+    system = {"role": "system", "content": "You are terse. " * (FORK_MIN_TOKENS // 3)}
+    first = VLMEngine(
+        TINY_VLM,
+        prompt_cache=True,
+        cache_budget=1 << 34,
+        fork_dir=tmp_path / "forks",
+        weights_identity="test",
+    )
+    first.generate([system, {"role": "user", "content": "Say A."}], tools, 4)
+    assert first.prompt_cache_stats()["persists"] == 1
+    first.unload()
+
+    second = VLMEngine(
+        TINY_VLM,
+        prompt_cache=True,
+        cache_budget=1 << 34,
+        fork_dir=tmp_path / "forks",
+        weights_identity="test",
+    )
+    second.generate([system, {"role": "user", "content": "Say B."}], tools, 4)
+    s = second.prompt_cache_stats()
+    assert (s["disk_hits"], s["restores"], s["misses"]) == (1, 1, 0)
+    assert s["reused_tokens"] >= FORK_MIN_TOKENS and s["took_kind"] == "disk"
+    assert s["disk"]["forks"] == 1 and s["forks"] >= 1  # republished as a resident fork
+    second.unload()

@@ -121,6 +121,44 @@ def test_prompt_cache_gb_rejects_garbage_with_a_warning(tmp_path: Path, bad: str
     assert cfg.prompt_cache_gb is None
 
 
+# ---- [model].prompt_cache_disk_gb ---------------------------------------------
+
+
+def test_prompt_cache_disk_gb_is_a_known_key_defaulting_to_auto(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nprompt_cache_disk_gb = 'auto'\n")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(p)
+    assert not [w for w in caught if "unknown" in str(w.message).lower()]
+    assert cfg.prompt_cache_disk_gb is None
+    assert load_config(tmp_path / "missing.toml").prompt_cache_disk_gb is None
+
+
+def test_prompt_cache_disk_gb_accepts_a_number_and_zero(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nprompt_cache_disk_gb = 24\n")
+    assert load_config(p).prompt_cache_disk_gb == 24.0
+    p.write_text("[model]\nprompt_cache_disk_gb = 0\n")
+    assert load_config(p).prompt_cache_disk_gb == 0.0
+
+
+@pytest.mark.parametrize("bad", ["-1", "true", "'lots'", "nan", "inf", "1e308"])
+def test_prompt_cache_disk_gb_rejects_garbage_with_a_warning(tmp_path: Path, bad: str):
+    p = tmp_path / "config.toml"
+    p.write_text(f"[model]\nprompt_cache_disk_gb = {bad}\n")
+    with pytest.warns(UserWarning, match=r"\[model\]\.prompt_cache_disk_gb"):
+        cfg = load_config(p)
+    assert cfg.prompt_cache_disk_gb is None
+
+
+def test_prompt_cache_disk_gb_beside_a_disabled_cache_warns(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nprompt_cache = false\nprompt_cache_disk_gb = 8\n")
+    with pytest.warns(UserWarning, match="prompt_cache_disk_gb has no effect"):
+        load_config(p)
+
+
 # ---- [model].int8_prefill -----------------------------------------------------
 
 

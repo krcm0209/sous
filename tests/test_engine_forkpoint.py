@@ -146,9 +146,14 @@ class Recording:
 
     def generate(self, stable_ids, full_ids, max_tokens, on_delta=None, fork_at=()):
         if callable(fork_at):
-            fork_at = self._resolver._fork_boundaries(
-                PromptCacheStats(), threading.current_thread(), list(stable_ids), fork_at, 0
-            )
+            # _fork_boundaries now returns (boundary, need_slot, need_file)
+            # triples; this stand-in only ever cared about the boundaries.
+            fork_at = [
+                b
+                for b, _, _ in self._resolver._fork_boundaries(
+                    PromptCacheStats(), threading.current_thread(), list(stable_ids), fork_at, 0
+                )
+            ]
         self.fork_ats.append(list(fork_at))
         return "text"
 

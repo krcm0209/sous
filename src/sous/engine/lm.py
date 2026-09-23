@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import threading
+import warnings
 from collections.abc import Callable
-from typing import cast
+from pathlib import Path
+from typing import Any, cast
 
+from sous.engine import forkio
 from sous.engine.base import Delta, OnDelta
+from sous.engine.forkstore import ForkStore, fork_key_fields
 from sous.engine.promptcache import FORK_MIN_TOKENS, PrefixCache, PromptMemo, probe_boundaries
 
 
@@ -21,6 +25,9 @@ class LMEngine:
         cache_budget: int | None = None,
         reserve_bytes: int = 0,
         int8_prefill: bool = False,
+        fork_dir: Path | None = None,
+        fork_budget: int | None = None,
+        weights_identity: str = "",
     ):
         from mlx_lm import load
         from mlx_lm.sample_utils import make_sampler
@@ -36,11 +43,43 @@ class LMEngine:
         self._sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
         self._memo = PromptMemo()
         self._tokenize_lock = threading.Lock()
+        # Forks on disk, when the factory handed us a directory: built after
+        # int8 has settled, since the key reads it. Tests and sous tune never
+        # pass one, so nothing they build touches ~/.sous.
+        self.fork_store: ForkStore | None = None
+        if fork_dir is not None and prompt_cache:
+            try:
+                self.fork_store = ForkStore(
+                    fork_dir, self._fork_key_fields(weights_identity), fork_budget
+                )
+            except Exception as e:  # noqa: BLE001 — a model load must never fail because of this
+                warnings.warn(f"sous: fork store off ({type(e).__name__})", stacklevel=2)
+                self.fork_store = None
         # Measured after load, so the weights are inside `active`.
         if cache_budget is None:
             cache_budget = measure_cache_budget(reserve_bytes)
         self._cache = PrefixCache(
-            self, enabled=prompt_cache, max_bytes=cache_budget, reserve_bytes=reserve_bytes
+            self,
+            enabled=prompt_cache,
+            max_bytes=cache_budget,
+            reserve_bytes=reserve_bytes,
+            store=self.fork_store,
+        )
+
+    def _fork_key_fields(self, weights: str) -> dict[str, str]:
+        from importlib.metadata import version
+
+        import mlx.core as mx
+
+        # mlx-lm's text models take their positions from the cache offset:
+        # the model's, always.
+        return fork_key_fields(
+            backend="lm",
+            backend_version=version("mlx-lm"),
+            weights=weights,
+            gpu=str(mx.device_info().get("architecture", "")),
+            positions="model",
+            int8_status=self.int8_prefill_status,
         )
 
     def _loaded(self) -> tuple:
@@ -170,6 +209,15 @@ class LMEngine:
         from sous.engine.base import kernel_memory_pressure
 
         return kernel_memory_pressure()
+
+    def eval_cache(self, cache: list) -> None:
+        forkio.eval_cache(cache)
+
+    def persist(self, cache: list, path: Path, ids: list[int], metadata: dict[str, str]) -> None:
+        forkio.persist_cache(cache, path, ids, metadata)
+
+    def restore(self, path: Path, header: Any, cache: list, ids: list[int]) -> None:
+        forkio.restore_cache(path, header, cache, ids)
 
     # ---- Engine ----------------------------------------------------------
 

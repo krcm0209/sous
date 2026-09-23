@@ -98,6 +98,7 @@ def test_status_is_the_full_status_document(tmp_path: Path):
         "port": 8383,
         "local_models": ["sous-local"],
         "max_context_tokens": 131072,
+        "prompt_cache_disk_gb": None,
         "upstream_url": "https://api.anthropic.com",
         "generation_timeout_minutes": 30,
     }

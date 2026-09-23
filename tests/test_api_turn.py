@@ -944,3 +944,32 @@ def test_a_turn_leaves_the_registry_before_it_releases_the_lock(tmp_path: Path):
     runner._lock = SpyLock()  # ty: ignore[invalid-assignment]
     runner.run(MSGS, [], 4096, RecordingSink(), turn_id="msg_1")
     assert seen == [[]]
+
+
+def test_a_disk_restore_is_reported_as_from_disk_with_its_seconds(tmp_path: Path):
+    inner = FakeEngine(["one", "two"])
+    inner.stats = {"hits": 0, "disk_hits": 0, "took_kind": ""}
+    runner, _ = _runner(tmp_path, inner)
+    first = runner.run(MSGS, [], 8, RecordingSink())
+    assert (first.from_disk, first.persist_seconds, first.restore_seconds) == (False, 0.0, 0.0)
+
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        inner.stats = {
+            "hits": 1,
+            "disk_hits": 1,
+            "reused_tokens": 50312,
+            "took_kind": "disk",
+            "took_len": 50312,
+            "restore_seconds": 1.4,
+            "persist_seconds": 2.1,
+        }
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    second = runner.run(MSGS, [], 8, RecordingSink())
+    assert (second.cache_hit, second.forked, second.from_disk) == (True, False, True)
+    assert (second.took_kind, second.took_len) == ("disk", 50312)
+    assert (second.persist_seconds, second.restore_seconds) == (2.1, 1.4)
