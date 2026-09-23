@@ -477,7 +477,6 @@ class StoreHooks(Protocol):
 
     state: str
 
-    def has(self, ids: Sequence[int]) -> bool: ...
     def longest_prefix(self, stable_ids: Sequence[int]) -> Any: ...
     def persist(
         self,
@@ -488,7 +487,7 @@ class StoreHooks(Protocol):
         expected_bytes: int,
     ) -> bool: ...
     def restore(self, entry: Any, load: Callable[[Path, Any], None]) -> bool: ...
-    def touch(self, ids: Sequence[int]) -> None: ...
+    def touch(self, ids: Sequence[int]) -> bool: ...
     def status(self) -> dict: ...
 
 
@@ -753,11 +752,11 @@ class PrefixCache:
         # The lowest boundary's file, when it exists, is touched on every
         # turn that passes or starts at or above it: a resident fork's file
         # is otherwise the oldest in the store and the first the LRU takes.
+        # A file removed under the daemon touches as absent, so it is
+        # written again.
         store = self._store if self._store is not None and self._store.state == "active" else None
         lowest = inside[0]
-        on_disk = store is not None and store.has(stable_ids[:lowest])
-        if on_disk:
-            store.touch(stable_ids[:lowest])
+        on_disk = store is not None and store.touch(stable_ids[:lowest])
         out: list[tuple[int, bool, bool]] = []
         for b in wanted:
             need_slot = self.max_bytes > 0 and stable_ids[:b] not in forks

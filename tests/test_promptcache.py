@@ -464,8 +464,11 @@ class FakeStore:
         load(entry.path, Header({"n_tokens": str(entry.n)}, {}, 0))
         return True
 
-    def touch(self, ids) -> None:
+    def touch(self, ids) -> bool:
+        if tuple(ids) not in self.files:
+            return False
         self.touched.append(list(ids))
+        return True
 
     def status(self) -> dict:
         return {

@@ -192,6 +192,13 @@ def engine_epoch() -> str:
     return h.hexdigest()
 
 
+@functools.cache
+def _sous_version() -> str:
+    from importlib.metadata import version
+
+    return version("sous-mcp")
+
+
 def weights_identity(config_path: Path) -> str:
     """What identifies the weights behind a config.json: the Hub snapshot's
     commit sha when the file sits under `snapshots/<sha>/` (never resolve the
@@ -307,14 +314,14 @@ class ForkStore:
         self._writing: set[str] = set()
         self._restoring: dict[Path, int] = {}
         self._failures = 0
-        # Consecutive generic (non-OSError) persist failures: a cache the
-        # format cannot cover fails identically on every cold turn, and this
-        # is what retires the store rather than writing a temp file forever.
+        # Consecutive persist failures short of a disabling errno: a cache the
+        # format cannot cover, or a disk that fails the same way, fails
+        # identically on every cold turn — each one after evicting room for
+        # it — and this is what retires the store rather than doing so forever.
         self._write_failures = 0
         self._oversize_warned = False
         self._floor_warned = False
-        # Writer failures already reported, by exception type: a cache the
-        # format cannot cover fails identically on every cold turn.
+        # Writer failures already reported, by exception type or errno name.
         self._warned_writers: set[str] = set()
         self.state = "active"
         self.reason: str | None = None
@@ -340,9 +347,12 @@ class ForkStore:
             reason = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
             self._disable(f"{reason or type(e).__name__} at {root}")
             return
+        # Eviction at construction is the one that can sweep every key's files
+        # at once (a lowered budget), so the load line says so.
+        evicted = f" evicted={self.evictions}" if self.evictions else ""
         _logger.info(
             f"prompt-cache forks on disk: {root} budget={self.budget / GIB:.1f}GiB "
-            f"found={self.forks} ({self.bytes / GIB:.1f} GiB)"
+            f"found={self.forks} ({self.bytes / GIB:.1f} GiB){evicted}"
         )
 
     # ---- construction ------------------------------------------------------
@@ -477,13 +487,15 @@ class ForkStore:
                     return e
         return None
 
-    def touch(self, ids: Sequence[int]) -> None:
-        path = self._path_for(len(ids), digest(ids))
+    def touch(self, ids: Sequence[int]) -> bool:
+        """Refresh `ids`' file's mtime; whether the store still holds it. One
+        digest for the lookup and the touch together."""
+        return self._touch(self._path_for(len(ids), digest(ids)))
+
+    def _touch(self, path: Path) -> bool:
         with self._lock:
             entry = self._entries.get(path)
-        if entry is None:
-            return
-        self.touch_entry(entry)
+        return entry is not None and self.touch_entry(entry)
 
     def persist(
         self,
@@ -507,17 +519,12 @@ class ForkStore:
             return False
         n, dig = len(ids), digest(ids)
         final = self._path_for(n, dig)
-        with self._lock:
-            if final in self._entries:
-                known = True
-            elif dig in self._writing:
-                return False
-            else:
-                known = False
-                self._writing.add(dig)
-        if known:
-            self.touch(ids)
+        if self._touch(final):
             return False
+        with self._lock:
+            if final in self._entries or dig in self._writing:
+                return False
+            self._writing.add(dig)
         temp: Path | None = None
         try:
             if expected_bytes > self.budget:
@@ -545,8 +552,6 @@ class ForkStore:
             with self._lock:
                 self._evict_locked(expected_bytes)
             temp = temp_name(final, self._pid())
-            from importlib.metadata import version
-
             metadata = {
                 "format": FORMAT,
                 "layout": str(FORK_LAYOUT),
@@ -554,7 +559,7 @@ class ForkStore:
                 "n_tokens": str(n),
                 "boundary": boundary,
                 "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "sous": version("sous-mcp"),
+                "sous": _sous_version(),
             }
             write(temp, metadata)
             os.chmod(temp, 0o600)
@@ -576,27 +581,24 @@ class ForkStore:
                 self._recount_locked()
             self._write_failures = 0
             return True
-        except OSError as e:
-            if temp is not None:
-                temp.unlink(missing_ok=True)
-            warnings.warn(
-                f"sous fork store: fork persist failed ({type(e).__name__}: {e.strerror})",
-                stacklevel=2,
-            )
-            if e.errno in _DISABLING_ERRNOS:
-                self._disable(f"{os.strerror(e.errno)} ({errno_mod.errorcode[e.errno]})")
-            return False
         except Exception as e:  # noqa: BLE001 — an optimization never fails a turn
             if temp is not None:
                 temp.unlink(missing_ok=True)
-            kind = type(e).__name__
+            kind = detail = type(e).__name__
+            if isinstance(e, OSError):
+                kind = errno_mod.errorcode.get(e.errno or 0, kind)
+                detail = f"{kind}: {e.strerror}" if e.strerror else kind
+                if e.errno in _DISABLING_ERRNOS:
+                    warnings.warn(f"sous fork store: fork persist failed ({detail})", stacklevel=2)
+                    self._disable(f"{os.strerror(e.errno)} ({kind})")
+                    return False
             self._write_failures += 1
             if self._write_failures >= MAX_FAILURES:
-                self._disable(f"{MAX_FAILURES} consecutive persist failures")
+                self._disable(f"{MAX_FAILURES} consecutive persist failures ({detail})")
             elif kind not in self._warned_writers:
                 self._warned_writers.add(kind)
                 warnings.warn(
-                    f"sous fork store: fork persist failed ({kind}); will retry on "
+                    f"sous fork store: fork persist failed ({detail}); will retry on "
                     "the next cold turn",
                     stacklevel=2,
                 )
@@ -653,14 +655,23 @@ class ForkStore:
                 else:
                     self._restoring.pop(entry.path, None)
 
-    def touch_entry(self, entry: Entry) -> None:
+    def touch_entry(self, entry: Entry) -> bool:
+        """Refresh `entry`'s mtime; False when its file is gone (removed under
+        a live daemon), which drops it from the index — a stale entry would
+        read as stored forever, and the fork would never be written again.
+        Any other OSError keeps the entry: the file is there, only the touch
+        failed."""
         try:
             os.utime(entry.path, None)
-            with self._lock:
-                if entry.path in self._entries:
-                    self._entries[entry.path] = dataclasses.replace(entry, mtime=time.time())
+        except FileNotFoundError:
+            self._forget(entry)
+            return False
         except OSError:
-            pass
+            return True
+        with self._lock:
+            if entry.path in self._entries:
+                self._entries[entry.path] = dataclasses.replace(entry, mtime=time.time())
+        return True
 
     def _forget(self, entry: Entry) -> None:
         with self._lock:

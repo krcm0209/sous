@@ -427,6 +427,49 @@ def test_a_disk_error_disables_the_store(tmp_path: Path, errno_name: str):
     assert s.state == "unavailable" and errno_name.lower() in (s.reason or "").lower()
 
 
+def test_a_repeated_non_disabling_os_error_warns_once_and_three_retire(tmp_path: Path):
+    """An errno that does not disable the store outright still fails the same
+    way on every cold turn, each time after evicting room for the write."""
+    import errno
+
+    s = store(tmp_path)
+
+    def write(path: Path, metadata: dict[str, str]) -> None:
+        raise OSError(errno.EIO, "io")
+
+    with pytest.warns(UserWarning, match=r"fork persist failed \(EIO: io\)"):
+        assert s.persist(IDS[:100], "tools", write, expected_bytes=8) is False
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert s.persist(IDS[:200], "tools", write, expected_bytes=8) is False
+    assert s.state == "active"
+    with pytest.warns(UserWarning, match="disabled"):
+        assert s.persist(IDS[:300], "tools", write, expected_bytes=8) is False
+    assert s.state == "unavailable" and "EIO" in (s.reason or "")
+
+
+def test_a_file_removed_under_the_store_is_forgotten_and_written_again(tmp_path: Path):
+    """rm -rf under a live daemon: the index must not keep reporting the
+    file, or the fork is never written again while its slot stays resident."""
+    s = store(tmp_path)
+    ids = IDS[:100]
+    assert s.persist(ids, "tools", fake_write(64, ids), expected_bytes=64)
+    shutil.rmtree(tmp_path / "forks")
+    assert s.touch(ids) is False
+    assert s.forks == 0 and not s.has(ids)
+    assert s.persist(ids, "tools", fake_write(64, ids), expected_bytes=64) is True
+    assert s.forks == 1
+
+
+def test_persist_rewrites_a_known_file_that_vanished(tmp_path: Path):
+    s = store(tmp_path)
+    ids = IDS[:100]
+    assert s.persist(ids, "tools", fake_write(64, ids), expected_bytes=64)
+    next((tmp_path / "forks" / s.key).glob("*.safetensors")).unlink()
+    assert s.persist(ids, "tools", fake_write(64, ids), expected_bytes=64) is True
+    assert s.forks == 1 and s.has(ids)
+
+
 def test_a_missing_directory_is_recreated_before_a_write(tmp_path: Path):
     s = store(tmp_path)
     shutil.rmtree(tmp_path / "forks")
@@ -585,6 +628,18 @@ def test_construction_enforces_the_budget_over_every_key(tmp_path: Path):
     assert small.forks == 1 and small.evictions == 1
 
 
+def test_the_load_line_says_what_a_lowered_budget_evicted(tmp_path: Path, caplog):
+    big = store(tmp_path, budget=10 * GIB)
+    a, b = IDS[:10], [*IDS[:9], 1001]
+    assert big.persist(a, "tools", fake_write(300, a), expected_bytes=300)
+    assert big.persist(b, "tools", fake_write(300, b), expected_bytes=300)
+    caplog.clear()
+    with caplog.at_level("INFO", logger="sous.engine"):
+        store(tmp_path, budget=1)
+    lines = [r.getMessage() for r in caplog.records if "forks on disk" in r.getMessage()]
+    assert len(lines) == 1 and "evicted=2" in lines[0]
+
+
 # ---- restore ---------------------------------------------------------------
 
 
@@ -706,9 +761,9 @@ def test_touch_refreshes_the_mtime_of_a_stored_prefix(tmp_path: Path):
     e = s.longest_prefix(IDS[:200])
     assert e is not None
     os.utime(e.path, (1, 1))
-    s.touch(IDS[:100])
+    assert s.touch(IDS[:100]) is True
     assert e.path.stat().st_mtime > 1
-    s.touch(IDS[:50])  # unknown: a no-op
+    assert s.touch(IDS[:50]) is False  # unknown: a no-op
 
 
 def test_nested_restore_of_same_file_refcounts_eviction_protection(tmp_path: Path):
