@@ -105,6 +105,7 @@ class Daemon:
                 "port": self.config.server_port,
                 "local_models": list(self.config.local_models),
                 "max_context_tokens": self.config.max_context_tokens,
+                "prompt_cache_disk_gb": self.config.prompt_cache_disk_gb,
                 "upstream_url": self.config.upstream_url,
                 "generation_timeout_minutes": self.config.generation_timeout_minutes,
             },

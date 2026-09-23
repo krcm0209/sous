@@ -12,6 +12,7 @@ import time
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Protocol
 
 from sous.config import SousConfig
@@ -225,6 +226,18 @@ def fetch_model_config(model_id: str) -> dict:
         return json.load(f)
 
 
+def weights_identity_for(model_id: str) -> str:
+    """The identity of the weights behind `model_id`, from the config.json
+    fetch_model_config has just cached: `local_files_only` makes this a
+    cache lookup, never a second Hub round-trip, and the un-resolved path's
+    parent is the snapshot commit."""
+    from huggingface_hub import hf_hub_download
+
+    from sous.engine.forkstore import weights_identity
+
+    return weights_identity(Path(hf_hub_download(model_id, "config.json", local_files_only=True)))
+
+
 def _default_factory(
     model_id: str,
     temperature: float = 0.7,
@@ -236,6 +249,8 @@ def _default_factory(
     cache_budget: int | None = None,
     reserve_tokens: int = 0,
     int8_prefill: bool = False,
+    fork_dir: Path | None = None,
+    fork_budget: int | None = None,
 ) -> Engine:
     from sous.engine.window import kv_bytes_per_token
 
@@ -259,11 +274,25 @@ def _default_factory(
                 " and a single prompt-cache slot is kept (set [model].prompt_cache_gb to override)"
                 if auto
                 else ""
-            ),
+            )
+            + (" and prompt-cache forks are not persisted" if fork_dir is not None else ""),
             stacklevel=2,
         )
         if auto:
             cache_budget = 0
+        # The pressure valve is off; the store must not be the one thing
+        # allocating a fork at a stroke.
+        fork_dir = None
+    weights = ""
+    if fork_dir is not None:
+        try:
+            weights = weights_identity_for(model_id)
+        except Exception as e:  # noqa: BLE001 — a model load must never fail because of this
+            warnings.warn(
+                f"sous: fork store off — weights identity unavailable ({type(e).__name__})",
+                stacklevel=2,
+            )
+            fork_dir = None
     if backend == "vlm":
         # Import the module, not the class, so tests can monkeypatch the
         # engine class on its home module and be seen here.
@@ -280,6 +309,9 @@ def _default_factory(
             cache_budget=cache_budget,
             reserve_bytes=reserve_bytes,
             int8_prefill=int8_prefill,
+            fork_dir=fork_dir,
+            fork_budget=fork_budget,
+            weights_identity=weights,
         )
     # The drafter settings stop here: speculative decoding is an mlx-vlm
     # feature, and the mlx-lm backend has no parameter for it.
@@ -294,14 +326,24 @@ def _default_factory(
         cache_budget=cache_budget,
         reserve_bytes=reserve_bytes,
         int8_prefill=int8_prefill,
+        fork_dir=fork_dir,
+        fork_budget=fork_budget,
+        weights_identity=weights,
     )
 
 
-def default_engine_factory(config: SousConfig) -> Callable[[str], Engine]:
+def default_engine_factory(config: SousConfig, *, forks: bool = True) -> Callable[[str], Engine]:
     """The factory EngineManager builds when given none: every [model] value
     mapped onto the backend. Public so a process that must wrap the real
     engine (the tune's suite runner counts its deltas) builds the same one
-    rather than a second copy of this mapping."""
+    rather than a second copy of this mapping.
+
+    `forks=False` is what `sous tune` passes: its arms would write synthetic
+    forks into the live store's LRU, and a 2 s write inside a timed prefill
+    moves the number the run reports."""
+    disk = config.prompt_cache_disk_gb
+    fork_dir = config.data_dir / "forks" if forks and config.prompt_cache and disk != 0 else None
+    fork_budget = None if disk is None else int(disk * (1 << 30))
     return lambda model_id: _default_factory(
         model_id,
         config.temperature,
@@ -315,6 +357,8 @@ def default_engine_factory(config: SousConfig) -> Callable[[str], Engine]:
         ),
         reserve_tokens=config.max_context_tokens,
         int8_prefill=config.int8_prefill,
+        fork_dir=fork_dir,
+        fork_budget=fork_budget,
     )
 
 

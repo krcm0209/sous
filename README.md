@@ -312,9 +312,21 @@ of the KV at its boundary (~3.5 GiB at 57K tokens on the default model):
 one tools fork per tool set, plus one header fork per session that has
 used it, so several live `claude` sessions accumulate more than the
 tool-set count alone suggests. Budgeted by `[model].prompt_cache_gb`
-below. Forks live as long as the weights: `[model].idle_unload_minutes`
-drops them with the model. Two subagents still run one at a time; batching
-is a later phase.
+below. The *tools* fork is also kept on disk: at the tools boundary a cold
+turn writes the live cache to `~/.sous/forks/` (~3.1 GiB at 50K tokens,
+about 2 s on the internal SSD) before taking its resident copy, and a miss
+whose render extends a stored file reads it back in seconds — across an
+idle unload, a daemon restart, an upgrade that leaves the engine's
+numerics alone, and a reboot. The header fork lives only as long as the
+weights (`[model].idle_unload_minutes` drops it with the model): measured
+on the maintainer's log, keeping it on disk too would have saved about
+eight seconds in nine days for a second 3.5 GiB write per cold turn. A
+file is used only when its ids are exactly a prefix of the render, whole
+or not at all, and only by a daemon whose backend and its version
+(mlx-vlm or mlx-lm), mlx version, GPU, weights snapshot, engine sources,
+positions owner and int8 state match the ones that wrote it; anything else
+is a natural miss and ages out of the budget below. Two subagents still
+run one at a time; batching is a later phase.
 
 Usage is split the way Anthropic's is. `cache_read_input_tokens` is what
 the turn served from a resident cache slot and `input_tokens` the rest, so a
@@ -401,11 +413,14 @@ example (wrapped here):
 `id` is the response's message id (the same one in `message_start`, so the
 line joins to Claude Code's transcript). `cache` is `hit` (this
 conversation's own slot), `fork` (a copy of a shared boundary — ~45–56K
-reused tokens is a tools fork, ~57K a header fork) or `miss`; `took` names
+reused tokens is a tools fork, ~57K a header fork) or `miss` — `disk` when
+the prefix came off disk; `took` names
 the slot and its length — `turn@N` for this conversation's own slot copied
 and left in place, `turn-moved@N` for one the budget could not hold a copy
 of, or whose copy failed (removed and extended in place — every hit at
-`prompt_cache_gb = 0`), `fork@N` for a shared boundary, `none` on a miss, and
+`prompt_cache_gb = 0`), `fork@N` for a shared boundary, `disk@N` for a
+fork read off disk (`cache=disk`; the turn also republishes it as a
+resident fork, so its line reads `forks=1`), `none` on a miss, and
 on a hit whose warm attempt failed and was rebuilt cold (a
 `WARNING py.warnings: … retrying cold` line comes first), where
 `prefilled_tokens` and the phases below describe that cold attempt.
@@ -424,7 +439,10 @@ phase below),
 `tokenize_s`, `prefill_s` and `decode_s` say where the time went, as far as
 the prompt cache measures it — not a strict partition of `seconds`: a turn
 that starts from a copied fork slot times that copy into neither phase, so
-the phases can sum to less than the total. `ttft_s` is not one more slice
+the phases can sum to less than the total. A fork written to disk
+(`persist_s`) or read from it (`restore_s`) is timed into neither phase
+either — both are their own fields, so `prefill_tps` stays a prefill rate
+on the turn that restores. `ttft_s` is not one more slice
 alongside them: it spans from the start of generation to the first token,
 overlapping `prefill_s` and however much of `decode_s` ran before that token,
 so adding every field this way can just as easily run past `seconds` as fall
@@ -501,6 +519,7 @@ top_p = 0.8
 top_k = 20
 prompt_cache = true
 # prompt_cache_gb = 8
+# prompt_cache_disk_gb = "auto"
 speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
 speculative_block_size = 3
 int8_prefill = false
@@ -586,10 +605,27 @@ for a while and would evict the forks a cold turn had just made. The
 conversation that just ran is never evicted by
 its own turn, and a cold turn's second fork copy never evicts its first, so
 `0` means exactly one slot and a 32 GB machine
-degrades to that on its own. Forks live as long as the weights do:
-`idle_unload_minutes` drops them with
-the model, so "every new session" means every new session inside that
-window.
+degrades to that on its own.
+
+`[model].prompt_cache_disk_gb` (default `"auto"` — a number sets the GiB,
+`0` keeps nothing on disk) bounds the tools forks kept under
+`~/.sous/forks/`, one file per tool array, least-recently-used first when
+the budget says so. `"auto"` is a quarter of the volume's free space at
+load (counting what the store already holds, so a restart never shrinks
+it), capped at 16 GiB — four to five forks of the default model; a write
+is skipped, with one warning, when it would leave the volume with less
+than 10 GiB (or 5 %) free. The daemon logs the directory, the budget and
+what it found at every load; `sous status` and `sous top` show the count
+and bytes, or the reason the store is off — the count is this model's
+forks, while the byte total (and the budget it is measured against) spans
+every key directory under `~/.sous/forks/`, one per model and backend
+combination that has ever written there. `rm -rf ~/.sous/forks` is the
+eraser, safe under a running daemon. Exclude the directory from Time
+Machine: its files are worthless the moment the weights or a version
+change, and churn with every new tool array. Requires `prompt_cache =
+true`; a daemon that cannot size the model's KV keeps forks in memory
+only.
+
 `GET /sous/status` (and `sous status`, `sous top`) reports the engine —
 `holders` (live `sous claude` sessions pinning the model), `loading` (a load
 in progress, a preload included), `memory_gb` and `prompt_cache` — slots,
@@ -744,6 +780,12 @@ sous executes nothing. The daemon binds to `127.0.0.1`, refuses foreign
 the `Authorization` header Claude Code sends to `[server].upstream_url`
 unmodified and nowhere else, stores no credential, and never logs a request
 body, header value or query string.
+
+One thing derived from prompts is kept at rest: a persisted fork holds the
+KV and the token ids of the rendered tool block (and, for a header-only
+template, the system text) of the sessions that produced it, unencrypted,
+in `~/.sous/forks/` (mode 0700, files 0600). `prompt_cache_disk_gb = 0`
+turns it off; `rm -rf ~/.sous/forks` clears it.
 
 The boundary around the local model is Claude Code's permission system, the
 same one that governs a frontier subagent:
