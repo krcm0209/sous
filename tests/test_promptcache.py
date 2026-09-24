@@ -26,6 +26,7 @@ from sous.engine.promptcache import (
     auto_cache_budget,
     common_prefix_length,
     fork_copy,
+    fork_file_bytes,
     fork_point,
     metal_headroom,
     restore,
@@ -2040,6 +2041,8 @@ def test_a_cold_turn_persists_the_lowest_boundary_from_the_live_cache_before_the
     assert h.log[:4] == ["new_cache", "prefill", "persist", "new_cache"]
     st = pc.stats()
     assert (st["persists"], st["forks"]) == (1, 2)  # both resident forks still made
+    # The store is handed the estimate of the live cache at the boundary.
+    assert s.expected_bytes_calls == [fork_file_bytes([FakeTrimmable(TOOLS_AT)] * h.layers, len(T))]
 
 
 def test_a_second_turn_skips_the_write_and_touches_the_file():
