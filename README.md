@@ -313,14 +313,16 @@ one tools fork per tool set, plus one header fork per session that has
 used it, so several live `claude` sessions accumulate more than the
 tool-set count alone suggests. Budgeted by `[model].prompt_cache_gb`
 below. The *tools* fork is also kept on disk: at the tools boundary a cold
-turn writes the live cache to `~/.sous/forks/` (~3.1 GiB at 50K tokens,
-about 2 s on the internal SSD) before taking its resident copy, and a miss
-whose render extends a stored file reads it back in seconds — across an
-idle unload, a daemon restart, an upgrade that leaves the engine's
-numerics alone, and a reboot. The header fork lives only as long as the
-weights (`[model].idle_unload_minutes` drops it with the model): measured
-on the maintainer's log, keeping it on disk too would have saved about
-eight seconds in nine days for a second 3.5 GiB write per cold turn. A
+turn writes the live cache to `~/.sous/forks/` (3.7 GiB at 58K tokens,
+0.3–0.4 s on the M5 Pro, where the write lands in the page cache) before
+taking its resident copy, and a miss whose render extends a stored file
+reads it back in under a second (0.5–0.7 s, from a file none of which was
+in memory) — across an idle unload, a daemon restart, an upgrade that
+leaves the engine's numerics alone, and a reboot. The header fork lives
+only as long as the weights (`[model].idle_unload_minutes` drops it with
+the model): measured on the maintainer's log, keeping it on disk too
+would have saved about eight seconds in nine days for a second 3.5 GiB
+write per cold turn. A
 file is used only when its ids are exactly a prefix of the render, whole
 or not at all, and only by a daemon whose backend and its version
 (mlx-vlm or mlx-lm), mlx version, GPU, weights snapshot, engine sources,
@@ -816,6 +818,10 @@ Validated end to end on an M5 Pro / 64 GB with the default model
   built the tools fork, across processes and projects.
 - **Same-session forks** (2026-09-04): 8.3 s against 168 s cold for the
   second subagent of a session.
+- **Forks on disk** (2026-09-23): after a daemon restart, with the file not
+  in memory, a new session's first local turn (61K tokens) took 15.7 s
+  against 175.5 s cold; the tools fork came back in 0.6 s. Writing it cost
+  the cold turn nothing measurable.
 - **Continuity** (2026-09-13/14): retained turn slots kept a subagent's cache
   through the progress-summary branches Claude Code makes every 30 s, at a
   262144-token window.
