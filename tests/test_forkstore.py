@@ -697,6 +697,33 @@ def test_a_victim_that_cannot_be_deleted_stays_counted(tmp_path: Path, monkeypat
     assert s.bytes <= s.budget * forkstore.EVICT_TO and s.evictions == 2
 
 
+def test_a_failed_delete_strands_no_later_victim_even_when_its_warning_raises(
+    tmp_path: Path, monkeypatch
+):
+    """Every victim is unlinked and released before the one warning, so a
+    warning escalated to an error (-W error) cannot leave a later victim on
+    disk and out of the index with its ids refused for the rest of the load."""
+    s, files, size = full_store(tmp_path)
+    s.budget = int(size * 1.5)  # the new file alone fits: both old ones go
+    real_unlink = Path.unlink
+
+    def refuse(self: Path, *a, **kw):
+        if self == files[0]:
+            raise PermissionError(13, "denied")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    c = [*IDS[:9], 1002]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        # persist's own handler turns the escalated warning into a failure
+        # report, which escalates in turn; either way, one warning escapes.
+        with pytest.raises(UserWarning):
+            s.persist(c, "tools", fake_write(300, c), expected_bytes=size)
+    assert files[0].exists() and not files[1].exists()
+    assert not s._unlinking
+
+
 def test_a_path_that_would_not_delete_is_evictable_once_written_again(tmp_path: Path, monkeypatch):
     """The exemption belongs to the file that refused, not to its path: once
     that file is gone and the same ids are written again, the new file
@@ -1066,6 +1093,42 @@ def test_a_bad_file_that_will_not_delete_is_dropped_and_counted(tmp_path: Path, 
         assert s.restore(e, bad) is False
     assert e.path.exists() and s._failures == 1 and s.forks == 0
     assert s.longest_prefix(IDS[:200]) is None and not s._unlinking
+
+
+def test_a_bad_file_is_not_rewritten_before_its_delete(tmp_path: Path, monkeypatch):
+    """Between leaving the index and its unlink, a file that failed
+    verification looks absent; a write of the same ids in that window would
+    be deleted by the unlink after it and leave the index pointing at
+    nothing."""
+    s = store(tmp_path)
+    ids = IDS[:100]
+    assert s.persist(ids, "tools", fake_write(64, ids), expected_bytes=64)
+    e = s.longest_prefix(IDS[:200])
+    assert e is not None
+    inner: list[bool] = []
+    calls: list[Path] = []
+    real_unlink = Path.unlink
+
+    def spy(self: Path, *args, **kw):
+        # Re-entering under the lock would deadlock; the lock-free delete is
+        # what this pins.
+        if self == e.path and not s._lock.locked():
+
+            def write(path: Path, metadata: dict[str, str]) -> None:
+                calls.append(path)
+
+            inner.append(s.persist(ids, "tools", write, expected_bytes=64))
+        return real_unlink(self, *args, **kw)
+
+    def bad(path: Path, header: Header) -> None:
+        raise ForkFileError("ids differ")
+
+    monkeypatch.setattr(Path, "unlink", spy)
+    with pytest.warns(UserWarning, match="deleted"):
+        assert s.restore(e, bad) is False
+    assert inner == [False] and calls == []
+    assert not e.path.exists() and not s.has(ids)
+    assert s.persist(ids, "tools", fake_write(64, ids), expected_bytes=64) is True  # later: fine
 
 
 def test_a_successful_restore_resets_the_failure_streak(tmp_path: Path):

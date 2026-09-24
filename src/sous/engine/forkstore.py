@@ -59,7 +59,8 @@ _EPOCH_FILES = ("vlm.py", "lm.py", "int8prefill.py")
 
 class ForkFileError(Exception):
     """A file that failed verification: format, size, layer layout, offsets
-    or ids. The store deletes it. Anything else raised around a file — an
+    or ids. The store drops it from the index and deletes it when it can.
+    Anything else raised around a file — an
     allocation failure, an OSError (a file that cannot be opened or read
     right now says nothing about its bytes) — keeps the file."""
 
@@ -329,7 +330,8 @@ class ForkStore:
         # verification): a write of the same ids in that window would be
         # deleted by the unlink after it.
         self._unlinking: set[Path] = set()
-        # Files whose unlink failed: back in the index, never picked again.
+        # Files whose unlink failed: back in the index, and not picked again
+        # while they stay there; leaving the index drops the exemption.
         self._undeletable: set[Path] = set()
         self._failures = 0
         # Consecutive persist failures short of a disabling errno: a cache the
@@ -393,14 +395,17 @@ class ForkStore:
     def _scan(self) -> None:
         """Sizes and mtimes across every key (for the budget), headers for
         this key only (for lookup), dead writers' temp files unlinked, and
-        this key's files that fail the header check deleted.
+        this key's files that fail the header check deleted — both where
+        they can be, since neither is ever indexed.
 
         Tolerant per item, so one bad file never disables the whole store: a
         pid_alive check that cannot answer (a crafted or unreadable pid)
         leaves the temp file alone rather than guessing whether to delete
-        someone else's in-flight write, and a file stat()-ed out from under
-        the scan (removed mid-scan, racing another thread's eviction) is
-        skipped. Anything else — a header whose JSON recurses past Python's
+        someone else's in-flight write; a file stat()-ed out from under the
+        scan (removed mid-scan, racing another thread's eviction), or whose
+        header cannot be read right now, is skipped; a key directory that
+        vanishes is skipped; a delete that fails leaves the file for the
+        next load. Anything else — a header whose JSON recurses past Python's
         stack, an unreadable key directory — still propagates, since it
         means the scan itself cannot be trusted; the constructor disables
         the store for that."""
@@ -507,7 +512,8 @@ class ForkStore:
     def _unlink(self, victims: list[Entry]) -> None:
         """Delete what `_evict_locked` took out of the index, outside the
         lock. A file that will not go goes back into the index, so the
-        budget still counts its bytes, and is never picked again: the next
+        budget still counts its bytes, and is not picked again while it stays
+        indexed: the next
         eviction takes the next oldest instead of counting it as freed."""
         if not victims:
             return
@@ -702,10 +708,13 @@ class ForkStore:
     def restore(self, entry: Entry, load: Callable[[Path, Header], None]) -> bool:
         """Read `entry` through `load(path, header)`. A ForkFileError from
         the header check or the loader is a verification failure: the file
-        is deleted and three in a row retire the store. Anything else keeps
-        the file — an allocation failure, or a file that cannot be opened
-        right now, is not corruption — and warns once per kind of failure. A
-        file that is gone is a plain miss. Never raises."""
+        leaves the index, is deleted when it can be, and three in a row
+        retire the store. Anything else keeps the file — an allocation
+        failure, or a file that cannot be opened right now, is not
+        corruption — and warns once per kind of failure. A file already gone
+        when the header is read is a plain miss; one removed after that
+        reaches the loader as a failure to open and is kept until the next
+        touch finds it gone. Never raises."""
         if self.state != "active":
             return False
         with self._lock:
