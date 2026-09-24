@@ -22,6 +22,14 @@ class ForkUnsupported(Exception):
     """A cache with a layer class the file format does not cover."""
 
 
+# How mlx's safetensors reader words a verdict on the bytes — a tensor whose
+# shape or dtype disagrees with its byte range, a dtype it does not know, a
+# header its JSON parser refuses. "Failed to open" shares the first prefix
+# but is about the path (removed, or unreadable), not the bytes.
+_MLX_FORMAT_ERRORS = ("[load_safetensors]", "[safetensor]", "[json.exception")
+_MLX_OPEN_ERROR = "[load_safetensors] Failed to open"
+
+
 def layer_kinds(cache: Sequence[Any]) -> list[str]:
     kinds: list[str] = []
     for c in cache:
@@ -109,7 +117,13 @@ def restore_cache(path: Path, header: Header, cache: Sequence[Any], ids: Sequenc
     n = len(ids)
     if meta.get("n_tokens") != str(n):
         raise ForkFileError(f"{path.name}: n_tokens {meta.get('n_tokens')!r} != {n}")
-    loaded = mx.load(str(path))
+    try:
+        loaded = mx.load(str(path))
+    except RuntimeError as e:
+        message = str(e)
+        if message.startswith(_MLX_FORMAT_ERRORS) and not message.startswith(_MLX_OPEN_ERROR):
+            raise ForkFileError(f"{path.name}: {message}") from e
+        raise
     if "ids" not in loaded:
         raise ForkFileError(f"{path.name}: no ids tensor")
     if loaded["ids"].tolist() != list(ids):  # ty: ignore[invalid-argument-type]

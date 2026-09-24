@@ -225,6 +225,19 @@ def slot_bytes(cache: Sequence[Any]) -> int:
     return sum(int(getattr(c, "nbytes", 0) or 0) for c in cache)
 
 
+# The safetensors header's share of a fork file: 12.8 KB measured at 57K
+# tokens on the default model's 64 layers; it grows with layers, not tokens.
+FORK_HEADER_ALLOWANCE = 64 << 10
+
+
+def fork_file_bytes(cache: Sequence[Any], n_ids: int) -> int:
+    """What persisting `cache` for `n_ids` ids writes, from above: the
+    padded buffers (forkio saves the whole capacity, not the trimmed offset
+    slice), the ids tensor (int32) and the header allowance. The store
+    refuses a write on this before any byte is written."""
+    return slot_bytes(cache) + 4 * n_ids + FORK_HEADER_ALLOWANCE
+
+
 def fork_copy(src: Sequence[Any], dst: Sequence[Any], copy_array: Callable) -> None:
     """Make `dst` — a fresh cache of the same layout — hold exactly what `src`
     holds now, as an independent copy.
@@ -965,11 +978,7 @@ class PrefixCache:
         hooks = self._hooks
         started = _clock()
         try:
-            # The padded buffers ARE what gets written (persist_cache saves
-            # the whole capacity, not the trimmed offset slice): slot_bytes
-            # plus the ids tensor (int32) plus a fixed allowance for the
-            # safetensors header.
-            expected_bytes = slot_bytes(cache) + 4 * len(ids) + (64 << 10)
+            expected_bytes = fork_file_bytes(cache, len(ids))
             if self._store.persist(
                 ids,
                 boundary,
