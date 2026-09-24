@@ -48,6 +48,9 @@ goal.
   config_path/data_dir.
 - `docs/superpowers/**` are point-in-time design/plan records: never edit,
   reformat, or "sync" them with current code (they are also ruff-excluded).
+  Once a record's work has shipped and nothing cites it as a current rule,
+  it leaves the tree: `git rm` it and add a permalink row to
+  `docs/design-records.md`.
 - Engine `on_delta` callbacks (`engine/base.py:Delta`) fire on the generation
   thread from inside the decode loop: never block or raise in one, and expect
   late deltas from a stalled-and-abandoned session.
