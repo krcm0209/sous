@@ -59,10 +59,12 @@ _EPOCH_FILES = ("vlm.py", "lm.py", "int8prefill.py")
 
 class ForkFileError(Exception):
     """A file that failed verification: format, size, layer layout, offsets
-    or ids. The store drops it from the index and deletes it when it can.
-    Anything else raised around a file — an
-    allocation failure, an OSError (a file that cannot be opened or read
-    right now says nothing about its bytes) — keeps the file."""
+    or ids. The store drops it from the index and deletes it when it can;
+    one that will not delete is not served again this load (the next load
+    re-checks it), is never written over, and stays charged to the budget
+    while it exists. Anything else raised around a file — an allocation
+    failure, an OSError (a file that cannot be opened or read right now
+    says nothing about its bytes) — keeps the file."""
 
 
 def digest(ids: Sequence[int]) -> str:
@@ -333,6 +335,12 @@ class ForkStore:
         # Files whose unlink failed: back in the index, and not picked again
         # while they stay there; leaving the index drops the exemption.
         self._undeletable: set[Path] = set()
+        # Files that failed verification and would not delete, by size: out
+        # of the index for this load, but charged while they exist (their
+        # bytes are on disk), and a write of the same ids would only fail
+        # replacing them — on every cold turn, since a success elsewhere
+        # resets the failure streak.
+        self._condemned: dict[Path, int] = {}
         self._failures = 0
         # Consecutive persist failures short of a disabling errno: a cache the
         # format cannot cover, or a disk that fails the same way, fails
@@ -357,7 +365,7 @@ class ForkStore:
             self._scan()
             usage = disk_usage(root)
             with self._lock:
-                found = sum(e.size for e in self._entries.values())
+                found = self._charged_locked()
             # `usage.free` already excludes this store's own files (they are
             # real bytes on disk by the time this reads it); add them back so
             # a restart derives the same budget the first run did, rather
@@ -410,6 +418,7 @@ class ForkStore:
         means the scan itself cannot be trusted; the constructor disables
         the store for that."""
         entries: dict[Path, Entry] = {}
+        condemned: dict[Path, int] = {}
         for key_dir in self.root.iterdir():
             if not key_dir.is_dir():
                 continue
@@ -446,10 +455,12 @@ class ForkStore:
                     except OSError:
                         continue  # unreadable now, not bad bytes: next load looks again
                     if header is None:
-                        # Never indexed either way; a delete that fails
-                        # leaves it for the next load to try again.
-                        with contextlib.suppress(OSError):
+                        # Never indexed either way; one that will not
+                        # delete is condemned until the next load tries again.
+                        try:
                             item.unlink(missing_ok=True)
+                        except OSError:
+                            condemned[item] = st.st_size
                         continue
                     # read_header checked the size against a stat of its own;
                     # the one above may predate a same-digest replacement.
@@ -457,6 +468,7 @@ class ForkStore:
                 entries[item] = Entry(item, key_dir.name, n, dig, size, st.st_mtime)
         with self._lock:
             self._entries = entries
+            self._condemned = condemned
 
     def _verify_header(self, path: Path, n: int) -> Header | None:
         """The header when `path` is a fork of this key for `n` ids, None
@@ -478,18 +490,23 @@ class ForkStore:
 
     def _recount_locked(self) -> None:
         # forks counts only this identity key's files; bytes sums every
-        # key's, because the budget (and the LRU that enforces it) spans
-        # every key directory under root, not just the current model's.
+        # key's, condemned files included, because the budget (and the LRU
+        # that enforces it) spans every key directory under root, not just
+        # the current model's.
         self.forks = sum(1 for e in self._entries.values() if e.key == self.key)
-        self.bytes = sum(e.size for e in self._entries.values())
+        self.bytes = self._charged_locked()
+
+    def _charged_locked(self) -> int:
+        return sum(e.size for e in self._entries.values()) + sum(self._condemned.values())
 
     def _evict_locked(self, target: int, keep: Path | None = None) -> list[Entry]:
-        """LRU by mtime across every key until the index fits under `target`
-        bytes, never a file being restored, one that would not delete, nor
-        `keep`. The victims leave the index here; the caller unlinks them
-        with `_unlink` once it has released the lock."""
+        """LRU by mtime across every key until what the store is charged —
+        the index plus condemned files — fits under `target` bytes, never a
+        file being restored, one that would not delete, nor `keep`. The
+        victims leave the index here; the caller unlinks them with
+        `_unlink` once it has released the lock."""
         victims: list[Entry] = []
-        total = sum(e.size for e in self._entries.values())
+        total = self._charged_locked()
         candidates = sorted(
             (
                 e
@@ -602,10 +619,11 @@ class ForkStore:
     ) -> bool:
         """Write `ids`' cache through `write(temp_path, metadata)` unless a
         file for it exists (then touch it), a write of it is in flight, the
-        store is off, the file is still being deleted, or the caller's own
-        `expected_bytes` estimate would breach the budget or the free-space
-        floor — checked before `write` ever runs, so a refused write never
-        touches disk. The file is indexed only after os.replace. The real size
+        store is off, the file is still being deleted or failed verification
+        and would not delete, or the caller's own `expected_bytes` estimate
+        would breach the budget or the free-space floor — checked before
+        `write` ever runs, so a refused write never touches disk. The file
+        is indexed only after os.replace. The real size
         is checked against the budget once more after the write, belt and
         braces against an under-estimate; the floor is not re-checked there,
         since the pre-check already reserved it. Room is made only once the
@@ -619,8 +637,16 @@ class ForkStore:
         final = self._path_for(n, dig)
         if self._touch(final):
             return False
+        self._prune_condemned()
         with self._lock:
-            if final in self._entries or dig in self._writing or final in self._unlinking:
+            # One check under one lock: a _delete that condemns the path is
+            # either done (condemned) or in flight (unlinking) here.
+            if (
+                final in self._entries
+                or dig in self._writing
+                or final in self._unlinking
+                or final in self._condemned
+            ):
                 return False
             self._writing.add(dig)
         temp: Path | None = None
@@ -786,22 +812,39 @@ class ForkStore:
         self._undeletable.discard(entry.path)
         self._recount_locked()
 
+    def _prune_condemned(self) -> None:
+        """Drop condemned files that are gone — removed by hand, or the whole
+        store erased — so they stop costing budget and stop refusing a write
+        of their ids. Checked from the write path only, outside the lock."""
+        with self._lock:
+            paths = list(self._condemned)
+        gone = [p for p in paths if not os.path.lexists(p)]
+        if gone:
+            with self._lock:
+                for p in gone:
+                    self._condemned.pop(p, None)
+                self._recount_locked()
+
     def _delete(self, entry: Entry) -> OSError | None:
         """Take a file that failed verification out of the index and off
         the disk, guarded like an eviction's victim so a write of the same
         ids cannot land between the two; the error when it would not go,
-        and then it stays out of the index — it is not served again."""
+        and then it is condemned: not served again this load, never written
+        over, and charged to the budget while it exists."""
         with self._lock:
             self._forget_locked(entry)
             self._unlinking.add(entry.path)
+        failed: OSError | None = None
         try:
             entry.path.unlink(missing_ok=True)
         except OSError as e:
-            return e
-        finally:
-            with self._lock:
-                self._unlinking.discard(entry.path)
-        return None
+            failed = e
+        with self._lock:
+            self._unlinking.discard(entry.path)
+            if failed is not None:
+                self._condemned[entry.path] = entry.size
+                self._recount_locked()
+        return failed
 
 
 def _pid_alive(pid: int) -> bool:

@@ -855,6 +855,11 @@ def test_a_scan_delete_that_fails_skips_the_file_and_stays_active(tmp_path: Path
     again = store(tmp_path)
     assert again.state == "active" and again.forks == 1
     assert bad.exists() and temp.exists()
+    # The bad file is charged, and a write of its ids is refused while it stays.
+    assert again.bytes == s.bytes + bad.stat().st_size
+    calls: list[Path] = []
+    assert again.persist(IDS[:5], "tools", lambda p, m: calls.append(p), expected_bytes=8) is False
+    assert calls == []
 
 
 def test_a_file_that_vanishes_during_the_scan_is_skipped_not_disabling(tmp_path: Path, monkeypatch):
@@ -1093,6 +1098,120 @@ def test_a_bad_file_that_will_not_delete_is_dropped_and_counted(tmp_path: Path, 
         assert s.restore(e, bad) is False
     assert e.path.exists() and s._failures == 1 and s.forks == 0
     assert s.longest_prefix(IDS[:200]) is None and not s._unlinking
+
+
+def test_a_bad_file_that_will_not_delete_is_never_written_over_while_it_exists(
+    tmp_path: Path, monkeypatch
+):
+    """A write of the same ids could only fail replacing it, a full fork's
+    worth of bytes on every cold turn; so it is refused, the stuck file's
+    bytes stay charged, and the first write after it is gone goes ahead."""
+    s = store(tmp_path)
+    ids = IDS[:100]
+    assert s.persist(ids, "tools", fake_write(64, ids), expected_bytes=64)
+    e = s.longest_prefix(IDS[:200])
+    assert e is not None
+    real_unlink = Path.unlink
+    refusing = [True]
+
+    def refuse(self: Path, *a, **kw):
+        if self == e.path and refusing[0]:
+            raise PermissionError(1, "not permitted")
+        return real_unlink(self, *a, **kw)
+
+    def bad(path: Path, header: Header) -> None:
+        raise ForkFileError("ids differ")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    with pytest.warns(UserWarning, match="could not delete it"):
+        assert s.restore(e, bad) is False
+    assert (s.forks, s.bytes) == (0, e.size)  # out of the index, still charged
+    calls: list[Path] = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert s.persist(ids, "tools", lambda p, m: calls.append(p), expected_bytes=64) is False
+    assert calls == [] and s._write_failures == 0
+    refusing[0] = False
+    e.path.unlink()  # the operator clears it
+    assert s.persist(ids, "tools", fake_write(64, ids), expected_bytes=64) is True
+    assert s.forks == 1 and s.bytes == e.size and not s._condemned
+
+
+def test_a_condemned_file_that_is_gone_stops_costing_budget(tmp_path: Path, monkeypatch):
+    """rm -rf under the daemon takes the stuck file with it: the next write
+    attempt, of any ids, stops charging for it."""
+    s = store(tmp_path)
+    ids = IDS[:100]
+    assert s.persist(ids, "tools", fake_write(64, ids), expected_bytes=64)
+    e = s.longest_prefix(IDS[:200])
+    assert e is not None
+    real_unlink = Path.unlink
+
+    def refuse(self: Path, *a, **kw):
+        if self == e.path:
+            raise PermissionError(1, "not permitted")
+        return real_unlink(self, *a, **kw)
+
+    def bad(path: Path, header: Header) -> None:
+        raise ForkFileError("ids differ")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    with pytest.warns(UserWarning, match="could not delete it"):
+        assert s.restore(e, bad) is False
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    shutil.rmtree(tmp_path / "forks")
+    assert s.bytes == e.size  # nothing has looked yet
+    other = IDS[:200]
+    assert s.persist(other, "tools", fake_write(64, other), expected_bytes=64) is True
+    written = s.longest_prefix(IDS[:300])
+    assert written is not None
+    assert not s._condemned and s.forks == 1 and s.bytes == written.size
+
+
+def test_the_auto_budget_counts_condemned_bytes_as_the_stores_own(tmp_path: Path, monkeypatch):
+    """Free space already excludes a file the store could not delete, so a
+    restart adds it back like any indexed file's."""
+    s = store(tmp_path, budget=10 * GIB)
+    assert s.persist(IDS[:100], "tools", fake_write(64, IDS[:100]), expected_bytes=64)
+    bad = tmp_path / "forks" / s.key / file_name(5, digest(IDS[:5]))
+    bad.write_bytes(b"not ours at all")
+    real_unlink = Path.unlink
+
+    def refuse(self: Path, *a, **kw):
+        if self == bad:
+            raise PermissionError(1, "not permitted")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    free = 4096
+    again = store(tmp_path, free=free)
+    assert again.budget == auto_budget(free + s.bytes + bad.stat().st_size)
+
+
+def test_a_condemned_file_is_charged_when_making_room(tmp_path: Path, monkeypatch):
+    """Its bytes are on disk, so eviction counts them: a write that fits
+    beside the index alone still takes the oldest indexed file."""
+    s, files, size = full_store(tmp_path)
+    b = [*IDS[:9], 1001]
+    e = s.longest_prefix([*b, 7])
+    assert e is not None and e.path == files[1]
+    real_unlink = Path.unlink
+
+    def refuse(self: Path, *a, **kw):
+        if self == files[1]:
+            raise PermissionError(1, "not permitted")
+        return real_unlink(self, *a, **kw)
+
+    def bad(path: Path, header: Header) -> None:
+        raise ForkFileError("ids differ")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    with pytest.warns(UserWarning, match="could not delete it"):
+        assert s.restore(e, bad) is False
+    c = [*IDS[:9], 1002]
+    assert s.persist(c, "tools", fake_write(300, c), expected_bytes=size) is True
+    assert not files[0].exists() and files[1].exists()  # room came from the index
+    assert s.evictions == 1 and s.bytes == 2 * size
 
 
 def test_a_bad_file_is_not_rewritten_before_its_delete(tmp_path: Path, monkeypatch):
