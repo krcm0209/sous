@@ -104,6 +104,16 @@ def test_read_header_refuses_garbage(tmp_path: Path):
         read_header(p)
 
 
+def test_read_header_refuses_metadata_that_is_not_an_object(tmp_path: Path):
+    """Anything but a ForkFileError keeps the file, so a corrupt
+    __metadata__ must not surface as an AttributeError."""
+    p = tmp_path / "f.safetensors"
+    body = json.dumps({"__metadata__": [1]}).encode()
+    p.write_bytes(struct.pack("<Q", len(body)) + body)
+    with pytest.raises(ForkFileError, match="metadata is not an object"):
+        read_header(p)
+
+
 # ---- identity key ---------------------------------------------------------
 
 
@@ -687,6 +697,34 @@ def test_a_victim_that_cannot_be_deleted_stays_counted(tmp_path: Path, monkeypat
     assert s.bytes <= s.budget * forkstore.EVICT_TO and s.evictions == 2
 
 
+def test_a_path_that_would_not_delete_is_evictable_once_written_again(tmp_path: Path, monkeypatch):
+    """The exemption belongs to the file that refused, not to its path: once
+    that file is gone and the same ids are written again, the new file
+    takes its place in the LRU like any other."""
+    s, files, size = full_store(tmp_path)
+    real_unlink = Path.unlink
+    refusing = [True]
+
+    def refuse(self: Path, *a, **kw):
+        if self == files[0] and refusing[0]:
+            raise PermissionError(13, "denied")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    c = [*IDS[:9], 1002]
+    with pytest.warns(UserWarning, match="could not delete"):
+        assert s.persist(c, "tools", fake_write(300, c), expected_bytes=size) is True
+    refusing[0] = False
+    files[0].unlink()  # the operator clears it by hand
+    a = IDS[:10]
+    assert s.persist(a, "tools", fake_write(300, a), expected_bytes=size) is True
+    os.utime(files[0], (1, 1))
+    s._entries[files[0]] = dataclasses.replace(s._entries[files[0]], mtime=1)
+    d = [*IDS[:9], 1003]
+    assert s.persist(d, "tools", fake_write(300, d), expected_bytes=size) is True
+    assert not files[0].exists()  # the oldest again, and evicted this time
+
+
 def test_a_fork_larger_than_the_whole_budget_is_not_written(tmp_path: Path):
     s = store(tmp_path, budget=100)
     calls: list[Path] = []
@@ -769,6 +807,27 @@ def test_a_pid_alive_check_that_raises_leaves_the_temp_file_and_stays_active(tmp
 
     again = store(tmp_path, pid_alive=raising_pid_alive)
     assert again.state == "active" and temp.exists()
+
+
+def test_a_scan_delete_that_fails_skips_the_file_and_stays_active(tmp_path: Path, monkeypatch):
+    """A dead writer's temp file or a file that fails the header check is
+    never indexed; a delete of either that fails leaves it for the next
+    load rather than disabling the store."""
+    s = store(tmp_path)
+    assert s.persist(IDS[:100], "tools", fake_write(8, IDS[:100]), expected_bytes=8)
+    d = tmp_path / "forks" / s.key
+    bad = d / file_name(5, digest(IDS[:5]))
+    bad.write_bytes(b"not ours")
+    temp = d / "1-x.99.tmp.safetensors"
+    temp.write_bytes(b"x")
+
+    def refuse(self: Path, *a, **kw):
+        raise PermissionError(1, "not permitted")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    again = store(tmp_path)
+    assert again.state == "active" and again.forks == 1
+    assert bad.exists() and temp.exists()
 
 
 def test_a_file_that_vanishes_during_the_scan_is_skipped_not_disabling(tmp_path: Path, monkeypatch):
@@ -965,29 +1024,48 @@ def test_a_kept_restore_failure_warns_once_per_kind_for_any_file(tmp_path: Path)
     assert s._failures == 0 and first.path.exists() and second.path.exists()
 
 
-def test_restore_trusts_the_header_reads_own_look_at_the_size(tmp_path: Path, monkeypatch):
-    """restore() stats the file only to tell a vanished one from a bad one;
-    a replacement landing between that stat and the header read is still a
-    whole file, not a verification failure."""
+def test_restore_of_a_file_gone_by_the_header_read_is_a_plain_miss(tmp_path: Path, monkeypatch):
+    """A file removed just as the restore opens it is forgotten, silently,
+    like one found gone: neither a strike nor a file 'kept'."""
     s = store(tmp_path)
     assert s.persist(IDS[:100], "tools", fake_write(64, IDS[:100]), expected_bytes=64)
     e = s.longest_prefix(IDS[:200])
     assert e is not None
-    real_stat = Path.stat
-    skewed: list[Path] = []
+    real_read_header = forkstore.read_header
 
-    def first_look_is_stale(self: Path, *a, **kw):
-        st = real_stat(self, *a, **kw)
-        if self == e.path and not skewed:
-            skewed.append(self)
-            fields = list(st)
-            fields[6] = st.st_size + 16
-            return os.stat_result(fields)
-        return st
+    def removed_first(path: Path) -> Header:
+        path.unlink()
+        return real_read_header(path)
 
-    monkeypatch.setattr(Path, "stat", first_look_is_stale)
-    assert s.restore(e, lambda p, h: None) is True
-    assert skewed == [e.path] and e.path.exists() and s._failures == 0
+    monkeypatch.setattr(forkstore, "read_header", removed_first)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert s.restore(e, lambda p, h: None) is False
+    assert s._failures == 0 and s.forks == 0 and not s.has(IDS[:100])
+
+
+def test_a_bad_file_that_will_not_delete_is_dropped_and_counted(tmp_path: Path, monkeypatch):
+    """restore() never raises: a failed delete still leaves the index (the
+    file is not served again), still counts a strike, and says it stayed."""
+    s = store(tmp_path)
+    assert s.persist(IDS[:100], "tools", fake_write(64, IDS[:100]), expected_bytes=64)
+    e = s.longest_prefix(IDS[:200])
+    assert e is not None
+    real_unlink = Path.unlink
+
+    def refuse(self: Path, *a, **kw):
+        if self == e.path:
+            raise PermissionError(1, "not permitted")
+        return real_unlink(self, *a, **kw)
+
+    def bad(path: Path, header: Header) -> None:
+        raise ForkFileError("ids differ")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    with pytest.warns(UserWarning, match=r"ids differ\); could not delete it \(EPERM\)"):
+        assert s.restore(e, bad) is False
+    assert e.path.exists() and s._failures == 1 and s.forks == 0
+    assert s.longest_prefix(IDS[:200]) is None and not s._unlinking
 
 
 def test_a_successful_restore_resets_the_failure_streak(tmp_path: Path):

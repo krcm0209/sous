@@ -11,6 +11,7 @@ callables.
 from __future__ import annotations
 
 import array
+import contextlib
 import dataclasses
 import errno as errno_mod
 import functools
@@ -107,6 +108,8 @@ def read_header(path: Path) -> Header:
         if not isinstance(parsed, dict):
             raise ForkFileError(f"{path.name}: header is not an object")
         metadata = parsed.pop("__metadata__", {}) or {}
+        if not isinstance(metadata, dict):
+            raise ForkFileError(f"{path.name}: metadata is not an object")
         tensors: dict[str, TensorInfo] = {}
         end = 0
         for name, entry in parsed.items():
@@ -284,6 +287,10 @@ _DISABLING_ERRNOS = frozenset(
 )
 
 
+def _errno_name(e: OSError) -> str:
+    return errno_mod.errorcode.get(e.errno or 0, type(e).__name__)
+
+
 class ForkStore:
     """One directory per identity key under `root`; the directory is the
     index. Files are shared across every owner thread — a file has no
@@ -318,8 +325,9 @@ class ForkStore:
         self._entries: dict[Path, Entry] = {}
         self._writing: set[str] = set()
         self._restoring: dict[Path, int] = {}
-        # Evicted files out of the index but not yet unlinked: a write of the
-        # same ids in that window would be deleted by the unlink after it.
+        # Files out of the index but not yet unlinked (evicted, or failed
+        # verification): a write of the same ids in that window would be
+        # deleted by the unlink after it.
         self._unlinking: set[Path] = set()
         # Files whose unlink failed: back in the index, never picked again.
         self._undeletable: set[Path] = set()
@@ -415,7 +423,8 @@ class ForkStore:
                     except Exception:  # noqa: BLE001 — can't tell; leave it
                         continue
                     if not alive:
-                        item.unlink(missing_ok=True)
+                        with contextlib.suppress(OSError):
+                            item.unlink(missing_ok=True)
                     continue
                 parsed = parse_file_name(item.name)
                 if parsed is None:
@@ -432,7 +441,10 @@ class ForkStore:
                     except OSError:
                         continue  # unreadable now, not bad bytes: next load looks again
                     if header is None:
-                        item.unlink(missing_ok=True)
+                        # Never indexed either way; a delete that fails
+                        # leaves it for the next load to try again.
+                        with contextlib.suppress(OSError):
+                            item.unlink(missing_ok=True)
                         continue
                     # read_header checked the size against a stat of its own;
                     # the one above may predate a same-digest replacement.
@@ -473,17 +485,19 @@ class ForkStore:
         with `_unlink` once it has released the lock."""
         victims: list[Entry] = []
         total = sum(e.size for e in self._entries.values())
-        while total > target:
-            candidates = [
+        candidates = sorted(
+            (
                 e
                 for e in self._entries.values()
                 if e.path != keep
                 and e.path not in self._undeletable
                 and self._restoring.get(e.path, 0) == 0
-            ]
-            if not candidates:
+            ),
+            key=lambda e: e.mtime,
+        )
+        for oldest in candidates:
+            if total <= target:
                 break
-            oldest = min(candidates, key=lambda e: e.mtime)
             del self._entries[oldest.path]
             self._unlinking.add(oldest.path)
             total -= oldest.size
@@ -495,27 +509,29 @@ class ForkStore:
         lock. A file that will not go goes back into the index, so the
         budget still counts its bytes, and is never picked again: the next
         eviction takes the next oldest instead of counting it as freed."""
+        if not victims:
+            return
+        failed: list[tuple[Entry, OSError]] = []
         for victim in victims:
-            failed: OSError | None = None
             try:
                 victim.path.unlink(missing_ok=True)
             except OSError as e:
-                failed = e
-            with self._lock:
+                failed.append((victim, e))
+        with self._lock:
+            for victim in victims:
                 self._unlinking.discard(victim.path)
-                if failed is None:
-                    self.evictions += 1
-                else:
-                    self._entries.setdefault(victim.path, victim)
-                    self._undeletable.add(victim.path)
-                self._recount_locked()
-            if failed is not None and not self._unlink_warned:
-                self._unlink_warned = True
-                kind = errno_mod.errorcode.get(failed.errno or 0, type(failed).__name__)
-                warnings.warn(
-                    f"sous fork store: could not delete an evicted fork ({kind}); kept",
-                    stacklevel=3,
-                )
+            for victim, _ in failed:
+                self._entries.setdefault(victim.path, victim)
+                self._undeletable.add(victim.path)
+            self.evictions += len(victims) - len(failed)
+            self._recount_locked()
+        if failed and not self._unlink_warned:
+            self._unlink_warned = True
+            warnings.warn(
+                f"sous fork store: could not delete an evicted fork ({_errno_name(failed[0][1])})"
+                "; kept",
+                stacklevel=3,
+            )
 
     def _disable(self, reason: str) -> None:
         self.state, self.reason = "unavailable", reason
@@ -580,7 +596,7 @@ class ForkStore:
     ) -> bool:
         """Write `ids`' cache through `write(temp_path, metadata)` unless a
         file for it exists (then touch it), a write of it is in flight, the
-        store is off, the file is still being evicted, or the caller's own
+        store is off, the file is still being deleted, or the caller's own
         `expected_bytes` estimate would breach the budget or the free-space
         floor — checked before `write` ever runs, so a refused write never
         touches disk. The file is indexed only after os.replace. The real size
@@ -662,7 +678,7 @@ class ForkStore:
                 temp.unlink(missing_ok=True)
             kind = detail = type(e).__name__
             if isinstance(e, OSError):
-                kind = errno_mod.errorcode.get(e.errno or 0, kind)
+                kind = _errno_name(e)
                 detail = f"{kind}: {e.strerror}" if e.strerror else kind
                 if e.errno in _DISABLING_ERRNOS:
                     warnings.warn(f"sous fork store: fork persist failed ({detail})", stacklevel=2)
@@ -698,19 +714,17 @@ class ForkStore:
             self._restoring[entry.path] = self._restoring.get(entry.path, 0) + 1
         try:
             try:
-                # Only to tell a vanished file from a bad one: read_header
-                # checks the size against a stat of its own.
-                entry.path.stat()
+                header = read_header(entry.path)
+                load(entry.path, header)
             except FileNotFoundError:
                 self._forget(entry)
                 return False
-            try:
-                header = read_header(entry.path)
-                load(entry.path, header)
             except ForkFileError as e:
-                warnings.warn(f"sous fork store: fork restore failed ({e}); deleted", stacklevel=2)
-                entry.path.unlink(missing_ok=True)
-                self._forget(entry)
+                failed = self._delete(entry)
+                outcome = f"could not delete it ({_errno_name(failed)})" if failed else "deleted"
+                warnings.warn(
+                    f"sous fork store: fork restore failed ({e}); {outcome}", stacklevel=2
+                )
                 self._failures += 1
                 if self._failures >= MAX_FAILURES:
                     self._disable(f"{MAX_FAILURES} consecutive restore failures")
@@ -754,8 +768,31 @@ class ForkStore:
 
     def _forget(self, entry: Entry) -> None:
         with self._lock:
-            self._entries.pop(entry.path, None)
-            self._recount_locked()
+            self._forget_locked(entry)
+
+    def _forget_locked(self, entry: Entry) -> None:
+        # A path that leaves the index is a new file if it is ever written
+        # again, so an old failure to delete it no longer exempts it.
+        self._entries.pop(entry.path, None)
+        self._undeletable.discard(entry.path)
+        self._recount_locked()
+
+    def _delete(self, entry: Entry) -> OSError | None:
+        """Take a file that failed verification out of the index and off
+        the disk, guarded like an eviction's victim so a write of the same
+        ids cannot land between the two; the error when it would not go,
+        and then it stays out of the index — it is not served again."""
+        with self._lock:
+            self._forget_locked(entry)
+            self._unlinking.add(entry.path)
+        try:
+            entry.path.unlink(missing_ok=True)
+        except OSError as e:
+            return e
+        finally:
+            with self._lock:
+                self._unlinking.discard(entry.path)
+        return None
 
 
 def _pid_alive(pid: int) -> bool:
