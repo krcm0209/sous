@@ -2118,3 +2118,91 @@ def test_a_stop_that_outlasts_its_bound_keeps_the_sweep_on_the_books():
         slow.release.set()
         mgr.stop_idle_sweep()
     assert not any(t.name == "sous-idle-sweep" for t in threading.enumerate())
+
+
+@pytest.mark.parametrize("drafter_loads", [True, False])
+def test_vlm_engine_probes_verify_attention_only_with_a_drafter(monkeypatch, drafter_loads):
+    from sous.engine import verifyattn, vlm
+
+    model = _positionless_model()
+    processor = types.SimpleNamespace(tokenizer=_RecordingTokenizer())
+    _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+
+    def load_drafter(m, draft_id):
+        if not drafter_loads:
+            raise RuntimeError("no such repo")
+        return types.SimpleNamespace(prefer_requested_block_size=False), "dflash"
+
+    monkeypatch.setattr(vlm, "_load_quantized_drafter", load_drafter)
+    seen: dict[str, object] = {}
+
+    def fake_enable(m, *, enabled):
+        seen["model"], seen["enabled"] = m, enabled
+        return {"state": "active" if enabled else "off", "reason": None, "probe_seconds": None}
+
+    monkeypatch.setattr(verifyattn, "enable", fake_enable)
+    if drafter_loads:
+        engine = vlm.VLMEngine("test/model", cache_budget=0, draft_id="z-lab/drafter")
+    else:
+        with pytest.warns(UserWarning, match="speculative drafter"):
+            engine = vlm.VLMEngine("test/model", cache_budget=0, draft_id="z-lab/drafter")
+    assert seen == {"model": model, "enabled": drafter_loads}
+    assert engine.verify_attention_status["state"] == ("active" if drafter_loads else "off")
+
+
+def test_get_logs_the_verify_attention_state_and_probe_cost(caplog):
+    import logging
+
+    def factory(model_id):
+        engine = _positional_factory(model_id)
+        engine.verify_attention_status = {  # ty: ignore[unresolved-attribute]
+            "state": "active",
+            "reason": None,
+            "probe_seconds": 0.21,
+        }
+        return engine
+
+    mgr = EngineManager(SousConfig(), engine_factory=factory)
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert len(lines) == 1
+    assert lines[0].endswith(
+        " positions=engine verify_attention=active verify_attention_probe_s=0.21"
+    )
+
+
+def test_get_logs_no_probe_cost_when_no_probe_ran(caplog):
+    import logging
+
+    def factory(model_id):
+        engine = _positional_factory(model_id)
+        engine.verify_attention_status = {  # ty: ignore[unresolved-attribute]
+            "state": "off",
+            "reason": None,
+            "probe_seconds": None,
+        }
+        return engine
+
+    mgr = EngineManager(SousConfig(), engine_factory=factory)
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert lines[0].endswith(" verify_attention=off")
+
+
+def test_status_carries_the_verify_attention_view_when_the_engine_reports_one(tmp_path):
+    inner = FakeEngine([])
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    assert "verify_attention" not in manager.status(), "fakes without the attribute stay silent"
+    inner.verify_attention_status = {  # ty: ignore[unresolved-attribute]
+        "state": "unavailable",
+        "reason": "mlx 0.33.0 not validated",
+        "probe_seconds": None,
+    }
+    assert manager.status()["verify_attention"] == {
+        "state": "unavailable",
+        "reason": "mlx 0.33.0 not validated",
+    }

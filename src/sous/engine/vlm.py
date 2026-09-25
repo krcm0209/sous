@@ -69,7 +69,7 @@ class VLMEngine:
     ):
         from mlx_vlm import load
 
-        from sous.engine import int8prefill
+        from sous.engine import int8prefill, verifyattn
         from sous.engine.base import measure_cache_budget
 
         self.model_id = model_id
@@ -100,6 +100,12 @@ class VLMEngine:
                     stacklevel=2,
                 )
             _pin_block_size(self._draft, draft_block_size)
+        # Only speculation runs the verifier, so only a drafter that loaded
+        # earns the probe; before the budget is measured, so the probe's
+        # transient K/V is already released.
+        self.verify_attention_status = verifyattn.enable(
+            self._model, enabled=self._draft is not None
+        )
         # Forks on disk, when the factory handed us a directory: built after
         # the drafter and int8 have settled, since the key reads both. Tests
         # and sous tune never pass one, so nothing they build touches ~/.sous.
