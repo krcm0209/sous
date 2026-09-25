@@ -26,6 +26,7 @@ grouping it would change output where rows straddle a plan transition.
 from __future__ import annotations
 
 import functools
+from typing import Any
 
 HEAD_DIM = 256
 MIN_ROWS = 3
@@ -118,3 +119,82 @@ def probe_cases(arch: str, gqa: int) -> tuple[tuple[int, int], ...]:
     for lo, hi in zip(edges, edges[1:], strict=False):
         cases.update(((lo + hi) // 2, t) for t in range(MIN_ROWS, MAX_ROWS + 1))
     return tuple(sorted(cases))
+
+
+def grouped_attention(
+    queries: Any, keys: Any, values: Any, scale: float, prefix: int, arch: str
+) -> Any:
+    """One stock SDPA call per group of rows that share their singleton plan:
+    causal for a group, unmasked for a lone row, which is the M=1 decode call."""
+    import mlx.core as mx
+
+    t = queries.shape[2]
+    gqa = queries.shape[1] // keys.shape[1]
+    parts = [
+        mx.fast.scaled_dot_product_attention(
+            queries[:, :, j:k, :],
+            keys[:, :, : prefix + k, :],
+            values[:, :, : prefix + k, :],
+            scale=scale,
+            mask="causal" if k - j > 1 else None,
+        )
+        for j, k in groups(arch, prefix, t, gqa)
+    ]
+    return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=2)
+
+
+def _row_loop(queries: Any, keys: Any, values: Any, cache: Any, scale: float) -> Any:
+    """mlx-vlm's own T > 2 loop: one single-query call per row over its own
+    prefix, through mlx-vlm's helpers so quantized KV tuples still work."""
+    import mlx.core as mx
+    from mlx_vlm.models.base import (
+        kv_sequence_length,
+        scaled_dot_product_attention,
+        slice_kv_sequence,
+    )
+
+    t = queries.shape[2]
+    prefix = kv_sequence_length(keys) - t
+    return mx.concatenate(
+        [
+            scaled_dot_product_attention(
+                queries[:, :, i : i + 1, :],
+                slice_kv_sequence(keys, prefix + i + 1),
+                slice_kv_sequence(values, prefix + i + 1),
+                cache=cache,
+                scale=scale,
+                mask=None,
+            )
+            for i in range(t)
+        ],
+        axis=2,
+    )
+
+
+def probe(arch: str, q_heads: int, kv_heads: int, dtype: Any) -> str | None:
+    """Prove grouped_attention bit-identical to the per-row loop on this GPU at
+    every plan transition. Returns why not, or None. Inputs are laid out as
+    serving lays them out: queries are a transposed [1, T, Hq, D] slice, K/V
+    slices of a buffer grown in KVCache's 256-token steps."""
+    import mlx.core as mx
+
+    cases = probe_cases(arch, q_heads // kv_heads)
+    capacity = -(-max(p + t for p, t in cases) // 256) * 256
+    k_key, v_key, q_key = mx.random.split(mx.random.key(0), 3)
+    keys = mx.random.normal((1, kv_heads, capacity, HEAD_DIM), key=k_key).astype(dtype)
+    values = mx.random.normal((1, kv_heads, capacity, HEAD_DIM), key=v_key).astype(dtype)
+    rows = mx.random.normal((1, MAX_ROWS, q_heads, HEAD_DIM), key=q_key).astype(dtype)
+    scale = HEAD_DIM**-0.5
+    try:
+        for prefix, t in cases:
+            queries = rows[:, :t].transpose(0, 2, 1, 3)
+            k = keys[..., : prefix + t, :]
+            v = values[..., : prefix + t, :]
+            got = grouped_attention(queries, k, v, scale, prefix, arch)
+            want = _row_loop(queries, k, v, None, scale)
+            if not mx.array_equal(got, want).item():
+                return f"grouped attention differs from the per-row loop at prefix {prefix}, T={t}"
+    finally:
+        del keys, values, rows
+        mx.clear_cache()
+    return None

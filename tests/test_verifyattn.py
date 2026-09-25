@@ -6,6 +6,11 @@ MLX_METAL_GPU_ARCH set, so the 's' and 'd' dispatch tables the M5 Pro takes are
 proven bit-exact on whatever GPU runs the suite.
 """
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 mx = pytest.importorskip("mlx.core")
@@ -13,6 +18,7 @@ mx = pytest.importorskip("mlx.core")
 from sous.engine import verifyattn  # noqa: E402 — after the importorskip guard
 
 S, D, G = "applegpu_g13s", "applegpu_g13d", "applegpu_g14g"
+ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize(
@@ -92,3 +98,61 @@ def test_probe_cases_straddle_every_transition_and_stop_past_the_last():
             assert any(p + 1 <= n - 1 and n <= p + t for p, tt in cases if tt == t), (n, t)
     assert all(verifyattn.MIN_ROWS <= t <= verifyattn.MAX_ROWS for _, t in cases)
     assert max(p + t for p, t in verifyattn.probe_cases(G, 6)) == 4096 + 7
+
+
+@pytest.mark.parametrize(("q_heads", "kv_heads"), [(24, 4), (16, 4)])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_probe_proves_grouping_exact_on_this_gpu(q_heads, kv_heads, dtype):
+    arch = mx.device_info()["architecture"]
+    assert verifyattn.probe(arch, q_heads, kv_heads, getattr(mx, dtype)) is None
+
+
+def test_probe_catches_a_grouping_that_ignores_the_plan(monkeypatch):
+    # One call over as many rows as the vector path takes, across transitions:
+    # the probe must see the rows whose plan it changed.
+    monkeypatch.setattr(
+        verifyattn,
+        "groups",
+        lambda arch, prefix, t, gqa: (
+            [(0, min(t, 32 // gqa))] + [(r, r + 1) for r in range(min(t, 32 // gqa), t)]
+        ),
+    )
+    arch = mx.device_info()["architecture"]
+    reason = verifyattn.probe(arch, 24, 4, mx.bfloat16)
+    assert reason is not None and reason.startswith("grouped attention differs")
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("arch", [S, D])
+def test_exactness_holds_under_every_dispatch_table(arch):
+    """mlx reads MLX_METAL_GPU_ARCH once, when it builds the device, and routes
+    SDPA by it; a child process with it set runs the other suffixes' tables on
+    this GPU."""
+    env = dict(os.environ, MLX_METAL_GPU_ARCH=arch)
+    tests = [
+        "tests/test_verifyattn.py::test_probe_proves_grouping_exact_on_this_gpu",
+        "tests/test_verifyattn.py::test_probe_catches_a_grouping_that_ignores_the_plan",
+    ]
+    done = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *tests],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "passed" in done.stdout and "skipped" not in done.stdout
+
+
+@pytest.mark.slow
+def test_the_arch_override_reaches_mlx():
+    code = "import mlx.core as mx; print(mx.device_info()['architecture'])"
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        env=dict(os.environ, MLX_METAL_GPU_ARCH=S),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert done.stdout.strip() == S, done.stderr
