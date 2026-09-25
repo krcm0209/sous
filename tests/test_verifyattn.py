@@ -286,7 +286,7 @@ def _verify(lm, cache, tokens):
     return arrays
 
 
-@pytest.mark.parametrize("t", [2, 3, 4, 5])
+@pytest.mark.parametrize("t", [2, 3, 4, 5, 6, 7, 8])
 def test_hooked_verify_forward_is_bit_equal_to_stock(tiny, t, monkeypatch):
     lm, cache, ids, prefix = tiny
     _ready(monkeypatch)

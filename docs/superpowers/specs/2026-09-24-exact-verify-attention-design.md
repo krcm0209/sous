@@ -117,6 +117,13 @@ Four guards stack. If any fails, the state is `unavailable` with a reason, and t
    - `_qwen3_5_left_padding_info`
    - `KVCache.update_and_fetch`
    - `KVCache.make_mask`
+   - `mlx_vlm.models.base.scaled_dot_product_attention`
+   - `mlx_vlm.models.base.slice_kv_sequence`
+   - `mlx_vlm.models.base.kv_sequence_length`
+
+   The last three are what the M=1 decode call and `_row_loop`'s reference
+   both go through to reach `mx.fast.scaled_dot_product_attention`; the
+   first seven alone pin the loop's control flow but not the call it makes.
 
    Any other hash, or source that cannot be read, is "mlx-vlm `<name>` changed". A body change of any kind disables the path until someone re-reads it and adds the new hash.
 3. **Load-time probe**, in `enable()`, on the `sous-model-load` thread.

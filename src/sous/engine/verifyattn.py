@@ -60,6 +60,12 @@ _SOURCES = {
     "_qwen3_5_left_padding_info": "mlx_vlm.models.qwen3_5.language",
     "KVCache.update_and_fetch": "mlx_vlm.models.cache",
     "KVCache.make_mask": "mlx_vlm.models.cache",
+    # The stock M=1 decode call and _row_loop's reference both go through
+    # these three, not straight through mx.fast — the source gate has to
+    # cover what actually decides the stock output, not just the T > 2 loop.
+    "scaled_dot_product_attention": "mlx_vlm.models.base",
+    "slice_kv_sequence": "mlx_vlm.models.base",
+    "kv_sequence_length": "mlx_vlm.models.base",
 }
 # sha256 of inspect.getsource() as validated (identical in mlx-vlm 0.7.1 and
 # 0.7.2). Add a hash only after re-reading that function against the hook.
@@ -84,6 +90,15 @@ VALIDATED_MLX_VLM_SOURCES: dict[str, frozenset[str]] = {
     ),
     "KVCache.make_mask": frozenset(
         {"d65ba0d83b52a93bb00faae6bcbac8add067724ebe9dd8ba6aaa716f81b6b620"}
+    ),
+    "scaled_dot_product_attention": frozenset(
+        {"9b12ea1ee54be83003091a88dd8657b1448e1a68681dd791e69fbe971cd27cb5"}
+    ),
+    "slice_kv_sequence": frozenset(
+        {"5d6042d27927663a2813587889f7617727704d2e383cac1f986fc905c3acc74a"}
+    ),
+    "kv_sequence_length": frozenset(
+        {"1f7c089333afa6730f5ea298b326f456294623d6360a145c7d15980d88275040"}
     ),
 }
 # Set with object.__setattr__ so it stays out of mlx's parameter tree; the value
@@ -239,6 +254,12 @@ def probe(arch: str, q_heads: int, kv_heads: int, dtype: Any) -> str | None:
     slices of a buffer grown in KVCache's 256-token steps."""
     import mlx.core as mx
 
+    # Serving always hands _row_loop a real KVCache, and mlx-vlm's own
+    # scaled_dot_product_attention branches on isinstance/hasattr checks
+    # against it — a bare None takes the same branch today, but only because
+    # nothing there tests "cache is None". Use the real type so the probe
+    # keeps proving what serving does, not a lookalike.
+    cache = importlib.import_module("mlx_vlm.models.cache").KVCache()
     cases = probe_cases(arch, q_heads // kv_heads)
     capacity = -(-max(p + t for p, t in cases) // 256) * 256
     k_key, v_key, q_key = mx.random.split(mx.random.key(0), 3)
@@ -252,11 +273,17 @@ def probe(arch: str, q_heads: int, kv_heads: int, dtype: Any) -> str | None:
             k = keys[..., : prefix + t, :]
             v = values[..., : prefix + t, :]
             got = grouped_attention(queries, k, v, scale, prefix, arch)
-            want = _row_loop(queries, k, v, None, scale)
-            if not mx.array_equal(got, want).item():
+            want = _row_loop(queries, k, v, cache, scale)
+            equal = mx.array_equal(got, want).item()
+            # Drop this case's slices and results now: a for-loop leaves its
+            # last iteration's names bound after it ends, so without this the
+            # final got/want/queries/k/v would still reference the pool's
+            # buffers when clear_cache() runs below and free nothing.
+            del queries, k, v, got, want
+            if not equal:
                 return f"grouped attention differs from the per-row loop at prefix {prefix}, T={t}"
     finally:
-        del keys, values, rows
+        del keys, values, rows, cache
         mx.clear_cache()
     return None
 
