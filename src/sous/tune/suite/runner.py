@@ -118,8 +118,8 @@ class CountingEngine:
         return self._inner.model_id
 
     def __getattr__(self, name: str):
-        # drafter, positions, int8_prefill_status: whatever the backend has,
-        # read through getattr(..., None) by ManagedEngine.
+        # drafter, positions, int8_prefill_status, verify_attention_status:
+        # whatever the backend has, read through getattr(..., None) by ManagedEngine.
         return getattr(self._inner, name)
 
     def generate(

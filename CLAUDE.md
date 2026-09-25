@@ -279,6 +279,26 @@ goal.
 - `int8prefill.enable()` never raises and a model load never fails because of
   it: every failure is one `warnings.warn` plus `state: unavailable`. Tests
   that need the GEMM without tensor units monkeypatch `int8prefill.qmm`.
+- `engine/verifyattn.py` replaces mlx-vlm's per-row SDPA loop in the exact
+  verifier (`Qwen3_5BatchInvariantForward._attention`, T = 3..8) with one
+  stock `mx.fast.scaled_dot_product_attention` per group of rows that share
+  mlx's kernel plan. Grouping is bit-exact only because inside one plan mlx
+  assigns key i to simdgroup `i % 32` or block `i % blocks` whatever the key
+  count and the causal mask skips excluded keys, and `plan()` mirrors mlx
+  0.32.2's dispatch (`VALIDATED_MLX`) — re-read
+  `scaled_dot_product_attention.cpp` and extend it on every mlx bump; every
+  mlx-vlm function the hook reads is pinned by source hash
+  (`VALIDATED_MLX_VLM_SOURCES`), checked at load because the daemon's tool
+  environment can resolve a newer mlx-vlm than the lock. T = 2 is left
+  alone: stock already makes one call there, and grouping it would change
+  output at plan straddles. Scope is decided before the projections —
+  `_prepare_projected_qkv` appends to the KV cache, so the wrapper never
+  re-enters the original method after them. `enable()` runs only when a
+  drafter loaded, probes every plan transition on this GPU before tagging,
+  and like int8 never raises. CI proves the 's' and 'd' tables through
+  `MLX_METAL_GPU_ARCH` subprocesses. The module stays out of
+  `forkstore._EPOCH_FILES` on purpose: prefill never enters the verifier and
+  verify output is bit-identical.
 
 ## Security boundary
 
