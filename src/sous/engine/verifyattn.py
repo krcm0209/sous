@@ -77,6 +77,14 @@ VALIDATED_MLX_VLM_SOURCES: dict[str, frozenset[str]] = {
         {"d65ba0d83b52a93bb00faae6bcbac8add067724ebe9dd8ba6aaa716f81b6b620"}
     ),
 }
+# Set with object.__setattr__ so it stays out of mlx's parameter tree; the value
+# is the GQA ratio the probe proved, 0 when untagged.
+_TAG = "_sous_verify_attention"
+_ARCH = ""
+_KVCACHE: type | None = None
+_WRAPPED: set[type] = set()
+# Per-path call counts; the tests read them to prove which path ran.
+calls = {"grouped": 0, "loop": 0, "original": 0}
 
 
 def plan(arch: str, n_keys: int, gqa: int, q_len: int) -> tuple[str, int]:
@@ -269,3 +277,110 @@ def _gate() -> str | None:
         if _source_digest(module, qualname) not in VALIDATED_MLX_VLM_SOURCES[qualname]:
             return f"mlx-vlm {qualname} changed"
     return None
+
+
+def _in_scope(verifier: Any, attention: Any, x: Any, mask: Any, cache: Any) -> bool:
+    """Whether this call takes the grouped path. Decided before any projection:
+    _prepare_projected_qkv appends the verify rows to the KV cache, so after it
+    the original method could only append them a second time."""
+    gqa = getattr(attention, _TAG, 0)
+    if not gqa or _KVCACHE is None:
+        return False
+    if x.ndim != 3 or x.shape[0] != 1 or not (MIN_ROWS <= x.shape[1] <= MAX_ROWS):
+        return False
+    if not (isinstance(mask, str) and mask == "causal"):
+        return False
+    # The exact type: mlx-vlm's KVCache subclasses keep other layouts.
+    if type(cache) is not _KVCACHE or hasattr(cache, "bits"):
+        return False
+    if getattr(cache, "_qwen3_5_decode_left_padding", None) is not None:
+        return False
+    info = verifier._helpers()._qwen3_5_left_padding_info(cache)
+    if info is not None and info[1] > 0:
+        return False
+    heads = getattr(attention, "num_attention_heads", 0)
+    kv_heads = getattr(attention, "num_key_value_heads", 0)
+    return (
+        getattr(attention, "head_dim", None) == HEAD_DIM
+        and kv_heads > 0
+        and heads == gqa * kv_heads
+    )
+
+
+def _post_ok(queries: Any, keys: Any, values: Any, length: int) -> bool:
+    """What the grouped call assumes of the projected tensors."""
+    import mlx.core as mx
+
+    return (
+        isinstance(keys, mx.array)
+        and isinstance(values, mx.array)
+        and queries.ndim == keys.ndim == values.ndim == 4
+        and queries.dtype == keys.dtype == values.dtype
+        and queries.shape[2] == length
+        and keys.shape[-2] == values.shape[-2] >= length
+        and queries.shape[1] % keys.shape[1] == 0
+    )
+
+
+def _wrap(cls: Any) -> None:
+    import mlx.core as mx
+
+    orig = cls._attention
+
+    # functools.wraps: the source gate follows __wrapped__ back to mlx-vlm's body.
+    @functools.wraps(orig)
+    def _attention(self, attention, x, mask, cache, position_ids, position_embeddings):
+        if not _in_scope(self, attention, x, mask, cache):
+            if getattr(attention, _TAG, 0):
+                calls["original"] += 1
+            return orig(self, attention, x, mask, cache, position_ids, position_embeddings)
+        batch, length, _ = x.shape
+        q_proj_output, keys, values = self._linears(
+            (attention.q_proj, attention.k_proj, attention.v_proj), x
+        )
+        queries, keys, values, gate, mask = attention._prepare_projected_qkv(
+            q_proj_output, keys, values, cache, position_ids, position_embeddings, mask
+        )
+        output = self._helpers()._qwen3_5_left_padded_attention(
+            queries, keys, values, cache=cache, scale=attention.scale, mask=mask
+        )
+        if output is None:
+            if _post_ok(queries, keys, values, length):
+                calls["grouped"] += 1
+                prefix = keys.shape[-2] - length
+                output = grouped_attention(queries, keys, values, attention.scale, prefix, _ARCH)
+            else:
+                calls["loop"] += 1
+                output = _row_loop(queries, keys, values, cache, attention.scale)
+        output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
+        return self._linear(attention.o_proj, output * mx.sigmoid(gate))
+
+    cls._attention = _attention
+
+
+def install_wrapper() -> None:
+    """Wrap the exact verifier's attention once per process. The wrapper acts only
+    on tagged modules, so installing it changes nothing for any other model."""
+    cls = importlib.import_module(
+        "mlx_vlm.models.qwen3_5.speculative_verifier"
+    ).Qwen3_5BatchInvariantForward
+    if cls not in _WRAPPED:
+        _wrap(cls)
+        _WRAPPED.add(cls)
+
+
+def _attention_modules(model: Any) -> list[Any]:
+    """The loaded target's full-attention modules; linear-attention layers have none."""
+    root = getattr(model, "language_model", model)
+    layers = getattr(getattr(root, "model", None), "layers", None) or []
+    return [
+        layer.self_attn
+        for layer in layers
+        if not getattr(layer, "is_linear", True) and hasattr(layer, "self_attn")
+    ]
+
+
+def _untag(model: Any) -> None:
+    for module in _attention_modules(model):
+        if _TAG in getattr(module, "__dict__", {}):
+            object.__setattr__(module, _TAG, 0)

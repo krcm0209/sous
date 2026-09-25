@@ -9,6 +9,7 @@ proven bit-exact on whatever GPU runs the suite.
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -132,6 +133,8 @@ def test_exactness_holds_under_every_dispatch_table(arch):
     tests = [
         "tests/test_verifyattn.py::test_probe_proves_grouping_exact_on_this_gpu",
         "tests/test_verifyattn.py::test_probe_catches_a_grouping_that_ignores_the_plan",
+        "tests/test_verifyattn.py::test_hooked_verify_forward_is_bit_equal_to_stock",
+        "tests/test_verifyattn.py::test_one_call_over_the_straddle_would_differ",
     ]
     done = subprocess.run(
         [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *tests],
@@ -197,3 +200,221 @@ def test_gate_refuses_a_changed_mlx_vlm_function(monkeypatch):
 
 def test_an_unreadable_source_counts_as_changed():
     assert verifyattn._source_digest("mlx_vlm.models.cache", "KVCache.no_such_method") is None
+
+
+GQA = 6
+VOCAB = 512
+
+
+def _tiny_language_model():
+    """A random qwen3_5 language model with two full-attention layers at the
+    27B's head dim and GQA ratio; mlx-vlm's verify path takes it unquantized."""
+    from mlx_vlm.models.qwen3_5.config import TextConfig
+    from mlx_vlm.models.qwen3_5.language import LanguageModel
+
+    args = TextConfig(
+        model_type="qwen3_5",
+        hidden_size=256,
+        intermediate_size=512,
+        linear_num_value_heads=2,
+        linear_num_key_heads=1,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_conv_kernel_dim=4,
+        num_hidden_layers=4,
+        num_attention_heads=GQA,
+        rms_norm_eps=1e-6,
+        vocab_size=VOCAB,
+        num_key_value_heads=1,
+        max_position_embeddings=65536,
+        head_dim=256,
+        full_attention_interval=2,  # layers 1 and 3 are full attention
+    )
+    mx.random.seed(0)
+    lm = LanguageModel(args)
+    lm.set_dtype(mx.bfloat16)
+    mx.eval(lm.parameters())
+    return lm
+
+
+@pytest.fixture(scope="module")
+def tiny():
+    """The tiny model prefilled to just below this GPU's first plan transition,
+    so verify rows of T = 3..5 straddle it."""
+    arch = mx.device_info()["architecture"]
+    lm = _tiny_language_model()
+    prefix = verifyattn.plan_transitions(arch, GQA)[0] - 3
+    ids = mx.random.randint(0, VOCAB, (prefix + 8,), key=mx.random.key(7)).tolist()
+    cache = lm.make_cache()
+    # Explicit positions and a zero delta, as the VLM engine hands them: the
+    # bare language model cannot derive rope positions without a vision config.
+    lm(
+        mx.array([ids[:prefix]], dtype=mx.int32),
+        cache=cache,
+        position_ids=mx.arange(prefix, dtype=mx.int32)[None],
+        rope_deltas=mx.zeros((1, 1), dtype=mx.int32),
+    )
+    mx.eval([c.state for c in cache])
+    return lm, cache, ids, prefix
+
+
+def _tag(lm, gqa):
+    for module in verifyattn._attention_modules(lm):
+        object.__setattr__(module, verifyattn._TAG, gqa)
+
+
+def _ready(monkeypatch):
+    from mlx_vlm.models.cache import KVCache
+
+    verifyattn.install_wrapper()
+    monkeypatch.setattr(verifyattn, "_ARCH", mx.device_info()["architecture"])
+    monkeypatch.setattr(verifyattn, "_KVCACHE", KVCache)
+
+
+def _verify(lm, cache, tokens):
+    """One verify forward as DFlash runs it, then the speculative round aborted
+    so the cache is back at the prefix."""
+    out = lm(
+        mx.array([tokens], dtype=mx.int32),
+        cache=cache,
+        capture_layer_ids=[0, 1, 2],
+        speculative_verify=True,
+    )
+    arrays = [out.logits, *out.hidden_states]
+    mx.eval(arrays)
+    out.gdn_states.abort()
+    return arrays
+
+
+@pytest.mark.parametrize("t", [2, 3, 4, 5])
+def test_hooked_verify_forward_is_bit_equal_to_stock(tiny, t, monkeypatch):
+    lm, cache, ids, prefix = tiny
+    _ready(monkeypatch)
+    tokens = ids[prefix : prefix + t]
+    _tag(lm, 0)
+    stock = _verify(lm, cache, tokens)
+    _tag(lm, GQA)
+    before = dict(verifyattn.calls)
+    try:
+        ours = _verify(lm, cache, tokens)
+    finally:
+        _tag(lm, 0)
+    assert all(c.offset == prefix for c in cache if hasattr(c, "offset"))
+    assert all(mx.array_equal(a, b).item() for a, b in zip(stock, ours, strict=True))
+    grouped = verifyattn.calls["grouped"] - before["grouped"]
+    original = verifyattn.calls["original"] - before["original"]
+    # T = 2 is stock's own single call; both full-attention layers group from T = 3
+    assert (grouped, original) == ((0, 2) if t == 2 else (2, 0))
+
+
+def test_one_call_over_the_straddle_would_differ(tiny, monkeypatch):
+    """The sensitivity half: ignoring the plan changes the logits, so the
+    bit-equality above is not vacuous."""
+    lm, cache, ids, prefix = tiny
+    _ready(monkeypatch)
+    tokens = ids[prefix : prefix + 3]
+    _tag(lm, 0)
+    stock = _verify(lm, cache, tokens)
+    monkeypatch.setattr(verifyattn, "groups", lambda arch, p, t, gqa: [(0, t)])
+    _tag(lm, GQA)
+    try:
+        bad = _verify(lm, cache, tokens)
+    finally:
+        _tag(lm, 0)
+    assert not mx.array_equal(stock[0], bad[0]).item()
+
+
+@pytest.mark.parametrize("t", [3, 5])
+def test_the_post_projection_fallback_is_the_stock_loop(tiny, t, monkeypatch):
+    lm, cache, ids, prefix = tiny
+    _ready(monkeypatch)
+    tokens = ids[prefix : prefix + t]
+    _tag(lm, 0)
+    stock = _verify(lm, cache, tokens)
+    monkeypatch.setattr(verifyattn, "_post_ok", lambda *a: False)
+    _tag(lm, GQA)
+    before = verifyattn.calls["loop"]
+    try:
+        ours = _verify(lm, cache, tokens)
+    finally:
+        _tag(lm, 0)
+    assert all(mx.array_equal(a, b).item() for a, b in zip(stock, ours, strict=True))
+    assert verifyattn.calls["loop"] - before == 2
+
+
+def test_install_wrapper_is_idempotent():
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    verifyattn.install_wrapper()
+    first = Qwen3_5BatchInvariantForward._attention
+    verifyattn.install_wrapper()
+    assert Qwen3_5BatchInvariantForward._attention is first
+
+
+def _scope(
+    monkeypatch,
+    *,
+    t=3,
+    batch=1,
+    mask="causal",
+    cache=None,
+    head_dim=256,
+    tag=GQA,
+    heads=24,
+    kv_heads=4,
+):
+    from mlx_vlm.models.cache import KVCache
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    monkeypatch.setattr(verifyattn, "_KVCACHE", KVCache)
+    attention = types.SimpleNamespace(
+        head_dim=head_dim, num_attention_heads=heads, num_key_value_heads=kv_heads
+    )
+    setattr(attention, verifyattn._TAG, tag)
+    return verifyattn._in_scope(
+        Qwen3_5BatchInvariantForward(),
+        attention,
+        mx.zeros((batch, t, 8)),
+        mask,
+        KVCache() if cache is None else cache,
+    )
+
+
+def test_scope_takes_a_plain_causal_verify_of_three_to_eight_rows(monkeypatch):
+    assert _scope(monkeypatch, t=3) and _scope(monkeypatch, t=8)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"t": 2},  # stock's own single call
+        {"t": 1},
+        {"t": 9},
+        {"batch": 2},
+        {"mask": None},
+        {"mask": "left_padded_decode"},
+        {"head_dim": 128},
+        {"tag": 0},  # untagged
+        {"tag": 4},  # probed for another GQA ratio
+    ],
+)
+def test_scope_refuses_everything_else(monkeypatch, overrides):
+    assert not _scope(monkeypatch, **overrides)
+
+
+def test_scope_refuses_an_array_mask(monkeypatch):
+    assert not _scope(monkeypatch, mask=mx.ones((1, 1, 3, 3), dtype=mx.bool_))
+
+
+def test_scope_refuses_kvcache_subclasses_quantized_and_left_padded_caches(monkeypatch):
+    from mlx_vlm.models.cache import KVCache
+
+    class Subclass(KVCache):
+        pass
+
+    quantized = KVCache()
+    quantized.bits = 4  # ty: ignore[unresolved-attribute]
+    padded = KVCache()
+    padded._qwen3_5_decode_left_padding = [1]  # ty: ignore[unresolved-attribute]
+    for cache in (Subclass(), quantized, padded):
+        assert not _scope(monkeypatch, cache=cache), type(cache).__name__
