@@ -156,3 +156,44 @@ def test_the_arch_override_reaches_mlx():
         timeout=120,
     )
     assert done.stdout.strip() == S, done.stderr
+
+
+def test_the_locked_mlx_is_validated():
+    """A dependency bump fails here until someone re-reads mlx's SDPA dispatch
+    against plan() and extends VALIDATED_MLX."""
+    assert mx.__version__ in verifyattn.VALIDATED_MLX
+
+
+def test_the_locked_mlx_vlm_sources_are_validated():
+    """A dependency bump that changes any function the hook reads fails here
+    until someone re-reads it and adds its new hash."""
+    for qualname, module in verifyattn._SOURCES.items():
+        digest = verifyattn._source_digest(module, qualname)
+        assert digest in verifyattn.VALIDATED_MLX_VLM_SOURCES[qualname], qualname
+    assert verifyattn._gate() is None
+
+
+def test_gate_refuses_an_unvalidated_mlx(monkeypatch):
+    monkeypatch.setattr(mx, "__version__", "0.99.0")
+    assert verifyattn._gate() == "mlx 0.99.0 not validated"
+
+
+def test_gate_refuses_a_forced_sdpa_block_count(monkeypatch):
+    monkeypatch.setenv("MLX_SDPA_BLOCKS", "128")
+    assert verifyattn._gate() == "MLX_SDPA_BLOCKS is set"
+
+
+def test_gate_ignores_a_zero_sdpa_block_count(monkeypatch):
+    monkeypatch.setenv("MLX_SDPA_BLOCKS", "0")
+    assert verifyattn._gate() is None
+
+
+def test_gate_refuses_a_changed_mlx_vlm_function(monkeypatch):
+    monkeypatch.setitem(
+        verifyattn.VALIDATED_MLX_VLM_SOURCES, "KVCache.make_mask", frozenset({"0" * 64})
+    )
+    assert verifyattn._gate() == "mlx-vlm KVCache.make_mask changed"
+
+
+def test_an_unreadable_source_counts_as_changed():
+    assert verifyattn._source_digest("mlx_vlm.models.cache", "KVCache.no_such_method") is None

@@ -26,6 +26,10 @@ grouping it would change output where rows straddle a plan transition.
 from __future__ import annotations
 
 import functools
+import hashlib
+import importlib
+import inspect
+import os
 from typing import Any
 
 HEAD_DIM = 256
@@ -33,6 +37,46 @@ MIN_ROWS = 3
 MAX_ROWS = 8
 # Past mlx 0.32.2's last SDPA dispatch threshold (65536 keys).
 _SCAN_TO = 70_000
+# mlx releases whose SDPA dispatch plan() has been read against; re-read
+# backend/metal/scaled_dot_product_attention.cpp and extend this on a bump.
+VALIDATED_MLX = frozenset({"0.32.2"})
+# Every mlx-vlm function the hook calls or re-implements around, by the module
+# that defines it. The daemon's tool environment can resolve a newer mlx-vlm
+# than the lock, so these are checked at load, not only in CI.
+_SOURCES = {
+    "Qwen3_5BatchInvariantForward._attention": "mlx_vlm.models.qwen3_5.speculative_verifier",
+    "Qwen3_5Attention._prepare_projected_qkv": "mlx_vlm.models.qwen3_5.language",
+    "_create_qwen3_5_attention_mask": "mlx_vlm.models.qwen3_5.language",
+    "_qwen3_5_left_padded_attention": "mlx_vlm.models.qwen3_5.language",
+    "_qwen3_5_left_padding_info": "mlx_vlm.models.qwen3_5.language",
+    "KVCache.update_and_fetch": "mlx_vlm.models.cache",
+    "KVCache.make_mask": "mlx_vlm.models.cache",
+}
+# sha256 of inspect.getsource() as validated (identical in mlx-vlm 0.7.1 and
+# 0.7.2). Add a hash only after re-reading that function against the hook.
+VALIDATED_MLX_VLM_SOURCES: dict[str, frozenset[str]] = {
+    "Qwen3_5BatchInvariantForward._attention": frozenset(
+        {"7790ae37e7a0d78d2287217a3050e03a4b9b7c10eb1e60839e4315226186cdf1"}
+    ),
+    "Qwen3_5Attention._prepare_projected_qkv": frozenset(
+        {"da21fd76217c72aa7ef15d4097e1fe428ff0022259f9556eb8fd95b59217c109"}
+    ),
+    "_create_qwen3_5_attention_mask": frozenset(
+        {"a74a1135eb644698e1beb6e43a5d51e27e6490d0b0f4f6d951d08dd5e908c681"}
+    ),
+    "_qwen3_5_left_padded_attention": frozenset(
+        {"e5d9f69065da9885674a6c3e11a65807948c5e9f9d7a1fef6211628328e7b312"}
+    ),
+    "_qwen3_5_left_padding_info": frozenset(
+        {"1cea363e3150f9262f7fb23d11d525b6be32625d3407cd324850d82d6a151fd5"}
+    ),
+    "KVCache.update_and_fetch": frozenset(
+        {"9cf2722ab3a6f71dba0e66bfb4f290b9611c740fa7958e84f61a616056d3df5b"}
+    ),
+    "KVCache.make_mask": frozenset(
+        {"d65ba0d83b52a93bb00faae6bcbac8add067724ebe9dd8ba6aaa716f81b6b620"}
+    ),
+}
 
 
 def plan(arch: str, n_keys: int, gqa: int, q_len: int) -> tuple[str, int]:
@@ -197,4 +241,31 @@ def probe(arch: str, q_heads: int, kv_heads: int, dtype: Any) -> str | None:
     finally:
         del keys, values, rows
         mx.clear_cache()
+    return None
+
+
+def _source_digest(module: str, qualname: str) -> str | None:
+    """sha256 of an mlx-vlm function's source, or None when it cannot be read."""
+    try:
+        obj: Any = importlib.import_module(module)
+        for part in qualname.split("."):
+            obj = getattr(obj, part)
+        return hashlib.sha256(inspect.getsource(obj).encode("utf-8")).hexdigest()
+    except ImportError, AttributeError, OSError, TypeError:
+        return None
+
+
+def _gate() -> str | None:
+    """Why plan() or the hook cannot be trusted in this process, or None."""
+    import mlx.core as mx
+
+    version = mx.__version__  # ty: ignore[unresolved-attribute]
+    if version not in VALIDATED_MLX:
+        return f"mlx {version} not validated"
+    # mlx honours this override of its two-pass block count; plan() does not.
+    if os.environ.get("MLX_SDPA_BLOCKS", "0") not in ("", "0"):
+        return "MLX_SDPA_BLOCKS is set"
+    for qualname, module in _SOURCES.items():
+        if _source_digest(module, qualname) not in VALIDATED_MLX_VLM_SOURCES[qualname]:
+            return f"mlx-vlm {qualname} changed"
     return None
