@@ -35,7 +35,7 @@ import time
 import warnings
 from typing import Any
 
-from sous.engine.int8prefill import _model_type
+from sous.engine.int8prefill import _model_type, _root
 
 logger = logging.getLogger("sous.engine.verifyattn")
 
@@ -149,15 +149,14 @@ def plan(arch: str, n_keys: int, gqa: int, q_len: int) -> tuple[str, int]:
 def groups(arch: str, prefix: int, t: int, gqa: int) -> list[tuple[int, int]]:
     """Contiguous row runs [j, k) whose one causal call gets every member row's
     singleton plan; a single row is always exact on its own."""
+    single = [plan(arch, prefix + r + 1, gqa, 1) for r in range(t)]
     out: list[tuple[int, int]] = []
     j = 0
     while j < t:
         k = j + 1
         while k < t:
             call = plan(arch, prefix + k + 1, gqa, k + 1 - j)
-            if call[0] == "fallback" or any(
-                plan(arch, prefix + r + 1, gqa, 1) != call for r in range(j, k + 1)
-            ):
+            if call[0] == "fallback" or any(s != call for s in single[j : k + 1]):
                 break
             k += 1
         out.append((j, k))
@@ -407,8 +406,7 @@ def install_wrapper() -> None:
 
 def _attention_modules(model: Any) -> list[Any]:
     """The loaded target's full-attention modules; linear-attention layers have none."""
-    root = getattr(model, "language_model", model)
-    layers = getattr(getattr(root, "model", None), "layers", None) or []
+    layers = getattr(getattr(_root(model), "model", None), "layers", None) or []
     return [
         layer.self_attn
         for layer in layers
