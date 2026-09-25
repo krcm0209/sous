@@ -418,3 +418,74 @@ def test_scope_refuses_kvcache_subclasses_quantized_and_left_padded_caches(monke
     padded._qwen3_5_decode_left_padding = [1]  # ty: ignore[unresolved-attribute]
     for cache in (Subclass(), quantized, padded):
         assert not _scope(monkeypatch, cache=cache), type(cache).__name__
+
+
+def _fresh_model():
+    return _tiny_language_model()
+
+
+def test_enable_off_does_nothing():
+    lm = _fresh_model()
+    assert verifyattn.enable(lm, enabled=False) == {
+        "state": "off",
+        "reason": None,
+        "probe_seconds": None,
+    }
+    assert all(not getattr(m, verifyattn._TAG, 0) for m in verifyattn._attention_modules(lm))
+
+
+def test_enable_tags_every_full_attention_layer_with_the_proved_ratio():
+    lm = _fresh_model()
+    status = verifyattn.enable(lm, enabled=True)
+    try:
+        assert status["state"] == "active" and status["reason"] is None
+        assert isinstance(status["probe_seconds"], float)
+        modules = verifyattn._attention_modules(lm)
+        assert len(modules) == 2 and all(getattr(m, verifyattn._TAG) == GQA for m in modules)
+    finally:
+        verifyattn._untag(lm)
+
+
+def test_enable_refuses_other_model_types(monkeypatch):
+    lm = _fresh_model()
+    # The language model carries model_type itself, and _model_type reads it first.
+    monkeypatch.setattr(lm, "model_type", "qwen3_5_moe")
+    with pytest.warns(UserWarning, match="unsupported model type 'qwen3_5_moe'"):
+        status = verifyattn.enable(lm, enabled=True)
+    assert status == {
+        "state": "unavailable",
+        "reason": "unsupported model type 'qwen3_5_moe' (qwen3_5 only)",
+        "probe_seconds": None,
+    }
+
+
+def test_enable_reports_a_failed_gate(monkeypatch):
+    lm = _fresh_model()
+    monkeypatch.setattr(verifyattn, "_gate", lambda: "mlx 0.99.0 not validated")
+    with pytest.warns(UserWarning, match="mlx 0.99.0 not validated"):
+        status = verifyattn.enable(lm, enabled=True)
+    assert status["state"] == "unavailable" and status["reason"] == "mlx 0.99.0 not validated"
+    assert all(not getattr(m, verifyattn._TAG, 0) for m in verifyattn._attention_modules(lm))
+
+
+def test_enable_reports_a_failed_probe_with_its_cost(monkeypatch):
+    lm = _fresh_model()
+    monkeypatch.setattr(verifyattn, "probe", lambda *a: "grouped attention differs at prefix 1")
+    with pytest.warns(UserWarning, match="differs at prefix 1"):
+        status = verifyattn.enable(lm, enabled=True)
+    assert status["state"] == "unavailable"
+    assert isinstance(status["probe_seconds"], float)
+    assert all(not getattr(m, verifyattn._TAG, 0) for m in verifyattn._attention_modules(lm))
+
+
+def test_enable_never_raises(monkeypatch):
+    lm = _fresh_model()
+
+    def boom(*a):
+        raise RuntimeError("metal said no")
+
+    monkeypatch.setattr(verifyattn, "probe", boom)
+    with pytest.warns(UserWarning, match="metal said no"):
+        status = verifyattn.enable(lm, enabled=True)
+    assert status["state"] == "unavailable" and status["reason"] == "metal said no"
+    assert all(not getattr(m, verifyattn._TAG, 0) for m in verifyattn._attention_modules(lm))

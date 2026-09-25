@@ -29,8 +29,15 @@ import functools
 import hashlib
 import importlib
 import inspect
+import logging
 import os
+import time
+import warnings
 from typing import Any
+
+from sous.engine.int8prefill import _model_type
+
+logger = logging.getLogger("sous.engine.verifyattn")
 
 HEAD_DIM = 256
 MIN_ROWS = 3
@@ -40,6 +47,8 @@ _SCAN_TO = 70_000
 # mlx releases whose SDPA dispatch plan() has been read against; re-read
 # backend/metal/scaled_dot_product_attention.cpp and extend this on a bump.
 VALIDATED_MLX = frozenset({"0.32.2"})
+# The MoE variant reuses the same verifier class with other attention shapes.
+SUPPORTED_MODEL_TYPES = frozenset({"qwen3_5"})
 # Every mlx-vlm function the hook calls or re-implements around, by the module
 # that defines it. The daemon's tool environment can resolve a newer mlx-vlm
 # than the lock, so these are checked at load, not only in CI.
@@ -384,3 +393,54 @@ def _untag(model: Any) -> None:
     for module in _attention_modules(model):
         if _TAG in getattr(module, "__dict__", {}):
             object.__setattr__(module, _TAG, 0)
+
+
+def _refuse(reason: str, probe_seconds: float | None = None) -> dict[str, Any]:
+    """The verifier keeps mlx-vlm's per-row attention: say so once, and why."""
+    warnings.warn(
+        f"sous: exact grouped verify attention unavailable ({reason}); "
+        "verifying with mlx-vlm's per-row attention",
+        stacklevel=3,
+    )
+    return {"state": "unavailable", "reason": reason, "probe_seconds": probe_seconds}
+
+
+def enable(model: Any, *, enabled: bool) -> dict[str, Any]:
+    """Opt one loaded model's verifier in. Returns the status the engine exposes;
+    never raises — a model load must not fail because of an optimisation."""
+    global _ARCH, _KVCACHE
+    if not enabled:
+        return {"state": "off", "reason": None, "probe_seconds": None}
+    model_type = _model_type(model)
+    if model_type not in SUPPORTED_MODEL_TYPES:
+        return _refuse(f"unsupported model type {model_type or 'unknown'!r} (qwen3_5 only)")
+    seconds: float | None = None
+    try:
+        import mlx.core as mx
+
+        reason = _gate()
+        if reason is not None:
+            return _refuse(reason)
+        modules = _attention_modules(model)
+        shapes = {(m.num_attention_heads, m.num_key_value_heads, m.head_dim) for m in modules}
+        if len(shapes) != 1:
+            return _refuse(f"expected one attention shape, found {sorted(shapes)}")
+        q_heads, kv_heads, head_dim = shapes.pop()
+        if head_dim != HEAD_DIM or kv_heads <= 0 or q_heads % kv_heads:
+            return _refuse(f"unsupported attention shape {q_heads}/{kv_heads}/{head_dim}")
+        arch = str(mx.device_info().get("architecture", ""))
+        start = time.perf_counter()
+        reason = probe(arch, q_heads, kv_heads, modules[0].k_norm.weight.dtype)
+        seconds = round(time.perf_counter() - start, 2)
+        if reason is not None:
+            return _refuse(reason, seconds)
+        _ARCH = arch
+        _KVCACHE = importlib.import_module("mlx_vlm.models.cache").KVCache
+        install_wrapper()
+        for module in modules:
+            object.__setattr__(module, _TAG, q_heads // kv_heads)
+    except Exception as e:  # noqa: BLE001 — degrade, never block the model
+        _untag(model)
+        return _refuse(str(e) or type(e).__name__, seconds)
+    logger.info("exact verify attention: %d layers, probe %.2fs", len(modules), seconds)
+    return {"state": "active", "reason": None, "probe_seconds": seconds}
