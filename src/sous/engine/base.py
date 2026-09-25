@@ -387,6 +387,12 @@ class ManagedEngine:
         return getattr(self._inner, "int8_prefill_status", None)
 
     @property
+    def verify_attention_status(self) -> dict | None:
+        # Optional on purpose: only the VLM backend sets this; the LM backend
+        # and fakes have no such attribute.
+        return getattr(self._inner, "verify_attention_status", None)
+
+    @property
     def positions(self) -> str | None:
         # Optional on purpose: only the VLM backend sets this; the LM backend
         # has no such attribute.
@@ -657,6 +663,11 @@ class EngineManager:
         line = f"model_load seconds={time.monotonic() - loading:.1f} model={engine.model_id}"
         if engine.positions is not None:
             line += f" positions={engine.positions}"
+        verify = engine.verify_attention_status
+        if verify is not None:
+            line += f" verify_attention={verify['state']}"
+            if verify.get("probe_seconds") is not None:
+                line += f" verify_attention_probe_s={verify['probe_seconds']}"
         _logger.info(line)
         return engine
 
@@ -960,6 +971,12 @@ class EngineManager:
                 int8 = self._engine.int8_prefill_status
                 if int8 is not None:
                     out["int8_prefill"] = dict(int8)
+                verify = self._engine.verify_attention_status
+                if verify is not None:
+                    out["verify_attention"] = {
+                        "state": verify["state"],
+                        "reason": verify["reason"],
+                    }
                 # Which side supplies the rotary positions behind a warm
                 # cache: the load line says it once, this says it for as long
                 # as the model is resident.

@@ -486,8 +486,10 @@ the forwarder's own synthesized `499` for a client gone mid-forward
 a free counting thread that `count_s` does not); the engine logs `model_load
 seconds=N.N model=<model_id>` when it loads, plus `positions=engine|model` on
 the VLM backend (which side supplies the rotary positions behind a warm
-cache). One more line names the Anthropic tool *types* a turn dropped, when
-any.
+cache) and `verify_attention=active|unavailable|off` (whether speculative
+verify runs its attention as grouped exact calls; with
+`verify_attention_probe_s=` when the load-time exactness probe ran). One
+more line names the Anthropic tool *types* a turn dropped, when any.
 Each forwarded request logs one line too: `upstream`, method, path, the
 model id when the body named one, the upstream's status, and seconds to
 its headers — at `INFO` whatever the status, since that is the upstream's

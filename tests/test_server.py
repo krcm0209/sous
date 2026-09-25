@@ -44,7 +44,13 @@ def _no_leaked_tqdm_switch():
 
 
 @pytest.fixture()
-def svc(tmp_path: Path):
+def svc(tmp_path: Path, monkeypatch):
+    # status_document() releases the calling thread's mlx state, as the pool
+    # thread that serves it must; on pytest's main thread that release leaves
+    # every later real-mlx test in the session without a stream.
+    from sous import server
+
+    monkeypatch.setattr(server, "release_mlx_thread_state", lambda: None)
     root = tmp_path / "proj"
     root.mkdir()
     cfg = SousConfig(data_dir=tmp_path / "data", config_path=tmp_path / "config.toml")
