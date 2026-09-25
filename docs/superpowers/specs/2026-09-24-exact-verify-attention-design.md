@@ -128,9 +128,9 @@ Four guards stack. If any fails, the state is `unavailable` with a reason, and t
      - every N at which `plan(arch, N, gqa, q)` differs from `plan(arch, N − 1, gqa, q)` for any q in 1..min(8, 32 // gqa);
      - for each such N and each T in 3..8, the prefixes `N − T`, `N − T // 2 − 1` and `N − 1`, so rows sit on both sides of the transition;
      - plus one interior prefix between consecutive transitions;
-     - capped at the last transition + 8, which is 65545 keys on 's' and 'd' and 4104 on other suffixes.
+     - capped at the last transition + 7 keys: 65544 on 's', 65543 on 'd' and 4103 on other suffixes.
    - **Check:** `grouped_attention` must be `mx.array_equal` to the per-row loop. The first mismatch disables the path and names the case.
-   - **Memory and time.** Transient K+V is about 270 MB for the 27B at the cap (4 KV heads × 256 × bf16 × 2 × 65.5K), freed with `mx.clear_cache()` before the cache budget is measured. The runtime has not been measured yet; the estimate is under a second against a ~10 s load. The implementation must measure it on the M5 and record it on the load line.
+   - **Memory and time.** Measured on an M2. On its own 'g' table the probe takes 0.9 s cold (it is the process's first attention call, so the SDPA kernels compile inside it) and 0.1 s warm, with a 51 MB peak. Under the 's' and 'd' tables it takes 2.5–2.9 s cold and 1.4–2.2 s warm, with about 0.8 GB peak. The M5 Pro's figure is recorded on its load line (`verify_attention_probe_s`).
 4. **Per-call scope check**, as above.
 
 **Failure policy (int8prefill's rule).** Nothing here raises or fails a model load. Every failure is one `warnings.warn` plus `state: unavailable`.
@@ -143,7 +143,7 @@ Four guards stack. If any fails, the state is `unavailable` with a reason, and t
   - The model-load line in `EngineManager.get()` appends `verify_attention=active|unavailable|off`, as it appends `positions=` today.
   - `EngineManager.status()` gains `verify_attention: {state, reason}` beside `int8_prefill`.
   - Nothing is logged per turn.
-- **Unchanged:** the LM backend, the fork key, `forkstore._EPOCH_FILES` / `engine_epoch`, `engine/kernels/`, the config, `sous tune` and the TUI. Prefill never goes through the verifier, and verify output is bit-identical, so nothing on disk can depend on this.
+- **Unchanged:** the LM backend, the fork key, `forkstore._EPOCH_FILES` / `engine_epoch`, `engine/kernels/`, the config, `sous tune` and the TUI. Prefill never goes through the verifier, and verify output is bit-identical, so nothing on disk can depend on this. `vlm.py` itself is in `_EPOCH_FILES`, so this change invalidates the on-disk forks once after it lands.
 
 ## Testing
 
