@@ -56,10 +56,10 @@ What it will not do for you:
   and about 19.5 tok/s at 57K on an M5 Pro, sampling as shipped. It prefills
   at about 480 tok/s on a 4K prompt and about 350 tok/s on a 61K one: a
   subagent's first turn takes about three minutes when nothing is cached,
-  and 16 s from a fork. Several engines in the table below publish higher
-  decode speeds for the same model family, one of them (LM Studio's Splash)
-  on an M5 Pro, all with other prompts and settings; none has been measured
-  side by side with sous.
+  and 16 s from a fork. Its short-context decode speed, scaled to the same
+  memory bandwidth, is roughly what MTPLX, mlx-serve and mlx-dspark publish;
+  LM Studio's Splash engine is faster on an M5 Pro (see
+  [How it compares](#how-it-compares)).
 - **It serves one local turn at a time.** Subagents running in parallel
   queue for the model.
 - **It does not choose per agent.** In a `sous claude` session every
@@ -137,14 +137,16 @@ Choose something else when:
   four.
 - **You want images:** most of the engines above take them; sous replaces
   them with a placeholder.
-- **You want higher decode speeds on Qwen:** MTPLX and mlx-serve run the
-  model's own multi-token-prediction heads and LM Studio's Splash engine
-  pairs Qwen3.8-27B with a DFlash2 drafter; all three publish higher decode
-  figures than sous's — MTPLX and mlx-serve on M5 Max and M4 Max, Splash on
-  an M5 Pro like sous's — with other prompts and settings, and none measured
-  side by side.
-  mlx-dspark runs the same model and drafter as sous, with its own
-  calibration.
+- **You want faster decode on Qwen:** LM Studio's Splash engine is faster
+  than sous on an M5 Pro with the same weights and drafter — by an
+  estimated 1.2–1.5x at short context and 1.7–1.9x at 51–57K. It drafts and
+  checks seven tokens per step in about 1.4 times the time sous takes for
+  one plain decode step, and it loses less speed as the context grows.
+  MTPLX and mlx-serve publish higher raw figures, on faster chips (M5 Max,
+  M4 Max) and, for mlx-serve, a short code prompt; mlx-dspark publishes
+  about sous's figure on a slower M4 Pro, from one-line prompts. Scaled to
+  the same bandwidth, all three come out near sous's. None has been
+  measured side by side with sous.
 - **You want clients besides Claude Code:** every engine in the table speaks
   the OpenAI API too, and claude-code-router drives about ten agents; sous
   speaks only Anthropic's Messages API, for Claude Code.
