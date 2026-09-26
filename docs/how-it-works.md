@@ -32,6 +32,8 @@ it replaces itself with `claude`, having set:
 | `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` | `1` | the override: since Claude Code 2.1.26x a built-in agent's own `model:` (Explore, for one) or a per-spawn model beats the default above; this applies the default to every subagent regardless |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | the daemon's `max_context_tokens` | Claude Code has no built-in size for `sous-local`; it honours this variable only for non-`claude-*` ids, so the main loop is unaffected |
 | `API_TIMEOUT_MS` | `3000000` | a cold model load plus a long prefill takes minutes |
+| `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` | `1`, unless already set | subagents served side by side evict each other's prompt-cache slots (four at once spent 56% of their engine time re-prefilling, krcm0209/sous#139); Claude Code refuses an extra Agent call while one runs, and the main loop launches it once the running one finishes |
+| `CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS` | `1`, unless already set | the same for workflow agents, which queue instead of being refused |
 
 plus `--disallowedTools LSP` unless you pass your own `--disallowedTools` (a
 language server connecting mid-session appends its schema to every request
@@ -47,6 +49,17 @@ also leaves `CLAUDE_CODE_AUTO_COMPACT_WINDOW` alone: that setting is global,
 and pinning it to the local window would make the frontier main loop compact
 far too early; the subagent's window is bounded by
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` instead.
+
+The two concurrency caps change how a parallel fan-out runs, not whether it
+completes. With four subagents asked for at once, Claude Code started one,
+refused the other three ("Concurrent subagent limit reached … Do not
+retry"), and the main loop launched each of them as the previous one
+finished. That was measured on a Sonnet 5 main loop, at the cost of a few
+more main-loop turns. Workflow agents simply queue. Four in turn took 15–20
+minutes on an M5 Pro, where four side by side took 47 (krcm0209/sous#140).
+Claude Code can lift the subagent cap itself in some modes. Overlapping
+subagents are then still served, one turn at a time, and may evict each
+other's cache slots.
 
 Before it execs, `sous claude` asks the daemon to keep the model loaded for
 the session: it `POST`s `/sous/hold` with its own process id and start time,
@@ -228,8 +241,9 @@ or not at all, and only by a daemon whose backend and its version
 (mlx-vlm or mlx-lm), mlx version, GPU, weights snapshot, engine sources,
 positions owner and int8 state match the ones that wrote it; anything else
 is a natural miss and ages out of the disk budget
-([`prompt_cache_disk_gb`](configuration.md)). Two subagents still
-run one at a time; batching is a later phase.
+([`prompt_cache_disk_gb`](configuration.md)). `sous claude` runs one
+subagent at a time, and the daemon serves one turn at a time whatever the
+client does; batching is a later phase.
 
 Usage is split the way Anthropic's is. `cache_read_input_tokens` is what
 the turn served from a resident cache slot and `input_tokens` the rest, so a

@@ -696,6 +696,7 @@ def _claude_setup(tmp_path, monkeypatch, *, status=_DEFAULT_STATUS, **overrides)
         "ANTHROPIC_API_KEY",
         "API_TIMEOUT_MS",
         *cli._TIER_VARS,
+        *cli._CONCURRENCY_CAPS,
     ):
         monkeypatch.delenv(var, raising=False)
     calls: list[tuple] = []
@@ -762,6 +763,32 @@ def test_claude_env_sets_the_gateway_variables_and_nothing_credential_shaped():
         assert forbidden not in env
 
 
+def test_claude_env_runs_one_subagent_at_a_time():
+    """Overlapped subagents evict each other's prompt-cache slots (#139), so
+    Claude Code is capped at one subagent and one workflow agent at a time."""
+    from sous.cli import claude_env
+
+    env = claude_env(8383, ["sous-local"], 131072, {"PATH": "/usr/bin"})
+    assert env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] == "1"
+    assert env["CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS"] == "1"
+
+
+def test_claude_env_keeps_the_users_own_concurrency_caps():
+    from sous.cli import claude_env
+
+    env = claude_env(
+        8383,
+        ["sous-local"],
+        131072,
+        {
+            "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "3",
+            "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS": "4",
+        },
+    )
+    assert env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] == "3"
+    assert env["CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS"] == "4"
+
+
 def test_claude_execs_claude_with_the_gateway_environment(tmp_path, capsys, monkeypatch):
     from sous import cli
 
@@ -775,11 +802,15 @@ def test_claude_execs_claude_with_the_gateway_environment(tmp_path, capsys, monk
     assert env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] == "1"
     assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
     assert env["API_TIMEOUT_MS"] == "3000000"
+    assert env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] == "1"
+    assert env["CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS"] == "1"
     assert "ANTHROPIC_API_KEY" not in env and "ANTHROPIC_AUTH_TOKEN" not in env
     err = capsys.readouterr().err
     assert "ANTHROPIC_BASE_URL=http://127.0.0.1:8383" in err
     assert "CLAUDE_CODE_SUBAGENT_MODEL=sous-local" in err
     assert "CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1" in err
+    assert "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=1" in err
+    assert "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS=1" in err
     assert "warning" not in err
 
 

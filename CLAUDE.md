@@ -253,6 +253,15 @@ goal.
   model's native length is 262144, at +8 GiB of KV reserve) — the classic
   threshold scales with it, the precompute fraction is remote-configured
   per window size and unmeasured at 262144.
+- `sous claude` sets `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=1` and
+  `CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS=1`, only when unset
+  (`cli._CONCURRENCY_CAPS`). Overlapped subagents evict each other's
+  prompt-cache slots: four at once re-prefilled 56% of their engine time
+  (#139). The workflow cap queues agents. The subagent cap *refuses* the extra
+  Agent calls ("Do not retry"), and the main loop launches each after the
+  running one finishes, measured on a Sonnet 5 main loop (#140). Claude Code
+  can lift the subagent cap itself in some modes, so the daemon must still
+  cope with overlap.
 - The endpoint forwards every request it does not serve (`api/upstream.py`)
   as a transparent proxy: never re-serialize a forwarded body, never add or
   alter an end-to-end header (only `Host`, the hop-by-hop set and a buffered

@@ -39,6 +39,16 @@ _TIER_VARS = (
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 )
+# One subagent (and one workflow agent) at a time: the daemon serves one turn
+# at a time from one prompt cache, and overlapped subagents evict each other's
+# slots — four at once re-prefilled 56% of their engine time (#139). The
+# workflow cap queues agents; the subagent cap refuses the extra Agent calls
+# and the main loop launches each one after the last finishes (measured,
+# #140). Set only when unset: a user's own cap is the user's.
+_CONCURRENCY_CAPS = (
+    "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS",
+    "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS",
+)
 _DISALLOWED_FLAGS = ("--disallowedTools", "--disallowed-tools")
 _LSP_OFF = ["--disallowedTools", "LSP"]
 # Invocations that exit at once: holding the model for them would start a
@@ -89,7 +99,8 @@ def claude_env(
     max_context_tokens: int,
     base: Mapping[str, str],
 ) -> dict[str, str]:
-    """The inherited environment plus the five variables Claude Code needs.
+    """The inherited environment plus the five variables Claude Code needs,
+    and the two concurrency caps (_CONCURRENCY_CAPS) unless the user set them.
 
     They are the RUNNING daemon's values (see _daemon_status), not the config
     file's: pinning subagents to an id the daemon does not serve would send
@@ -115,6 +126,8 @@ def claude_env(
     env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] = "1"
     env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(max_context_tokens)
     env["API_TIMEOUT_MS"] = _API_TIMEOUT_MS
+    for var in _CONCURRENCY_CAPS:
+        env.setdefault(var, "1")
     return env
 
 
@@ -335,7 +348,8 @@ def _cmd_claude(user_args: list[str]) -> None:
         f"CLAUDE_CODE_SUBAGENT_MODEL={env['CLAUDE_CODE_SUBAGENT_MODEL']} "
         f"CLAUDE_CODE_SUBAGENT_MODEL_FORCE={env['CLAUDE_CODE_SUBAGENT_MODEL_FORCE']} "
         f"CLAUDE_CODE_MAX_CONTEXT_TOKENS={env['CLAUDE_CODE_MAX_CONTEXT_TOKENS']} "
-        f"API_TIMEOUT_MS={env['API_TIMEOUT_MS']}",
+        f"API_TIMEOUT_MS={env['API_TIMEOUT_MS']} "
+        + " ".join(f"{var}={env[var]}" for var in _CONCURRENCY_CAPS),
         file=sys.stderr,
     )
     # exec, not a subprocess: the TTY, the signals and the exit code are
