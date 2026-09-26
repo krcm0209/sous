@@ -121,6 +121,8 @@ env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
   CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072 \
   CLAUDE_CODE_AUTO_COMPACT_WINDOW=131072 \
   API_TIMEOUT_MS=3000000 \
+  CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=1 \
+  CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS=1 \
   claude --disallowedTools LSP
 ```
 
@@ -135,7 +137,9 @@ local, and wrong in hybrid mode — `sous claude` leaves it unset because the
 setting is global and would cap the frontier main loop.
 `API_TIMEOUT_MS` covers model load plus a long prefill; `--disallowedTools
 LSP` keeps a language server from appending its schema mid-session and
-re-prefilling the whole conversation. Watch `~/.sous/daemon.log` for the
+re-prefilling the whole conversation. The two concurrency caps are what
+`sous claude` sets: subagents served side by side evict each other's cache
+slots, and here, with every tier local, the main loop's too. Watch `~/.sous/daemon.log` for the
 `INFO sous.api:` lines (both streams land there; every line carries a
 timestamp and a level), or `sous top` in a second terminal for the same
 turns as they happen. The main loop's turns should now report `cache=hit`

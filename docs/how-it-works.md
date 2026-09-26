@@ -32,8 +32,8 @@ it replaces itself with `claude`, having set:
 | `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` | `1` | the override: since Claude Code 2.1.26x a built-in agent's own `model:` (Explore, for one) or a per-spawn model beats the default above; this applies the default to every subagent regardless |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | the daemon's `max_context_tokens` | Claude Code has no built-in size for `sous-local`; it honours this variable only for non-`claude-*` ids, so the main loop is unaffected |
 | `API_TIMEOUT_MS` | `3000000` | a cold model load plus a long prefill takes minutes |
-| `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` | `1`, unless already set | subagents served side by side evict each other's prompt-cache slots (four at once spent 56% of their engine time re-prefilling, krcm0209/sous#139); Claude Code refuses an extra Agent call while one runs (see below) |
-| `CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS` | `1`, unless already set | the same for workflow agents, which queue instead of being refused |
+| `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` | `1`, unless already set to a value Claude Code reads (digits, from 1 up) | subagents served side by side evict each other's prompt-cache slots (four at once spent 56% of their engine time re-prefilling, krcm0209/sous#139); Claude Code refuses an extra Agent call while one runs (see below) |
+| `CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS` | `1`, unless already set to a value Claude Code reads (digits, 1 to 256) | the same for workflow agents, which queue instead of being refused |
 
 plus `--disallowedTools LSP` unless you pass your own `--disallowedTools` (a
 language server connecting mid-session appends its schema to every request

@@ -254,8 +254,11 @@ goal.
   threshold scales with it, the precompute fraction is remote-configured
   per window size and unmeasured at 262144.
 - `sous claude` sets `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=1` and
-  `CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS=1`, only when unset
-  (`cli._CONCURRENCY_CAPS`). Overlapped subagents evict each other's
+  `CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS=1` unless the user set them to
+  a value Claude Code reads: digits from 1 up (the workflow cap to 256);
+  empty, 0 or text is unset to Claude Code too, and it would run its default
+  of 20 behind a launch line naming the value (`cli._CONCURRENCY_CAPS`,
+  `cli._claude_code_reads_cap`). Overlapped subagents evict each other's
   prompt-cache slots: four at once re-prefilled 56% of their engine time
   (#139). The workflow cap queues agents. The subagent cap *refuses* the extra
   Agent calls ("Do not retry"), at every depth, so a running subagent's own
