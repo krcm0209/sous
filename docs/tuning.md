@@ -1,10 +1,78 @@
-# Tuning: the suite and the candidate table
+# Tuning
 
-`sous tune` measures this machine and grades the candidate models; the README's
-Tuning section says what it does and what it may change. This note is for
-changing what it measures.
+`sous tune` chooses the model and the `[model]` settings for the machine it
+runs on, so you never read a tok/s table or a quantization format. It ends
+with a report, a unified diff of `~/.sous/config.toml`, and a question:
 
-## Adding a suite task
+```
+Apply these changes to ~/.sous/config.toml? [y/N]
+```
+
+Nothing is written before that yes; a backup is kept beside the config file,
+and the tune prints the daemon-restart command every applied change needs
+(`sous stop`, then `sous serve`, or `launchctl kickstart -k gui/<uid>/<label>`
+for a managed daemon — the daemon reads `[model]` once at startup).
+
+**`sous tune --quick`** (about 15 minutes on an M5 Pro for three fitting
+candidates) detects the chip, the Metal working set and whether the GPU has
+tensor units, fits every curated candidate to memory (printing the
+arithmetic for each one it refuses), asks about every download it would need
+one by one, then measures prefill and decode throughput of every arm — a
+model, a drafter or none, a block size — through sous's own engine
+(`--repeat` sets the attempts per measurement, default 2; the best wins and
+the spread is printed). It proposes only the settings that cannot change
+what the model says: the drafter, its block size, and a window that fits.
+Other models are measured and reported with a "quality untested" label; a
+quick run never changes the model.
+
+**`sous tune`** (about three hours on an M5 Pro for three fitting models; the
+estimate is printed after the quick stage from the measured speeds and covers
+the model stage; the winner stage adds up to two arms of the same size) does
+all of the above, then grades the candidates: for each model's fastest
+quality-neutral arm, and for your current configuration, it runs a suite of
+eight mechanical coding tasks — implement a module from its spec, write
+tests for one, a docstring sweep, a cross-file rename, a bug fix, a dataclass
+from a JSON schema, a CLI flag, a config-format migration — through an agent
+loop of its own over a scratch copy of each task's project, running only that
+task's verify commands and the suite's test runners, and denying nothing
+because there is nothing to approve. Each run is scored by a
+hidden grader (`--runs` sets the runs per task, default 2). The rule, printed
+in full with every number:
+
+- the **reference** is your current configuration when it fits this machine,
+  else the fastest arm of the largest tier that does;
+- an arm is **eligible** when its mean grade is within 0.05 of the
+  reference's, it completed at least as many runs as the reference minus one
+  task's worth, and it looped on a tool no more often;
+- the **winner** is the eligible arm with the lowest total suite wall time
+  (a tie goes to the smaller memory footprint).
+
+On the winner, the same rule then judges one extra arm per quality-affecting
+setting: INT8 prefill (where the tensor units and the checkpoint allow it)
+and greedy sampling (`temperature = 0`, which also lets the drafter's
+exact-match verify run). A setting lands in the diff only when its own
+measured arm is eligible and faster — that is why there is no `--greedy`
+flag to understand. The full run may therefore change `[model].id`, the
+drafter and block size, the window, `int8_prefill` and `temperature`.
+
+The daemon is asked to release the model first (`POST /sous/unload`) and
+refuses while a `sous claude` session holds it, a turn is in flight, or a
+load or unload is under way — the tune waits for none of them, it tells you,
+and it asks again right before its first bench load and before every model the
+suite loads. Results (`results.jsonl` with every bench row and suite run,
+`hardware.json`, `report.md`, and each suite run's project and transcript under
+`suite/`) land in `~/.sous/tune/<run-id>/`; `--resume <run-id>` continues an
+interrupted run from the rows it already has; `--models ID ...` measures ids of
+your own; `--yes` answers every prompt for scripted use, `--apply` skips only
+the final one. Adding a suite task or a curated candidate is described
+[below](#changing-what-it-measures).
+
+## Changing what it measures
+
+The section above says what `sous tune` does and what it may change. This
+one is for changing what it measures.
+
+### Adding a suite task
 
 A task is a directory under `src/sous/tune/suite/tasks/<name>/`:
 
@@ -52,7 +120,7 @@ Rules the loader and CI enforce (`tests/test_tune_suite.py`):
 The fixture trees are excluded from `ty` (their imports resolve only inside a
 copied project) and linted and formatted by ruff like everything else.
 
-## Adding a curated candidate
+### Adding a curated candidate
 
 `src/sous/tune/candidates.toml` lists the models `sous tune` measures. A row
 is an id, a tier, the drafters known to pair with it and a note; everything
