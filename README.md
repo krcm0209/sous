@@ -61,9 +61,12 @@ What it will not do for you:
   LM Studio's Splash engine is faster on an M5 Pro (see
   [How it compares](#how-it-compares)).
 - **It runs one subagent at a time.** `sous claude` caps Claude Code at one
-  subagent and one workflow agent at once, because subagents served side by
-  side evict each other's cached context: four at once took 47 minutes on an
-  M5 Pro, four in turn 15–20. A parallel fan-out runs in sequence.
+  subagent and one workflow agent at once, unless you set those caps
+  yourself. Subagents served side by side evict each other's cached context:
+  four at once took 47 minutes on an M5 Pro, and four in turn 15–20.
+  Claude Code can lift the subagent cap in some modes. Subagents that do
+  overlap are served one turn at a time, and they still evict each other's
+  cache ([details](docs/how-it-works.md#sous-claude)).
 - **It does not choose per agent.** In a `sous claude` session every
   subagent goes local, including agents pinned to a Claude model.
 - **It does not make the local model as good as Claude.** Delegated work is
@@ -91,7 +94,7 @@ mlx-serve 26.9.5, claude-code-router 3.1.1, Ollama 0.34.4 and LM Studio 0.4.25.
 
 | | Main loop runs on | Engine | Speculative decoding | Parallel requests | Prompt cache across sessions | Interface |
 |---|---|---|---|---|---|---|
-| **sous** | Claude, on your own login | MLX, one model | A draft model (DFlash2) | No, one subagent at a time | Yes, at the end of the tool block; kept on disk | CLI, terminal UI |
+| **sous** | Claude, on your own login | MLX, one model | A draft model (DFlash2) | No, one turn at a time | Yes, at the end of the tool block; kept on disk | CLI, terminal UI |
 | [oMLX](https://github.com/jundot/omlx) | The local model | MLX, many models at once | A draft model or the model's MTP heads, opt-in | Yes, 8 by default | Yes, in 2K–4K-token blocks; kept on SSD (see below) | Menu-bar app, web dashboard, CLI |
 | [MTPLX](https://github.com/youssofal/MTPLX) | The local model | MLX, one model | The model's MTP heads, on its own model packs | Opt-in on the CLI; 4 for the app's Claude Code target | Yes, from the nearest saved checkpoint; kept on SSD | Mac app, CLI, web dashboard |
 | [mlx-dspark](https://github.com/ARahim3/mlx-dspark) | The local model | MLX, one model | Draft models (DSpark, DFlash), n-gram lookup | Opt-in | Yes, in memory (2 slots); lost on restart | Mac app, CLI |
@@ -130,7 +133,8 @@ adds is the router and the engine as one daemon, a prompt cache that forks
 at the exact end of Claude Code's tool block (measured on the hybrid
 Qwen3.8 model it defaults to), and a per-session launcher that leaves your
 login, the main loop's model and Claude Code's compaction settings alone. It
-does turn off the LSP tool and lengthen the API timeout for the session.
+does turn off the LSP tool, lengthen the API timeout and cap Claude Code at one
+subagent at a time for the session.
 
 Choose something else when:
 

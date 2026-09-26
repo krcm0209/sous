@@ -32,7 +32,7 @@ it replaces itself with `claude`, having set:
 | `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` | `1` | the override: since Claude Code 2.1.26x a built-in agent's own `model:` (Explore, for one) or a per-spawn model beats the default above; this applies the default to every subagent regardless |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | the daemon's `max_context_tokens` | Claude Code has no built-in size for `sous-local`; it honours this variable only for non-`claude-*` ids, so the main loop is unaffected |
 | `API_TIMEOUT_MS` | `3000000` | a cold model load plus a long prefill takes minutes |
-| `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` | `1`, unless already set | subagents served side by side evict each other's prompt-cache slots (four at once spent 56% of their engine time re-prefilling, krcm0209/sous#139); Claude Code refuses an extra Agent call while one runs, and the main loop launches it once the running one finishes |
+| `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` | `1`, unless already set | subagents served side by side evict each other's prompt-cache slots (four at once spent 56% of their engine time re-prefilling, krcm0209/sous#139); Claude Code refuses an extra Agent call while one runs (see below) |
 | `CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS` | `1`, unless already set | the same for workflow agents, which queue instead of being refused |
 
 plus `--disallowedTools LSP` unless you pass your own `--disallowedTools` (a
@@ -50,16 +50,26 @@ and pinning it to the local window would make the frontier main loop compact
 far too early; the subagent's window is bounded by
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` instead.
 
-The two concurrency caps change how a parallel fan-out runs, not whether it
-completes. With four subagents asked for at once, Claude Code started one,
-refused the other three ("Concurrent subagent limit reached … Do not
-retry"), and the main loop launched each of them as the previous one
-finished. That was measured on a Sonnet 5 main loop, at the cost of a few
-more main-loop turns. Workflow agents simply queue. Four in turn took 15–20
-minutes on an M5 Pro, where four side by side took 47 (krcm0209/sous#140).
-Claude Code can lift the subagent cap itself in some modes. Overlapping
-subagents are then still served, one turn at a time, and may evict each
-other's cache slots.
+The two caps work differently.
+
+- **Workflow cap:** extra workflow agents queue, so it changes how a fan-out
+  runs, not whether it completes.
+- **Subagent cap:** the extra launches are refused, so completion depends on
+  the main loop.
+  - With four subagents asked for at once, Claude Code started one and
+    refused the other three ("Concurrent subagent limit reached … Do not
+    retry").
+  - A Sonnet 5 main loop then launched each refused agent as the previous
+    one finished, at the cost of a few more main-loop turns. Four in turn
+    took 15–20 minutes on an M5 Pro, where four side by side took 47
+    (krcm0209/sous#139, krcm0209/sous#140).
+  - Other main-loop models have not been measured.
+- **Nested subagents:** the cap counts subagents at every depth. A running
+  subagent's own Agent calls are therefore refused, and it has to do that
+  work itself.
+- **When the cap is lifted:** Claude Code can lift the subagent cap itself
+  in some modes. Overlapping subagents are then still served, one turn at a
+  time, and may evict each other's cache slots.
 
 Before it execs, `sous claude` asks the daemon to keep the model loaded for
 the session: it `POST`s `/sous/hold` with its own process id and start time,

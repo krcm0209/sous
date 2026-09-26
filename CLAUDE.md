@@ -258,10 +258,11 @@ goal.
   (`cli._CONCURRENCY_CAPS`). Overlapped subagents evict each other's
   prompt-cache slots: four at once re-prefilled 56% of their engine time
   (#139). The workflow cap queues agents. The subagent cap *refuses* the extra
-  Agent calls ("Do not retry"), and the main loop launches each after the
-  running one finishes, measured on a Sonnet 5 main loop (#140). Claude Code
-  can lift the subagent cap itself in some modes, so the daemon must still
-  cope with overlap.
+  Agent calls ("Do not retry"), at every depth, so a running subagent's own
+  launches are refused too. A Sonnet 5 main loop relaunched each refused
+  agent after the running one finished (#140); other main-loop models are
+  unmeasured. Claude Code can lift the subagent cap itself in some modes, so
+  the daemon must still cope with overlap.
 - The endpoint forwards every request it does not serve (`api/upstream.py`)
   as a transparent proxy: never re-serialize a forwarded body, never add or
   alter an end-to-end header (only `Host`, the hop-by-hop set and a buffered

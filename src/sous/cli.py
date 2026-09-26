@@ -43,8 +43,9 @@ _TIER_VARS = (
 # at a time from one prompt cache, and overlapped subagents evict each other's
 # slots — four at once re-prefilled 56% of their engine time (#139). The
 # workflow cap queues agents; the subagent cap refuses the extra Agent calls
-# and the main loop launches each one after the last finishes (measured,
-# #140). Set only when unset: a user's own cap is the user's.
+# (at every depth: a running subagent's own launches too), and a Sonnet 5
+# main loop launched each one after the last finished (#140). Set only when
+# unset: a user's own cap is the user's.
 _CONCURRENCY_CAPS = (
     "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS",
     "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS",
@@ -127,7 +128,10 @@ def claude_env(
     env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(max_context_tokens)
     env["API_TIMEOUT_MS"] = _API_TIMEOUT_MS
     for var in _CONCURRENCY_CAPS:
-        env.setdefault(var, "1")
+        # Empty is unset to Claude Code too (it parses only digits and falls
+        # back to its own default), as it is to the warnings in _cmd_claude.
+        if not env.get(var):
+            env[var] = "1"
     return env
 
 

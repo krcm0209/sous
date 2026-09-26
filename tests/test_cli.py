@@ -789,6 +789,24 @@ def test_claude_env_keeps_the_users_own_concurrency_caps():
     assert env["CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS"] == "4"
 
 
+def test_claude_env_treats_an_empty_cap_as_unset():
+    """Claude Code parses only digits, so an exported empty value would leave
+    its own default of 20 in force while the launch line showed a cap."""
+    from sous.cli import claude_env
+
+    env = claude_env(
+        8383,
+        ["sous-local"],
+        131072,
+        {
+            "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "",
+            "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS": "",
+        },
+    )
+    assert env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] == "1"
+    assert env["CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS"] == "1"
+
+
 def test_claude_execs_claude_with_the_gateway_environment(tmp_path, capsys, monkeypatch):
     from sous import cli
 
