@@ -39,6 +39,29 @@ _TIER_VARS = (
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 )
+# One subagent (and one workflow agent) at a time: the daemon serves one turn
+# at a time from one prompt cache, and overlapped subagents evict each other's
+# slots — four at once re-prefilled 56% of their engine time (#139). The
+# workflow cap queues agents; the subagent cap refuses the extra Agent calls
+# (at every depth: a running subagent's own launches too), and a Sonnet 5
+# main loop launched each one after the last finished (#140). Set only when
+# unset: a user's own cap is the user's. The value is the ceiling Claude Code
+# (2.1.269) applies to each: it reads a cap only as a run of digits from 1
+# up to that ceiling and falls back to its own default (20 subagents) for
+# anything else, so an unreadable value counts as unset here too.
+_CONCURRENCY_CAPS: dict[str, int | None] = {
+    "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": None,
+    "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS": 256,
+}
+# Every variable the launch line reports, in that order.
+_LAUNCH_LINE_VARS = (
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "API_TIMEOUT_MS",
+    *_CONCURRENCY_CAPS,
+)
 _DISALLOWED_FLAGS = ("--disallowedTools", "--disallowed-tools")
 _LSP_OFF = ["--disallowedTools", "LSP"]
 # Invocations that exit at once: holding the model for them would start a
@@ -89,7 +112,9 @@ def claude_env(
     max_context_tokens: int,
     base: Mapping[str, str],
 ) -> dict[str, str]:
-    """The inherited environment plus the five variables Claude Code needs.
+    """The inherited environment plus the five variables Claude Code needs,
+    and the two concurrency caps (_CONCURRENCY_CAPS) unless the user set them
+    to a value Claude Code reads.
 
     They are the RUNNING daemon's values (see _daemon_status), not the config
     file's: pinning subagents to an id the daemon does not serve would send
@@ -115,7 +140,23 @@ def claude_env(
     env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] = "1"
     env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(max_context_tokens)
     env["API_TIMEOUT_MS"] = _API_TIMEOUT_MS
+    for var, ceiling in _CONCURRENCY_CAPS.items():
+        if not _claude_code_reads_cap(env.get(var, ""), ceiling):
+            env[var] = "1"
     return env
+
+
+def _claude_code_reads_cap(value: str, ceiling: int | None) -> bool:
+    """Whether Claude Code applies `value` as a concurrency cap: an optionally
+    signed run of ASCII digits (its regex, on the trimmed value) from 1 up to
+    `ceiling`. Empty, 0, a negative, text or a value past the ceiling is
+    unset to it, and would leave its default in force behind a launch line
+    that named the value."""
+    digits = value.strip().removeprefix("+")
+    if not digits.isascii() or not digits.isdigit():
+        return False
+    cap = int(digits)
+    return cap >= 1 and (ceiling is None or cap <= ceiling)
 
 
 def _sous_request(port: int, method: str, path: str, json: dict | None = None) -> tuple[int, bytes]:
@@ -331,11 +372,7 @@ def _cmd_claude(user_args: list[str]) -> None:
             what = f"{model_id} not loaded yet"
         print(f"sous claude: {what}; held while this session runs", file=sys.stderr)
     print(
-        f"sous claude: ANTHROPIC_BASE_URL={env['ANTHROPIC_BASE_URL']} "
-        f"CLAUDE_CODE_SUBAGENT_MODEL={env['CLAUDE_CODE_SUBAGENT_MODEL']} "
-        f"CLAUDE_CODE_SUBAGENT_MODEL_FORCE={env['CLAUDE_CODE_SUBAGENT_MODEL_FORCE']} "
-        f"CLAUDE_CODE_MAX_CONTEXT_TOKENS={env['CLAUDE_CODE_MAX_CONTEXT_TOKENS']} "
-        f"API_TIMEOUT_MS={env['API_TIMEOUT_MS']}",
+        "sous claude: " + " ".join(f"{var}={env[var]}" for var in _LAUNCH_LINE_VARS),
         file=sys.stderr,
     )
     # exec, not a subprocess: the TTY, the signals and the exit code are

@@ -60,8 +60,13 @@ What it will not do for you:
   memory bandwidth, is roughly what MTPLX, mlx-serve and mlx-dspark publish;
   LM Studio's Splash engine is faster on an M5 Pro (see
   [How it compares](#how-it-compares)).
-- **It serves one local turn at a time.** Subagents running in parallel
-  queue for the model.
+- **It runs one subagent at a time.** `sous claude` caps Claude Code at one
+  subagent and one workflow agent at once, unless you set those caps
+  yourself. Subagents served side by side evict each other's cached context:
+  four at once took 47 minutes on an M5 Pro, and four in turn 15–20.
+  Claude Code can lift the subagent cap in some modes. Subagents that do
+  overlap are served one turn at a time, and they still evict each other's
+  cache ([details](docs/how-it-works.md#sous-claude)).
 - **It does not choose per agent.** In a `sous claude` session every
   subagent goes local, including agents pinned to a Claude model.
 - **It does not make the local model as good as Claude.** Delegated work is
@@ -128,7 +133,8 @@ adds is the router and the engine as one daemon, a prompt cache that forks
 at the exact end of Claude Code's tool block (measured on the hybrid
 Qwen3.8 model it defaults to), and a per-session launcher that leaves your
 login, the main loop's model and Claude Code's compaction settings alone. It
-does turn off the LSP tool and lengthen the API timeout for the session.
+does turn off the LSP tool, lengthen the API timeout and cap Claude Code at one
+subagent at a time for the session.
 
 Choose something else when:
 
@@ -187,7 +193,8 @@ From a checkout, `uv tool install .` works instead of the PyPI package.
 `sous claude` launches Claude Code with `ANTHROPIC_BASE_URL` pointing at the
 daemon, `CLAUDE_CODE_SUBAGENT_MODEL=sous-local` (forced),
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` set to the served window, a longer
-`API_TIMEOUT_MS` and `--disallowedTools LSP`, and holds the model loaded
+`API_TIMEOUT_MS`, one subagent and one workflow agent at a time (unless you
+set those caps yourself) and `--disallowedTools LSP`, and holds the model loaded
 while the session lives. Every argument after `claude` passes through to
 Claude Code. The first run downloads the model (~16 GB for the default),
 once. Claude Desktop is not supported: it cannot point Claude Code at a local
