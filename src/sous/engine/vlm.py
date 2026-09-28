@@ -8,10 +8,16 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
-from sous.engine import forkio
+from sous.engine import draftctx, forkio
 from sous.engine.base import Delta, OnDelta
 from sous.engine.forkstore import ForkStore, fork_key_fields
-from sous.engine.promptcache import FORK_MIN_TOKENS, PrefixCache, PromptMemo, probe_boundaries
+from sous.engine.promptcache import (
+    FORK_MIN_TOKENS,
+    PrefixCache,
+    PromptMemo,
+    Speculation,
+    probe_boundaries,
+)
 
 
 def _load_quantized_drafter(model: object, draft_id: str) -> tuple[Any, str]:
@@ -106,6 +112,10 @@ class VLMEngine:
         self.verify_attention_status = verifyattn.enable(
             self._model, enabled=self._draft is not None
         )
+        # The drafter's context on the prompt-cache path: armed once the
+        # drafter has settled, so one that failed to load leaves it off.
+        self._draft_context = draftctx.enable(self._model, self._draft, self._draft_kind)
+        self._speculation = Speculation()
         # Forks on disk, when the factory handed us a directory: built after
         # the drafter and int8 have settled, since the key reads both. Tests
         # and sous tune never pass one, so nothing they build touches ~/.sous.
@@ -154,6 +164,13 @@ class VLMEngine:
         none was asked for or the one asked for failed to load, which the
         engine survives with a warning rather than an error."""
         return self._draft_id
+
+    @property
+    def draft_context_status(self) -> dict:
+        """Whether the drafter is seeded with the prompt's hidden states on
+        the prompt-cache path — the model-load line's and the status
+        document's `draft_context` block."""
+        return dict(self._draft_context.status)
 
     def _fork_key_fields(self, weights: str) -> dict[str, str]:
         from importlib.metadata import version
@@ -232,26 +249,37 @@ class VLMEngine:
         # all-plain KVCache and loses the model's real cache layout.
         return make_prompt_cache(model.language_model)
 
-    def prefill(self, cache: list, token_ids: list[int]) -> None:
+    def prefill(self, cache: list, token_ids: list[int], capture: Any = None) -> Any:
         import mlx.core as mx
         from mlx_vlm import generate
 
         model, processor = self._loaded()
+        # A captured prefill keeps the newest window of its target-layer
+        # hidden states in the sink it hands back, for the turn's later
+        # prefills to add to and its decode to seed the drafter with. The
+        # kwarg is the one mlx-vlm's own speculative prefill passes, so every
+        # forward of this call returns them, and the hook that keeps them
+        # reads only this model's language model while the sink is armed —
+        # the prefill itself runs exactly as it does uncaptured.
+        sink = self._draft_context.sink(capture)
         if not token_ids:
-            return
+            return sink
         # max_tokens=0 is prefill-only: dispatch has an explicit
         # `if not generated_tokens:` branch that yields a result and returns
         # without touching any cache state.
-        generate(
-            model,
-            processor,
-            "",
-            max_tokens=0,
-            verbose=False,
-            prompt_cache=cache,
-            input_ids=mx.array(token_ids)[None],
-            **self._positions(cache, len(token_ids)),
-        )
+        with self._draft_context.arm(model, sink):
+            generate(
+                model,
+                processor,
+                "",
+                max_tokens=0,
+                verbose=False,
+                prompt_cache=cache,
+                input_ids=mx.array(token_ids)[None],
+                **self._positions(cache, len(token_ids)),
+                **draftctx.DraftContext.capture_kwargs(sink),
+            )
+        return sink
 
     def _positions(self, cache: list, n_tokens: int) -> dict[str, Any]:
         """Explicit rotary positions for `n_tokens` appended behind `cache`,
@@ -327,7 +355,12 @@ class VLMEngine:
         return getattr(out, "position_ids", None) is not None
 
     def decode(
-        self, cache: list, token_ids: list[int], max_tokens: int, on_delta: OnDelta | None = None
+        self,
+        cache: list,
+        token_ids: list[int],
+        max_tokens: int,
+        on_delta: OnDelta | None = None,
+        context: Any = None,
     ) -> str:
         import mlx.core as mx
         from mlx_vlm import stream_generate
@@ -335,8 +368,11 @@ class VLMEngine:
         model, processor = self._loaded()
         # Speculative decoding rides on the decode call only: prefill has no
         # tokens to draft, and generate_step captures the hidden states the
-        # drafter needs during its own prefill of these input_ids. block size
-        # 0 means None — let the drafter's own policy pick the depth.
+        # drafter needs during its own prefill of these input_ids — which on
+        # the hybrid prompt-cache path are the generation prompt alone, so
+        # `context`, what the turn's prefills captured before it, goes in
+        # front of them on the drafter's first draft. block size 0 means
+        # None — let the drafter's own policy pick the depth.
         draft_kwargs = (
             {
                 "draft_model": self._draft,
@@ -363,26 +399,35 @@ class VLMEngine:
         # prompt_cache plus input_ids, not prompt_cache_state: sous owns the
         # cache outright rather than driving mlx-vlm's reuse path, and so
         # also owns the positions the suffix is encoded at (_positions).
-        for r in stream_generate(
-            model,
-            processor,
-            "",
-            max_tokens=max_tokens,
-            verbose=False,
-            prompt_cache=cache,
-            input_ids=mx.array(token_ids)[None],
-            **self._positions(cache, len(token_ids)),
-            **sampling,
-            **draft_kwargs,
-        ):
-            # Draft rows are the speculator's proposals, not accepted output;
-            # generate() skips them the same way.
-            if r.is_draft:
-                continue
-            chunks.append(r.text)
-            if on_delta is not None:
-                on_delta(Delta(r.text, r.generation_tokens, r.finish_reason))
+        before = draftctx.rounds_snapshot(self._draft)
+        with self._draft_context.seed(draftctx.DraftContext.tail(context)):
+            for r in stream_generate(
+                model,
+                processor,
+                "",
+                max_tokens=max_tokens,
+                verbose=False,
+                prompt_cache=cache,
+                input_ids=mx.array(token_ids)[None],
+                **self._positions(cache, len(token_ids)),
+                **sampling,
+                **draft_kwargs,
+            ):
+                # Draft rows are the speculator's proposals, not accepted output;
+                # generate() skips them the same way.
+                if r.is_draft:
+                    continue
+                chunks.append(r.text)
+                if on_delta is not None:
+                    on_delta(Delta(r.text, r.generation_tokens, r.finish_reason))
+        rounds, accepted, drafted = draftctx.rounds_since(self._draft, before)
+        self._speculation = Speculation(
+            rounds=rounds, drafted=drafted, accepted=accepted, context=self._draft_context.fed()
+        )
         return "".join(chunks)
+
+    def speculation(self) -> Speculation:
+        return self._speculation
 
     def copy_array(self, a: object) -> object:
         import mlx.core as mx
@@ -493,5 +538,10 @@ class VLMEngine:
         self._model = None
         self._processor = None
         self._draft = None
+        # The context's wraps close over the drafter, and the drafter holds
+        # the target's embedding and head: let go before collecting, or the
+        # weights outlive the unload.
+        self._draft_context.close()
+        self._draft_context = draftctx.OFF
         gc.collect()
         mx.clear_cache()

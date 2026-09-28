@@ -11,7 +11,13 @@ from typing import Any, cast
 from sous.engine import forkio
 from sous.engine.base import Delta, OnDelta
 from sous.engine.forkstore import ForkStore, fork_key_fields
-from sous.engine.promptcache import FORK_MIN_TOKENS, PrefixCache, PromptMemo, probe_boundaries
+from sous.engine.promptcache import (
+    FORK_MIN_TOKENS,
+    PrefixCache,
+    PromptMemo,
+    Speculation,
+    probe_boundaries,
+)
 
 
 class LMEngine:
@@ -150,13 +156,15 @@ class LMEngine:
         model, _ = self._loaded()
         return make_prompt_cache(model)
 
-    def prefill(self, cache: list, token_ids: list[int]) -> None:
+    def prefill(self, cache: list, token_ids: list[int], capture: Any = None) -> None:
         # mlx-lm has no prefill-only entry point: stream_generate raises on
         # max_tokens=0 because its `token` local is unbound when the loop never
         # runs. Calling the model directly is what generate_step does anyway,
         # and RoPE offsets come from the cache, so a warm suffix needs nothing
         # extra. The non-trimmable path and any turn that forks at the header
         # reach here; the trimmable path otherwise fuses prefill into decode.
+        # `capture` is the VLM backend's: this backend runs no drafter, so
+        # there is nothing to capture for.
         import mlx.core as mx
 
         model, _ = self._loaded()
@@ -172,7 +180,12 @@ class LMEngine:
             mx.eval([c.state for c in cache])
 
     def decode(
-        self, cache: list, token_ids: list[int], max_tokens: int, on_delta: OnDelta | None = None
+        self,
+        cache: list,
+        token_ids: list[int],
+        max_tokens: int,
+        on_delta: OnDelta | None = None,
+        context: Any = None,
     ) -> str:
         from mlx_lm import stream_generate
 
@@ -190,6 +203,10 @@ class LMEngine:
             if on_delta is not None:
                 on_delta(Delta(r.text, r.generation_tokens, r.finish_reason))
         return "".join(chunks)
+
+    def speculation(self) -> Speculation:
+        # No drafter on this backend: every decode is plain.
+        return Speculation()
 
     def copy_array(self, a: object) -> object:
         import mlx.core as mx

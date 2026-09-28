@@ -312,6 +312,55 @@ goal.
   `MLX_METAL_GPU_ARCH` subprocesses. The module stays out of
   `forkstore._EPOCH_FILES` on purpose: prefill never enters the verifier and
   verify output is bit-identical.
+- `engine/draftctx.py` hands the DFlash drafter the prompt's hidden states on
+  the hybrid prompt-cache path (#142). mlx-vlm's round loop
+  (`speculative/dflash.py:_dflash_rounds`) gives the drafter, on its first
+  draft call after `reset`, the hidden states of whatever the *decode call*
+  prefilled — the 7-token generation prompt there, since `PrefixCache._run`
+  prefills the stable render in a drafter-less call and stops at the anchor.
+  So every segment a turn prefills before its decode — the fork stops'
+  and the last — runs with a `capture` the orchestrator threads through
+  (`True` starts one, the engine's return continues it, None when the
+  engine has nothing to seed): the prefill passes mlx-vlm's own
+  `capture_layer_ids` kwarg to `generate()` and a class-level post-hook on
+  the language model's forward (armed per instance with
+  `object.__setattr__`, like int8's tags) keeps the newest window of each
+  forward's `hidden_states` in one `Sink` — `generate_step` deletes every
+  chunk's output, so the hook is the only observer, and the prefill itself
+  runs exactly as uncaptured, so the KV is bit-identical. A sink that fails
+  part-way voids itself: a tail ending short of the generation prompt would
+  seed the wrong positions. The decode assembles the tail (its own buffer:
+  a slice of the chunks would pin twice its size) and `seed()`s it into
+  instance-level wraps of the drafter's `draft_block`, `draft_block_greedy`
+  and `reset`, which prepend it once (the greedy wrap may delegate to the
+  sampled one — the first-call flag is consumed by the outer call). The
+  wrap hands over at most one window — the newest rows of the tail that
+  fit beside the call's own rows, none when those already fill it: the
+  drafter's sliding layers would skip the rest, and on the trimmable path
+  the call's own rows are everything after the last fork stop. The
+  `_Seeded` context drops its reference once the drafter holds the tail,
+  so the tail is freed by the first draft call, not the end of the decode.
+  On the trimmable path the decode call
+  prefills the last segment itself, so only fork stops feed the capture
+  there. `unload()` must `close()` the context first: the wraps close over
+  the drafter and the drafter binds the target's embedding and head, so
+  the weights would outlive the unload. Nothing here changes a token — the
+  verify is exact — so the gates are structural (kind `dflash`, none of the
+  hooks the round loop looks for, target layers named, no
+  `_batch_invariant_decode`), not source hashes, and a drift shows on the
+  turn line as `draft_context=7` (the capture lost) or as `draft_context=0`
+  beside `draft_context=unavailable` on the load line (a gate tripped) —
+  the context gauge is measured only while the seeding is active; the
+  count gauges are 0 when no drafter ran and when it ran no round (one
+  token asked for), the prompt cache off included — there the drafter runs
+  over the whole prompt and the counts are logged the same way.
+  `tests/test_draftctx.py` drives the real `generate_step` and
+  `_dflash_rounds` on stubs (CPU mlx suffices) to pin both contracts.
+  Per-decode acceptance (`rounds_since`, mlx-vlm's lifetime counters,
+  which its per-call `accept_lens` are not) reaches the turn line through
+  the prompt cache's per-turn gauges (`draft_rounds`, `drafted_tokens`,
+  `accepted_tokens`, `draft_context`) via `hooks.speculation()` after every
+  decode.
 
 ## Security boundary
 

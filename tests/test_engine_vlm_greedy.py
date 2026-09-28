@@ -8,6 +8,7 @@ import sys
 import threading
 import types
 
+from sous.engine import draftctx
 from sous.engine.promptcache import PromptMemo
 from sous.engine.vlm import VLMEngine
 
@@ -32,6 +33,7 @@ def _engine(sampler) -> VLMEngine:
     engine._draft = None
     engine._draft_kind = ""
     engine._draft_block_size = 0
+    engine._draft_context = draftctx.OFF
     return engine
 
 

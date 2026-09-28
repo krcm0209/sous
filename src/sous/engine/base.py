@@ -393,6 +393,12 @@ class ManagedEngine:
         return getattr(self._inner, "verify_attention_status", None)
 
     @property
+    def draft_context_status(self) -> dict | None:
+        # Optional on purpose, like verify_attention_status: the VLM backend's
+        # word on whether its drafter is seeded with the prompt's hidden states.
+        return getattr(self._inner, "draft_context_status", None)
+
+    @property
     def positions(self) -> str | None:
         # Optional on purpose: only the VLM backend sets this; the LM backend
         # has no such attribute.
@@ -668,6 +674,11 @@ class EngineManager:
             line += f" verify_attention={verify['state']}"
             if verify.get("probe_seconds") is not None:
                 line += f" verify_attention_probe_s={verify['probe_seconds']}"
+        context = engine.draft_context_status
+        if context is not None:
+            line += f" draft_context={context['state']}"
+            if context["state"] == "active":
+                line += f" draft_context_window={context['window']}"
         _logger.info(line)
         return engine
 
@@ -976,6 +987,13 @@ class EngineManager:
                     out["verify_attention"] = {
                         "state": verify["state"],
                         "reason": verify["reason"],
+                    }
+                context = self._engine.draft_context_status
+                if context is not None:
+                    out["draft_context"] = {
+                        "state": context["state"],
+                        "reason": context["reason"],
+                        "window": context["window"],
                     }
                 # Which side supplies the rotary positions behind a warm
                 # cache: the load line says it once, this says it for as long

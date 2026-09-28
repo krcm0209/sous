@@ -98,6 +98,14 @@ class TurnResult:
     persist_seconds: float = 0.0  # writing a fork at a boundary; in no phase
     restore_seconds: float = 0.0  # reading a fork off disk; in no phase
     bounds: tuple[int, int] = (0, 0)  # the probe's (tools, header) boundaries; 0 = absent
+    # The drafter's part of the decode: rounds run, draft tokens proposed and
+    # accepted (each round's bonus token is in neither), and the positions
+    # of context its first draft saw. The counts are 0 without a drafter;
+    # the context is measured only while the engine seeds it.
+    draft_rounds: int = 0
+    drafted_tokens: int = 0
+    accepted_tokens: int = 0
+    draft_context: int = 0
 
 
 @dataclass(frozen=True)
@@ -332,6 +340,10 @@ class TurnRunner:
                     persist_seconds=after.get("persist_seconds", 0.0),
                     restore_seconds=after.get("restore_seconds", 0.0),
                     bounds=(after.get("bound_lo", 0), after.get("bound_hi", 0)),
+                    draft_rounds=after.get("draft_rounds", 0),
+                    drafted_tokens=after.get("drafted_tokens", 0),
+                    accepted_tokens=after.get("accepted_tokens", 0),
+                    draft_context=after.get("draft_context", 0),
                 )
         finally:
             self._engines.touch()

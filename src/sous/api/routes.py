@@ -237,6 +237,12 @@ def _turn_summary(
         "restore_s": result.restore_seconds,
         "prefill_tps": _per_second(result.prefilled_tokens, result.prefill_seconds),
         "decode_tps": _per_second(result.output_tokens, result.decode_seconds),
+        # The drafter's rounds behind decode_tps: what it proposed, what the
+        # exact verify accepted, and how much context its first draft saw.
+        "draft_rounds": result.draft_rounds,
+        "drafted": result.drafted_tokens,
+        "accepted": result.accepted_tokens,
+        "draft_context": result.draft_context,
         "seconds": result.seconds,
         "tools_hash": chat.tools_hash or None,
         "system_hash": chat.system_hash or None,
@@ -263,6 +269,8 @@ def _turn_line(s: dict) -> str:
         f"prefill_s={s['prefill_s']:.1f} decode_s={s['decode_s']:.1f} "
         f"persist_s={s['persist_s']:.1f} restore_s={s['restore_s']:.1f} "
         f"prefill_tps={_opt(s['prefill_tps'])} decode_tps={_opt(s['decode_tps'])} "
+        f"draft_rounds={s['draft_rounds']} drafted={s['drafted']} accepted={s['accepted']} "
+        f"draft_context={s['draft_context']} "
         f"seconds={s['seconds']:.1f}{diag} "
         f"tools={s['tools_hash'] or '-'} system={s['system_hash'] or '-'}"
     )

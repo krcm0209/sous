@@ -579,6 +579,10 @@ def test_gauge_fields_are_read_directly_not_as_deltas(tmp_path: Path):
         "probe_seconds": 5.0,
         "prefill_seconds": 5.0,
         "decode_seconds": 5.0,
+        "draft_rounds": 50,
+        "drafted_tokens": 100,
+        "accepted_tokens": 70,
+        "draft_context": 2054,
     }
     original = inner.generate
 
@@ -593,6 +597,10 @@ def test_gauge_fields_are_read_directly_not_as_deltas(tmp_path: Path):
             "probe_seconds": 3.0,
             "prefill_seconds": 2.0,
             "decode_seconds": 2.5,
+            "draft_rounds": 12,
+            "drafted_tokens": 24,
+            "accepted_tokens": 17,
+            "draft_context": 305,
         }
         return out
 
@@ -601,6 +609,8 @@ def test_gauge_fields_are_read_directly_not_as_deltas(tmp_path: Path):
     result = runner.run(MSGS, [], 100, RecordingSink())
     assert (result.prefilled_tokens, result.took_len, result.bounds) == (40, 40, (10, 20))
     assert (result.prefill_seconds, result.decode_seconds) == (2.0, 2.5)
+    assert (result.draft_rounds, result.drafted_tokens, result.accepted_tokens) == (12, 24, 17)
+    assert result.draft_context == 305
     # probe_seconds is added into tokenize_seconds rather than exposed on its
     # own; a delta (3.0 - 5.0, clamped to 0) would land near zero on a fast
     # FakeEngine.count_tokens, far below this window.
