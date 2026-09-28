@@ -99,20 +99,26 @@ def test_the_tail_holds_no_more_memory_than_its_own_rows(forwards, keep):
     """A slice of an mlx array is a view on its parent: sliced off the
     assembled chunks, the tail would keep every row of them alive across the
     decode — half again to twice its size when a chunk boundary falls inside
-    it. The assembled tail must own exactly its rows, to within the
-    allocator's page."""
+    it. The assembled tail must cost what one array of its own shape costs,
+    measured the same way: Metal rounds a buffer up to its size class, so
+    the budget is read off the allocator rather than computed."""
     width = 256
+    rows = min(keep, sum(forwards))
+    base = _active_bytes()
+    reference = mx.zeros((1, rows, width), dtype=mx.bfloat16)
+    mx.eval(reference)
+    budget = _active_bytes() - base
+    del reference
     sink = draftctx.Sink([0], keep)
     base = _active_bytes()
     for i, n in enumerate(forwards):
         sink.take([mx.zeros((1, n, width), dtype=mx.bfloat16) + i])
     tail = sink.finish()
     assert tail is not None
-    rows = min(keep, sum(forwards))
     assert tail.shape == (1, rows, width) and tail.dtype == mx.bfloat16
     assert tail[0, -1, 0].item() == len(forwards) - 1  # the newest forward's rows last
     held = _active_bytes() - base
-    assert held <= rows * width * 2 + 16 * 1024, (held, rows * width * 2)
+    assert 0 < held <= budget, (held, budget)
 
 
 def test_sink_finish_empties_it():
