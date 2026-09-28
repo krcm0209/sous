@@ -25,7 +25,9 @@ armed:
   whatever the prompt's length;
 - instance-level wraps of the drafter's `draft_block`, `draft_block_greedy`
   and `reset` that prepend the pending context once, on the first draft call
-  after a reset, and record how many positions that call saw.
+  after a reset — as much of it as fills the window beside the call's own
+  rows, the newest rows of a longer tail being all the drafter's sliding
+  layers would keep — and record how many positions that call saw.
 
 Neither changes a token: the verify is exact, so a missing or wrong context
 costs acceptance, never output. That is also why the gates here are
@@ -85,6 +87,10 @@ class Sink:
         self._failed = True
         self._chunks = []
         self._held = 0
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
 
     def take(self, hidden_states: Any) -> None:
         import mlx.core as mx
@@ -162,10 +168,11 @@ def install_forward_hook(cls: type) -> None:
         _WRAPPED.add(cls)
 
 
-def _wrap_drafter(drafter: Any) -> None:
+def _wrap_drafter(drafter: Any, keep: int) -> None:
     """Shadow the drafter's draft calls and reset per instance, the way
     mlx-vlm binds the target's argmax onto the drafter (`argmax_from_hidden`).
-    Once: a second engine over the same drafter would otherwise nest them."""
+    Once: a second engine over the same drafter would otherwise nest them.
+    `keep` bounds what the first draft call is handed."""
     import mlx.core as mx
 
     if getattr(drafter, _WRAPPED_DRAFTER, False):
@@ -192,12 +199,21 @@ def _wrap_drafter(drafter: Any) -> None:
                 object.__setattr__(drafter, _FIRST, False)
                 pending = getattr(drafter, _PENDING, None)
                 object.__setattr__(drafter, _PENDING, None)
+                # Only what fills the window beside the call's own rows: the
+                # drafter's sliding layers skip older context themselves, so
+                # a longer hand-over — the trimmable path's decode call
+                # prefills everything after the last fork stop — would copy
+                # rows they never keep.
+                room = keep - int(hidden.shape[1])
                 if (
-                    pending is not None
+                    room > 0
+                    and pending is not None
                     and pending.ndim == hidden.ndim == 3
                     and pending.shape[0] == hidden.shape[0]
                     and pending.shape[-1] == hidden.shape[-1]
                 ):
+                    if int(pending.shape[1]) > room:
+                        pending = pending[:, -room:, :]
                     hidden = mx.concatenate([pending, hidden], axis=1)
                 object.__setattr__(drafter, _FED, int(hidden.shape[1]))
             return _orig(last_bonus, hidden, cache, block_size, sampler, *args, **kwargs)
@@ -251,7 +267,9 @@ class DraftContext:
         one this engine handed out, a fresh one when the turn asks to start
         capturing, None when it asks for nothing or there is nothing to seed."""
         if isinstance(capture, Sink):
-            return capture
+            # A capture that voided itself is done for the turn: nothing it
+            # takes from here reaches the decode, so stop asking for it.
+            return None if capture.failed else capture
         return Sink(self.layer_ids, self.keep) if capture and self.active else None
 
     @staticmethod
@@ -286,9 +304,8 @@ class DraftContext:
 
     def fed(self) -> int:
         """The context the most recent decode drafted from: the positions its
-        first draft call was handed, capped at the window — the drafter's
-        sliding attention drops the oldest rows past it, so a full tail plus
-        the generation prompt is still one window. 0 when it never drafted."""
+        first draft call was handed — at most the window, which is all the
+        wrap hands over. 0 when it never drafted."""
         if not self.active:
             return 0
         return min(int(getattr(self._drafter, _FED, 0) or 0), self.keep)
@@ -319,6 +336,10 @@ class _Seeded:
             # before the loop runs never resets, and must not read the
             # previous decode's context as its own.
             object.__setattr__(self._drafter, _FED, 0)
+        # The drafter's is the only reference from here: the wrap drops it on
+        # the first draft call, so the tail is freed then rather than held
+        # for the rest of the decode.
+        self._context = None
 
     def __exit__(self, *exc: object) -> None:
         if self._drafter is not None:
@@ -393,7 +414,10 @@ def enable(model: Any, drafter: Any, kind: str) -> DraftContext:
             return _refuse("language model decodes single tokens outside its forward")
         keep = window(drafter)
         install_forward_hook(type(lm))
-        _wrap_drafter(drafter)
+        # Seeded so the hook's read on an unarmed forward is a plain __dict__
+        # hit rather than mlx's __getattr__ miss on every decode step.
+        object.__setattr__(lm, _SINK, None)
+        _wrap_drafter(drafter, keep)
     except Exception as e:  # noqa: BLE001 — degrade, never block the model
         return _refuse(str(e) or type(e).__name__)
     logger.info("drafter context: %d target layers, window %d", len(layer_ids), keep)

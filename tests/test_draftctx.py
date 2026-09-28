@@ -8,7 +8,6 @@ whole prompt hidden — are driven through the real functions on stub models,
 the way tests/test_engine_positions.py drives generate_step. No weights.
 """
 
-import sys
 import threading
 import types
 from typing import Any
@@ -323,7 +322,7 @@ def test_arming_no_sink_touches_nothing():
     lm = _LM()
     ctx = draftctx.enable(_model(lm), _Drafter(), "dflash")
     with ctx.arm(_model(lm), None) as armed:
-        assert armed is None and draftctx._SINK not in vars(lm)
+        assert armed is None and vars(lm)[draftctx._SINK] is None  # enable() seeds it
 
 
 def test_install_forward_hook_is_idempotent():
@@ -442,19 +441,26 @@ def test_a_context_of_another_shape_is_left_out_rather_than_forced(tail):
     assert drafter.calls[-1][1].shape == (1, 2, 4) and ctx.fed() == 2
 
 
-def test_the_context_fed_is_reported_no_larger_than_the_window():
-    """A full tail plus the generation prompt is handed over whole — the
-    drafter drops the oldest rows past its window itself — but what it
+def test_the_first_draft_is_handed_at_most_one_window():
+    """A tail longer than the room beside the call's own rows is cut to its
+    newest rows — the drafter's sliding layers would skip the rest — and own
+    rows that already fill the window get no tail at all; what the drafter
     drafted from is one window, and that is the number logged."""
     drafter = _Drafter()
     drafter.config.sliding_window = 4  # a window of 3
     ctx = draftctx.enable(_model(), drafter, "dflash")
     assert ctx.keep == 3
+    tail = mx.arange(3, dtype=mx.float32)[None, :, None] + mx.zeros((1, 3, 4))
+    with ctx.seed(tail):
+        drafter.reset(_model())
+        _draft(drafter, "draft_block", 1, mx.full((1, 2, 4), 9.0))
+    handed = drafter.calls[-1][1]
+    assert handed.shape == (1, 3, 4) and handed[0, :, 0].tolist() == [2, 9, 9]
+    assert ctx.fed() == 3
     with ctx.seed(mx.full((1, 3, 4), 7.0)):
         drafter.reset(_model())
-        _draft(drafter, "draft_block", 1, mx.zeros((1, 2, 4)))
-    assert drafter.calls[-1][1].shape == (1, 5, 4)  # handed over whole
-    assert ctx.fed() == 3
+        _draft(drafter, "draft_block", 1, mx.full((1, 3, 4), 9.0))
+    assert drafter.calls[-1][1].shape == (1, 3, 4) and ctx.fed() == 3
 
 
 def test_seeding_nothing_leaves_the_drafters_own_context_alone():
@@ -716,11 +722,13 @@ def _stub_mlx_vlm(monkeypatch, model, calls: dict, rounds: int = 0) -> None:
                 setattr(drafter, attr, getattr(drafter, attr, 0) + step)
         return iter(())
 
-    monkeypatch.setitem(
-        sys.modules,
-        "mlx_vlm",
-        types.SimpleNamespace(generate=generate, stream_generate=stream_generate),
-    )
+    # On the real module, not a stand-in for it in sys.modules: the engine's
+    # decode also imports mlx_vlm.speculative.utils, which a stand-in that is
+    # not a package refuses whenever nothing imported that submodule earlier.
+    import mlx_vlm
+
+    monkeypatch.setattr(mlx_vlm, "generate", generate)
+    monkeypatch.setattr(mlx_vlm, "stream_generate", stream_generate)
 
 
 def test_a_captured_prefill_asks_for_the_target_layers_and_keeps_the_tail(monkeypatch):
@@ -804,7 +812,11 @@ def test_a_capture_that_failed_part_way_seeds_nothing(monkeypatch):
     with pytest.warns(UserWarning, match="capture failed"):
         assert engine.prefill([_cache()], list(range(10)), capture=capture) is capture
     assert draftctx.DraftContext.tail(capture) is None
-    engine.prefill([_cache()], list(range(10, 14)), capture=capture)
+    # The rest of the turn is not asked to capture: the engine answers None
+    # and the forward is not asked for the target layers again.
+    calls.clear()
+    assert engine.prefill([_cache()], list(range(10, 14)), capture=capture) is None
+    assert "capture_layer_ids" not in calls["prefill"]
     assert draftctx.DraftContext.tail(capture) is None
 
 

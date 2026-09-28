@@ -9,6 +9,7 @@ import threading
 
 import pytest
 
+from sous.engine import draftctx
 from sous.engine.lm import LMEngine
 from sous.engine.vlm import VLMEngine
 
@@ -36,6 +37,9 @@ def _unloaded_vlm() -> VLMEngine:
     engine._model = None
     engine._processor = None
     engine._positional = True  # unload() leaves the load-time probe's answer alone
+    engine._draft = None
+    engine._draft_kind = ""
+    engine._draft_context = draftctx.OFF  # unload() closes the drafter's context
     engine._memo = PromptMemo()
     engine._tokenize_lock = threading.Lock()
     engine._cache = PrefixCache(engine, enabled=True)

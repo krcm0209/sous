@@ -2326,7 +2326,7 @@ def test_a_retired_owner_still_persists_though_its_fork_is_refused():
     pc = PrefixCache(h, max_bytes=ROOMY, store=s)
     original = h.prefill
 
-    def prefill(cache, token_ids, capture=False):
+    def prefill(cache, token_ids, capture=None):
         context = original(cache, token_ids, capture)
         pc.reset(threading.current_thread())  # the endpoint retiring this session
         return context
@@ -2877,7 +2877,7 @@ class TimedHooks(FakeHooks):
         super().__init__(**kw)
         self.clock = clock
 
-    def prefill(self, cache, token_ids, capture=False):
+    def prefill(self, cache, token_ids, capture=None):
         self.clock.advance(2.0)
         return super().prefill(cache, token_ids, capture)
 

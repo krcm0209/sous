@@ -144,8 +144,9 @@ of the hidden states of everything the turn prefilled before it, so a
 warm turn whose delta since the previous one was short reads short here
 too, and `7` means the drafter saw the generation prompt alone. It is
 measured only while the load line says `draft_context=active` and reads 0
-otherwise, whatever the drafter saw; the three counts are 0 only when no
-drafter ran (with the prompt cache off the drafter sees the whole prompt,
+otherwise, whatever the drafter saw; the three counts are 0 when no
+drafter ran, and when it ran no round — one token asked for, or a stop on
+the first (with the prompt cache off the drafter sees the whole prompt,
 and they are logged the same way). `seconds` is the total, running
 from the moment the turn takes the endpoint lock, so client-visible latency is
 `seconds` plus `queue_s`. On a miss the line adds `lcp=` (how many leading
