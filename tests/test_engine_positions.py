@@ -18,7 +18,8 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-from sous.engine.vlm import VLMEngine  # noqa: E402 — after the importorskip guard
+from sous.engine import draftctx  # noqa: E402 — after the importorskip guard
+from sous.engine.vlm import VLMEngine  # noqa: E402
 
 
 class _Layer:
@@ -70,6 +71,7 @@ def _engine(model: _Model, positional: bool = True) -> VLMEngine:
     engine._draft = None
     engine._draft_kind = ""
     engine._draft_block_size = 0
+    engine._draft_context = draftctx.OFF
     return engine
 
 

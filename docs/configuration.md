@@ -173,7 +173,14 @@ M5 Pro (+3% on prose, +13% on code re-emission over the drafter's adaptive
 policy); 0 lets that policy pick the depth; anything above 5 is clamped,
 because mlx's fused attention kernel takes at most 5 verify rows on this
 model and 6–8 rows run 5–6x slower per layer. It auto-disables with a
-warning when the drafter can't serve the configured model.
+warning when the drafter can't serve the configured model. On the prompt-cache
+path of a hybrid model the decode call itself prefills only the generation
+prompt, so the drafter is handed the newest window (2047 positions on the
+default drafter) of the hidden states of everything the turn prefilled
+before it, and drafts from the conversation rather than from those 7 tokens (#142); the
+turn line's `draft_context` says how much it saw, and `draft_rounds`,
+`drafted` and `accepted` what it made of it (see
+[Observability](observability.md#the-turn-line)).
 
 ## Smaller machines
 

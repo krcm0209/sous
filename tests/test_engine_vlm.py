@@ -668,3 +668,133 @@ def test_vlm_engine_serves_a_second_session_from_a_fork_on_disk(tmp_path):
     assert s["reused_tokens"] >= FORK_MIN_TOKENS and s["took_kind"] == "disk"
     assert s["disk"]["forks"] == 1 and s["forks"] >= 1  # republished as a resident fork
     second.unload()
+
+
+class _TargetLayersDrafter:
+    """What draftctx.enable reads off a drafter, without one: HYBRID_VLM has
+    no published DFlash checkpoint, and the capture side needs none — only
+    the target layers to ask the forward for and a window to keep."""
+
+    prefer_requested_block_size = True
+
+    def __init__(self, layer_ids, sliding_window=2048):
+        import types
+
+        self.config = types.SimpleNamespace(
+            target_layer_ids=list(layer_ids),
+            sliding_window=sliding_window,
+            layer_types=["sliding_attention"],
+            draft_window_size=None,
+        )
+
+    def reset(self, target_model):
+        return []
+
+    def draft_block(self, last_bonus, hidden, cache, block_size, sampler, token_dtype=None):
+        raise AssertionError("the capture side never drafts")
+
+
+def test_vlm_a_captured_prefill_leaves_the_cache_bit_identical_and_keeps_the_tail():
+    """The prefill that captures the drafter's context runs mlx-vlm's own
+    generate_step, chunking included, with one extra kwarg the forward
+    honours by handing its hidden states out; the KV it builds must be the
+    uncaptured prefill's to the bit, and the capture it hands back holds the
+    newest window of the target layers' outputs for those tokens. A hybrid because
+    that is the path that needs the capture (a trimmable model's decode call
+    prefills the delta itself), and because Qwen2-VL's forward captures
+    nothing."""
+    import mlx.core as mx
+
+    from sous.engine import draftctx
+    from sous.engine.vlm import VLMEngine
+
+    e = VLMEngine(HYBRID_VLM, cache_budget=0)
+    model, _ = e._loaded()
+    layers = list(range(0, len(model.language_model.layers), 8))
+    e._draft_context = draftctx.enable(
+        model, _TargetLayersDrafter(layers, sliding_window=9), "dflash"
+    )
+    assert e._draft_context.status["state"] == "active"
+    ids = e._encode("def f(x):\n    return x + 1\n" * 40)
+    head, tail_ids = ids[: len(ids) // 2], ids[len(ids) // 2 :]
+
+    plain = e.new_cache()
+    e.prefill(plain, head)
+    assert e.prefill(plain, tail_ids) is None
+
+    captured = e.new_cache()
+    e.prefill(captured, head)
+    tail = draftctx.DraftContext.tail(e.prefill(captured, tail_ids, capture=True))
+
+    for a, b in zip(plain, captured, strict=True):
+        off = int(getattr(a, "offset", 0) or 0)
+        assert off == int(getattr(b, "offset", 0) or 0)
+        for xa, xb in zip(a.state, b.state, strict=True):
+            if xa is None or xb is None:
+                assert xa is None and xb is None
+                continue
+            if hasattr(a, "trim") and xa.ndim >= 3 and off:
+                xa, xb = xa[..., :off, :], xb[..., :off, :]
+            d = mx.max(mx.abs(xa.astype(mx.float32) - xb.astype(mx.float32)))
+            mx.eval(d)
+            assert d.item() == 0.0
+    # The window is 8 positions; every target layer's hidden state, side by side.
+    hidden = model.language_model.args.hidden_size
+    assert tail is not None and tail.shape == (1, 8, hidden * len(layers))
+    # What the sink kept is the forward's own output: the same tokens run the
+    # way generate_step runs a segment under 2048 tokens — one forward over
+    # all but the last, one over the last — with the capture kwarg give the
+    # same tail to the bit.
+    reference = e.new_cache()
+    e.prefill(reference, head)
+    parts = []
+    for chunk in (tail_ids[:-1], tail_ids[-1:]):
+        out = model.language_model(
+            mx.array(chunk)[None],
+            cache=reference,
+            capture_layer_ids=layers,
+            **e._positions(reference, len(chunk)),
+        )
+        parts.append(mx.concatenate(out.hidden_states, axis=-1))
+    want = mx.concatenate(parts, axis=1)[:, -8:, :]
+    d = mx.max(mx.abs(tail.astype(mx.float32) - want.astype(mx.float32)))
+    mx.eval(d)
+    assert d.item() == 0.0
+    e.unload()
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.7], ids=["greedy", "sampled"])
+def test_vlm_drafter_drafts_from_the_prompts_context_on_the_hybrid_path(temperature):
+    """The #142 gate, on one turn: a hybrid turn's drafter sees the tail of
+    what the turn prefilled in front of the generation prompt (draft_context
+    well past the 7 tokens of the generation prompt alone), the turn's
+    acceptance is logged, and greedy output is token-identical to the same
+    turn drafted from the generation prompt alone. Heavy — the default model
+    and its drafter, local only."""
+    from sous.engine import draftctx
+    from sous.engine.vlm import VLMEngine
+    from sous.tune.payload import TOOLS
+
+    e = VLMEngine(DEFAULT_27B, draft_id=DRAFTER, prompt_cache=True, temperature=temperature)
+    assert e._draft is not None, "drafter should load and validate on the default model"
+    assert e.draft_context_status["state"] == "active"
+    assert e.draft_context_status["window"] == 2047
+    msgs = [
+        {"role": "system", "content": "Answer in two short sentences. " * 40},
+        {"role": "user", "content": "List three uses of a paper clip."},
+    ]
+    seeded = e.generate(msgs, TOOLS, max_tokens=48)
+    s = e.prompt_cache_stats()
+    assert s["draft_rounds"] > 0 and s["drafted_tokens"] >= s["accepted_tokens"] > 0
+    assert 7 < s["draft_context"] <= 2047, s
+    # The same turn with the seeding off: the prefill captures nothing and
+    # the drafter starts from the generation prompt, as before #142.
+    armed = e._draft_context
+    e._draft_context = draftctx.OFF
+    e.reset_prompt_cache()
+    plain = e.generate(msgs, TOOLS, max_tokens=48)
+    e._draft_context = armed
+    assert e.prompt_cache_stats()["draft_context"] == 0  # not measured when off
+    if temperature == 0:
+        assert plain == seeded
+    e.unload()

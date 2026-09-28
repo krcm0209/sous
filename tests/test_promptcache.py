@@ -22,6 +22,7 @@ from sous.engine.promptcache import (
     PrefixCache,
     PromptCacheStats,
     PromptMemo,
+    Speculation,
     all_trimmable,
     auto_cache_budget,
     common_prefix_length,
@@ -332,6 +333,16 @@ class FakeHooks:
         self.caches: list[list] = []
         self.prefilled: list[list[int]] = []
         self.decoded: list[list[int]] = []
+        # Which prefills were asked to capture the drafter's context, the
+        # token each such prefill handed back, and the context each decode
+        # was given — pins that the last stable segment's capture, and only
+        # it, reaches the decode that follows.
+        self.captured: list[bool] = []
+        self.contexts_given: list[object] = []
+        self.contexts_seen: list[object] = []
+        # What speculation() answers after a decode; a test sets it to pin
+        # the gauges the orchestrator assigns from it.
+        self.speculation_value = Speculation()
         self.generated = [7, 8, 9]
         self.headroom_value: int | None = None
         self.pressure_value: int | None = None  # the kernel's level: 1 normal, 2 warn, 4 critical
@@ -359,14 +370,28 @@ class FakeHooks:
             if isinstance(c, FakeTrimmable):
                 c.offset += n
 
-    def prefill(self, cache, token_ids):
+    def prefill(self, cache, token_ids, capture=None):
         self.log.append("prefill")
         self.prefilled.append(list(token_ids))
+        self.captured.append(capture is not None)
         self._advance(cache, len(token_ids))
+        if capture is None:
+            return None
+        # A capture names every segment it saw, in order: `True` starts one,
+        # an earlier segment's capture continues it.
+        context = (
+            f"context:{list(token_ids)}" if capture is True else f"{capture}+{list(token_ids)}"
+        )
+        self.contexts_given.append(context)
+        return context
 
-    def decode(self, cache, token_ids, max_tokens, on_delta=None):
+    def speculation(self):
+        return self.speculation_value
+
+    def decode(self, cache, token_ids, max_tokens, on_delta=None, context=None):
         self.log.append("decode")
         self.on_deltas.append(on_delta)
+        self.contexts_seen.append(context)
         if self.fail_once:
             self.fail_once = False
             if self.stream_before_fail and on_delta is not None:
@@ -532,6 +557,120 @@ def test_non_trimmable_second_turn_prefills_the_delta_then_the_suffix():
     assert pc.stats()["hits"] == 1
 
 
+def test_non_trimmable_hands_its_capture_to_the_decode_that_follows():
+    """The decode call prefills only the generation suffix, so the drafter
+    would see nothing of the conversation: what the turn prefills before it
+    is captured, and that capture — the same object — reaches the decode."""
+    h = FakeHooks(trimmable=False)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    pc.generate(STABLE_2, FULL_2, 16)
+    assert h.captured == [True, True]
+    assert h.contexts_given == ["context:[1, 2, 3, 4]", "context:[5, 6]"]
+    assert h.contexts_seen == h.contexts_given
+
+
+def test_the_trimmable_path_captures_nothing_without_fork_stops():
+    # The decode call prefills the delta itself, so the drafter already sees it.
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    pc.generate(STABLE_2, FULL_2, 16)
+    assert h.captured == [] and h.contexts_seen == [None, None]
+
+
+def test_every_segment_a_turn_prefills_feeds_one_capture():
+    """A turn that stops at two fork boundaries prefills three segments; the
+    drafter's context is the newest window of all of them, so one capture
+    runs through every prefill and the decode gets it whole."""
+    h = FakeHooks(trimmable=False)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    assert h.captured == [True, True, True]
+    assert h.contexts_seen == [f"context:{T}+{HA[len(T) :]}+{AX1[len(HA) :]}"]
+
+
+def test_a_trimmable_turn_with_fork_stops_seeds_its_decode_with_them():
+    """The decode call prefills the last segment itself, so the capture
+    carries only the fork stops' segments — everything prefilled before it."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    assert h.captured == [True, True]
+    assert h.decoded == [AX1_FULL[len(HA) :]]
+    assert h.contexts_seen == [f"context:{T}+{HA[len(T) :]}"]
+
+
+def test_an_engine_that_captures_nothing_is_asked_once_and_left_alone():
+    """The engine answers None to a capture it cannot serve (no drafter):
+    the later segments of the turn are not asked again."""
+
+    asked: list[object] = []
+
+    class Plain(FakeHooks):
+        def prefill(self, cache, token_ids, capture=None):
+            self.log.append("prefill")
+            asked.append(capture)
+            self._advance(cache, len(token_ids))
+            return None
+
+    h = Plain(trimmable=False)
+    pc = PrefixCache(h, max_bytes=ROOMY)
+    pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
+    assert asked == [True, None, None] and h.contexts_seen == [None]
+
+
+def test_a_cold_retry_captures_again_and_the_decode_gets_the_retrys_context():
+    h = FakeHooks(trimmable=False)
+    pc = PrefixCache(h)
+    pc.generate(STABLE_1, FULL_1, 16)
+    h.fail_once = True
+    with pytest.warns(UserWarning, match="retrying cold"):
+        pc.generate(STABLE_2, FULL_2, 16)
+    # the warm attempt's capture (the delta), then the cold one's (everything)
+    assert h.contexts_given == ["context:[1, 2, 3, 4]", "context:[5, 6]", f"context:{STABLE_2}"]
+    assert h.contexts_seen[-1] == f"context:{STABLE_2}"
+
+
+def test_the_drafters_gauges_are_assigned_per_turn_from_the_last_decode():
+    """Rounds, drafted, accepted and the context the drafter saw are per-turn
+    gauges like the phase timings: assigned after each decode, zeroed with
+    the next turn, and the daemon-wide view drops them."""
+    from sous.engine.promptcache import without_turn_gauges
+
+    h = FakeHooks(trimmable=False)
+    pc = PrefixCache(h)
+    h.speculation_value = Speculation(rounds=12, accepted=17, drafted=24, context=2054)
+    pc.generate(STABLE_1, FULL_1, 16)
+    st = pc.stats()
+    assert (st["draft_rounds"], st["drafted_tokens"], st["accepted_tokens"]) == (12, 24, 17)
+    assert st["draft_context"] == 2054
+    assert not {"draft_rounds", "drafted_tokens", "accepted_tokens", "draft_context"} & set(
+        without_turn_gauges(st)
+    )
+    h.speculation_value = Speculation()
+    pc.generate(STABLE_2, FULL_2, 16)
+    st = pc.stats()
+    assert (st["draft_rounds"], st["drafted_tokens"], st["accepted_tokens"]) == (0, 0, 0)
+    assert st["draft_context"] == 0
+
+
+@pytest.mark.parametrize("trimmable", [True, False])
+def test_the_drafters_gauges_follow_every_decode_path(trimmable):
+    h = FakeHooks(trimmable=trimmable)
+    pc = PrefixCache(h)
+    h.speculation_value = Speculation(rounds=3, accepted=4, drafted=6, context=9)
+    pc.generate(STABLE_1, FULL_1, 16)
+    assert pc.stats()["draft_context"] == 9
+    # The render that is not a strict prefix of the full prompt decodes cold
+    # outside the cache's own run, and still reports its decode's drafter.
+    h.speculation_value = Speculation(rounds=1, accepted=0, drafted=2, context=3)
+    with pytest.warns(UserWarning, match="not the stable render"):
+        pc.generate([7, 8], [9, 9, 9], 16)
+    st = pc.stats()
+    assert (st["draft_rounds"], st["drafted_tokens"], st["draft_context"]) == (1, 2, 3)
+
+
 def test_non_trimmable_restores_the_cache_to_the_stable_boundary():
     h = FakeHooks(trimmable=False)
     pc = PrefixCache(h)
@@ -597,6 +736,21 @@ def test_disabled_never_reuses_and_never_counts():
     assert len(h.caches) == 2
     assert pc.stats() == _empty_stats()
     assert pc.stats()["prefill_seconds"] == 0.0 and pc.stats()["took_len"] == 0
+
+
+def test_disabled_still_reports_the_drafters_gauges():
+    """The drafter runs over the whole prompt when nothing is cached, and
+    the turn line reads its rounds off the same gauges as on a cached turn."""
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, enabled=False)
+    h.speculation_value = Speculation(rounds=9, drafted=18, accepted=11, context=40)
+    pc.generate(STABLE_1, FULL_1, 16)
+    st = pc.stats()
+    assert (st["draft_rounds"], st["drafted_tokens"], st["accepted_tokens"]) == (9, 18, 11)
+    assert st["draft_context"] == 40 and st["hits"] == 0 and st["misses"] == 0
+    h.speculation_value = Speculation()
+    pc.generate(STABLE_2, FULL_2, 16)
+    assert pc.stats()["draft_rounds"] == 0
 
 
 def test_disabled_never_reads_stable_ids():
@@ -1032,6 +1186,10 @@ def test_stats_as_dict_reports_every_counter():
         "decode_seconds": 0.0,
         "persist_seconds": 0.0,
         "restore_seconds": 0.0,
+        "draft_rounds": 0,
+        "drafted_tokens": 0,
+        "accepted_tokens": 0,
+        "draft_context": 0,
     }
 
 
@@ -2168,9 +2326,10 @@ def test_a_retired_owner_still_persists_though_its_fork_is_refused():
     pc = PrefixCache(h, max_bytes=ROOMY, store=s)
     original = h.prefill
 
-    def prefill(cache, token_ids):
-        original(cache, token_ids)
+    def prefill(cache, token_ids, capture=None):
+        context = original(cache, token_ids, capture)
         pc.reset(threading.current_thread())  # the endpoint retiring this session
+        return context
 
     h.prefill = prefill  # ty: ignore[invalid-assignment]
     pc.generate(AX1, AX1_FULL, 16, fork_at=BOUNDS_A)
@@ -2718,13 +2877,13 @@ class TimedHooks(FakeHooks):
         super().__init__(**kw)
         self.clock = clock
 
-    def prefill(self, cache, token_ids):
+    def prefill(self, cache, token_ids, capture=None):
         self.clock.advance(2.0)
-        super().prefill(cache, token_ids)
+        return super().prefill(cache, token_ids, capture)
 
-    def decode(self, cache, token_ids, max_tokens, on_delta=None):
+    def decode(self, cache, token_ids, max_tokens, on_delta=None, context=None):
         self.clock.advance(5.0)
-        return super().decode(cache, token_ids, max_tokens, on_delta)
+        return super().decode(cache, token_ids, max_tokens, on_delta, context)
 
 
 @pytest.fixture()

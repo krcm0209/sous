@@ -2206,3 +2206,95 @@ def test_status_carries_the_verify_attention_view_when_the_engine_reports_one(tm
         "state": "unavailable",
         "reason": "mlx 0.33.0 not validated",
     }
+
+
+@pytest.mark.parametrize("drafter_loads", [True, False])
+def test_vlm_engine_arms_the_drafters_context_once_the_drafter_has_settled(
+    monkeypatch, drafter_loads
+):
+    from sous.engine import draftctx, verifyattn, vlm
+
+    model = _positionless_model()
+    processor = types.SimpleNamespace(tokenizer=_RecordingTokenizer())
+    _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+    drafter = types.SimpleNamespace(prefer_requested_block_size=False)
+
+    def load_drafter(m, draft_id):
+        if not drafter_loads:
+            raise RuntimeError("no such repo")
+        return drafter, "dflash"
+
+    monkeypatch.setattr(vlm, "_load_quantized_drafter", load_drafter)
+    monkeypatch.setattr(verifyattn, "enable", lambda m, *, enabled: {"state": "off"})
+    seen: dict[str, object] = {}
+
+    def fake_enable(m, d, kind):
+        seen["model"], seen["drafter"], seen["kind"] = m, d, kind
+        status = {"state": "active" if d is not None else "off", "reason": None, "window": 2047}
+        return draftctx.DraftContext(status)
+
+    monkeypatch.setattr(draftctx, "enable", fake_enable)
+    if drafter_loads:
+        engine = vlm.VLMEngine("test/model", cache_budget=0, draft_id="z-lab/drafter")
+    else:
+        with pytest.warns(UserWarning, match="speculative drafter"):
+            engine = vlm.VLMEngine("test/model", cache_budget=0, draft_id="z-lab/drafter")
+    expected = {"model": model, "drafter": drafter, "kind": "dflash"}
+    assert seen == (expected if drafter_loads else {**expected, "drafter": None, "kind": ""})
+    assert engine.draft_context_status["state"] == ("active" if drafter_loads else "off")
+
+
+def test_get_logs_the_drafter_context_state_and_its_window(caplog):
+    import logging
+
+    def factory(model_id):
+        engine = _positional_factory(model_id)
+        engine.draft_context_status = {  # ty: ignore[unresolved-attribute]
+            "state": "active",
+            "reason": None,
+            "window": 2047,
+            "layers": 5,
+        }
+        return engine
+
+    mgr = EngineManager(SousConfig(), engine_factory=factory)
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert len(lines) == 1
+    assert lines[0].endswith(" positions=engine draft_context=active draft_context_window=2047")
+
+
+def test_get_logs_no_window_when_the_drafter_context_is_not_active(caplog):
+    import logging
+
+    def factory(model_id):
+        engine = _positional_factory(model_id)
+        engine.draft_context_status = {  # ty: ignore[unresolved-attribute]
+            "state": "unavailable",
+            "reason": "drafter kind 'eagle3' (dflash only)",
+            "window": 0,
+            "layers": 0,
+        }
+        return engine
+
+    mgr = EngineManager(SousConfig(), engine_factory=factory)
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert lines[0].endswith(" draft_context=unavailable")
+
+
+def test_status_carries_the_drafter_context_view_when_the_engine_reports_one(tmp_path):
+    inner = FakeEngine([])
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    assert "draft_context" not in manager.status(), "fakes without the attribute stay silent"
+    inner.draft_context_status = {  # ty: ignore[unresolved-attribute]
+        "state": "active",
+        "reason": None,
+        "window": 2047,
+        "layers": 5,
+    }
+    assert manager.status()["draft_context"] == {"state": "active", "reason": None, "window": 2047}
