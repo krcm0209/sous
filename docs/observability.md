@@ -87,7 +87,8 @@ example (wrapped here):
   stream=1 status=200 input_tokens=84335 output_tokens=2887 stop=end_turn
   cache=hit took=turn@82647 reused_tokens=82647 prefilled_tokens=1681 forks=0 evicted=1 pressure=0
   load_s=0.0 queue_s=2.5 engine_wait_s=0.0 tokenize_s=1.1 ttft_s=9.8 prefill_s=7.9 decode_s=196.6
-  prefill_tps=212.8 decode_tps=14.7 seconds=207.4 tools=1b21cd75 system=9f8e7d6c
+  prefill_tps=212.8 decode_tps=14.7 draft_rounds=1104 drafted=2208 accepted=1782 draft_context=1688
+  seconds=207.4 tools=1b21cd75 system=9f8e7d6c
 ```
 
 `id` is the response's message id (the same one in `message_start`, so the
@@ -129,7 +130,23 @@ so adding every field this way can just as easily run past `seconds` as fall
 short of it. `prefill_tps`/`decode_tps` are that same phase attribution
 expressed as a rate, not a throughput measurement — `prefill_s` also carries
 fork copies and the snapshot, so a turn that publishes forks reports a lower
-`prefill_tps` than its real prefill speed. `seconds` is the total, running
+`prefill_tps` than its real prefill speed. `draft_rounds`, `drafted` and
+`accepted` are the speculative drafter's part of that decode: how many
+draft-verify rounds it ran, how many tokens it proposed over them and how
+many of those the exact verify kept — each round also yields one bonus
+token, in neither count, so tokens per round is `(accepted + draft_rounds)
+/ draft_rounds` and the acceptance rate `accepted / drafted`.
+`draft_context` is how many positions of context the drafter's first draft
+ran with, at most its window (2047 on the default drafter): on the hybrid
+prompt-cache path the decode call itself prefills only the generation
+prompt (7 tokens on Qwen3.8), and the drafter is handed the newest window
+of the hidden states of everything the turn prefilled before it, so a
+warm turn whose delta since the previous one was short reads short here
+too, and `7` means the drafter saw the generation prompt alone. It is
+measured only while the load line says `draft_context=active` and reads 0
+otherwise, whatever the drafter saw; the three counts are 0 only when no
+drafter ran (with the prompt cache off the drafter sees the whole prompt,
+and they are logged the same way). `seconds` is the total, running
 from the moment the turn takes the endpoint lock, so client-visible latency is
 `seconds` plus `queue_s`. On a miss the line adds `lcp=` (how many leading
 tokens the render shared with the closest resident slot), `lcp_region=`
@@ -166,7 +183,12 @@ seconds=N.N model=<model_id>` when it loads, plus `positions=engine|model` on
 the VLM backend (which side supplies the rotary positions behind a warm
 cache) and `verify_attention=active|unavailable|off` (whether speculative
 verify runs its attention as grouped exact calls; with
-`verify_attention_probe_s=` when the load-time exactness probe ran). One
+`verify_attention_probe_s=` when the load-time exactness probe ran) and
+`draft_context=active|unavailable|off` (whether the drafter is handed the
+prompt's hidden states on the prompt-cache path, with
+`draft_context_window=` when it is; `off` means no drafter loaded, and
+`unavailable` a drafter this cannot seed — the status document's
+`draft_context` block carries the reason). One
 more line names the Anthropic tool *types* a turn dropped, when any.
 Each forwarded request logs one line too: `upstream`, method, path, the
 model id when the body named one, the upstream's status, and seconds to

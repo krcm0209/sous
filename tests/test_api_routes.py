@@ -1660,9 +1660,10 @@ def test_a_claimed_model_id_cannot_forge_or_bloat_a_log_line(tmp_path: Path, cap
     lines = [line for line in err.splitlines() if "sous.api:" in line]
     assert lines, "expected at least one log line"
     for line in lines:
-        # The attributed turn line is ~410 chars with its prefix; the cap is
-        # here to catch an unbounded client string, not to pin a length.
-        assert len(line) < 500, line
+        # The attributed turn line is ~470 chars with its prefix (~510 with a
+        # miss's diagnostics); the cap is here to catch an unbounded client
+        # string, not to pin a length.
+        assert len(line) < 600, line
         assert "A" * 20 not in line, line  # the oversized id never reaches it
         if "model=" in line:
             assert "model=-" in line, line
@@ -1719,6 +1720,10 @@ def test_the_turn_line_attributes_a_hit(tmp_path: Path, capsys):
                 "pressure_evictions": 1,
                 "prefill_seconds": 2.0,
                 "decode_seconds": 4.0,
+                "draft_rounds": 2,
+                "drafted_tokens": 4,
+                "accepted_tokens": 1,
+                "draft_context": 2054,
             }
         return out
 
@@ -1736,6 +1741,9 @@ def test_the_turn_line_attributes_a_hit(tmp_path: Path, capsys):
     assert f["prefill_s"] == "2.0" and f["decode_s"] == "4.0"
     # 6 prefilled tokens / 2.0 s; "second reply here" is 3 words = 3 output tokens / 4.0 s
     assert f["prefill_tps"] == "3.0" and f["decode_tps"] == "0.8"
+    # the drafter's rounds behind that decode: what it drafted, what the verify kept
+    assert (f["draft_rounds"], f["drafted"], f["accepted"]) == ("2", "4", "1")
+    assert f["draft_context"] == "2054"
     assert f["persist_s"] == "0.0" and f["restore_s"] == "0.0"
     for key in ("load_s", "queue_s", "engine_wait_s", "tokenize_s", "ttft_s", "seconds"):
         assert key in f, key
@@ -1942,7 +1950,8 @@ def test_a_served_turn_is_recorded_with_the_lines_fields(tmp_path: Path):
         "input_tokens", "output_tokens", "reused_tokens", "prefilled_tokens", "lcp",
         "lcp_region", "bounds", "forks", "evicted", "pressure", "load_s", "queue_s",
         "engine_wait_s", "tokenize_s", "ttft_s", "prefill_s", "decode_s", "persist_s",
-        "restore_s", "prefill_tps", "decode_tps", "seconds", "tools_hash", "system_hash",
+        "restore_s", "prefill_tps", "decode_tps", "draft_rounds", "drafted", "accepted",
+        "draft_context", "seconds", "tools_hash", "system_hash",
     }  # fmt: skip
     _post(app, _body(stream=False))
     ids = [t["id"] for t in _recent(endpoint)]

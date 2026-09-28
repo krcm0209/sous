@@ -306,6 +306,10 @@ TURN_GAUGES = frozenset(
         "decode_seconds",
         "persist_seconds",
         "restore_seconds",
+        "draft_rounds",
+        "drafted_tokens",
+        "accepted_tokens",
+        "draft_context",
     }
 )
 _GAUGES = frozenset({"snapshot_bytes", "miss_lcp"}) | TURN_GAUGES
@@ -386,6 +390,16 @@ class PromptCacheStats:
     decode_seconds: float = 0.0  # hooks.decode, plus the restore
     persist_seconds: float = 0.0  # writing the live cache at a boundary; never prefill time
     restore_seconds: float = 0.0  # time spent attempting a restore, charged on a skip too
+    # What the drafter did in the decode that produced the text: rounds run,
+    # draft tokens proposed and accepted (the bonus token each round also
+    # yields is in neither), and the positions of context its first draft
+    # saw — the generation prompt alone reads 7 on Qwen3.8. The counts are
+    # zero without a drafter; the context is measured only while the engine
+    # seeds it, so it also reads zero when the seeding is unavailable.
+    draft_rounds: int = 0
+    drafted_tokens: int = 0
+    accepted_tokens: int = 0
+    draft_context: int = 0
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -446,21 +460,49 @@ class PromptMemo:
         self._slots = dict.fromkeys(_MEMO_SLOTS)
 
 
+@dataclass(frozen=True)
+class Speculation:
+    """What the drafter did in one decode call: rounds run, draft tokens
+    proposed and accepted (the bonus token each round also yields is in
+    neither), and the positions of context its first draft saw. The counts
+    are zero without a drafter, or when the call never drafted; the context
+    is measured only while the engine seeds it, and reads zero otherwise
+    whatever the drafter saw."""
+
+    rounds: int = 0
+    drafted: int = 0
+    accepted: int = 0
+    context: int = 0
+
+
 class CacheHooks(Protocol):
     """The things only an engine can do. Everything else is shared.
 
-    `eval_cache` materialises a cache's arrays on the calling thread (a fork
-    copy is lazy, and the pressure valve reads active memory). `persist`
-    writes the live working cache at a boundary to `path` — called on the
-    owner thread, holding no lock, never with a Slot; `restore` fills a fresh
-    cache from `path` on the calling thread and evaluates it, raising the
-    store's verification error on any mismatch."""
+    `prefill` with `capture` keeps the newest window of the segment's
+    target-layer hidden states for `decode` to seed the drafter with, and
+    returns the capture — an opaque object the orchestrator only carries:
+    `True` starts one, a value an earlier prefill of the turn returned
+    continues it, None asks for none (the engine returns None when it has
+    nothing to seed with, and that passes back in unchanged). `speculation`
+    is the drafter's count for the most recent decode call. `eval_cache`
+    materialises a cache's arrays on the calling thread (a fork copy is lazy,
+    and the pressure valve reads active memory). `persist` writes the live
+    working cache at a boundary to `path` — called on the owner thread,
+    holding no lock, never with a Slot; `restore` fills a fresh cache from
+    `path` on the calling thread and evaluates it, raising the store's
+    verification error on any mismatch."""
 
     def new_cache(self) -> list: ...
-    def prefill(self, cache: list, token_ids: list[int]) -> None: ...
+    def prefill(self, cache: list, token_ids: list[int], capture: Any = None) -> Any: ...
     def decode(
-        self, cache: list, token_ids: list[int], max_tokens: int, on_delta: OnDelta | None
+        self,
+        cache: list,
+        token_ids: list[int],
+        max_tokens: int,
+        on_delta: OnDelta | None,
+        context: Any = None,
     ) -> str: ...
+    def speculation(self) -> Speculation: ...
     def copy_array(self, a: object) -> object: ...
     # Bytes the machine can still give a cache right now, or None when it
     # cannot tell (no mlx). Read on the owner thread; must not release thread
@@ -1064,7 +1106,15 @@ class PrefixCache:
         budget to fork into or a store to write to."""
         hooks = self._hooks
         if not self.enabled:
-            return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens, on_delta)
+            # Nothing is cached or counted, but the drafter still runs — over
+            # the whole prompt, which the decode call prefills itself — and
+            # the turn line's acceptance is read off the same gauges as ever.
+            with self._lock:
+                stats = self._stats_for(threading.current_thread())
+                stats.begin_turn()
+            text = hooks.decode(hooks.new_cache(), list(full_ids), max_tokens, on_delta)
+            _note_speculation(stats, hooks)
+            return text
 
         owner = threading.current_thread()
         with self._lock:
@@ -1098,7 +1148,9 @@ class PrefixCache:
                 "plus a generation suffix; decoding cold this turn",
                 stacklevel=2,
             )
-            return hooks.decode(hooks.new_cache(), list(full_ids), max_tokens, on_delta)
+            text = hooks.decode(hooks.new_cache(), list(full_ids), max_tokens, on_delta)
+            _note_speculation(stats, hooks)
+            return text
 
         with self._lock:
             # Owner-filtered: the arrays live only on the publishing thread's
@@ -1325,6 +1377,11 @@ class PrefixCache:
         entry_reuse = reuse
         stats.prefilled_tokens += anchor - entry_reuse
         published: list[Slot] = []
+        # Everything this turn prefills before its decode is captured into
+        # one context for the drafter — the newest window of it — whatever
+        # segments the fork stops cut it into: what the decode call itself
+        # prefills is all the drafter would otherwise see.
+        capture: Any = True
         for boundary, need_slot, need_file in self._fork_boundaries(
             stats, owner, stable_ids, fork_at, reuse
         ):
@@ -1334,7 +1391,7 @@ class PrefixCache:
             # a prefix already prefilled. An empty segment (a turn that
             # started exactly here) is a no-op on both backends.
             started = _clock()
-            hooks.prefill(cache, list(stable_ids[reuse:boundary]))
+            capture = hooks.prefill(cache, list(stable_ids[reuse:boundary]), capture=capture)
             reuse = boundary
             stats.prefill_seconds += _clock() - started
             if need_file:
@@ -1397,24 +1454,44 @@ class PrefixCache:
         # evicts during the decode below is freed then, not pinned by this
         # frame until the turn ends.
         published = []
+        # A capture the engine never started (no drafter) is None from here on.
+        context = None if capture is True else capture
         if all_trimmable(cache):
             # Everything rewinds, so (the rest of) prefill and decode fuse into
             # one pass and the generation block plus the generated tokens are
-            # simply trimmed back off afterwards.
+            # simply trimmed back off afterwards. The decode call prefills the
+            # rest itself, so the drafter sees it; the fork stops' segments,
+            # when there were any, are what the capture adds in front.
             started = _clock()
-            text = hooks.decode(cache, list(full_ids[reuse:]), max_tokens, on_delta)
+            text = hooks.decode(
+                cache, list(full_ids[reuse:]), max_tokens, on_delta, context=context
+            )
             trim_to(cache, anchor)
             stats.decode_seconds += _clock() - started
+            _note_speculation(stats, hooks)
             return text
         # A recurrent layer cannot rewind, so stop at the anchor, record it,
-        # and put the cache back there once the generation is done.
+        # and put the cache back there once the generation is done. The decode
+        # call then prefills only the generation prompt, which is all the
+        # drafter would see of the conversation without the capture.
         started = _clock()
-        hooks.prefill(cache, list(stable_ids[reuse:]))
+        context = hooks.prefill(cache, list(stable_ids[reuse:]), capture=capture)
         snap, nbytes = snapshot(cache, hooks.copy_array)
         stats.snapshot_bytes = nbytes
         stats.prefill_seconds += _clock() - started
         started = _clock()
-        text = hooks.decode(cache, list(full_ids[anchor:]), max_tokens, on_delta)
+        text = hooks.decode(cache, list(full_ids[anchor:]), max_tokens, on_delta, context=context)
         restore(cache, snap, hooks.copy_array)
         stats.decode_seconds += _clock() - started
+        _note_speculation(stats, hooks)
         return text
+
+
+def _note_speculation(stats: PromptCacheStats, hooks: CacheHooks) -> None:
+    """Assign the decode's drafter gauges — the last decode call's, so a cold
+    retry's counts replace the failed warm attempt's."""
+    spec = hooks.speculation()
+    stats.draft_rounds = spec.rounds
+    stats.drafted_tokens = spec.drafted
+    stats.accepted_tokens = spec.accepted
+    stats.draft_context = spec.context
