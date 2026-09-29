@@ -135,10 +135,12 @@ _ARCH = re.compile(r"applegpu_g(\d+)(\D?)$")
 
 
 def availability() -> Availability:
-    """Mirror of mlx's own is_nax_available() (device.cpp, 0.32.2): macOS >= 26.2
-    and an Apple GPU of generation >= 17 (>= 18 for 'p'-suffix parts) — the M5
-    family and later. Older GPUs run the Metal-4 tensor ops on the plain shader
-    path, where int8 buys nothing, so they are `unavailable`, not merely slow."""
+    """mlx's own is_nax_available() (device.cpp, 0.32.2) — macOS >= 26.2 and an
+    Apple GPU of generation >= 17 (>= 18 for 'p'-suffix parts), the M5 family and
+    later — then `_gemm_probe()`, which compiles and runs the kernels, so this is
+    mlx work, not a device query. Older GPUs run the Metal-4 tensor ops on the
+    plain shader path, where int8 buys nothing, so they are `unavailable`, not
+    merely slow."""
     if platform.system() != "Darwin":
         return Availability(False, "not macOS")
     try:
@@ -163,7 +165,7 @@ def availability() -> Availability:
         )
     rejected = _gemm_probe()
     if rejected is not None:
-        return Availability(False, f"the int8 GEMM does not compile here: {rejected}")
+        return Availability(False, f"the int8 GEMM probe failed: {rejected}")
     return Availability(True)
 
 
@@ -517,7 +519,7 @@ def enable(model: Any, *, enabled: bool) -> dict[str, Any]:
         _warm_up(model)
     except Exception as e:  # noqa: BLE001 — degrade, never block the model
         _untag(model)
-        logger.warning("int8 prefill: warm-up failed:\n%s", e)
+        logger.warning("int8 prefill: enabling failed:\n%s", e)
         return _refuse(str(e))
     logger.info("int8 prefill: routed %d projections", routed)
     return {"state": "active", "reason": None, "routed": routed}

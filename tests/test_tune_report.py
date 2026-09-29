@@ -110,7 +110,7 @@ def test_nax_reason_none_renders_without_a_parenthetical(tmp_path):
         choice=None,
         current_model=M,
     )
-    assert "NAX tensor units: no" in text
+    assert "NAX int8 GEMM: no" in text
     assert "no (None)" not in text
 
 

@@ -202,8 +202,10 @@ def test_gemm_probe_remembers_success_but_not_failure(monkeypatch):
 
 # ---- GEMM (needs the tensor units; skipped where they are absent) ----------------
 
+# Read once: a failed probe is not remembered, so each call would compile again.
+_AVAILABILITY = i8.availability()
 nax = pytest.mark.skipif(
-    not i8.availability().available, reason=f"no tensor units: {i8.availability().reason}"
+    not _AVAILABILITY.available, reason=f"int8 GEMM unavailable: {_AVAILABILITY.reason}"
 )
 
 
