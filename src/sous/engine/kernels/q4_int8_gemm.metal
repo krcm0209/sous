@@ -41,8 +41,12 @@
   mpp::tensor_ops::matmul2d<desc_set, metal::execution_simdgroup> op_set;
   auto ct_a = op.template get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
   auto ct_b = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
-  auto acc0 = op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), int32_t>();
-  auto acc1 = op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), int32_t>();
+  // MSL 4.1 (macOS 27) gives locals a generic address space, so decltype carries
+  // `thread` and the MPP operand check rejects it; mlx's own nax.h strips it the same way.
+  using ct_a_t = metal::remove_addrspace_t<decltype(ct_a)>;
+  using ct_b_t = metal::remove_addrspace_t<decltype(ct_b)>;
+  auto acc0 = op.template get_destination_cooperative_tensor<ct_a_t, ct_b_t, int32_t>();
+  auto acc1 = op.template get_destination_cooperative_tensor<ct_a_t, ct_b_t, int32_t>();
 
   const int n_run0 = col_base + int(coord.x);
   const int m_base = row_base + int(coord.y);

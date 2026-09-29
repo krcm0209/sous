@@ -161,7 +161,36 @@ def availability() -> Availability:
         return Availability(
             False, f"GPU {arch} predates the neural accelerators (gen {gen} < {need})"
         )
+    rejected = _gemm_probe()
+    if rejected is not None:
+        return Availability(False, f"the int8 GEMM does not compile here: {rejected}")
     return Availability(True)
+
+
+@functools.cache
+def _gemm_probe() -> str | None:
+    """Compile and run both kernels once, on the smallest shape they take; None when
+    they work, else the first line of the error. The kernels compile against the
+    OS's own Metal toolchain at runtime, so a new macOS can reject a source that
+    compiled before (#123: macOS 27's MSL 4.1). This probe runs only GPU work,
+    which fails cleanly; the same failure with a CPU-stream op in flight deadlocks
+    inside mlx's exception path (0.32.2) instead of raising."""
+    import mlx.core as mx
+
+    try:
+        x = mx.zeros((MIN_ROWS, GROUP), dtype=mx.bfloat16)
+        weight = mx.zeros((BN, GROUP // 8), dtype=mx.uint32)
+        scales = mx.ones((BN, 1), dtype=mx.bfloat16)
+        biases = mx.zeros((BN, 1), dtype=mx.bfloat16)
+        mx.eval(qmm(*stage_a(x), weight, scales, biases))
+    except Exception as e:  # noqa: BLE001 — any failure means the kernels cannot serve
+        return _first_line(str(e))
+    return None
+
+
+def _first_line(text: str) -> str:
+    lines = text.strip().splitlines()
+    return lines[0] if lines else text
 
 
 def qmm(qa: Any, sa: Any, ra: Any, weight: Any, scales: Any, biases: Any) -> Any:
@@ -446,6 +475,8 @@ def _warm_up(model: Any) -> None:
 def _refuse(reason: str) -> dict[str, Any]:
     """The requested accelerator cannot serve this load: say so once and report why.
     A silently inert opt-in is worse than one warning line."""
+    # A compiler error runs to dozens of lines; the first says what failed.
+    reason = _first_line(reason)
     warnings.warn(
         f"sous: int8 prefill requested but unavailable ({reason}); prefilling with stock kernels",
         stacklevel=3,

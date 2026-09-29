@@ -132,6 +132,7 @@ def _fake_platform(monkeypatch, mac_ver: str, arch: str):
 )
 def test_availability_mirrors_mlx_nax_rule(monkeypatch, mac_ver, arch, available, needle):
     _fake_platform(monkeypatch, mac_ver, arch)
+    monkeypatch.setattr(i8, "_gemm_probe", lambda: None)
     a = i8.availability()
     assert a.available is available
     if needle is not None:
@@ -141,6 +142,38 @@ def test_availability_mirrors_mlx_nax_rule(monkeypatch, mac_ver, arch, available
 def test_availability_on_this_machine_reports_a_reason_when_unavailable():
     a = i8.availability()
     assert a.available or (isinstance(a.reason, str) and a.reason)
+
+
+def test_availability_is_unavailable_when_the_gemm_does_not_compile(monkeypatch):
+    """A toolchain that rejects the kernel reads as unavailable, so the load warns
+    once and the `nax` tests below skip instead of hanging in mlx's exception path."""
+    _fake_platform(monkeypatch, "27.0", "applegpu_g17s")
+    monkeypatch.setattr(i8, "_gemm_probe", lambda: "Unable to build metal library from source")
+    a = i8.availability()
+    assert a.available is False
+    assert a.reason is not None and "Unable to build metal library" in a.reason
+
+
+def test_gemm_probe_reports_the_first_line_of_a_compile_error(monkeypatch):
+    monkeypatch.setattr(i8, "stage_a", lambda x: (x, x, x))
+
+    def rejected(*args):
+        raise RuntimeError(
+            "[metal::Device] Unable to build metal library from source\n"
+            "utils.h:544:27: error: no matching member function for call to "
+            "'get_destination_cooperative_tensor'"
+        )
+
+    monkeypatch.setattr(i8, "qmm", rejected)
+    assert (
+        i8._gemm_probe.__wrapped__() == "[metal::Device] Unable to build metal library from source"
+    )
+
+
+def test_gemm_probe_is_none_when_the_gemm_runs(monkeypatch):
+    monkeypatch.setattr(i8, "stage_a", lambda x: (x, x, x))
+    monkeypatch.setattr(i8, "qmm", lambda qa, sa, ra, w, scales, biases: mx.zeros((1,)))
+    assert i8._gemm_probe.__wrapped__() is None
 
 
 # ---- GEMM (needs the tensor units; skipped where they are absent) ----------------
@@ -520,6 +553,21 @@ def test_enable_degrades_when_warm_up_fails(monkeypatch):
         status = i8.enable(model, enabled=True)
     assert status == {"state": "unavailable", "reason": "compiler said no", "routed": 0}
     assert _tags(model) == []
+
+
+def test_enable_reports_only_the_first_line_of_a_compiler_error(monkeypatch):
+    """The whole compiler output would otherwise go into the load warning and the
+    status document's int8_prefill.reason."""
+    monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
+
+    def boom(model):
+        raise RuntimeError("Unable to build metal library from source\nutils.h:544:27: error: …")
+
+    monkeypatch.setattr(i8, "_warm_up", boom)
+    with pytest.warns(UserWarning) as caught:
+        status = i8.enable(_Model([_Layer()]), enabled=True)
+    assert status["reason"] == "Unable to build metal library from source"
+    assert "\n" not in str(caught[0].message)
 
 
 def test_warm_up_runs_one_int8_linear_per_distinct_shape(monkeypatch):
