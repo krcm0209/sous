@@ -138,9 +138,9 @@ evictions and the subset the pressure valve took — counts only — and
 `[model].int8_prefill` (default `false`) runs the prefill matmuls as INT8 activations
 against the checkpoint's packed 4-bit weights on the M5 GPU's neural accelerators
 (Apache-2.0 kernel derived from oMLX, compiled at model load — no build step). Measured
-on an M5 Pro with the default model: 492 → 695 tok/s at 4K tokens, 410 → 570 tok/s at
-32K (MLP and linear-attention projections; attention projections are not routed, see
-#76). Decode and speculative verify are untouched. It changes prefill numerics (KL 0.033
+on an M5 Pro with the default model on macOS 27: 374 → 602 tok/s at 4K tokens, 336 →
+503 tok/s at 32K, and 8–25% off warm prefills at 64–192K of context (MLP and
+linear-attention projections; attention projections are not routed, see #76). Decode and speculative verify are untouched. It changes prefill numerics (KL 0.033
 vs the stock path on a code prompt; 4-bit weights alone are 0.052 vs 8-bit), which is
 why it ships off. Needs an M5-family or newer GPU and macOS 26.2+; anywhere else the
 status document reports `int8_prefill: unavailable` with the reason and prefill
