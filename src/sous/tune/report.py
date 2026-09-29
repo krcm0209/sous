@@ -115,12 +115,15 @@ def render_report(
         f"  {hardware.chip}, {gib(hardware.memory_bytes)} unified memory, Metal working set "
         f"{gib(hardware.working_set_bytes)}, macOS {hardware.macos}"
     )
+    # `nax` is int8prefill.availability(): the tensor units *and* a GEMM that
+    # compiles on this macOS, so a rejected kernel reads as no without the
+    # machine lacking the units.
     if hardware.nax:
-        nax = "NAX tensor units: yes"
+        nax = "NAX int8 GEMM: yes"
     elif hardware.nax_reason is None:
-        nax = "NAX tensor units: no"
+        nax = "NAX int8 GEMM: no"
     else:
-        nax = f"NAX tensor units: no ({hardware.nax_reason})"
+        nax = f"NAX int8 GEMM: no ({hardware.nax_reason})"
     out.append(f"  {nax}; " + ", ".join(f"{k} {v}" for k, v in hardware.versions.items()))
     out.append(f"  hub cache {hardware.hub_cache}: {gib(hardware.disk_free_bytes)} free")
     if table_age_days > STALE_AFTER_DAYS:

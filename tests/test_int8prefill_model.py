@@ -15,10 +15,12 @@ mx = pytest.importorskip("mlx.core")
 
 from sous.engine import int8prefill as i8  # noqa: E402
 
+# Read once: a failed probe is not remembered, so each call would compile again.
+_AVAILABILITY = i8.availability()
 pytestmark = [
     pytest.mark.model,
     pytest.mark.skipif(
-        not i8.availability().available, reason=f"no tensor units: {i8.availability().reason}"
+        not _AVAILABILITY.available, reason=f"int8 GEMM unavailable: {_AVAILABILITY.reason}"
     ),
 ]
 

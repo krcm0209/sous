@@ -292,6 +292,15 @@ goal.
 - `int8prefill.enable()` never raises and a model load never fails because of
   it: every failure is one `warnings.warn` plus `state: unavailable`. Tests
   that need the GEMM without tensor units monkeypatch `int8prefill.qmm`.
+- mlx (>= 0.32.1) compiles runtime kernels as the newest MSL the OS has — 4.1 on
+  macOS 27, where `decltype` of a local cooperative tensor carries `thread` and
+  must be wrapped in `metal::remove_addrspace_t` (#123) — so any macOS major can
+  reject a kernel that compiled before. `int8prefill.availability()` therefore
+  compiles and runs the GEMM once where the tensor units exist (`_gemm_probe`,
+  GPU work only, success remembered, the full compiler report logged): a
+  rejected kernel reads as `unavailable` and the `nax` tests skip, where a
+  compile failure with a CPU-stream op in flight deadlocks in mlx's exception
+  path. Being mlx ops, it inherits the thread rules above.
 - `engine/verifyattn.py` replaces mlx-vlm's per-row SDPA loop in the exact
   verifier (`Qwen3_5BatchInvariantForward._attention`, T = 3..8) with one
   stock `mx.fast.scaled_dot_product_attention` per group of rows that share
