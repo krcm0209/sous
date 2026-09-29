@@ -167,14 +167,21 @@ def availability() -> Availability:
     return Availability(True)
 
 
-@functools.cache
+_probe_ok = False
+
+
 def _gemm_probe() -> str | None:
-    """Compile and run both kernels once, on the smallest shape they take; None when
-    they work, else the first line of the error. The kernels compile against the
-    OS's own Metal toolchain at runtime, so a new macOS can reject a source that
-    compiled before (#123: macOS 27's MSL 4.1). This probe runs only GPU work,
-    which fails cleanly; the same failure with a CPU-stream op in flight deadlocks
-    inside mlx's exception path (0.32.2) instead of raising."""
+    """Compile and run both kernels once, on one routed-size tile (MIN_ROWS rows,
+    one group, one column tile); None when they work, else the error line. The
+    kernels compile against the OS's own Metal toolchain at runtime, so a new macOS
+    can reject a source that compiled before (#123: macOS 27's MSL 4.1). This runs
+    only GPU work, which fails cleanly; the same failure with a CPU-stream op in
+    flight deadlocks inside mlx's exception path (0.32.2) instead of raising. Only
+    success is remembered: a failure is probed again on the next call, so one bad
+    moment cannot switch int8 off for a long-lived daemon."""
+    global _probe_ok
+    if _probe_ok:
+        return None
     import mlx.core as mx
 
     try:
@@ -184,13 +191,19 @@ def _gemm_probe() -> str | None:
         biases = mx.zeros((BN, 1), dtype=mx.bfloat16)
         mx.eval(qmm(*stage_a(x), weight, scales, biases))
     except Exception as e:  # noqa: BLE001 — any failure means the kernels cannot serve
-        return _first_line(str(e))
+        # The one-line reason cannot carry a compiler's full report; the log can.
+        logger.warning("int8 prefill: the GEMM probe failed:\n%s", e)
+        return _error_line(str(e))
+    _probe_ok = True
     return None
 
 
-def _first_line(text: str) -> str:
-    lines = text.strip().splitlines()
-    return lines[0] if lines else text
+def _error_line(text: str) -> str:
+    """The line of a (compiler) error that names the failure. mlx prefixes the
+    compiler's report with a fixed "Unable to build metal library" line."""
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    named = [line for line in lines if "error:" in line]
+    return (named or lines or [text])[0]
 
 
 def qmm(qa: Any, sa: Any, ra: Any, weight: Any, scales: Any, biases: Any) -> Any:
@@ -475,8 +488,8 @@ def _warm_up(model: Any) -> None:
 def _refuse(reason: str) -> dict[str, Any]:
     """The requested accelerator cannot serve this load: say so once and report why.
     A silently inert opt-in is worse than one warning line."""
-    # A compiler error runs to dozens of lines; the first says what failed.
-    reason = _first_line(reason)
+    # A compiler error runs to dozens of lines; the status needs the one naming it.
+    reason = _error_line(reason)
     warnings.warn(
         f"sous: int8 prefill requested but unavailable ({reason}); prefilling with stock kernels",
         stacklevel=3,
@@ -504,6 +517,7 @@ def enable(model: Any, *, enabled: bool) -> dict[str, Any]:
         _warm_up(model)
     except Exception as e:  # noqa: BLE001 — degrade, never block the model
         _untag(model)
+        logger.warning("int8 prefill: warm-up failed:\n%s", e)
         return _refuse(str(e))
     logger.info("int8 prefill: routed %d projections", routed)
     return {"state": "active", "reason": None, "routed": routed}

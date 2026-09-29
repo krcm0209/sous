@@ -80,8 +80,9 @@ def detect(
     version: Callable[[str], str] | None = None,
     hub_cache: str | None = None,
 ) -> Hardware:
-    """Every reading through an injectable so the tests need no GPU. The mlx
-    call is a device query, not an op, so it is safe on any thread."""
+    """Every reading through an injectable so the tests need no GPU. On a
+    machine with tensor units `availability()` compiles and runs the int8 GEMM
+    once, so this runs mlx ops: call it where CLAUDE.md's thread rules allow them."""
     info = (device_info or _device_info)()
     release = (mac_ver or platform.mac_ver)()[0]
     cache = hub_cache if hub_cache is not None else hub_cache_dir()

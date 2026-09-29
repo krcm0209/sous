@@ -154,26 +154,50 @@ def test_availability_is_unavailable_when_the_gemm_does_not_compile(monkeypatch)
     assert a.reason is not None and "Unable to build metal library" in a.reason
 
 
-def test_gemm_probe_reports_the_first_line_of_a_compile_error(monkeypatch):
+_COMPILER_ERROR = (
+    "[metal::Device] Unable to build metal library from source\n"
+    "utils.h:544:27: error: no matching member function for call to "
+    "'get_destination_cooperative_tensor'\n"
+    "  auto acc0 = op.template get_destination_cooperative_tensor<...>();"
+)
+
+
+def test_gemm_probe_reports_the_compilers_error_line_and_logs_the_rest(monkeypatch, caplog):
+    """mlx's first line is the same for every compile failure; the reason keeps the
+    line that names this one, and the log keeps the whole report."""
+    monkeypatch.setattr(i8, "_probe_ok", False)
     monkeypatch.setattr(i8, "stage_a", lambda x: (x, x, x))
 
     def rejected(*args):
-        raise RuntimeError(
-            "[metal::Device] Unable to build metal library from source\n"
-            "utils.h:544:27: error: no matching member function for call to "
-            "'get_destination_cooperative_tensor'"
-        )
+        raise RuntimeError(_COMPILER_ERROR)
 
     monkeypatch.setattr(i8, "qmm", rejected)
-    assert (
-        i8._gemm_probe.__wrapped__() == "[metal::Device] Unable to build metal library from source"
+    with caplog.at_level("WARNING", logger="sous.engine.int8prefill"):
+        reason = i8._gemm_probe()
+    assert reason == (
+        "utils.h:544:27: error: no matching member function for call to "
+        "'get_destination_cooperative_tensor'"
     )
+    assert "auto acc0" in caplog.text
 
 
-def test_gemm_probe_is_none_when_the_gemm_runs(monkeypatch):
+def test_gemm_probe_remembers_success_but_not_failure(monkeypatch):
+    """One bad moment must not switch int8 off for the rest of a daemon's life."""
+    monkeypatch.setattr(i8, "_probe_ok", False)
     monkeypatch.setattr(i8, "stage_a", lambda x: (x, x, x))
-    monkeypatch.setattr(i8, "qmm", lambda qa, sa, ra, w, scales, biases: mx.zeros((1,)))
-    assert i8._gemm_probe.__wrapped__() is None
+    calls = []
+
+    def flaky(*args):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("transient")
+        return mx.zeros((1,))
+
+    monkeypatch.setattr(i8, "qmm", flaky)
+    assert i8._gemm_probe() == "transient"
+    assert i8._gemm_probe() is None
+    assert i8._gemm_probe() is None
+    assert len(calls) == 2
 
 
 # ---- GEMM (needs the tensor units; skipped where they are absent) ----------------
@@ -555,18 +579,18 @@ def test_enable_degrades_when_warm_up_fails(monkeypatch):
     assert _tags(model) == []
 
 
-def test_enable_reports_only_the_first_line_of_a_compiler_error(monkeypatch):
+def test_enable_reports_one_line_of_a_compiler_error(monkeypatch):
     """The whole compiler output would otherwise go into the load warning and the
     status document's int8_prefill.reason."""
     monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
 
     def boom(model):
-        raise RuntimeError("Unable to build metal library from source\nutils.h:544:27: error: …")
+        raise RuntimeError(_COMPILER_ERROR)
 
     monkeypatch.setattr(i8, "_warm_up", boom)
     with pytest.warns(UserWarning) as caught:
         status = i8.enable(_Model([_Layer()]), enabled=True)
-    assert status["reason"] == "Unable to build metal library from source"
+    assert status["reason"].startswith("utils.h:544:27: error: no matching member function")
     assert "\n" not in str(caught[0].message)
 
 
