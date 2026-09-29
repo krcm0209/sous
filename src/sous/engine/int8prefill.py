@@ -135,10 +135,12 @@ _ARCH = re.compile(r"applegpu_g(\d+)(\D?)$")
 
 
 def availability() -> Availability:
-    """Mirror of mlx's own is_nax_available() (device.cpp, 0.32.2): macOS >= 26.2
-    and an Apple GPU of generation >= 17 (>= 18 for 'p'-suffix parts) — the M5
-    family and later. Older GPUs run the Metal-4 tensor ops on the plain shader
-    path, where int8 buys nothing, so they are `unavailable`, not merely slow."""
+    """mlx's own is_nax_available() (device.cpp, 0.32.2) — macOS >= 26.2 and an
+    Apple GPU of generation >= 17 (>= 18 for 'p'-suffix parts), the M5 family and
+    later — then `_gemm_probe()`, which compiles and runs the kernels, so this is
+    mlx work, not a device query. Older GPUs run the Metal-4 tensor ops on the
+    plain shader path, where int8 buys nothing, so they are `unavailable`, not
+    merely slow."""
     if platform.system() != "Darwin":
         return Availability(False, "not macOS")
     try:
@@ -161,7 +163,49 @@ def availability() -> Availability:
         return Availability(
             False, f"GPU {arch} predates the neural accelerators (gen {gen} < {need})"
         )
+    rejected = _gemm_probe()
+    if rejected is not None:
+        return Availability(False, f"the int8 GEMM probe failed: {rejected}")
     return Availability(True)
+
+
+_probe_ok = False
+
+
+def _gemm_probe() -> str | None:
+    """Compile and run both kernels once, on one routed-size tile (MIN_ROWS rows,
+    one group, one column tile); None when they work, else the error line. The
+    kernels compile against the OS's own Metal toolchain at runtime, so a new macOS
+    can reject a source that compiled before (#123: macOS 27's MSL 4.1). This runs
+    only GPU work, which fails cleanly; the same failure with a CPU-stream op in
+    flight deadlocks inside mlx's exception path (0.32.2) instead of raising. Only
+    success is remembered: a failure is probed again on the next call, so one bad
+    moment cannot switch int8 off for a long-lived daemon."""
+    global _probe_ok
+    if _probe_ok:
+        return None
+    import mlx.core as mx
+
+    try:
+        x = mx.zeros((MIN_ROWS, GROUP), dtype=mx.bfloat16)
+        weight = mx.zeros((BN, GROUP // 8), dtype=mx.uint32)
+        scales = mx.ones((BN, 1), dtype=mx.bfloat16)
+        biases = mx.zeros((BN, 1), dtype=mx.bfloat16)
+        mx.eval(qmm(*stage_a(x), weight, scales, biases))
+    except Exception as e:  # noqa: BLE001 — any failure means the kernels cannot serve
+        # The one-line reason cannot carry a compiler's full report; the log can.
+        logger.warning("int8 prefill: the GEMM probe failed:\n%s", e)
+        return _error_line(str(e))
+    _probe_ok = True
+    return None
+
+
+def _error_line(text: str) -> str:
+    """The line of a (compiler) error that names the failure. mlx prefixes the
+    compiler's report with a fixed "Unable to build metal library" line."""
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    named = [line for line in lines if "error:" in line]
+    return (named or lines or [text])[0]
 
 
 def qmm(qa: Any, sa: Any, ra: Any, weight: Any, scales: Any, biases: Any) -> Any:
@@ -446,6 +490,8 @@ def _warm_up(model: Any) -> None:
 def _refuse(reason: str) -> dict[str, Any]:
     """The requested accelerator cannot serve this load: say so once and report why.
     A silently inert opt-in is worse than one warning line."""
+    # A compiler error runs to dozens of lines; the status needs the one naming it.
+    reason = _error_line(reason)
     warnings.warn(
         f"sous: int8 prefill requested but unavailable ({reason}); prefilling with stock kernels",
         stacklevel=3,
@@ -473,6 +519,7 @@ def enable(model: Any, *, enabled: bool) -> dict[str, Any]:
         _warm_up(model)
     except Exception as e:  # noqa: BLE001 — degrade, never block the model
         _untag(model)
+        logger.warning("int8 prefill: enabling failed:\n%s", e)
         return _refuse(str(e))
     logger.info("int8 prefill: routed %d projections", routed)
     return {"state": "active", "reason": None, "routed": routed}

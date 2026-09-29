@@ -132,6 +132,7 @@ def _fake_platform(monkeypatch, mac_ver: str, arch: str):
 )
 def test_availability_mirrors_mlx_nax_rule(monkeypatch, mac_ver, arch, available, needle):
     _fake_platform(monkeypatch, mac_ver, arch)
+    monkeypatch.setattr(i8, "_gemm_probe", lambda: None)
     a = i8.availability()
     assert a.available is available
     if needle is not None:
@@ -143,10 +144,68 @@ def test_availability_on_this_machine_reports_a_reason_when_unavailable():
     assert a.available or (isinstance(a.reason, str) and a.reason)
 
 
+def test_availability_is_unavailable_when_the_gemm_does_not_compile(monkeypatch):
+    """A toolchain that rejects the kernel reads as unavailable, so the load warns
+    once and the `nax` tests below skip instead of hanging in mlx's exception path."""
+    _fake_platform(monkeypatch, "27.0", "applegpu_g17s")
+    monkeypatch.setattr(i8, "_gemm_probe", lambda: "Unable to build metal library from source")
+    a = i8.availability()
+    assert a.available is False
+    assert a.reason is not None and "Unable to build metal library" in a.reason
+
+
+_COMPILER_ERROR = (
+    "[metal::Device] Unable to build metal library from source\n"
+    "utils.h:544:27: error: no matching member function for call to "
+    "'get_destination_cooperative_tensor'\n"
+    "  auto acc0 = op.template get_destination_cooperative_tensor<...>();"
+)
+
+
+def test_gemm_probe_reports_the_compilers_error_line_and_logs_the_rest(monkeypatch, caplog):
+    """mlx's first line is the same for every compile failure; the reason keeps the
+    line that names this one, and the log keeps the whole report."""
+    monkeypatch.setattr(i8, "_probe_ok", False)
+    monkeypatch.setattr(i8, "stage_a", lambda x: (x, x, x))
+
+    def rejected(*args):
+        raise RuntimeError(_COMPILER_ERROR)
+
+    monkeypatch.setattr(i8, "qmm", rejected)
+    with caplog.at_level("WARNING", logger="sous.engine.int8prefill"):
+        reason = i8._gemm_probe()
+    assert reason == (
+        "utils.h:544:27: error: no matching member function for call to "
+        "'get_destination_cooperative_tensor'"
+    )
+    assert "auto acc0" in caplog.text
+
+
+def test_gemm_probe_remembers_success_but_not_failure(monkeypatch):
+    """One bad moment must not switch int8 off for the rest of a daemon's life."""
+    monkeypatch.setattr(i8, "_probe_ok", False)
+    monkeypatch.setattr(i8, "stage_a", lambda x: (x, x, x))
+    calls = []
+
+    def flaky(*args):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("transient")
+        return mx.zeros((1,))
+
+    monkeypatch.setattr(i8, "qmm", flaky)
+    assert i8._gemm_probe() == "transient"
+    assert i8._gemm_probe() is None
+    assert i8._gemm_probe() is None
+    assert len(calls) == 2
+
+
 # ---- GEMM (needs the tensor units; skipped where they are absent) ----------------
 
+# Read once: a failed probe is not remembered, so each call would compile again.
+_AVAILABILITY = i8.availability()
 nax = pytest.mark.skipif(
-    not i8.availability().available, reason=f"no tensor units: {i8.availability().reason}"
+    not _AVAILABILITY.available, reason=f"int8 GEMM unavailable: {_AVAILABILITY.reason}"
 )
 
 
@@ -520,6 +579,21 @@ def test_enable_degrades_when_warm_up_fails(monkeypatch):
         status = i8.enable(model, enabled=True)
     assert status == {"state": "unavailable", "reason": "compiler said no", "routed": 0}
     assert _tags(model) == []
+
+
+def test_enable_reports_one_line_of_a_compiler_error(monkeypatch):
+    """The whole compiler output would otherwise go into the load warning and the
+    status document's int8_prefill.reason."""
+    monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
+
+    def boom(model):
+        raise RuntimeError(_COMPILER_ERROR)
+
+    monkeypatch.setattr(i8, "_warm_up", boom)
+    with pytest.warns(UserWarning) as caught:
+        status = i8.enable(_Model([_Layer()]), enabled=True)
+    assert status["reason"].startswith("utils.h:544:27: error: no matching member function")
+    assert "\n" not in str(caught[0].message)
 
 
 def test_warm_up_runs_one_int8_linear_per_distinct_shape(monkeypatch):
