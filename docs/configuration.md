@@ -169,7 +169,11 @@ KV heads, head dim 256, bf16 attention, as the default model is) with no
 drafter or a DFlash one. Anywhere else the model-load line reads
 `attention_tile=unavailable` (`off` on the mlx-lm backend, which has no
 tile), the status document's `attention_tile` block carries the reason, and
-decode and verify run stock. The on-disk forks are
+decode and verify run stock. Because that is how most Macs load, the daemon
+logs it as one INFO line, not a warning; a `WARNING` saying `sous: attention
+tile unavailable (…)` means the tile should have run here and did not — its
+kernel or load-time check failed, or a pinned mlx or mlx-vlm changed under
+it. The on-disk forks are
 keyed by it: changing it starts the fork store cold once (so does any macOS
 update, whatever the setting). The daemon reads it at startup, so a change
 takes effect on its next start.

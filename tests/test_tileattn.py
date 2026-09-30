@@ -5,6 +5,7 @@ plain-mlx stand-in for the Metal kernel, which CI's GPU (macos-15) cannot
 compile; the `nax`-marked tests run the real kernel where the tensor units are.
 """
 
+import contextlib
 import importlib
 import inspect
 import json
@@ -841,19 +842,55 @@ def test_probe_passes_the_real_kernel(monkeypatch):
 # ---- the gates and enable() ---------------------------------------------------------
 
 
-def _refusal(lm, **kwargs) -> dict:
-    """enable() on `lm`, expected to refuse: exactly one warning, on one line,
-    in the tile's words, and the flag left clear."""
+class _Records(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@contextlib.contextmanager
+def _tile_log():
+    """Every record the tile's logger emits inside the block, INFO included.
+    Records still propagate, so a test's own caplog sees them too."""
+    logger = logging.getLogger("sous.engine.tileattn")
+    handler, level = _Records(), logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield handler.records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+
+
+def _refusal(lm, *, warned: bool, **kwargs) -> dict:
+    """enable() on `lm`, expected to refuse, leaving the flag clear and
+    mlx-vlm's decode global the object it found. A load the tile does not
+    apply to (the Mac, the model, the drafter's kind, the split target) is
+    one INFO line and no warning, since that is the state most Macs load in;
+    one where it should have run and did not is exactly one warning, on one
+    line, in the tile's words."""
     kwargs = {"drafter_kind": None, "verify_status": None, **kwargs}
-    with warnings.catch_warnings(record=True) as caught:
+    installed = _language_module().scaled_dot_product_attention
+    with warnings.catch_warnings(record=True) as caught, _tile_log() as records:
         warnings.simplefilter("always")
         status = tileattn.enable(lm, enabled=True, **kwargs)
     messages = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
-    assert len(messages) == 1, messages
-    assert messages[0].startswith("sous: attention tile unavailable (")
-    assert "\n" not in messages[0]
+    infos = [r.getMessage() for r in records if r.levelno == logging.INFO]
     assert status["state"] == "unavailable" and status["splits"] is None
+    if warned:
+        assert len(messages) == 1, messages
+        assert messages[0].startswith("sous: attention tile unavailable (")
+        assert "\n" not in messages[0]
+        assert not any(m.startswith("attention tile unavailable") for m in infos), infos
+    else:
+        assert messages == []
+        assert infos == [f"attention tile unavailable: {status['reason']}"]
     assert tileattn._active_splits == 0
+    assert _language_module().scaled_dot_product_attention is installed
     return status
 
 
@@ -867,20 +904,23 @@ def test_enable_off_returns_before_any_guard(monkeypatch):
     monkeypatch.setattr(tileattn.nax, "platform_reason", untouchable)
     monkeypatch.setattr(tileattn, "_model_reason", untouchable)
     monkeypatch.setattr(tileattn, "probe", untouchable)
-    with warnings.catch_warnings(record=True) as caught:
+    installed = _language_module().scaled_dot_product_attention
+    with warnings.catch_warnings(record=True) as caught, _tile_log() as records:
         warnings.simplefilter("always")
         status = tileattn.enable(
             types.SimpleNamespace(), enabled=False, drafter_kind="mtp", verify_status=None
         )
     assert status == {"state": "off", "reason": None, "splits": None, "probe_seconds": None}
     assert [w for w in caught if issubclass(w.category, UserWarning)] == []
+    assert records == []
     assert tileattn._active_splits == 0
+    assert _language_module().scaled_dot_product_attention is installed
 
 
 def test_enable_reports_the_platform_whatever_the_model(monkeypatch):
     tfx.guard_tile_state(monkeypatch)
     monkeypatch.setattr(tileattn.nax, "platform_reason", lambda: "macOS 15.5 < 26.2")
-    status = _refusal(types.SimpleNamespace(), drafter_kind="mtp")
+    status = _refusal(types.SimpleNamespace(), warned=False, drafter_kind="mtp")
     assert status["reason"] == "macOS 15.5 < 26.2" and status["probe_seconds"] is None
 
 
@@ -893,6 +933,10 @@ _GUARD_REASONS = [
     "split target 16 not measured (measured: 20)",
     "parity: verify rows at prefix 1535, T=6 differ from decode",
 ]
+# Which of them warn: a pinned dependency that drifted and a failed probe.
+# The Mac, the model, the drafter's kind and the core count only say the tile
+# does not apply to this load.
+_GUARD_WARNS = [False, False, False, True, True, False, True]
 
 
 @pytest.mark.parametrize("first", range(len(_GUARD_REASONS)))
@@ -921,7 +965,8 @@ def test_enable_names_the_first_failing_guard(monkeypatch, first):
     ]
     for brk in breakers[first:]:
         brk()
-    assert _refusal(lm, **kwargs)["reason"] == _GUARD_REASONS[first]
+    status = _refusal(lm, warned=_GUARD_WARNS[first], **kwargs)
+    assert status["reason"] == _GUARD_REASONS[first]
 
 
 def test_enable_refuses_other_model_types(monkeypatch):
@@ -929,40 +974,47 @@ def test_enable_refuses_other_model_types(monkeypatch):
     lm = tfx.tiny_language_model()
     # The MoE variant reuses these very attention classes.
     monkeypatch.setattr(lm, "model_type", "qwen3_5_moe")
-    assert _refusal(lm)["reason"] == "unsupported model type 'qwen3_5_moe' (qwen3_5 only)"
+    status = _refusal(lm, warned=False)
+    assert status["reason"] == "unsupported model type 'qwen3_5_moe' (qwen3_5 only)"
 
 
 def test_enable_refuses_a_model_without_full_attention(monkeypatch):
     tfx.tile_ready(monkeypatch)
     monkeypatch.setattr(verifyattn, "_attention_modules", lambda model: [])
-    assert _refusal(tfx.tiny_language_model())["reason"] == "no full-attention layers"
+    assert _refusal(tfx.tiny_language_model(), warned=False)["reason"] == (
+        "no full-attention layers"
+    )
 
 
 def test_enable_refuses_another_attention_shape(monkeypatch):
     tfx.tile_ready(monkeypatch)
     lm = tfx.tiny_language_model(heads=6, kv_heads=1)
-    assert _refusal(lm)["reason"] == "unsupported attention shape 6/1/256 (24/4/256 only)"
+    status = _refusal(lm, warned=False)
+    assert status["reason"] == "unsupported attention shape 6/1/256 (24/4/256 only)"
 
 
 def test_enable_refuses_another_attention_scale(monkeypatch):
     tfx.tile_ready(monkeypatch)
     lm = tfx.tiny_language_model()
     monkeypatch.setattr(verifyattn._attention_modules(lm)[1], "scale", 0.1)
-    assert _refusal(lm)["reason"] == "attention scale 0.1 is not 1/16"
+    assert _refusal(lm, warned=False)["reason"] == "attention scale 0.1 is not 1/16"
 
 
 def test_enable_refuses_another_attention_dtype(monkeypatch):
     tfx.tile_ready(monkeypatch)
     lm = tfx.tiny_language_model()
     lm.set_dtype(mx.float16)
-    assert _refusal(lm)["reason"] == f"attention dtype {mx.float16} is not bfloat16"
+    assert _refusal(lm, warned=False)["reason"] == f"attention dtype {mx.float16} is not bfloat16"
 
 
 @pytest.mark.parametrize("kind", ["mtp", "eagle3"])
 def test_enable_refuses_drafters_other_than_dflash(monkeypatch, kind):
     tfx.tile_ready(monkeypatch)
     status = _refusal(
-        tfx.tiny_language_model(), drafter_kind=kind, verify_status={"state": "active"}
+        tfx.tiny_language_model(),
+        warned=False,
+        drafter_kind=kind,
+        verify_status={"state": "active"},
     )
     assert status["reason"] == f"drafter kind {kind!r} (dflash only)"
 
@@ -977,7 +1029,9 @@ def test_enable_refuses_drafters_other_than_dflash(monkeypatch, kind):
 )
 def test_enable_needs_exact_verify_beside_a_dflash_drafter(monkeypatch, verify_status):
     tfx.tile_ready(monkeypatch)
-    status = _refusal(tfx.tiny_language_model(), drafter_kind="dflash", verify_status=verify_status)
+    status = _refusal(
+        tfx.tiny_language_model(), warned=True, drafter_kind="dflash", verify_status=verify_status
+    )
     state = verify_status["state"] if verify_status else None
     assert status["reason"] == (
         f"exact verify attention is {state}: the verifier would run stock attention beside the tile"
@@ -985,20 +1039,24 @@ def test_enable_needs_exact_verify_beside_a_dflash_drafter(monkeypatch, verify_s
 
 
 def test_enable_passes_no_drafter_and_a_dflash_one_with_exact_verify():
-    assert tileattn._drafter_reason(None, None) is None
-    assert tileattn._drafter_reason("dflash", {"state": "active", "reason": None}) is None
+    assert tileattn._drafter_reason(None) is None
+    assert tileattn._drafter_reason("dflash") is None
+    assert tileattn._verify_reason(None, None) is None
+    assert tileattn._verify_reason("dflash", {"state": "active", "reason": None}) is None
 
 
 def test_enable_refuses_an_unvalidated_mlx(monkeypatch):
     tfx.tile_ready(monkeypatch)
     monkeypatch.setattr(mx, "__version__", "0.99.0")
-    assert _refusal(tfx.tiny_language_model())["reason"] == "mlx 0.99.0 not validated"
+    assert _refusal(tfx.tiny_language_model(), warned=True)["reason"] == (
+        "mlx 0.99.0 not validated"
+    )
 
 
 def test_enable_refuses_a_forced_sdpa_block_count(monkeypatch):
     tfx.tile_ready(monkeypatch)
     monkeypatch.setenv("MLX_SDPA_BLOCKS", "4")
-    assert _refusal(tfx.tiny_language_model())["reason"] == "MLX_SDPA_BLOCKS is set"
+    assert _refusal(tfx.tiny_language_model(), warned=True)["reason"] == "MLX_SDPA_BLOCKS is set"
 
 
 def test_enable_validates_the_locked_mlx_vlm_decode_sources():
@@ -1015,7 +1073,7 @@ def test_enable_refuses_a_changed_decode_source(monkeypatch):
     monkeypatch.setitem(
         tileattn.VALIDATED_DECODE_SOURCES, "Qwen3_5Model.__call__", frozenset({"0" * 64})
     )
-    reason = _refusal(tfx.tiny_language_model())["reason"]
+    reason = _refusal(tfx.tiny_language_model(), warned=True)["reason"]
     assert reason == "mlx-vlm Qwen3_5Model.__call__ changed"
 
 
@@ -1040,7 +1098,7 @@ def test_enable_needs_a_measured_core_count_of_this_gpu(monkeypatch, case):
         ),
     }[case]
     monkeypatch.setattr(tileattn.gpucores, "read", lambda: reading)
-    assert _refusal(tfx.tiny_language_model())["reason"] == reason
+    assert _refusal(tfx.tiny_language_model(), warned=False)["reason"] == reason
 
 
 def test_enable_refuses_a_failed_probe_with_its_cost(monkeypatch):
@@ -1048,25 +1106,38 @@ def test_enable_refuses_a_failed_probe_with_its_cost(monkeypatch):
     monkeypatch.setattr(
         tileattn, "probe", lambda modules, splits, arch: "correctness: n=1536 is 0.101 from stock"
     )
-    status = _refusal(tfx.tiny_language_model())
+    status = _refusal(tfx.tiny_language_model(), warned=True)
     assert status["reason"] == "correctness: n=1536 is 0.101 from stock"
     assert isinstance(status["probe_seconds"], float)
 
 
-def test_enable_refuses_an_exception_in_a_guard_with_its_error_line(monkeypatch):
+def _enabling_failures(caplog) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == "sous.engine.tileattn" and r.getMessage() == "attention tile: enabling failed"
+    ]
+
+
+def test_enable_refuses_an_exception_in_a_guard_with_its_error_line(monkeypatch, caplog):
     tfx.tile_ready(monkeypatch)
     monkeypatch.setattr(tileattn, "_active_splits", 20)
+    error = RuntimeError("Unable to build metal library\nprogram_source:3:1: error: boom")
 
     def broken(model):
-        raise RuntimeError("Unable to build metal library\nprogram_source:3:1: error: boom")
+        raise error
 
     monkeypatch.setattr(verifyattn, "_attention_modules", broken)
-    status = _refusal(tfx.tiny_language_model())
+    status = _refusal(tfx.tiny_language_model(), warned=True)
     assert status["reason"] == "program_source:3:1: error: boom"
     assert status["probe_seconds"] is None
+    # The warning keeps one line; the log keeps where it was raised.
+    (record,) = _enabling_failures(caplog)
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is not None and record.exc_info[1] is error
 
 
-def test_enable_refuses_a_probe_that_raises_and_reports_what_it_cost(monkeypatch):
+def test_enable_refuses_a_probe_that_raises_and_reports_what_it_cost(monkeypatch, caplog):
     def fails_past_the_first_step(q, k, v, n, chunk):
         if n >= 1921:
             raise RuntimeError("device lost")
@@ -1074,10 +1145,12 @@ def test_enable_refuses_a_probe_that_raises_and_reports_what_it_cost(monkeypatch
 
     tfx.tile_ready(monkeypatch)
     _probe_setup(monkeypatch, fails_past_the_first_step)
-    status = _refusal(tfx.tiny_language_model())
+    status = _refusal(tfx.tiny_language_model(), warned=True)
     assert "device lost" in status["reason"]
     assert isinstance(status["probe_seconds"], float)
     assert tileattn._active_splits == 0
+    (record,) = _enabling_failures(caplog)
+    assert record.exc_info is not None and "device lost" in str(record.exc_info[1])
 
 
 @pytest.mark.parametrize(
@@ -1155,10 +1228,10 @@ def test_enable_then_a_later_load_or_clear_leaves_decode_and_verify_stock(monkey
         monkeypatch.setattr(
             tileattn.gpucores, "read", lambda: gpucores.GPUCores(16, device, None, "iokit")
         )
-        _refusal(lm)
+        _refusal(lm, warned=False)
     elif ending == "other model":
         monkeypatch.setattr(lm, "model_type", "qwen3_5_moe")
-        _refusal(lm)
+        _refusal(lm, warned=False)
     else:
         tileattn.clear()
 

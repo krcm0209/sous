@@ -655,16 +655,26 @@ def _probe_steps(modules: list[Any], splits: int, arch: str, language: Any) -> s
     return None
 
 
-def _refuse(reason: str, probe_seconds: float | None = None) -> dict[str, Any]:
-    """This load cannot use the tile: say so once and report why. A default-on
-    switch that is silently inert is worse than one warning line."""
+def _refuse(
+    reason: str, probe_seconds: float | None = None, *, expected: bool = False
+) -> dict[str, Any]:
+    """This load cannot use the tile: report why. An `expected` refusal says
+    only that the tile does not apply here (the Mac, the model, the drafter's
+    kind, the split target), which is how most Macs load a default-on tile:
+    one INFO line, and the reason in the status. Any other refusal means the
+    tile should have run and did not (a kernel or probe failure, a pinned
+    dependency that drifted, the exact verifier missing beside DFlash):
+    one warning, since a switch that is silently inert there hides a fault."""
     # A compiler error runs to dozens of lines; the status needs the one naming it.
     reason = _error_line(reason)
-    warnings.warn(
-        f"sous: attention tile unavailable ({reason}); "
-        "decode and verify run the stock attention paths",
-        stacklevel=3,
-    )
+    if expected:
+        logger.info("attention tile unavailable: %s", reason)
+    else:
+        warnings.warn(
+            f"sous: attention tile unavailable ({reason}); "
+            "decode and verify run the stock attention paths",
+            stacklevel=3,
+        )
     return {
         "state": "unavailable",
         "reason": reason,
@@ -698,16 +708,19 @@ def _model_reason(model: Any) -> str | None:
     return None
 
 
-def _drafter_reason(
-    drafter_kind: str | None, verify_status: Mapping[str, Any] | None
-) -> str | None:
+def _drafter_reason(drafter_kind: str | None) -> str | None:
+    """A drafter whose proposals could reach the hooked global, or None."""
+    if drafter_kind is None or drafter_kind in SUPPORTED_DRAFTER_KINDS:
+        return None
+    return f"drafter kind {drafter_kind!r} (dflash only)"
+
+
+def _verify_reason(drafter_kind: str | None, verify_status: Mapping[str, Any] | None) -> str | None:
     """With a drafter, the verifier must be on its exact grouped path too:
     otherwise decode runs the tile while verify runs stock SDPA, and output
     with the drafter no longer equals output without it."""
     if drafter_kind is None:
         return None
-    if drafter_kind not in SUPPORTED_DRAFTER_KINDS:
-        return f"drafter kind {drafter_kind!r} (dflash only)"
     state = (verify_status or {}).get("state")
     if state != "active":
         return (
@@ -762,14 +775,16 @@ def enable(
         # that whatever its model.
         reason = nax.platform_reason()
         if reason is not None:
-            return _refuse(reason)
+            return _refuse(reason, expected=True)
         import mlx.core as mx
 
         from sous.engine import verifyattn
 
+        reason = _model_reason(model) or _drafter_reason(drafter_kind)
+        if reason is not None:
+            return _refuse(reason, expected=True)
         reason = (
-            _model_reason(model)
-            or _drafter_reason(drafter_kind, verify_status)
+            _verify_reason(drafter_kind, verify_status)
             or verifyattn._gate()
             or _decode_sources_reason()
         )
@@ -777,7 +792,7 @@ def enable(
             return _refuse(reason)
         splits, reason = _split_target(str(mx.device_info().get("device_name", "")))
         if splits is None:
-            return _refuse(reason or "no split target")
+            return _refuse(reason or "no split target", expected=True)
         modules = verifyattn._attention_modules(model)
         start = time.perf_counter()
         try:
@@ -794,4 +809,6 @@ def enable(
         return {"state": "active", "reason": None, "splits": splits, "probe_seconds": seconds}
     except Exception as e:  # noqa: BLE001 — degrade, never block the model
         _active_splits = 0
+        # The warning carries one line; the traceback goes to the log.
+        logger.warning("attention tile: enabling failed", exc_info=True)
         return _refuse(str(e) or type(e).__name__, seconds)

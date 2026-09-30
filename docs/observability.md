@@ -195,7 +195,9 @@ verify's attention run on the tensor-unit tile, with
 `attention_tile_splits=` and `attention_tile_probe_s=` when it does; `off`
 means `[model].attention_tile = false` or the mlx-lm backend, and
 `unavailable` a load the tile cannot serve — the status document's
-`attention_tile` block carries the reason). One
+`attention_tile` block carries the reason; the log has it as one INFO line
+where the tile does not apply to the Mac, the model or the drafter, and as
+a `WARNING py.warnings` line where it should have run and did not). One
 more line names the Anthropic tool *types* a turn dropped, when any.
 Each forwarded request logs one line too: `upstream`, method, path, the
 model id when the body named one, the upstream's status, and seconds to

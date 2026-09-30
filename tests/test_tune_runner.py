@@ -638,7 +638,7 @@ def test_an_arm_that_inherits_the_tile_runs_stock_where_the_engine_cannot_serve_
     """Every arm inherits attention_tile from the user's config, and none is
     built to measure it: an engine that reports the tile unavailable must
     not refuse the arm, since the daemon would serve that checkpoint with
-    stock attention and one warning."""
+    stock attention."""
     lines = []
     outcome = run_suite(
         _arm(tmp_path),
@@ -693,7 +693,11 @@ def test_no_tile_notice_when_the_tile_is_active_or_the_arm_runs_stock(tmp_path):
         assert not any("attention tile" in line for line in lines), lines
 
 
-def test_the_tile_notice_names_the_engines_state_when_it_gives_no_reason(tmp_path):
+def test_the_tile_notice_is_only_for_an_engine_that_reports_it_unavailable(tmp_path):
+    """`off` is an engine with no tile at all (the mlx-lm backend), and an
+    engine that reports nothing has no tile either: neither is a machine
+    where the tile cannot run, so neither gets the notice."""
+
     class Off(FakeEngine):
         drafter = ""
         attention_tile_status = {"state": "off", "reason": None}
@@ -701,21 +705,29 @@ def test_the_tile_notice_names_the_engines_state_when_it_gives_no_reason(tmp_pat
     class Silent(FakeEngine):
         drafter = ""
 
-    for engine, reason in ((Off, "engine reports off"), (Silent, "engine reports nothing")):
+    class Unexplained(FakeEngine):
+        drafter = ""
+        attention_tile_status = {"state": "unavailable", "reason": None}
+
+    notice = "  m: attention tile unavailable here (no reason given); "
+    notice += "the engine runs stock, as the daemon would"
+    for name, engine, expected in (
+        ("off", Off, []),
+        ("silent", Silent, []),
+        ("unexplained", Unexplained, [notice]),
+    ):
         lines = []
-        run_suite(
+        outcome = run_suite(
             _arm(tmp_path),
             [_task()],
             runs=1,
             done=set(),
             record=lambda r: None,
-            scratch=tmp_path / f"s-{reason.split()[-1]}",
+            scratch=tmp_path / f"s-{name}",
             out=lines.append,
             factory=lambda mid, engine=engine: engine([FINISH]),
             python=PYTHON,
             active_memory=lambda: 0,
         )
-        assert (
-            f"  m: attention tile unavailable here ({reason}); "
-            "the engine runs stock, as the daemon would"
-        ) in lines
+        assert len(outcome.runs) == 1 and outcome.error is None, name
+        assert [line for line in lines if "attention tile" in line] == expected, name

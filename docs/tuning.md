@@ -56,8 +56,10 @@ flag to understand. The full run may therefore change `[model].id`, the
 drafter and block size, the window, `int8_prefill` and `temperature`.
 Every arm inherits `[model].attention_tile` and no arm changes it; suite
 rows are keyed by it, so a `--resume` after it was flipped runs those arms
-again instead of mixing tile and stock rows, and where the tile cannot run,
-the arm prints a notice and runs stock, as the daemon would.
+again instead of mixing tile and stock rows, and where the engine reports
+the tile `unavailable`, the arm prints a notice with the reason and runs
+stock, as the daemon would (an `off` engine, such as the mlx-lm backend's,
+gets no notice).
 
 The daemon is asked to release the model first (`POST /sous/unload`) and
 refuses while a `sous claude` session holds it, a turn is in flight, or a

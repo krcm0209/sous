@@ -327,16 +327,17 @@ def _check_int8(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> No
 
 def _check_tile(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> None:
     """Every arm inherits the attention tile from the user's config and none
-    exists to measure it, so unlike int8 there is nothing to fail: wherever
-    the engine reports the tile anything but active, the daemon would serve
-    this checkpoint with stock attention and one warning, and the arm runs
-    the same way after a notice."""
+    exists to measure it, so unlike int8 there is nothing to fail: where the
+    engine reports the tile unavailable, the daemon would serve this
+    checkpoint with stock attention, and the arm runs the same way after a
+    notice. `off`, or no status, is an engine with no tile (the mlx-lm
+    backend), not a machine the tile cannot run on: no notice."""
     if not arm.attention_tile:
         return
     status = engine.attention_tile_status or {}
-    if status.get("state") == "active":
+    if status.get("state") != "unavailable":
         return
-    reason = status.get("reason") or f"engine reports {status.get('state', 'nothing')}"
+    reason = status.get("reason") or "no reason given"
     out(
         f"  {arm.label}: attention tile unavailable here ({reason}); "
         "the engine runs stock, as the daemon would"

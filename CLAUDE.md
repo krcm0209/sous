@@ -380,8 +380,18 @@ goal.
   prove every read stops at n, compares with stock one-row SDPA within
   1e-2 relative RMS (parity cannot catch a kernel that is wrong the same
   way on both paths) and runs one of the model's own attention modules
-  through a restored-style `KVCache`. Like int8 it never raises: every
-  refusal is one warning plus `unavailable`. The engine constructors
+  through a restored-style `KVCache`. Like int8 it never raises, but being
+  on by default its refusals come in two kinds (`_refuse(expected=...)`). One
+  that only says the tile does not apply to this load — the platform rule,
+  the split target (unreadable, another GPU, unmeasured), the model's type,
+  shape, scale or dtype, a drafter kind other than `dflash` — is one INFO
+  line plus `unavailable` with its reason: that is how most Macs load, and
+  a WARNING there reads as a fault nobody can act on. One that says it
+  should have run and did not — a compile or probe failure, any exception
+  (logged with its traceback), mlx, `MLX_SDPA_BLOCKS` or source-hash
+  drift, exact verify not active beside a DFlash drafter — is one
+  `warnings.warn` plus `unavailable`. `sous tune` prints its per-arm
+  notice only for `unavailable`, never for `off`. The engine constructors
   default it off (`VLMEngine(attention_tile=False)`, like `int8_prefill`);
   only `default_engine_factory` hands them the config's `true`, so tests
   and scripts keep today's paths unless they opt in. Nothing is logged per
