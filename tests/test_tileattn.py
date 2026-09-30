@@ -5,6 +5,8 @@ plain-mlx stand-in for the Metal kernel, which CI's GPU (macos-15) cannot
 compile; the `nax`-marked tests run the real kernel where the tensor units are.
 """
 
+import importlib
+import inspect
 from importlib.resources import files
 
 import pytest
@@ -431,3 +433,251 @@ def test_real_kernel_is_no_less_accurate_than_stock(n, gain):
     tile_error = _relative_rms(tileattn.decode(q, k, v, 20), want)
     stock_error = _relative_rms(stock, want)
     assert tile_error <= 1.05 * stock_error, (tile_error, stock_error)
+
+
+# ---- the decode hook -------------------------------------------------------------
+
+
+def _tile_counts_since(before):
+    """The counters that moved since `before`, by how much."""
+    return {k: n - before[k] for k, n in tileattn.calls.items() if n != before[k]}
+
+
+def _language_module():
+    return importlib.import_module("mlx_vlm.models.qwen3_5.language")
+
+
+def _kv_cache_with(**attrs):
+    from mlx_vlm.models.cache import KVCache
+
+    cache = KVCache()
+    for name, value in attrs.items():
+        setattr(cache, name, value)
+    return cache
+
+
+def _subclass_cache():
+    from mlx_vlm.models.cache import KVCache
+
+    class Subclass(KVCache):
+        pass
+
+    return Subclass()
+
+
+def _decode_call(n=2000, t=1, *, queries=None, dtype=None, cache=None, **kwargs):
+    q, k, v = tfx.serving_qkv(n, t)
+    if dtype is not None:
+        q, k, v = q.astype(dtype), k.astype(dtype), v.astype(dtype)
+    cache = _kv_cache_with() if cache is None else cache
+    call = {"cache": cache, "scale": tileattn.SCALE, "mask": None, **kwargs}
+    return (q if queries is None else queries(q), k, v), call
+
+
+# case -> (the call, the counter it moves; None moves none)
+_PASSED_THROUGH = {
+    "causal mask": (lambda: _decode_call(mask="causal"), "decode_out"),
+    "array mask": (
+        lambda: _decode_call(mask=mx.ones((1, 1, 1, 2000), dtype=mx.bool_)),
+        "decode_out",
+    ),
+    "sinks": (lambda: _decode_call(sinks=mx.zeros((24,), dtype=mx.bfloat16)), "decode_out"),
+    "float16": (lambda: _decode_call(dtype=mx.float16), "decode_out"),
+    "scale 0.1": (lambda: _decode_call(scale=0.1), "decode_out"),
+    "16 query heads": (lambda: _decode_call(queries=lambda q: q[:, :16]), "decode_out"),
+    "KVCache subclass": (lambda: _decode_call(cache=_subclass_cache()), "decode_out"),
+    "left padding": (
+        lambda: _decode_call(cache=_kv_cache_with(left_padding=mx.array([1]))),
+        "decode_out",
+    ),
+    "decode left padding": (
+        lambda: _decode_call(cache=_kv_cache_with(_qwen3_5_decode_left_padding=[1])),
+        "decode_out",
+    ),
+    "flag clear": (lambda: _decode_call(), None),
+    "two rows": (lambda: _decode_call(t=2), None),
+    "below N0": (lambda: _decode_call(n=tileattn.N0 - 1), "decode_stock"),
+}
+
+
+def test_the_decode_hook_serves_a_plain_one_row_call(monkeypatch):
+    tfx.hooked(monkeypatch)
+    q, k, v = tfx.serving_qkv(2000, 1)
+    before = dict(tileattn.calls)
+    got = _language_module().scaled_dot_product_attention(
+        q, k, v, cache=_kv_cache_with(), scale=tileattn.SCALE, mask=None
+    )
+    assert _tile_counts_since(before) == {"decode_tile": 1}
+    assert mx.array_equal(got, tileattn.decode(q, k, v, 20)).item()
+
+
+@pytest.mark.parametrize("case", list(_PASSED_THROUGH))
+def test_the_decode_hook_hands_every_other_call_to_mlx_vlm(monkeypatch, case):
+    from mlx_vlm.models.base import scaled_dot_product_attention as original
+
+    build, counter = _PASSED_THROUGH[case]
+    tfx.hooked(monkeypatch, splits=0 if case == "flag clear" else 20)
+    args, kwargs = build()
+    before = dict(tileattn.calls)
+    got = _language_module().scaled_dot_product_attention(*args, **kwargs)
+    assert _tile_counts_since(before) == ({} if counter is None else {counter: 1})
+    assert mx.array_equal(got, original(*args, **kwargs)).item()
+
+
+def test_the_decode_hook_hands_a_quantized_cache_over_untouched(monkeypatch):
+    """mlx-vlm's quantized path needs quantized K/V, so this one is checked against a
+    recording original: the same arguments, and its answer returned."""
+    seen = []
+
+    def original(*args, **kwargs):
+        seen.append((args, kwargs))
+        return "mlx-vlm's answer"
+
+    wrapped = tileattn._decode_wrapper(original)
+    assert inspect.unwrap(wrapped) is original and getattr(wrapped, tileattn._HOOK_MARK)
+    monkeypatch.setattr(tileattn, "_active_splits", 20)
+    q, k, v = tfx.serving_qkv(2000, 1)
+    cache = _kv_cache_with(bits=4)
+    before = dict(tileattn.calls)
+    assert wrapped(q, k, v, cache=cache, scale=tileattn.SCALE, mask=None) == "mlx-vlm's answer"
+    ((args, kwargs),) = seen
+    assert all(a is b for a, b in zip(args, (q, k, v), strict=True))
+    assert kwargs == {"cache": cache, "scale": tileattn.SCALE, "mask": None}
+    assert _tile_counts_since(before) == {"decode_out": 1}
+
+
+def test_install_decode_hook_is_idempotent(monkeypatch):
+    from mlx_vlm.models.base import scaled_dot_product_attention as original
+
+    language = _language_module()
+    # Registers the restore: the replacement must not outlive this test.
+    monkeypatch.setattr(
+        language, "scaled_dot_product_attention", language.scaled_dot_product_attention
+    )
+    tileattn.install_decode_hook()
+    first = language.scaled_dot_product_attention
+    tileattn.install_decode_hook()
+    assert language.scaled_dot_product_attention is first
+    assert getattr(first, tileattn._HOOK_MARK) and inspect.unwrap(first) is original
+
+
+@pytest.fixture(scope="module")
+def tiny_verifier():
+    """The tiny model, its token ids, and prefilled caches by prefix. A verify
+    forward rolls its cache back, so those caches are shared; a test that decodes
+    builds its own."""
+    lm = tfx.tiny_language_model()
+    ids = mx.random.randint(0, tfx.VOCAB, (2000,), key=mx.random.key(7)).tolist()
+    return lm, ids, {}
+
+
+def test_a_real_attention_module_reaches_the_tile_once(tiny_verifier, monkeypatch):
+    """One-row decode through Qwen3_5Attention.__call__ itself: its projections, rope
+    and cache append, then the replaced global."""
+    lm, ids, _ = tiny_verifier
+    index = next(i for i, layer in enumerate(lm.layers) if not layer.is_linear)
+    module = lm.layers[index].self_attn
+    stock_cache = tfx.prefill_cache(lm, ids[:1700])[index]
+    tile_cache = tfx.prefill_cache(lm, ids[:1700])[index]
+    x = mx.random.normal((1, 1, 256), key=mx.random.key(3)).astype(mx.bfloat16)
+    tfx.hooked(monkeypatch, splits=0)
+    want = module(x, mask=None, cache=stock_cache)
+    monkeypatch.setattr(tileattn, "_active_splits", 20)
+    before = dict(tileattn.calls)
+    got = module(x, mask=None, cache=tile_cache)
+    mx.eval(want, got)
+    assert stock_cache.offset == tile_cache.offset == 1701
+    assert _tile_counts_since(before) == {"decode_tile": 1}
+    assert _relative_rms(got, want) <= 1e-2
+
+
+# ---- the verify branch, through mlx-vlm's exact verifier -------------------------
+
+
+def _prefilled_cache(verifier, prefix):
+    lm, ids, caches = verifier
+    if prefix not in caches:
+        caches[prefix] = tfx.prefill_cache(lm, ids[:prefix])
+    return caches[prefix]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("prefix", [1000, 1530, 1700, 1915])
+def test_verify_rows_follow_the_plan(tiny_verifier, monkeypatch, prefix):
+    """Below N0, above it, and straddling N0 and the step at 1921, T = 1..16: each of
+    the two full-attention layers sends one call, cut as verify_plan says."""
+    lm, ids, _ = tiny_verifier
+    tfx.verify_ready(monkeypatch, lm)
+    tfx.hooked(monkeypatch)
+    cache = _prefilled_cache(tiny_verifier, prefix)
+    for t in range(1, 17):
+        runs = tileattn.verify_plan(prefix, t, 20)
+        tile_rows = sum(k - j for j, k, chunk in runs if chunk)
+        expected = {
+            "verify_calls": 2,
+            f"verify_t{t}" if t <= tileattn.MAX_RUN else "verify_t9_up": 2,
+            "verify_rows_tile": 2 * tile_rows,
+            "verify_rows_stock": 2 * (t - tile_rows),
+            "verify_launches": 2 * sum(1 for *_, chunk in runs if chunk),
+            "verify_straddles": 2 * (len(runs) > 1),
+        }
+        before = dict(tileattn.calls)
+        tfx.verify_forward(lm, cache, ids[prefix : prefix + t])
+        assert _tile_counts_since(before) == {k: n for k, n in expected.items() if n}, (prefix, t)
+        assert all(c.offset == prefix for c in cache if hasattr(c, "offset"))
+
+
+def test_an_untagged_verifier_never_reaches_the_tile(tiny_verifier, monkeypatch):
+    lm, ids, _ = tiny_verifier
+    for module in tfx.verify_ready(monkeypatch, lm):
+        object.__setattr__(module, verifyattn._TAG, 0)
+    cache = _prefilled_cache(tiny_verifier, 1700)
+    tokens = ids[1700:1703]
+    tfx.hooked(monkeypatch, splits=0)
+    stock = tfx.verify_forward(lm, cache, tokens)
+    monkeypatch.setattr(tileattn, "_active_splits", 20)
+    before = dict(tileattn.calls)
+    ours = tfx.verify_forward(lm, cache, tokens)
+    assert _tile_counts_since(before) == {}
+    assert all(mx.array_equal(a, b).item() for a, b in zip(stock, ours, strict=True))
+
+
+def test_a_tagged_verify_the_scope_refuses_is_counted_out_of_scope(tiny_verifier, monkeypatch):
+    """A served turn should never take this path, so its count is the signal that a
+    tagged module fell out of scope."""
+
+    class OtherCache:
+        pass
+
+    lm, ids, _ = tiny_verifier
+    tfx.verify_ready(monkeypatch, lm)
+    monkeypatch.setattr(verifyattn, "_KVCACHE", OtherCache)
+    cache = _prefilled_cache(tiny_verifier, 1700)
+    tokens = ids[1700:1703]
+    tfx.hooked(monkeypatch, splits=0)
+    stock = tfx.verify_forward(lm, cache, tokens)
+    monkeypatch.setattr(tileattn, "_active_splits", 20)
+    before, original = dict(tileattn.calls), verifyattn.calls["original"]
+    ours = tfx.verify_forward(lm, cache, tokens)
+    assert _tile_counts_since(before) == {"verify_out": 2}
+    assert verifyattn.calls["original"] - original == 2
+    assert all(mx.array_equal(a, b).item() for a, b in zip(stock, ours, strict=True))
+
+
+@pytest.mark.parametrize(("owner", "check"), [(verifyattn, "_post_ok"), (tileattn, "in_scope")])
+@pytest.mark.parametrize("t", [1, 2, 3, 5])
+def test_a_declined_verify_computes_todays_attention(tiny_verifier, monkeypatch, owner, check, t):
+    """After the projections the rows are already appended, so a decline must
+    reproduce the stock verifier (T = 1, 2) or the grouped path (T >= 3) itself."""
+    lm, ids, _ = tiny_verifier
+    tfx.verify_ready(monkeypatch, lm)
+    cache = _prefilled_cache(tiny_verifier, 1700)
+    tokens = ids[1700 : 1700 + t]
+    tfx.hooked(monkeypatch, splits=0)
+    stock = tfx.verify_forward(lm, cache, tokens)
+    monkeypatch.setattr(owner, check, lambda *a: False)
+    monkeypatch.setattr(tileattn, "_active_splits", 20)
+    before = dict(tileattn.calls)
+    ours = tfx.verify_forward(lm, cache, tokens)
+    assert _tile_counts_since(before) == {"verify_declined": 2}
+    assert all(mx.array_equal(a, b).item() for a, b in zip(stock, ours, strict=True))

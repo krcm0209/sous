@@ -19,8 +19,11 @@ guards stand between it and a served turn:
   append the verify rows to the KV cache, so the original method cannot be
   re-entered after them.
 
-T = 2 is left alone. The stock verifier already makes one call there, and
-grouping it would change output where rows straddle a plan transition.
+While the attention tile (tileattn) is inactive, T = 2 is left alone: the stock
+verifier already makes one call there, and grouping it would change output where
+rows straddle a plan transition. While it is active, every T from 1 goes to
+tileattn, whose rows below its N0 take grouped_attention, T = 2 included, so that
+they equal the one-row decode at their own lengths.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ import time
 import warnings
 from typing import Any
 
+from sous.engine import tileattn
 from sous.engine.int8prefill import _model_type, _root
 
 logger = logging.getLogger("sous.engine.verifyattn")
@@ -314,16 +318,28 @@ def _gate() -> str | None:
     return None
 
 
-def _in_scope(verifier: Any, attention: Any, x: Any, mask: Any, cache: Any) -> bool:
-    """Whether this call takes the grouped path. Decided before any projection:
+def _in_scope(
+    verifier: Any, attention: Any, x: Any, mask: Any, cache: Any, splits: int = 0
+) -> bool:
+    """Whether this call leaves mlx-vlm's method. Decided before any projection:
     _prepare_projected_qkv appends the verify rows to the KV cache, so after it
-    the original method could only append them a second time."""
+    the original method could only append them a second time. While the tile is
+    active (splits > 0) every T from 1 is taken, bf16 only, with the mask the
+    verifier builds for it: None for one row, "causal" above."""
     gqa = getattr(attention, _TAG, 0)
     if not gqa or _KVCACHE is None:
         return False
-    if x.ndim != 3 or x.shape[0] != 1 or not (MIN_ROWS <= x.shape[1] <= MAX_ROWS):
+    if x.ndim != 3 or x.shape[0] != 1:
         return False
-    if not (isinstance(mask, str) and mask == "causal"):
+    rows = x.shape[1]
+    if splits:
+        import mlx.core as mx
+
+        if rows < 1 or x.dtype != mx.bfloat16:
+            return False
+        if not (mask is None if rows == 1 else (isinstance(mask, str) and mask == "causal")):
+            return False
+    elif not (MIN_ROWS <= rows <= MAX_ROWS and isinstance(mask, str) and mask == "causal"):
         return False
     # The exact type: mlx-vlm's KVCache subclasses keep other layouts.
     if type(cache) is not _KVCACHE or hasattr(cache, "bits"):
@@ -357,6 +373,34 @@ def _post_ok(queries: Any, keys: Any, values: Any, length: int) -> bool:
     )
 
 
+def _stock_verify(
+    queries: Any, keys: Any, values: Any, cache: Any, scale: float, length: int
+) -> Any:
+    """Today's attention for a call the tile declined after the projections, which
+    have already appended the rows, so the original method cannot be re-entered:
+    grouped (or mlx-vlm's row loop) from T = 3, and below that the stock verifier's
+    own single call, bool-masked at T = 2 and unmasked at T = 1."""
+    import mlx.core as mx
+    from mlx_vlm.models.base import kv_sequence_length, scaled_dot_product_attention
+
+    if length >= MIN_ROWS:
+        if _post_ok(queries, keys, values, length):
+            calls["grouped"] += 1
+            prefix = keys.shape[-2] - length
+            return grouped_attention(queries, keys, values, scale, prefix, _ARCH)
+        calls["loop"] += 1
+        return _row_loop(queries, keys, values, cache, scale)
+    mask = None
+    if length == 2:
+        key_length = kv_sequence_length(keys)
+        prefix = key_length - length
+        mask = (
+            mx.arange(key_length)[None, None, None, :]
+            < (prefix + mx.arange(length) + 1)[None, None, :, None]
+        )
+    return scaled_dot_product_attention(queries, keys, values, cache=cache, scale=scale, mask=mask)
+
+
 def _wrap(cls: Any) -> None:
     import mlx.core as mx
 
@@ -365,9 +409,12 @@ def _wrap(cls: Any) -> None:
     # functools.wraps: the source gate follows __wrapped__ back to mlx-vlm's body.
     @functools.wraps(orig)
     def _attention(self, attention, x, mask, cache, position_ids, position_embeddings):
-        if not _in_scope(self, attention, x, mask, cache):
+        splits = tileattn._active_splits
+        if not _in_scope(self, attention, x, mask, cache, splits):
             if getattr(attention, _TAG, 0):
                 calls["original"] += 1
+                if splits:
+                    tileattn.calls["verify_out"] += 1
             return orig(self, attention, x, mask, cache, position_ids, position_embeddings)
         batch, length, _ = x.shape
         q_proj_output, keys, values = self._linears(
@@ -379,14 +426,16 @@ def _wrap(cls: Any) -> None:
         output = self._helpers()._qwen3_5_left_padded_attention(
             queries, keys, values, cache=cache, scale=attention.scale, mask=mask
         )
-        if output is None:
-            if _post_ok(queries, keys, values, length):
-                calls["grouped"] += 1
-                prefix = keys.shape[-2] - length
-                output = grouped_attention(queries, keys, values, attention.scale, prefix, _ARCH)
+        if output is None and splits:
+            if _post_ok(queries, keys, values, length) and tileattn.in_scope(
+                queries, keys, values, attention.scale
+            ):
+                output = tileattn.serve_verify(queries, keys, values, splits)
             else:
-                calls["loop"] += 1
-                output = _row_loop(queries, keys, values, cache, attention.scale)
+                tileattn.calls["verify_declined"] += 1
+                output = _stock_verify(queries, keys, values, cache, attention.scale, length)
+        elif output is None:
+            output = _stock_verify(queries, keys, values, cache, attention.scale, length)
         output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         return self._linear(attention.o_proj, output * mx.sigmoid(gate))
 

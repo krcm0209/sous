@@ -30,6 +30,7 @@ it. Nothing here raises into a model load.
 from __future__ import annotations
 
 import functools
+import importlib
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -60,6 +61,36 @@ _REDUCE_MARK = "// REDUCE\n"
 # mlx's default, stated rather than inherited: parity between the row variants needs
 # each to round exactly as written, which relaxed and fast math do not promise.
 _SAFE_MATH = {"math_mode": "safe"}
+
+# The active split target S, or 0: set only by an enable() that reached active,
+# cleared first by every enable() and by clear(). A plain int, so nothing it holds
+# outlives an unload.
+_active_splits = 0
+# Set on the decode wrapper so a second install never wraps it again.
+_HOOK_MARK = "_sous_attention_tile"
+# Per attention call (one layer of one forward), not per turn: the tests read deltas.
+# Nothing is logged per turn.
+calls: dict[str, int] = {
+    "decode_tile": 0,  # one-row call served by the kernel (n >= N0)
+    "decode_stock": 0,  # one-row call in scope below N0: mlx-vlm's function answered
+    "decode_out": 0,  # one-row call while active but out of scope: mlx-vlm's function
+    "verify_calls": 0,
+    "verify_rows_tile": 0,
+    "verify_rows_stock": 0,  # rows below N0, through grouped_attention
+    "verify_launches": 0,  # tile runs
+    "verify_straddles": 0,  # calls cut into more than one run
+    "verify_declined": 0,  # in scope before the projections, refused after them
+    "verify_out": 0,  # tagged verifier calls while active but out of scope
+    "verify_t1": 0,
+    "verify_t2": 0,
+    "verify_t3": 0,
+    "verify_t4": 0,
+    "verify_t5": 0,
+    "verify_t6": 0,
+    "verify_t7": 0,
+    "verify_t8": 0,
+    "verify_t9_up": 0,
+}
 
 
 def chunk_for(n: int, splits: int) -> int:
@@ -283,3 +314,100 @@ def availability() -> nax.Availability:
     if failed is not None:
         return nax.Availability(False, f"the attention tile kernel failed: {failed}")
     return nax.Availability(True)
+
+
+def clear() -> None:
+    """Stop serving: both hooks pass every call through from here on."""
+    global _active_splits
+    _active_splits = 0
+
+
+def _bind(queries, keys, values, cache, scale, mask, sinks=None) -> tuple:
+    """mlx-vlm's base.scaled_dot_product_attention parameter list, which verifyattn's
+    source gate pins."""
+    return queries, keys, values, cache, scale, mask, sinks
+
+
+def _plain_kv_cache(cache: Any) -> bool:
+    """mlx-vlm's single-sequence KVCache itself (its subclasses keep other layouts),
+    unquantized and without left padding. The left-padded helpers hand the global a
+    None or batch cache, so they never pass."""
+    kv_cache = importlib.import_module("mlx_vlm.models.cache").KVCache
+    return (
+        type(cache) is kv_cache
+        and not hasattr(cache, "bits")
+        and getattr(cache, "_qwen3_5_decode_left_padding", None) is None
+        and getattr(cache, "left_padding", None) is None
+    )
+
+
+def _serve_decode(args: tuple, kwargs: dict) -> Any | None:
+    """The tile's output for a one-row call it serves, else None, and the wrapper
+    then makes the very call Qwen3_5Attention.__call__ made: deciding after the
+    projections never appends to the cache twice. Multi-row (prefill) calls and
+    calls while the flag is clear are not counted."""
+    splits = _active_splits
+    if not splits:
+        return None
+    try:
+        queries, keys, values, cache, scale, mask, sinks = _bind(*args, **kwargs)
+    except TypeError:
+        return None
+    if getattr(queries, "ndim", 0) != 4 or queries.shape[2] != 1:
+        return None
+    if not (
+        mask is None
+        and sinks is None
+        and _plain_kv_cache(cache)
+        and in_scope(queries, keys, values, scale)
+    ):
+        calls["decode_out"] += 1
+        return None
+    if keys.shape[2] < N0:
+        calls["decode_stock"] += 1
+        return None
+    calls["decode_tile"] += 1
+    return decode(queries, keys, values, splits)
+
+
+def _decode_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    """mlx-vlm's attention function with the one-row calls the tile serves taken
+    out; every other call reaches `original` with its own arguments."""
+
+    @functools.wraps(original)
+    def scaled_dot_product_attention(*args: Any, **kwargs: Any) -> Any:
+        out = _serve_decode(args, kwargs)
+        return original(*args, **kwargs) if out is None else out
+
+    setattr(scaled_dot_product_attention, _HOOK_MARK, True)
+    return scaled_dot_product_attention
+
+
+def install_decode_hook() -> None:
+    """Replace the global Qwen3_5Attention.__call__ calls after its projections; the
+    module has no other seam there. Idempotent. enable() installs it on the first
+    activation only, so a process that never activates the tile runs mlx-vlm's
+    function untouched, and the wrapper passes every call through while the flag
+    is clear, so an unload leaves it inert."""
+    language: Any = importlib.import_module("mlx_vlm.models.qwen3_5.language")
+    current = language.scaled_dot_product_attention
+    if not getattr(current, _HOOK_MARK, False):
+        language.scaled_dot_product_attention = _decode_wrapper(current)
+
+
+def serve_verify(queries: Any, keys: Any, values: Any, splits: int) -> Any:
+    """verify() for the exact verifier's hook, counted by T, by the rows each path
+    took and by the calls cut into more than one run."""
+    t = queries.shape[2]
+    runs = verify_plan(keys.shape[2] - t, t, splits)
+    calls["verify_calls"] += 1
+    calls[f"verify_t{t}" if t <= MAX_RUN else "verify_t9_up"] += 1
+    for j, k, chunk in runs:
+        if chunk:
+            calls["verify_rows_tile"] += k - j
+            calls["verify_launches"] += 1
+        else:
+            calls["verify_rows_stock"] += k - j
+    if len(runs) > 1:
+        calls["verify_straddles"] += 1
+    return verify(queries, keys, values, splits)

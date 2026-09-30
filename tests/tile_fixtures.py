@@ -1,5 +1,6 @@
 """Shared helpers for the attention tile's tests: a plain-mlx stand-in for the
-Metal kernel, serving-layout inputs, and the `nax` skip marker.
+Metal kernel, serving-layout inputs, the `nax` skip marker, a tiny qwen3_5 model
+at the 27B's attention shape, and the installers for both hooks.
 
 mlx is imported inside each helper, so importing this module needs only what
 `tileattn.availability()` itself imports."""
@@ -8,7 +9,9 @@ from typing import Any
 
 import pytest
 
-from sous.engine import tileattn
+from sous.engine import tileattn, verifyattn
+
+VOCAB = 512
 
 # Read once: a failed compile is not remembered, so each call would compile again.
 TILE = tileattn.availability()
@@ -102,3 +105,101 @@ def serving_qkv(n: int, t: int, *, seed: int = 0) -> tuple[Any, Any, Any]:
     values = mx.random.normal((1, tileattn.HKV, cap, tileattn.D), key=v_key).astype(mx.bfloat16)
     mx.eval(pool, keys, values)
     return pool.transpose(0, 2, 1, 3), keys[:, :, :n, :], values[:, :, :n, :]
+
+
+def tiny_language_model(*, seed: int = 0, heads: int = 24, kv_heads: int = 4) -> Any:
+    """A random qwen3_5 language model with two full-attention layers (1 and 3) at
+    the 27B's attention shape by default, bf16, unquantized."""
+    import mlx.core as mx
+    from mlx_vlm.models.qwen3_5.config import TextConfig
+    from mlx_vlm.models.qwen3_5.language import LanguageModel
+
+    args = TextConfig(
+        model_type="qwen3_5",
+        hidden_size=256,
+        intermediate_size=512,
+        linear_num_value_heads=2,
+        linear_num_key_heads=1,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_conv_kernel_dim=4,
+        num_hidden_layers=4,
+        num_attention_heads=heads,
+        rms_norm_eps=1e-6,
+        vocab_size=VOCAB,
+        num_key_value_heads=kv_heads,
+        max_position_embeddings=65536,
+        head_dim=256,
+        full_attention_interval=2,
+    )
+    mx.random.seed(seed)
+    lm = LanguageModel(args)
+    lm.set_dtype(mx.bfloat16)
+    mx.eval(lm.parameters())
+    return lm
+
+
+def prefill_cache(lm: Any, ids: list[int]) -> list:
+    """A fresh cache holding `ids`, prefilled in one call. Explicit positions and a
+    zero delta, as the VLM engine hands them: the bare language model cannot derive
+    rope positions without a vision config."""
+    import mlx.core as mx
+
+    cache = lm.make_cache()
+    lm(
+        mx.array([ids], dtype=mx.int32),
+        cache=cache,
+        position_ids=mx.arange(len(ids), dtype=mx.int32)[None],
+        rope_deltas=mx.zeros((1, 1), dtype=mx.int32),
+    )
+    mx.eval([c.state for c in cache])
+    return cache
+
+
+def verify_forward(lm: Any, cache: list, tokens: list[int]) -> list:
+    """One verify forward as DFlash runs it, then the speculative round aborted so
+    the cache is back where it was: the logits and three layers' hidden states."""
+    import mlx.core as mx
+
+    out = lm(
+        mx.array([tokens], dtype=mx.int32),
+        cache=cache,
+        capture_layer_ids=[0, 1, 2],
+        speculative_verify=True,
+    )
+    arrays = [out.logits, *out.hidden_states]
+    mx.eval(arrays)
+    out.gdn_states.abort()
+    return arrays
+
+
+def hooked(monkeypatch: pytest.MonkeyPatch, *, splits: int = 20, stand_in: bool = True) -> None:
+    """The decode hook installed and the flag set for this test only; monkeypatch
+    restores the language module's global and the flag afterwards."""
+    import importlib
+
+    language = importlib.import_module("mlx_vlm.models.qwen3_5.language")
+    current = language.scaled_dot_product_attention
+    if not getattr(current, tileattn._HOOK_MARK, False):
+        monkeypatch.setattr(
+            language, "scaled_dot_product_attention", tileattn._decode_wrapper(current)
+        )
+    monkeypatch.setattr(tileattn, "_active_splits", splits)
+    if stand_in:
+        monkeypatch.setattr(tileattn, "tile", stand_in_tile)
+
+
+def verify_ready(monkeypatch: pytest.MonkeyPatch, lm: Any) -> list:
+    """verifyattn's wrapper installed and `lm`'s full-attention modules tagged, as
+    its enable() leaves them. Tags stay on the modules; a test that needs them off
+    sets them to 0."""
+    import mlx.core as mx
+    from mlx_vlm.models.cache import KVCache
+
+    verifyattn.install_wrapper()
+    monkeypatch.setattr(verifyattn, "_ARCH", mx.device_info()["architecture"])
+    monkeypatch.setattr(verifyattn, "_KVCACHE", KVCache)
+    modules = verifyattn._attention_modules(lm)
+    for module in modules:
+        object.__setattr__(module, verifyattn._TAG, tileattn.GQA)
+    return modules
