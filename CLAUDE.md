@@ -160,8 +160,9 @@ goal.
   the M5 Pro for the kernels themselves — CI cannot load the models. A fork
   on disk written by a build with wrong KV would survive a restart, which is
   why the fork store's identity key hashes the engine sources
-  (`forkstore.engine_epoch`: vlm.py, lm.py, int8prefill.py, kernels/*.metal
-  and *.h) beside the versions, the GPU and the weights snapshot — any
+  (`forkstore.engine_epoch`: vlm.py, lm.py, int8prefill.py, tileattn.py,
+  kernels/*.metal and *.h) beside the versions, the GPU and the weights
+  snapshot — any
   change to what a token id produces invalidates every file; `rm -rf
   ~/.sous/forks` is the manual eraser.
 - Prompt-cache per-turn gauges (`promptcache.TURN_GAUGES`, reset by
@@ -286,34 +287,43 @@ goal.
   route (decode/verify never do), only tagged modules route (tags are set with
   `object.__setattr__` so they stay out of mlx's parameter tree) and only on
   `model_type` `qwen3_5` (the MoE variant reuses the same classes and is refused), and only the
-  GEMM's header includes the Metal-4 `MetalPerformancePrimitives` header, which
-  needs macOS 26.2+ — the Stage-A kernel must keep compiling on any Metal GPU
-  so CI (macos-15, no tensor units) can test it.
+  tensor-op kernels — the GEMM and the attention tile's split kernel — get
+  `nax.h`, whose Metal-4 `MetalPerformancePrimitives` include needs macOS
+  26.2+: the Stage-A kernel and the tile's reduce kernel stay MPP-free, and
+  Stage A must keep compiling on any Metal GPU so CI (macos-15, no tensor
+  units) can test it.
 - `int8prefill.enable()` never raises and a model load never fails because of
   it: every failure is one `warnings.warn` plus `state: unavailable`. Tests
   that need the GEMM without tensor units monkeypatch `int8prefill.qmm`.
 - mlx (>= 0.32.1) compiles runtime kernels as the newest MSL the OS has — 4.1 on
   macOS 27, where `decltype` of a local cooperative tensor carries `thread` and
   must be wrapped in `metal::remove_addrspace_t` (#123) — so any macOS major can
-  reject a kernel that compiled before. `int8prefill.availability()` therefore
-  compiles and runs the GEMM once where the tensor units exist (`_gemm_probe`,
-  GPU work only, success remembered, the full compiler report logged): a
-  rejected kernel reads as `unavailable` and the `nax` tests skip, where a
-  compile failure with a CPU-stream op in flight deadlocks in mlx's exception
-  path. Being mlx ops, it inherits the thread rules above.
+  reject a kernel that compiled before. The platform half of the rule (macOS
+  >= 26.2, GPU generation >= 17, >= 18 for 'p' parts) is
+  `nax.platform_reason()`, shared by both tensor-op kernels; past it
+  `int8prefill.availability()` compiles and runs the GEMM once where the
+  tensor units exist (`_gemm_probe`) and `tileattn.availability()` every tile
+  variant (`_compile_probe`) — GPU work only, success remembered, the full
+  compiler report logged: a rejected kernel reads as `unavailable` and that
+  kernel's `nax` tests skip, where a compile failure with a CPU-stream op in
+  flight deadlocks in mlx's exception path. Being mlx ops, both inherit the
+  thread rules above.
 - `engine/verifyattn.py` replaces mlx-vlm's per-row SDPA loop in the exact
-  verifier (`Qwen3_5BatchInvariantForward._attention`, T = 3..8) with one
-  stock `mx.fast.scaled_dot_product_attention` per group of rows that share
-  mlx's kernel plan. Grouping is bit-exact only because inside one plan mlx
+  verifier (`Qwen3_5BatchInvariantForward._attention`, T = 3..8 while the
+  attention tile is inactive) with one stock
+  `mx.fast.scaled_dot_product_attention` per group of rows that share mlx's
+  kernel plan. Grouping is bit-exact only because inside one plan mlx
   assigns key i to simdgroup `i % 32` or block `i % blocks` whatever the key
   count and the causal mask skips excluded keys, and `plan()` mirrors mlx
   0.32.2's dispatch (`VALIDATED_MLX`) — re-read
   `scaled_dot_product_attention.cpp` and extend it on every mlx bump; every
   mlx-vlm function the hook reads is pinned by source hash
   (`VALIDATED_MLX_VLM_SOURCES`), checked at load because the daemon's tool
-  environment can resolve a newer mlx-vlm than the lock. T = 2 is left
-  alone: stock already makes one call there, and grouping it would change
-  output at plan straddles. Scope is decided before the projections —
+  environment can resolve a newer mlx-vlm than the lock. While the tile is
+  inactive T = 2 is left alone: stock already makes one call there, and
+  grouping it would change output at plan straddles. While it is active the
+  wrapper's scope widens to every T from 1 and the rows go to `tileattn`
+  (next bullet). Scope is decided before the projections —
   `_prepare_projected_qkv` appends to the KV cache, so the wrapper never
   re-enters the original method after them. `enable()` runs only when a
   drafter loaded, probes every plan transition on this GPU before tagging,
@@ -321,6 +331,68 @@ goal.
   `MLX_METAL_GPU_ARCH` subprocesses. The module stays out of
   `forkstore._EPOCH_FILES` on purpose: prefill never enters the verifier and
   verify output is bit-identical.
+- `engine/tileattn.py` serves decode's one-row attention and the exact
+  verifier's attention from one GQA-packed MPP tile on the M5's tensor
+  units (`kernels/attention_tile.metal`: a split kernel and a fixed-order
+  reduce, specialised to bf16, 24/4/256 heads and scale 1/16). Greedy
+  parity with the drafter on or off holds only because a row's output
+  depends on its chunk and nothing else about the call, and the chunk is
+  fixed per 32·S-key step: `chunk_for(n, S)` is 0 (stock) below `N0` =
+  1536 keys and `32 * ceil(n / (32 * S))` from there. `verify_plan` cuts a
+  T-row verify into runs at every step boundary, at `N0` and every
+  `MAX_RUN` = 8 rows, so any T stays exact; runs below `N0` go to
+  `verifyattn.grouped_attention` with tileattn's own `_arch()`, never
+  `verifyattn._ARCH`. Decode replaces one module global,
+  `mlx_vlm.models.qwen3_5.language.scaled_dot_product_attention`, on the
+  first `enable()` that reaches `active` and never earlier (the probe wraps
+  it only while it runs and puts back what it found).
+  The global cannot tell which module calls it, so its scope rests on the
+  flag plus the post-projection checks (one row, mask and sinks None,
+  `in_scope`, n ≥ `N0`, `type(cache) is KVCache` without bits or left
+  padding): the families that reuse the qwen3_5 language model are refused
+  by model type, DFlash drafters call `mx.fast` directly and MTP drafters
+  are refused. Deciding after the projections is safe because the fallback
+  is the very call the method made, so nothing is appended twice. Verify
+  rows arrive through verifyattn's wrapper, whose scope widens to every T
+  from 1 while the flag is set. The flag `_active_splits` is a plain int,
+  the active S or 0, never a model reference: the first statement of every
+  `enable()` clears it, only an `active` result sets it, and
+  `VLMEngine.unload()` clears it through `tileattn.clear()`. `enable()`
+  checks, in order: the config; the shared platform rule
+  (`nax.platform_reason()`); the model (qwen3_5, every full-attention
+  module at 24/4/256, scale 1/16, bf16); the drafter (none, or `dflash`
+  with verify attention active — else the verifier would run stock beside
+  a tiled decode and drafter-on output would stop equalling drafter-off);
+  verifyattn's whole `_gate()`; the source hashes of the three decode
+  functions (`VALIDATED_DECODE_SOURCES`); the split target, the GPU core
+  count read once per process by `gpucores.read()` (IOKit, then
+  `/usr/sbin/ioreg`), which must be in `MEASURED_SPLITS` — a chip joins
+  only after the tile's T = 1, 3 and 8 timings are measured on it, since
+  the guards prove exactness, not speed; and a probe on the
+  `sous-model-load` thread. The probe compiles every T = 1..8, proves
+  verify rows `array_equal` to decode at `N0`, the next two step
+  boundaries and the first one at or past 57K keys, plants NaN past n to
+  prove every read stops at n, compares with stock one-row SDPA within
+  1e-2 relative RMS (parity cannot catch a kernel that is wrong the same
+  way on both paths) and runs one of the model's own attention modules
+  through a restored-style `KVCache`. Like int8 it never raises: every
+  refusal is one warning plus `unavailable`. The engine constructors
+  default it off (`VLMEngine(attention_tile=False)`, like `int8_prefill`);
+  only `default_engine_factory` hands them the config's `true`, so tests
+  and scripts keep today's paths unless they opt in. Nothing is logged per
+  turn; `tileattn.calls` counts every path for the tests and for harnesses
+  that wrap the daemon. The fork key records `tile` (`active:S`, else
+  `off`) and always `os` (the macOS build), because every stored KV depends
+  on Metal compiled at load — mlx-vlm's gated-delta kernel and `mx.compile`
+  fusions, mlx's JIT kernels, and the tile's and int8's kernels — so a
+  macOS update starts every fork store cold once; `tileattn.py` is in
+  `_EPOCH_FILES`. Every kernel edit and every `VALIDATED_MLX` extension
+  re-runs the tile's exactness tests and its T = 1, 3 and 8 timings:
+  codegen is fragile, and `sg >> 1` for `sg / 2` kept the output but ran
+  1.4x slower. Tests install the decode hook through monkeypatch,
+  monkeypatch S (never IOKit) and swap the plain-mlx stand-in in for
+  `tileattn.tile`; the `nax` tests skip on `tileattn.availability()`, never
+  int8's.
 - `engine/draftctx.py` hands the DFlash drafter the prompt's hidden states on
   the hybrid prompt-cache path (#142). mlx-vlm's round loop
   (`speculative/dflash.py:_dflash_rounds`) gives the drafter, on its first

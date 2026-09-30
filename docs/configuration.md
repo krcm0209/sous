@@ -25,6 +25,7 @@ prompt_cache = true
 speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
 speculative_block_size = 3
 int8_prefill = false
+attention_tile = true
 ```
 
 Every value is optional. Swap `[model].id` for any MLX text or vision model
@@ -150,6 +151,28 @@ runs stock. Only dense Qwen3.5-family models (`model_type` `qwen3_5`, as the def
 model is) with affine 4-bit, group-size-64 weights route, and the MoE variant is refused;
 a checkpoint with no eligible projection warns once; in a mixed checkpoint, ineligible
 projections fall through per projection.
+
+`[model].attention_tile` (default `true`) runs decode's one-row attention and
+speculative verify's attention on the M5 GPU's neural accelerators, as one
+GQA-packed tile whose key partition steps with the context (sous's own
+kernel, compiled at model load — no build step). Measured on an M5 Pro with
+the default model and drafter: the verify forward's attention at block 3 is
+2–2.6x faster than the grouped stock calls it replaces, and decode is 1.22x
+faster on 64 real subagent turns at 44–77K of context. Greedy output with the
+drafter stays identical to output without it — a verify row and the decode
+step at the same key count use the same partition — and the tile is as
+accurate as the stock kernels, but not bit-identical to them: a near-tie can
+resolve the other way than with `false`, which runs the stock paths. It is
+active only where it has been measured: a 20-core M5 Pro GPU on macOS 26.2+,
+running a dense Qwen3.5-family model (`model_type` `qwen3_5`, 24 query and 4
+KV heads, head dim 256, bf16 attention, as the default model is) with no
+drafter or a DFlash one. Anywhere else the model-load line reads
+`attention_tile=unavailable` (`off` on the mlx-lm backend, which has no
+tile), the status document's `attention_tile` block carries the reason, and
+decode and verify run stock. The on-disk forks are
+keyed by it: changing it starts the fork store cold once (so does any macOS
+update, whatever the setting). The daemon reads it at startup, so a change
+takes effect on its next start.
 
 `[server].generation_timeout_minutes` bounds a turn at both ends: how long it
 may wait for a generation slot before the endpoint answers `529`, and how long
