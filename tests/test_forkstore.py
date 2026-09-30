@@ -6,6 +6,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import platform
 import re
 import shutil
 import struct
@@ -134,7 +135,7 @@ def test_engine_epoch_is_stable_and_16_hex(monkeypatch):
 def test_engine_epoch_changes_when_a_source_byte_changes(monkeypatch, tmp_path: Path):
     src = tmp_path / "engine"
     (src / "kernels").mkdir(parents=True)
-    for name in ("vlm.py", "lm.py", "int8prefill.py"):
+    for name in ("vlm.py", "lm.py", "int8prefill.py", "tileattn.py"):
         (src / name).write_text(f"# {name}\n")
     (src / "kernels" / "a.metal").write_text("kernel\n")
     (src / "kernels" / "common.h").write_text("header\n")
@@ -148,7 +149,15 @@ def test_engine_epoch_changes_when_a_source_byte_changes(monkeypatch, tmp_path: 
     (src / "kernels" / "common.h").write_text("header changed\n")
     forkstore.engine_epoch.cache_clear()
     assert engine_epoch() != changed  # the headers are compiled into the kernels
+    changed = engine_epoch()
+    (src / "tileattn.py").write_text("# tileattn.py changed\n")
     forkstore.engine_epoch.cache_clear()
+    assert engine_epoch() != changed  # the tile's schedule decides which kernel runs
+    forkstore.engine_epoch.cache_clear()
+
+
+def test_the_attention_tile_module_is_an_epoch_file():
+    assert "tileattn.py" in forkstore._EPOCH_FILES
 
 
 def test_weights_identity_is_the_snapshot_sha_for_a_hub_layout(tmp_path: Path):
@@ -1396,11 +1405,13 @@ def test_fork_key_fields_carry_everything_that_changes_the_kv(monkeypatch):
         gpu="applegpu_g16s",
         positions="engine",
         int8_status={"state": "active", "reason": None, "routed": 336},
+        tile_status={"state": "active", "reason": None, "splits": 20, "probe_seconds": 0.43},
     )
     assert f["backend"] == "vlm" and f["backend_version"] == "0.7.1"
     assert f["mlx"] and f["weights"] == "sha" and f["gpu"] == "applegpu_g16s"
     assert f["epoch"] == engine_epoch() and f["layout"] == str(FORK_LAYOUT)
     assert f["positions"] == "engine" and f["int8"] == "active:336"
+    assert f["tile"] == "active:20" and f["os"] == forkstore.os_release()
     assert f["env"] == "MLX_ENABLE_TF32=1"
     off = fork_key_fields(
         backend="lm",
@@ -1409,8 +1420,10 @@ def test_fork_key_fields_carry_everything_that_changes_the_kv(monkeypatch):
         gpu="g",
         positions="model",
         int8_status={"state": "unavailable", "reason": "no tensor units", "routed": 0},
+        tile_status={"state": "off", "reason": None},
     )
     assert off["int8"] == "off"  # off and unavailable ran the same numerics
+    assert off["tile"] == "off" and "os" not in off
     monkeypatch.delenv("MLX_ENABLE_TF32")
     assert "env" not in fork_key_fields(
         backend="lm",
@@ -1419,4 +1432,53 @@ def test_fork_key_fields_carry_everything_that_changes_the_kv(monkeypatch):
         gpu="g",
         positions="model",
         int8_status={"state": "off", "reason": None, "routed": 0},
+        tile_status={"state": "off", "reason": None},
     )
+
+
+_TILE_OFF = {"state": "off", "reason": None, "splits": None, "probe_seconds": None}
+_TILE_20 = {"state": "active", "reason": None, "splits": 20, "probe_seconds": 0.43}
+_INT8_OFF = {"state": "off", "reason": None, "routed": 0}
+
+
+def _vlm_fields(*, tile=_TILE_OFF, int8=_INT8_OFF) -> dict[str, str]:
+    from sous.engine.forkstore import fork_key_fields
+
+    return fork_key_fields(
+        backend="vlm",
+        backend_version="0.7.2",
+        weights="sha",
+        gpu="applegpu_g17s",
+        positions="engine",
+        int8_status=int8,
+        tile_status=tile,
+    )
+
+
+def test_the_key_moves_with_the_tile_and_its_split_target():
+    """A store written with the tile is never restored without it, or with
+    another S; unavailable ran off's numerics, so it shares off's key."""
+    unavailable = {**_TILE_OFF, "state": "unavailable", "reason": "macOS 15.5 < 26.2"}
+    tile_16 = {**_TILE_20, "splits": 16}
+    names = {key_name(_vlm_fields(tile=t)) for t in (_TILE_20, tile_16, _TILE_OFF)}
+    assert len(names) == 3
+    assert _vlm_fields(tile=unavailable)["tile"] == "off"
+    assert key_name(_vlm_fields(tile=unavailable)) == key_name(_vlm_fields())
+
+
+def test_the_os_build_is_in_the_key_while_a_runtime_compiled_kernel_is_active(monkeypatch):
+    int8 = {"state": "active", "reason": None, "routed": 336}
+    assert "os" not in _vlm_fields()
+    assert _vlm_fields(int8=int8)["os"] == forkstore.os_release()
+    assert _vlm_fields(tile=_TILE_20)["os"] == forkstore.os_release()
+    off, tiled = key_name(_vlm_fields()), key_name(_vlm_fields(tile=_TILE_20))
+    monkeypatch.setattr(forkstore, "os_release", lambda: "15.6 (24G84)")
+    assert key_name(_vlm_fields(tile=_TILE_20)) != tiled
+    assert key_name(_vlm_fields()) == off  # a macOS update leaves a stock store alone
+
+
+@pytest.mark.skipif(platform.system() != "Darwin", reason="reads this Mac's build")
+def test_os_release_is_the_version_and_the_build():
+    release = forkstore.os_release()
+    assert re.fullmatch(r"\d+(\.\d+)+ \([0-9A-Za-z]+\)", release), release
+    assert release.startswith(f"{platform.mac_ver()[0]} (")

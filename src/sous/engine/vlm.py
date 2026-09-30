@@ -196,6 +196,7 @@ class VLMEngine:
             gpu=str(mx.device_info().get("architecture", "")),
             positions=self.positions,
             int8_status=self.int8_prefill_status,
+            tile_status=self.attention_tile_status,
         )
 
     def _loaded(self) -> tuple:
