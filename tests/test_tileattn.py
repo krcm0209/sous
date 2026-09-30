@@ -814,6 +814,26 @@ def test_probe_restores_what_it_touched_when_it_raises(monkeypatch):
     assert _language_module().scaled_dot_product_attention is installed
 
 
+def test_probe_restores_the_flag_the_counters_and_the_global_when_the_module_step_raises(
+    monkeypatch,
+):
+    def fails_in_the_module_step(q, k, v, n, chunk):
+        # The flag is set only for the module step, after the wrapper is installed.
+        if tileattn._active_splits:
+            raise RuntimeError("device lost")
+        return tfx.stand_in_tile(q, k, v, n, chunk)
+
+    modules = _probe_setup(monkeypatch, fails_in_the_module_step)
+    monkeypatch.setattr(tileattn, "parity_cases", lambda splits, arch: ([tileattn.N0], []))
+    installed = _language_module().scaled_dot_product_attention
+    before = dict(tileattn.calls)
+    with pytest.raises(RuntimeError, match="device lost"):
+        tileattn.probe(modules, 20, tileattn._arch())
+    assert tileattn._active_splits == 0
+    assert tileattn.calls == before
+    assert _language_module().scaled_dot_product_attention is installed
+
+
 @tfx.nax
 def test_probe_passes_the_real_kernel(monkeypatch):
     _guard_probe(monkeypatch)
