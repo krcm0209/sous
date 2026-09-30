@@ -329,8 +329,13 @@ goal.
   drafter loaded, probes every plan transition on this GPU before tagging,
   and like int8 never raises. CI proves the 's' and 'd' tables through
   `MLX_METAL_GPU_ARCH` subprocesses. The module stays out of
-  `forkstore._EPOCH_FILES` on purpose: prefill never enters the verifier and
-  verify output is bit-identical.
+  `forkstore._EPOCH_FILES` on purpose: prefill never enters the verifier, so
+  no stored KV depends on it. Its grouping is bit-identical to the per-row
+  loop and to M=1 decode, and while the tile is active the rows from `N0` up
+  are tileattn's (keyed by `tileattn.py`) and equal the tile's decode
+  instead; tileattn still sends every sub-`N0` run through
+  `grouped_attention` (T = 1 and 2 included) and relies on it equalling
+  stock one-row SDPA.
 - `engine/tileattn.py` serves decode's one-row attention and the exact
   verifier's attention from one GQA-packed MPP tile on the M5's tensor
   units (`kernels/attention_tile.metal`: a split kernel and a fixed-order
