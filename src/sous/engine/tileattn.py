@@ -29,7 +29,13 @@ it. Nothing here raises into a model load.
 
 from __future__ import annotations
 
+import functools
 import logging
+from collections.abc import Callable
+from typing import Any
+
+from sous.engine import nax
+from sous.engine.int8prefill import _error_line, _kernel, _kernel_text
 
 logger = logging.getLogger("sous.engine.tileattn")
 
@@ -49,6 +55,11 @@ N0 = 1536
 GRAN = 32
 # Split targets measured for speed: 20, the M5 Pro's GPU core count.
 MEASURED_SPLITS = frozenset({20})
+# attention_tile.metal holds the split body, this line, then the reduce body.
+_REDUCE_MARK = "// REDUCE\n"
+# mlx's default, stated rather than inherited: parity between the row variants needs
+# each to round exactly as written, which relaxed and fast math do not promise.
+_SAFE_MATH = {"math_mode": "safe"}
 
 
 def chunk_for(n: int, splits: int) -> int:
@@ -94,3 +105,181 @@ def verify_plan(prefix: int, t: int, splits: int) -> list[tuple[int, int, int]]:
         runs.append((j, k, chunk))
         j = k
     return runs
+
+
+def _kernel_pair() -> tuple[Callable[..., list[Any]], Callable[..., list[Any]]]:
+    """The split and reduce kernels, built on first use. The split kernel reads K/V
+    in place through their strides: a KVCache hands back a slice of its padded
+    buffer, which ensure_row_contiguous would copy whole on every call. Only the
+    split kernel uses the tensor ops, so only its header carries nax.h."""
+    split_source, reduce_source = _kernel_text("attention_tile.metal").split(_REDUCE_MARK)
+    common = _kernel_text("common.h")
+    split = _kernel(
+        "sous_attention_tile_split",
+        ["q", "k", "v", "params"],
+        ["part", "stats"],
+        split_source,
+        common + _kernel_text("nax.h"),
+        ensure_row_contiguous=False,
+        compile_options=_SAFE_MATH,
+    )
+    reduce = _kernel(
+        "sous_attention_tile_reduce",
+        ["part", "stats", "params"],
+        ["out"],
+        reduce_source,
+        common,
+        compile_options=_SAFE_MATH,
+    )
+    return split, reduce
+
+
+def tile(queries: Any, keys: Any, values: Any, n: int, chunk: int) -> Any:
+    """One kernel call over T <= MAX_RUN rows: row t sees keys [0, n - T + t], every
+    K/V read is clamped to n - 1, and keys are split at multiples of `chunk`.
+    Queries are [1, 24, T, 256], K/V [1, 4, >= n, 256], all bf16 with innermost
+    stride 1. Returns the contiguous [1, T, 24, 256] bf16 output."""
+    import mlx.core as mx
+
+    split, reduce = _kernel_pair()
+    t = queries.shape[2]
+    mr = GQA * t
+    rgt = -(-mr // 16)
+    nsplit = -(-n // chunk)
+    params = mx.array([n, chunk, nsplit], dtype=mx.int32)
+    part, stats = split(
+        inputs=[queries, keys, values, params],
+        template=[("TR", t), ("MR", mr), ("RGT", rgt)],
+        grid=(64 * rgt, nsplit, HKV),
+        threadgroup=(64 * rgt, 1, 1),
+        output_shapes=[(HKV * nsplit * mr * D,), (HKV * nsplit * mr * 2,)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    (out,) = reduce(
+        inputs=[part, stats, params],
+        template=[("MR", mr)],
+        grid=(D, mr, HKV),
+        threadgroup=(D, 1, 1),
+        output_shapes=[(1, t, HQ, D)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return out
+
+
+@functools.cache
+def _arch() -> str:
+    """This process's GPU architecture, for grouped_attention's plan. Read here, never
+    from verifyattn._ARCH, which is set only when verifyattn's own probe passed."""
+    import mlx.core as mx
+
+    return str(mx.device_info().get("architecture", ""))
+
+
+def in_scope(queries: Any, keys: Any, values: Any, scale: float) -> bool:
+    """What decode() and verify() assume of the projected tensors; both hooks check
+    it after the projections."""
+    import mlx.core as mx
+
+    return (
+        isinstance(queries, mx.array)
+        and isinstance(keys, mx.array)
+        and isinstance(values, mx.array)
+        and queries.ndim == keys.ndim == values.ndim == 4
+        and queries.shape[0] == keys.shape[0] == values.shape[0] == 1
+        and queries.shape[1] == HQ
+        and keys.shape[1] == values.shape[1] == HKV
+        and queries.shape[3] == keys.shape[3] == values.shape[3] == D
+        and queries.dtype == keys.dtype == values.dtype == mx.bfloat16
+        and queries.shape[2] >= 1
+        and keys.shape[2] == values.shape[2] >= queries.shape[2]
+        and scale == SCALE
+    )
+
+
+def decode(queries: Any, keys: Any, values: Any, splits: int) -> Any:
+    """The one-row call over all n = keys.shape[2] keys, [1, 24, 1, 256]. Stock one-row
+    SDPA below N0, where the decode hook never calls this; the probe and the tests
+    compare against it there."""
+    import mlx.core as mx
+
+    n = keys.shape[2]
+    chunk = chunk_for(n, splits)
+    if chunk == 0:
+        return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=SCALE, mask=None)
+    return tile(queries, keys, values, n, chunk).transpose(0, 2, 1, 3)
+
+
+def verify(queries: Any, keys: Any, values: Any, splits: int) -> Any:
+    """The verifier's T-row causal call, row r over keys [0, n - T + r], as
+    [1, 24, T, 256]: one tile call per run of verify_plan(), grouped stock calls for
+    the runs below N0, concatenated in row order."""
+    import mlx.core as mx
+
+    from sous.engine.verifyattn import grouped_attention
+
+    t = queries.shape[2]
+    n = keys.shape[2]
+    prefix = n - t
+    runs = verify_plan(prefix, t, splits)
+    if len(runs) == 1 and runs[0][2]:
+        return tile(queries, keys, values, n, runs[0][2]).transpose(0, 2, 1, 3)
+    parts = []
+    for j, k, chunk in runs:
+        q = queries if (j, k) == (0, t) else queries[:, :, j:k, :]
+        kk = keys if k == t else keys[:, :, : prefix + k, :]
+        vv = values if k == t else values[:, :, : prefix + k, :]
+        if chunk:
+            parts.append(tile(q, kk, vv, prefix + k, chunk))
+        else:
+            stock = grouped_attention(q, kk, vv, SCALE, prefix + j, _arch())
+            parts.append(stock.transpose(0, 2, 1, 3))
+    out = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=1)
+    return out.transpose(0, 2, 1, 3)
+
+
+_compile_ok = False
+
+
+def _compile_probe() -> str | None:
+    """Compile and run every row variant, T = 1..MAX_RUN, on serving-layout inputs;
+    None when they all work, else the compiler's error line. The kernel is compiled
+    at runtime against the OS's own Metal toolchain, so a new macOS can reject a
+    source that compiled before. The inputs are built with GPU ops and evaluated
+    first: a compile failure with a CPU-stream op in flight deadlocks inside mlx's
+    exception path (0.32.2) instead of raising. Only success is remembered, so one
+    bad moment cannot switch the tile off for a long-lived daemon."""
+    global _compile_ok
+    if _compile_ok:
+        return None
+    import mlx.core as mx
+
+    try:
+        q_key, k_key, v_key = mx.random.split(mx.random.key(0), 3)
+        rows = mx.random.normal((1, MAX_RUN, HQ, D), key=q_key).astype(mx.bfloat16)
+        # One 256-token step past N0: the K/V are slices of a padded buffer, as served.
+        keys = mx.random.normal((1, HKV, N0 + 256, D), key=k_key).astype(mx.bfloat16)
+        values = mx.random.normal((1, HKV, N0 + 256, D), key=v_key).astype(mx.bfloat16)
+        mx.eval(rows, keys, values)
+        queries = rows.transpose(0, 2, 1, 3)
+        chunk = chunk_for(N0, min(MEASURED_SPLITS))
+        for t in range(1, MAX_RUN + 1):
+            mx.eval(tile(queries[:, :, :t], keys[:, :, :N0], values[:, :, :N0], N0, chunk))
+    except Exception as e:  # noqa: BLE001 — any failure means the kernel cannot serve
+        # The one-line reason cannot carry a compiler's full report; the log can.
+        logger.warning("attention tile: the kernel failed to build or run:\n%s", e)
+        return _error_line(str(e))
+    _compile_ok = True
+    return None
+
+
+def availability() -> nax.Availability:
+    """The tensor-unit rule the tile shares with int8 prefill, then a compile and run
+    of every row variant. The `nax` tests skip on this, never on int8's: the two
+    kernels can fail to compile on different toolchains."""
+    reason = nax.platform_reason()
+    if reason is not None:
+        return nax.Availability(False, reason)
+    failed = _compile_probe()
+    if failed is not None:
+        return nax.Availability(False, f"the attention tile kernel failed: {failed}")
+    return nax.Availability(True)

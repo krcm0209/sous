@@ -58,6 +58,9 @@ def _kernel(
     output_names: list[str],
     source: str,
     header: str,
+    *,
+    ensure_row_contiguous: bool = True,
+    compile_options: dict[str, str] | None = None,
 ) -> Callable[..., list[Any]]:
     """One metal_kernel object per name, built on first use. mlx compiles each
     (source, template) instantiation once per process behind it."""
@@ -73,6 +76,8 @@ def _kernel(
                 output_names=output_names,
                 source=source,
                 header=header,
+                ensure_row_contiguous=ensure_row_contiguous,
+                compile_options=compile_options,
             ),
         )
         _kernels[name] = kernel
