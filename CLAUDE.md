@@ -298,9 +298,10 @@ goal.
 - mlx (>= 0.32.1) compiles runtime kernels as the newest MSL the OS has — 4.1 on
   macOS 27, where `decltype` of a local cooperative tensor carries `thread` and
   must be wrapped in `metal::remove_addrspace_t` (#123) — so any macOS major can
-  reject a kernel that compiled before. The platform half of the rule (macOS
-  >= 26.2, GPU generation >= 17, >= 18 for 'p' parts) is
-  `nax.platform_reason()`, shared by both tensor-op kernels; past it
+  reject a kernel that compiled before. Whether a tensor-op kernel may run
+  is therefore decided in two halves. The platform half (macOS >= 26.2, GPU
+  generation >= 17, >= 18 for 'p' parts) is `nax.platform_reason()`, shared
+  by both tensor-op kernels; past it, the compile half:
   `int8prefill.availability()` compiles and runs the GEMM once where the
   tensor units exist (`_gemm_probe`) and `tileattn.availability()` every tile
   variant (`_compile_probe`) — GPU work only, success remembered, the full
@@ -394,7 +395,7 @@ goal.
   notice only for `unavailable`, never for `off`. The engine constructors
   default it off (`VLMEngine(attention_tile=False)`, like `int8_prefill`);
   only `default_engine_factory` hands them the config's `true`, so tests
-  and scripts keep today's paths unless they opt in. Nothing is logged per
+  and scripts keep the stock paths unless they opt in. Nothing is logged per
   turn; `tileattn.calls` counts every path for the tests and for harnesses
   that wrap the daemon. The fork key records `tile` (`active:S`, else
   `off`) and always `os` (the macOS build), because every stored KV depends
@@ -404,10 +405,12 @@ goal.
   `_EPOCH_FILES`. Every kernel edit and every `VALIDATED_MLX` extension
   re-runs the tile's exactness tests and its T = 1, 3 and 8 timings:
   codegen is fragile, and `sg >> 1` for `sg / 2` kept the output but ran
-  1.4x slower. Tests install the decode hook through monkeypatch,
-  monkeypatch S (never IOKit) and swap the plain-mlx stand-in in for
-  `tileattn.tile`; the `nax` tests skip on `tileattn.availability()`, never
-  int8's.
+  1.4x slower. A newer mlx-vlm makes the tile `unavailable` until the
+  three decode sources (`VALIDATED_DECODE_SOURCES`) are re-read and
+  re-pinned, as verifyattn's are. Tests install the decode hook through
+  monkeypatch, monkeypatch S (never IOKit) and swap the plain-mlx stand-in
+  in for `tileattn.tile`; the `nax` tests skip on
+  `tileattn.availability()`, never int8's.
 - `engine/draftctx.py` hands the DFlash drafter the prompt's hidden states on
   the hybrid prompt-cache path (#142). mlx-vlm's round loop
   (`speculative/dflash.py:_dflash_rounds`) gives the drafter, on its first

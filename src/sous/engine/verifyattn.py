@@ -376,10 +376,11 @@ def _post_ok(queries: Any, keys: Any, values: Any, length: int) -> bool:
 def _stock_verify(
     queries: Any, keys: Any, values: Any, cache: Any, scale: float, length: int
 ) -> Any:
-    """Today's attention for a call the tile declined after the projections, which
-    have already appended the rows, so the original method cannot be re-entered:
-    grouped (or mlx-vlm's row loop) from T = 3, and below that the stock verifier's
-    own single call, bool-masked at T = 2 and unmasked at T = 1."""
+    """The verifier's attention without the tile: the path while the tile is off,
+    and for a call it declined after the projections, which have already
+    appended the rows, so the original method cannot be re-entered. Grouped (or
+    mlx-vlm's row loop) from T = 3, and below that the stock verifier's own
+    single call, bool-masked at T = 2 and unmasked at T = 1."""
     import mlx.core as mx
     from mlx_vlm.models.base import kv_sequence_length, scaled_dot_product_attention
 

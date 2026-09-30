@@ -183,8 +183,10 @@ a free counting thread that `count_s` does not); the engine logs `model_load
 seconds=N.N model=<model_id>` when it loads, plus `positions=engine|model` on
 the VLM backend (which side supplies the rotary positions behind a warm
 cache) and `verify_attention=active|unavailable|off` (whether speculative
-verify runs its attention as grouped exact calls; with
-`verify_attention_probe_s=` when the load-time exactness probe ran) and
+verify runs its attention as grouped exact calls, which with the attention
+tile active take only the rows that see fewer than 1,536 keys, the rest
+running on the tile; with `verify_attention_probe_s=` when the load-time
+exactness probe ran) and
 `draft_context=active|unavailable|off` (whether the drafter is handed the
 prompt's hidden states on the prompt-cache path, with
 `draft_context_window=` when it is; `off` means no drafter loaded, and

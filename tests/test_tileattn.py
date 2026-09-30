@@ -673,7 +673,9 @@ def test_a_tagged_verify_the_scope_refuses_is_counted_out_of_scope(tiny_verifier
 
 @pytest.mark.parametrize(("owner", "check"), [(verifyattn, "_post_ok"), (tileattn, "in_scope")])
 @pytest.mark.parametrize("t", [1, 2, 3, 5])
-def test_a_declined_verify_computes_todays_attention(tiny_verifier, monkeypatch, owner, check, t):
+def test_a_declined_verify_computes_the_stock_attention(
+    tiny_verifier, monkeypatch, owner, check, t
+):
     """After the projections the rows are already appended, so a decline must
     reproduce the stock verifier (T = 1, 2) or the grouped path (T >= 3) itself."""
     lm, ids, _ = tiny_verifier

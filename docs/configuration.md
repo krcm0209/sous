@@ -158,25 +158,30 @@ GQA-packed tile whose key partition steps with the context (sous's own
 kernel, compiled at model load — no build step). Measured on an M5 Pro with
 the default model and drafter: the verify forward's attention at block 3 is
 2–2.6x faster than the grouped stock calls it replaces, and decode is 1.22x
-faster on 64 real subagent turns at 44–77K of context. Greedy output with the
-drafter stays identical to output without it — a verify row and the decode
-step at the same key count use the same partition — and the tile is as
-accurate as the stock kernels, but not bit-identical to them: a near-tie can
-resolve the other way than with `false`, which runs the stock paths. It is
-active only where it has been measured: a 20-core M5 Pro GPU on macOS 26.2+,
-running a dense Qwen3.5-family model (`model_type` `qwen3_5`, 24 query and 4
-KV heads, head dim 256, bf16 attention, as the default model is) with no
-drafter or a DFlash one. Anywhere else the model-load line reads
-`attention_tile=unavailable` (`off` on the mlx-lm backend, which has no
-tile), the status document's `attention_tile` block carries the reason, and
-decode and verify run stock. Because that is how most Macs load, the daemon
-logs it as one INFO line, not a warning; a `WARNING` saying `sous: attention
-tile unavailable (…)` means the tile should have run here and did not — its
-kernel or load-time check failed, or a pinned mlx or mlx-vlm changed under
-it. The on-disk forks are
-keyed by it: changing it starts the fork store cold once (so does any macOS
-update, whatever the setting). The daemon reads it at startup, so a change
-takes effect on its next start.
+faster on 64 real subagent turns at 44–77K of context. It serves attention
+over 1,536 keys or more; below that, decode and verify take the stock paths,
+which are as fast there. Greedy output with the drafter stays identical to
+output without it — a verify row and the decode step at the same key count
+use the same partition — and the tile is as accurate as the stock kernels,
+but not bit-identical to them: a near-tie can resolve the other way than
+with `false`, which runs the stock paths. It is active only where it has
+been measured: a 20-core M5 Pro GPU on macOS 26.2+, running a dense
+Qwen3.5-family model (`model_type` `qwen3_5`, 24 query and 4 KV heads, head
+dim 256, bf16 attention, as the default model is) with no drafter or a
+DFlash one, on the mlx it was validated with (0.32.2) and with the mlx-vlm
+functions it hooks unchanged (sous pins their sources, so a newer mlx or
+mlx-vlm leaves it unavailable until sous is updated for it). Anywhere else the
+model-load line reads `attention_tile=unavailable` (`off` on the mlx-lm
+backend, which has no tile), the status document's `attention_tile` block
+carries the reason, and decode and verify run stock. Because that is how
+most Macs load, the daemon logs it as one INFO line, not a warning; a
+`WARNING` saying `sous: attention tile unavailable (…)` means the tile
+should have run here and did not — its kernel or load-time check failed, or
+a pinned mlx or mlx-vlm changed under it. The on-disk forks are keyed by
+whether the tile served them: where it is active, changing the setting
+starts the fork store cold once, and elsewhere it changes nothing (any macOS
+update starts the store cold, whatever the setting). The daemon reads it at
+startup, so a change takes effect on its next start.
 
 `[server].generation_timeout_minutes` bounds a turn at both ends: how long it
 may wait for a generation slot before the endpoint answers `529`, and how long

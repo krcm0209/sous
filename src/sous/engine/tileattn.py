@@ -444,7 +444,7 @@ VALIDATED_DECODE_SOURCES: dict[str, frozenset[str]] = {
 
 # The probe's far parity mark is the first step boundary at or past this many
 # keys: every row runs its full S splits there (from 11,553 keys at S = 20),
-# and the subagent turns the tile was measured on sit at 44-77K.
+# and subagent turns sit at 44-77K keys.
 PROBE_FAR_KEYS = 57_000
 # How far the probe lets the tile land from stock one-row SDPA, as a relative
 # RMS difference. The tile's error against a float64 reference is at or below
@@ -523,11 +523,11 @@ def probe(modules: list[Any], splits: int, arch: str) -> str | None:
 
 
 def _probe_steps(modules: list[Any], splits: int, arch: str, language: Any) -> str | None:
-    """Every input is made with GPU ops (no float64, which is CPU-only in mlx)
-    and evaluated before the first launch: a kernel failure with a CPU-stream
-    op in flight deadlocks mlx's exception path. Inputs are laid out as
-    serving lays them out: transposed query rows, K/V slices of 256-step
-    padded buffers."""
+    """Every input is made with GPU ops (no float64, which is CPU-only in mlx),
+    and each step's K/V inputs are evaluated before that step's launches: a
+    kernel failure with a CPU-stream op in flight deadlocks mlx's exception
+    path. Inputs are laid out as serving lays them out: transposed query rows,
+    K/V slices of 256-step padded buffers."""
     import mlx.core as mx
 
     global _active_splits
