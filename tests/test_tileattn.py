@@ -143,13 +143,11 @@ def test_both_kernels_are_built_with_safe_math_and_the_split_reads_strides(monke
         ["out"],
     )
     assert split["ensure_row_contiguous"] is False and "k_strides" in split["source"]
-    assert reduce["ensure_row_contiguous"] is True
+    # mlx's own default, row-contiguous inputs, left for mlx to apply.
+    assert "ensure_row_contiguous" not in reduce
     assert split["compile_options"] == reduce["compile_options"] == {"math_mode": "safe"}
     assert "MetalPerformancePrimitives" in split["header"]
     assert "MetalPerformancePrimitives" not in reduce["header"]
-    int8prefill._kernel("sous_test_plain", ["x"], ["y"], "y[0] = x[0];", "")
-    plain = made["sous_test_plain"]
-    assert plain["ensure_row_contiguous"] is True and plain["compile_options"] is None
 
 
 # ---- entries, with the stand-in (and the real kernel where it compiles) ----------

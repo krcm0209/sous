@@ -68,6 +68,14 @@ def _kernel(
     if kernel is None:
         import mlx.core as mx
 
+        # Only what differs from mlx's defaults: an older mlx within the
+        # dependency floor may not take these keywords, and int8's kernels,
+        # which need neither, must keep building there.
+        options: dict[str, Any] = {}
+        if not ensure_row_contiguous:
+            options["ensure_row_contiguous"] = False
+        if compile_options is not None:
+            options["compile_options"] = compile_options
         kernel = cast(
             "Callable[..., list[Any]]",
             mx.fast.metal_kernel(
@@ -76,8 +84,7 @@ def _kernel(
                 output_names=output_names,
                 source=source,
                 header=header,
-                ensure_row_contiguous=ensure_row_contiguous,
-                compile_options=compile_options,
+                **options,
             ),
         )
         _kernels[name] = kernel

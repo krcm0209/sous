@@ -593,6 +593,10 @@ def _probe_steps(modules: list[Any], splits: int, arch: str, language: Any) -> s
             got = verify(rows(0, t), keys, values, splits)
             if not (mx.array_equal(got, want).item() and mx.all(mx.isfinite(got)).item()):
                 return f"reads past n: T={t} at n={n} differs from the clean buffer"
+    # A for-loop leaves its last iteration's names bound: at the far mark that
+    # is about 470 MB of K/V copies, which would sit beside the correctness
+    # section's own and raise the load's transient peak for nothing.
+    del want, k_nan, v_nan, k_end, v_end, keys, values, got
 
     # Correctness, which parity cannot see in a kernel wrong the same way on
     # both paths: x8 queries, a dominant key at n - 1, and a second one at n,

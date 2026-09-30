@@ -209,6 +209,15 @@ def os_release() -> str:
         import ctypes.util
 
         libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        # Declared, so `newlen` goes over as the size_t the call takes.
+        libc.sysctlbyname.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        libc.sysctlbyname.restype = ctypes.c_int
         buf = ctypes.create_string_buffer(64)
         size = ctypes.c_size_t(len(buf))
         if libc.sysctlbyname(b"kern.osversion", buf, ctypes.byref(size), None, 0) != 0:

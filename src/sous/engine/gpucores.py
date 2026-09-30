@@ -50,7 +50,8 @@ def parse_services(services: list[dict[str, Any]], source: str) -> GPUCores:
 
 
 def _iokit_services() -> list[dict[str, Any]]:
-    """Every AGXAccelerator service's two properties; OSError when IOKit cannot be used."""
+    """Every AGXAccelerator service's two properties; OSError when IOKit cannot be used
+    (ctypes can raise others, which read() treats the same way)."""
     iokit = ctypes.CDLL(_IOKIT)
     cf = ctypes.CDLL(_CORE_FOUNDATION)
     vp, u32 = ctypes.c_void_p, ctypes.c_uint32
@@ -71,7 +72,7 @@ def _iokit_services() -> list[dict[str, Any]]:
     cf.CFNumberGetTypeID.restype = ctypes.c_ulong
     cf.CFStringGetTypeID.restype = ctypes.c_ulong
     cf.CFNumberGetValue.restype = ctypes.c_bool
-    cf.CFNumberGetValue.argtypes = [vp, ctypes.c_int, vp]
+    cf.CFNumberGetValue.argtypes = [vp, ctypes.c_long, vp]  # CFNumberType is a CFIndex
     cf.CFStringGetCString.restype = ctypes.c_bool
     cf.CFStringGetCString.argtypes = [vp, ctypes.c_char_p, ctypes.c_long, u32]
     cf.CFRelease.restype = None
@@ -141,7 +142,7 @@ def read() -> GPUCores:
     """Read once per process: the core count cannot change under a running daemon."""
     try:
         return parse_services(_iokit_services(), "iokit")
-    except OSError, AttributeError, ValueError:
+    except Exception:  # noqa: BLE001 — ctypes also raises ArgumentError and TypeError; ioreg decides
         pass
     try:
         return parse_services(_ioreg_services(), "ioreg")

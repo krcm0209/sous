@@ -1480,6 +1480,40 @@ def test_the_os_build_is_in_every_key(monkeypatch):
     assert all(a != b for a, b in zip(after, before, strict=True))
 
 
+def test_os_release_calls_sysctlbyname_with_its_c_signature(monkeypatch):
+    """Undeclared, ctypes would pass the last argument as a C int where
+    sysctlbyname takes a size_t."""
+    import ctypes
+    import ctypes.util  # loads libc through the real CDLL on its first import
+
+    seen: dict = {}
+
+    class Sysctlbyname:
+        argtypes = None
+        restype = None
+
+        def __call__(self, name, buf, size, new, newlen):
+            seen.update(argtypes=self.argtypes, restype=self.restype, name=name)
+            ctypes.memmove(buf, b"24F74\0", 6)
+            return 0
+
+    libc = SimpleNamespace(sysctlbyname=Sysctlbyname())
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(platform, "mac_ver", lambda: ("15.5", ("", "", ""), "arm64"))
+    monkeypatch.setattr(ctypes, "CDLL", lambda *args, **kwargs: libc)
+    # Past the per-process cache: this call must run, and must not be remembered.
+    assert forkstore.os_release.__wrapped__() == "15.5 (24F74)"
+    assert seen["name"] == b"kern.osversion"
+    assert seen["argtypes"] == [
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    assert seen["restype"] is ctypes.c_int
+
+
 @pytest.mark.skipif(platform.system() != "Darwin", reason="reads this Mac's build")
 def test_os_release_is_the_version_and_the_build():
     release = forkstore.os_release()

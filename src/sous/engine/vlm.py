@@ -547,6 +547,10 @@ class VLMEngine:
 
         import mlx.core as mx
 
+        # First, before anything below can raise: until the next load decides
+        # afresh, no one-row call may reach the tile on the strength of this
+        # model's gates.
+        tileattn.clear()
         self.reset_prompt_cache()
         self._model = None
         self._processor = None
@@ -556,8 +560,5 @@ class VLMEngine:
         # weights outlive the unload.
         self._draft_context.close()
         self._draft_context = draftctx.OFF
-        # Until the next load decides afresh, no one-row call may reach the
-        # tile on the strength of this model's gates.
-        tileattn.clear()
         gc.collect()
         mx.clear_cache()

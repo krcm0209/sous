@@ -1,6 +1,7 @@
 """The GPU core count (sous.engine.gpucores): IORegistry parsing, the ioreg
 fallback, the match against mlx's device name, and one live read on a Mac."""
 
+import ctypes
 import os
 import plistlib
 import subprocess
@@ -54,8 +55,21 @@ def _unusable():
     raise OSError("IOKit unusable")
 
 
-def test_read_falls_back_to_ioreg_when_iokit_cannot_be_used(monkeypatch):
-    monkeypatch.setattr(gpucores, "_iokit_services", _unusable)
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("IOKit unusable"),
+        # What ctypes raises for an argument its declared argtypes refuse.
+        ctypes.ArgumentError("argument 2: TypeError: wrong type"),
+        TypeError("an unexpected ctypes result"),
+    ],
+    ids=["OSError", "ArgumentError", "TypeError"],
+)
+def test_read_falls_back_to_ioreg_whatever_stops_iokit(monkeypatch, error):
+    def fails():
+        raise error
+
+    monkeypatch.setattr(gpucores, "_iokit_services", fails)
     monkeypatch.setattr(
         gpucores, "_ioreg_services", lambda: [{"gpu-core-count": 20, "model": "Apple M5 Pro"}]
     )
@@ -158,7 +172,8 @@ def test_read_happens_once_per_process(monkeypatch):
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="the IORegistry is macOS's")
 @pytest.mark.skipif(
-    bool(os.environ.get("CI")), reason="CI never reads IOKit; S is monkeypatched there"
+    bool(os.environ.get("CI")),
+    reason="CI never reads IOKit; its tests set the GPU core count by monkeypatch",
 )
 def test_a_live_read_never_raises_and_names_mlxs_gpu():
     """A virtualised GPU may expose no AGXAccelerator service, so only a
