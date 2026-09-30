@@ -32,12 +32,14 @@ from __future__ import annotations
 import functools
 import importlib
 import logging
+import time
 import traceback
-from collections.abc import Callable
+import warnings
+from collections.abc import Callable, Mapping
 from typing import Any
 
-from sous.engine import nax
-from sous.engine.int8prefill import _error_line, _kernel, _kernel_text
+from sous.engine import gpucores, nax
+from sous.engine.int8prefill import _error_line, _kernel, _kernel_text, _model_type
 
 logger = logging.getLogger("sous.engine.tileattn")
 
@@ -390,7 +392,7 @@ def install_decode_hook() -> None:
     activation only, so a process that never activates the tile runs mlx-vlm's
     function untouched, and the wrapper passes every call through while the flag
     is clear, so an unload leaves it inert."""
-    language: Any = importlib.import_module("mlx_vlm.models.qwen3_5.language")
+    language: Any = importlib.import_module(_DECODE_MODULE)
     current = language.scaled_dot_product_attention
     if not getattr(current, _HOOK_MARK, False):
         language.scaled_dot_product_attention = _decode_wrapper(current)
@@ -412,6 +414,32 @@ def serve_verify(queries: Any, keys: Any, values: Any, splits: int) -> Any:
     if len(runs) > 1:
         calls["verify_straddles"] += 1
     return verify(queries, keys, values, splits)
+
+
+# The dense Qwen3.5-family text model. The families that reuse its language
+# module, qwen3_5_moe among them, would reach the same hooked global, so they
+# are refused by model type, not by class.
+SUPPORTED_MODEL_TYPES = frozenset({"qwen3_5"})
+# DFlash drafts with mx.fast.scaled_dot_product_attention of its own, so its
+# proposals never reach the hooked global. mlx-vlm's qwen3_5 MTP drafter builds
+# its layers from the target's attention class over plain KVCaches: the decode
+# hook would serve its proposals, and that path is unmeasured.
+SUPPORTED_DRAFTER_KINDS = frozenset({"dflash"})
+# Home of Qwen3_5Attention and of the global it calls after its projections.
+_DECODE_MODULE = "mlx_vlm.models.qwen3_5.language"
+# The one-row forward's path to that global with mask None, which decode parity
+# rests on: sha256 of inspect.getsource, as verifyattn pins its own sources.
+VALIDATED_DECODE_SOURCES: dict[str, frozenset[str]] = {
+    "Qwen3_5Attention.__call__": frozenset(
+        {"b051c66057acc90f4ed78691f90254685cfdb20d5814b0d58beec4d2bb34c184"}
+    ),
+    "Qwen3_5Model.__call__": frozenset(
+        {"9dfc2048db0d818595bcdeb306a59e80cf1217331784fe7361c92a2dbf13ab65"}
+    ),
+    "LanguageModel.__call__": frozenset(
+        {"af7f3f6427c2e59ab5266798b7518eaf026c3f7f749dd0962e38a6acece49cc9"}
+    ),
+}
 
 
 # The probe's far parity mark is the first step boundary at or past this many
@@ -477,7 +505,7 @@ def probe(modules: list[Any], splits: int, arch: str) -> str | None:
     import mlx.core as mx
 
     global _active_splits
-    language = importlib.import_module("mlx_vlm.models.qwen3_5.language")
+    language = importlib.import_module(_DECODE_MODULE)
     installed = language.scaled_dot_product_attention
     counted = dict(calls)
     try:
@@ -625,3 +653,145 @@ def _probe_steps(modules: list[Any], splits: int, arch: str, language: Any) -> s
     if not _close(got, want):
         return f"correctness: the model's module is {_rel_rms(got, want):.3g} from stock"
     return None
+
+
+def _refuse(reason: str, probe_seconds: float | None = None) -> dict[str, Any]:
+    """This load cannot use the tile: say so once and report why. A default-on
+    switch that is silently inert is worse than one warning line."""
+    # A compiler error runs to dozens of lines; the status needs the one naming it.
+    reason = _error_line(reason)
+    warnings.warn(
+        f"sous: attention tile unavailable ({reason}); "
+        "decode and verify run the stock attention paths",
+        stacklevel=3,
+    )
+    return {
+        "state": "unavailable",
+        "reason": reason,
+        "splits": None,
+        "probe_seconds": probe_seconds,
+    }
+
+
+def _model_reason(model: Any) -> str | None:
+    """Why this model's attention is not the one the kernel is specialised
+    for, or None."""
+    import mlx.core as mx
+
+    from sous.engine import verifyattn
+
+    model_type = _model_type(model)
+    if model_type not in SUPPORTED_MODEL_TYPES:
+        return f"unsupported model type {model_type or 'unknown'!r} (qwen3_5 only)"
+    modules = verifyattn._attention_modules(model)
+    if not modules:
+        return "no full-attention layers"
+    for module in modules:
+        q, kv, d = module.num_attention_heads, module.num_key_value_heads, module.head_dim
+        if (q, kv, d) != (HQ, HKV, D):
+            return f"unsupported attention shape {q}/{kv}/{d} (24/4/256 only)"
+        if module.scale != SCALE:
+            return f"attention scale {module.scale} is not 1/16"
+        dtype = module.k_norm.weight.dtype
+        if dtype != mx.bfloat16:
+            return f"attention dtype {dtype} is not bfloat16"
+    return None
+
+
+def _drafter_reason(
+    drafter_kind: str | None, verify_status: Mapping[str, Any] | None
+) -> str | None:
+    """With a drafter, the verifier must be on its exact grouped path too:
+    otherwise decode runs the tile while verify runs stock SDPA, and output
+    with the drafter no longer equals output without it."""
+    if drafter_kind is None:
+        return None
+    if drafter_kind not in SUPPORTED_DRAFTER_KINDS:
+        return f"drafter kind {drafter_kind!r} (dflash only)"
+    state = (verify_status or {}).get("state")
+    if state != "active":
+        return (
+            f"exact verify attention is {state}: "
+            "the verifier would run stock attention beside the tile"
+        )
+    return None
+
+
+def _decode_sources_reason() -> str | None:
+    """Which function on the one-row forward's path changed, or None."""
+    from sous.engine.verifyattn import _source_digest
+
+    for qualname, digests in VALIDATED_DECODE_SOURCES.items():
+        if _source_digest(_DECODE_MODULE, qualname) not in digests:
+            return f"mlx-vlm {qualname} changed"
+    return None
+
+
+def _split_target(device_name: str) -> tuple[int | None, str | None]:
+    """(S, None) when this GPU's core count is a measured split target, else
+    (None, why). The guards prove exactness, not speed: an unmeasured core
+    count may run the tile slower than stock."""
+    cores, reason = gpucores.matched_cores(device_name)
+    if cores is None:
+        return None, reason
+    if cores not in MEASURED_SPLITS:
+        measured = ", ".join(str(s) for s in sorted(MEASURED_SPLITS))
+        return None, f"split target {cores} not measured (measured: {measured})"
+    return cores, None
+
+
+def enable(
+    model: Any,
+    *,
+    enabled: bool,
+    drafter_kind: str | None,
+    verify_status: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Decide whether this load's decode and verify attention run on the tile.
+    Returns the status the engine exposes and never raises: a model load must
+    not fail because an accelerator is missing."""
+    global _active_splits
+    # First, on every call: a flag left from an earlier load must never serve
+    # this one, whatever happens below.
+    _active_splits = 0
+    if not enabled:
+        return {"state": "off", "reason": None, "splits": None, "probe_seconds": None}
+    seconds: float | None = None
+    try:
+        # Before anything imports mlx, so a GPU without tensor units reports
+        # that whatever its model.
+        reason = nax.platform_reason()
+        if reason is not None:
+            return _refuse(reason)
+        import mlx.core as mx
+
+        from sous.engine import verifyattn
+
+        reason = (
+            _model_reason(model)
+            or _drafter_reason(drafter_kind, verify_status)
+            or verifyattn._gate()
+            or _decode_sources_reason()
+        )
+        if reason is not None:
+            return _refuse(reason)
+        splits, reason = _split_target(str(mx.device_info().get("device_name", "")))
+        if splits is None:
+            return _refuse(reason or "no split target")
+        modules = verifyattn._attention_modules(model)
+        start = time.perf_counter()
+        try:
+            reason = probe(modules, splits, _arch())
+        finally:
+            seconds = round(time.perf_counter() - start, 2)
+        if reason is not None:
+            return _refuse(reason, seconds)
+        install_decode_hook()
+        _active_splits = splits
+        logger.info(
+            "attention tile: %d layers, %d splits, probe %.2fs", len(modules), splits, seconds
+        )
+        return {"state": "active", "reason": None, "splits": splits, "probe_seconds": seconds}
+    except Exception as e:  # noqa: BLE001 — degrade, never block the model
+        _active_splits = 0
+        return _refuse(str(e) or type(e).__name__, seconds)

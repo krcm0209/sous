@@ -7,8 +7,15 @@ compile; the `nax`-marked tests run the real kernel where the tensor units are.
 
 import importlib
 import inspect
+import json
+import logging
+import subprocess
+import sys
 import time
+import types
+import warnings
 from importlib.resources import files
+from pathlib import Path
 
 import pytest
 
@@ -692,23 +699,11 @@ _REJECTED_BUILD = (
 )
 
 
-def _guard_probe(monkeypatch) -> None:
-    """Registers restores for every global a probe run touches, so a probe
-    that fails a test cannot leak a hook, a flag or a compile verdict into
-    the next one."""
-    language = _language_module()
-    monkeypatch.setattr(
-        language, "scaled_dot_product_attention", language.scaled_dot_product_attention
-    )
-    monkeypatch.setattr(tileattn, "_active_splits", tileattn._active_splits)
-    monkeypatch.setattr(tileattn, "_compile_ok", tileattn._compile_ok)
-
-
 def _probe_setup(monkeypatch, tile=tfx.stand_in_tile) -> list:
     """`tile` as the kernel, a far mark of 3,201 keys instead of 57,601 (the
     stand-in is plain mlx, far slower than the kernel), a compile check that
     really runs, and the tiny model's full-attention modules."""
-    _guard_probe(monkeypatch)
+    tfx.guard_tile_state(monkeypatch)
     monkeypatch.setattr(tileattn, "tile", tile)
     monkeypatch.setattr(tileattn, "_compile_ok", False)
     monkeypatch.setattr(tileattn, "PROBE_FAR_KEYS", 3_000)
@@ -836,8 +831,406 @@ def test_probe_restores_the_flag_the_counters_and_the_global_when_the_module_ste
 
 @tfx.nax
 def test_probe_passes_the_real_kernel(monkeypatch):
-    _guard_probe(monkeypatch)
+    tfx.guard_tile_state(monkeypatch)
     modules = verifyattn._attention_modules(tfx.tiny_language_model())
     start = time.perf_counter()
     reason = _run_probe(modules)
     assert reason is None, f"{reason} (after {time.perf_counter() - start:.2f}s)"
+
+
+# ---- the gates and enable() ---------------------------------------------------------
+
+
+def _refusal(lm, **kwargs) -> dict:
+    """enable() on `lm`, expected to refuse: exactly one warning, on one line,
+    in the tile's words, and the flag left clear."""
+    kwargs = {"drafter_kind": None, "verify_status": None, **kwargs}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        status = tileattn.enable(lm, enabled=True, **kwargs)
+    messages = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    assert len(messages) == 1, messages
+    assert messages[0].startswith("sous: attention tile unavailable (")
+    assert "\n" not in messages[0]
+    assert status["state"] == "unavailable" and status["splits"] is None
+    assert tileattn._active_splits == 0
+    return status
+
+
+def test_enable_off_returns_before_any_guard(monkeypatch):
+    tfx.guard_tile_state(monkeypatch)
+    monkeypatch.setattr(tileattn, "_active_splits", 20)
+
+    def untouchable(*args, **kwargs):
+        raise AssertionError("a guard ran while the tile is off")
+
+    monkeypatch.setattr(tileattn.nax, "platform_reason", untouchable)
+    monkeypatch.setattr(tileattn, "_model_reason", untouchable)
+    monkeypatch.setattr(tileattn, "probe", untouchable)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        status = tileattn.enable(
+            types.SimpleNamespace(), enabled=False, drafter_kind="mtp", verify_status=None
+        )
+    assert status == {"state": "off", "reason": None, "splits": None, "probe_seconds": None}
+    assert [w for w in caught if issubclass(w.category, UserWarning)] == []
+    assert tileattn._active_splits == 0
+
+
+def test_enable_reports_the_platform_whatever_the_model(monkeypatch):
+    tfx.guard_tile_state(monkeypatch)
+    monkeypatch.setattr(tileattn.nax, "platform_reason", lambda: "macOS 15.5 < 26.2")
+    status = _refusal(types.SimpleNamespace(), drafter_kind="mtp")
+    assert status["reason"] == "macOS 15.5 < 26.2" and status["probe_seconds"] is None
+
+
+_GUARD_REASONS = [
+    "macOS 15.5 < 26.2",
+    "unsupported model type 'qwen3_5_moe' (qwen3_5 only)",
+    "drafter kind 'mtp' (dflash only)",
+    "mlx 0.99.0 not validated",
+    "mlx-vlm Qwen3_5Attention.__call__ changed",
+    "split target 16 not measured (measured: 20)",
+    "parity: verify rows at prefix 1535, T=6 differ from decode",
+]
+
+
+@pytest.mark.parametrize("first", range(len(_GUARD_REASONS)))
+def test_enable_names_the_first_failing_guard(monkeypatch, first):
+    """Guard `first` and every guard after it fail; the reason is guard `first`'s."""
+    from sous.engine import gpucores
+
+    tfx.tile_ready(monkeypatch)
+    lm = tfx.tiny_language_model()
+    device = str(mx.device_info()["device_name"])
+    kwargs: dict = {"drafter_kind": None, "verify_status": None}
+    breakers = [
+        lambda: monkeypatch.setattr(tileattn.nax, "platform_reason", lambda: _GUARD_REASONS[0]),
+        lambda: monkeypatch.setattr(lm, "model_type", "qwen3_5_moe"),
+        lambda: kwargs.update(drafter_kind="mtp"),
+        lambda: monkeypatch.setattr(mx, "__version__", "0.99.0"),
+        lambda: monkeypatch.setitem(
+            tileattn.VALIDATED_DECODE_SOURCES, "Qwen3_5Attention.__call__", frozenset({"0" * 64})
+        ),
+        lambda: monkeypatch.setattr(
+            tileattn.gpucores, "read", lambda: gpucores.GPUCores(16, device, None, "iokit")
+        ),
+        lambda: monkeypatch.setattr(
+            tileattn, "probe", lambda modules, splits, arch: _GUARD_REASONS[6]
+        ),
+    ]
+    for brk in breakers[first:]:
+        brk()
+    assert _refusal(lm, **kwargs)["reason"] == _GUARD_REASONS[first]
+
+
+def test_enable_refuses_other_model_types(monkeypatch):
+    tfx.tile_ready(monkeypatch)
+    lm = tfx.tiny_language_model()
+    # The MoE variant reuses these very attention classes.
+    monkeypatch.setattr(lm, "model_type", "qwen3_5_moe")
+    assert _refusal(lm)["reason"] == "unsupported model type 'qwen3_5_moe' (qwen3_5 only)"
+
+
+def test_enable_refuses_a_model_without_full_attention(monkeypatch):
+    tfx.tile_ready(monkeypatch)
+    monkeypatch.setattr(verifyattn, "_attention_modules", lambda model: [])
+    assert _refusal(tfx.tiny_language_model())["reason"] == "no full-attention layers"
+
+
+def test_enable_refuses_another_attention_shape(monkeypatch):
+    tfx.tile_ready(monkeypatch)
+    lm = tfx.tiny_language_model(heads=6, kv_heads=1)
+    assert _refusal(lm)["reason"] == "unsupported attention shape 6/1/256 (24/4/256 only)"
+
+
+def test_enable_refuses_another_attention_scale(monkeypatch):
+    tfx.tile_ready(monkeypatch)
+    lm = tfx.tiny_language_model()
+    monkeypatch.setattr(verifyattn._attention_modules(lm)[1], "scale", 0.1)
+    assert _refusal(lm)["reason"] == "attention scale 0.1 is not 1/16"
+
+
+def test_enable_refuses_another_attention_dtype(monkeypatch):
+    tfx.tile_ready(monkeypatch)
+    lm = tfx.tiny_language_model()
+    lm.set_dtype(mx.float16)
+    assert _refusal(lm)["reason"] == f"attention dtype {mx.float16} is not bfloat16"
+
+
+@pytest.mark.parametrize("kind", ["mtp", "eagle3"])
+def test_enable_refuses_drafters_other_than_dflash(monkeypatch, kind):
+    tfx.tile_ready(monkeypatch)
+    status = _refusal(
+        tfx.tiny_language_model(), drafter_kind=kind, verify_status={"state": "active"}
+    )
+    assert status["reason"] == f"drafter kind {kind!r} (dflash only)"
+
+
+@pytest.mark.parametrize(
+    "verify_status",
+    [
+        {"state": "unavailable", "reason": "mlx 0.33.0 not validated", "probe_seconds": None},
+        {"state": "off", "reason": None, "probe_seconds": None},
+        None,
+    ],
+)
+def test_enable_needs_exact_verify_beside_a_dflash_drafter(monkeypatch, verify_status):
+    tfx.tile_ready(monkeypatch)
+    status = _refusal(tfx.tiny_language_model(), drafter_kind="dflash", verify_status=verify_status)
+    state = verify_status["state"] if verify_status else None
+    assert status["reason"] == (
+        f"exact verify attention is {state}: the verifier would run stock attention beside the tile"
+    )
+
+
+def test_enable_passes_no_drafter_and_a_dflash_one_with_exact_verify():
+    assert tileattn._drafter_reason(None, None) is None
+    assert tileattn._drafter_reason("dflash", {"state": "active", "reason": None}) is None
+
+
+def test_enable_refuses_an_unvalidated_mlx(monkeypatch):
+    tfx.tile_ready(monkeypatch)
+    monkeypatch.setattr(mx, "__version__", "0.99.0")
+    assert _refusal(tfx.tiny_language_model())["reason"] == "mlx 0.99.0 not validated"
+
+
+def test_enable_refuses_a_forced_sdpa_block_count(monkeypatch):
+    tfx.tile_ready(monkeypatch)
+    monkeypatch.setenv("MLX_SDPA_BLOCKS", "4")
+    assert _refusal(tfx.tiny_language_model())["reason"] == "MLX_SDPA_BLOCKS is set"
+
+
+def test_enable_validates_the_locked_mlx_vlm_decode_sources():
+    assert set(tileattn.VALIDATED_DECODE_SOURCES) == {
+        "Qwen3_5Attention.__call__",
+        "Qwen3_5Model.__call__",
+        "LanguageModel.__call__",
+    }
+    assert tileattn._decode_sources_reason() is None
+
+
+def test_enable_refuses_a_changed_decode_source(monkeypatch):
+    tfx.tile_ready(monkeypatch)
+    monkeypatch.setitem(
+        tileattn.VALIDATED_DECODE_SOURCES, "Qwen3_5Model.__call__", frozenset({"0" * 64})
+    )
+    reason = _refusal(tfx.tiny_language_model())["reason"]
+    assert reason == "mlx-vlm Qwen3_5Model.__call__ changed"
+
+
+@pytest.mark.parametrize("case", ["unreadable", "another GPU", "unmeasured"])
+def test_enable_needs_a_measured_core_count_of_this_gpu(monkeypatch, case):
+    from sous.engine import gpucores
+
+    tfx.tile_ready(monkeypatch)
+    device = str(mx.device_info()["device_name"])
+    reading, reason = {
+        "unreadable": (
+            gpucores.GPUCores(None, None, "GPU core count unreadable: timed out", "none"),
+            "GPU core count unreadable: timed out",
+        ),
+        "another GPU": (
+            gpucores.GPUCores(20, "Apple M9 Ultra", None, "iokit"),
+            f"IORegistry GPU 'Apple M9 Ultra' is not mlx's {device!r}",
+        ),
+        "unmeasured": (
+            gpucores.GPUCores(16, device, None, "iokit"),
+            "split target 16 not measured (measured: 20)",
+        ),
+    }[case]
+    monkeypatch.setattr(tileattn.gpucores, "read", lambda: reading)
+    assert _refusal(tfx.tiny_language_model())["reason"] == reason
+
+
+def test_enable_refuses_a_failed_probe_with_its_cost(monkeypatch):
+    tfx.tile_ready(monkeypatch)
+    monkeypatch.setattr(
+        tileattn, "probe", lambda modules, splits, arch: "correctness: n=1536 is 0.101 from stock"
+    )
+    status = _refusal(tfx.tiny_language_model())
+    assert status["reason"] == "correctness: n=1536 is 0.101 from stock"
+    assert isinstance(status["probe_seconds"], float)
+
+
+def test_enable_refuses_an_exception_in_a_guard_with_its_error_line(monkeypatch):
+    tfx.tile_ready(monkeypatch)
+    monkeypatch.setattr(tileattn, "_active_splits", 20)
+
+    def broken(model):
+        raise RuntimeError("Unable to build metal library\nprogram_source:3:1: error: boom")
+
+    monkeypatch.setattr(verifyattn, "_attention_modules", broken)
+    status = _refusal(tfx.tiny_language_model())
+    assert status["reason"] == "program_source:3:1: error: boom"
+    assert status["probe_seconds"] is None
+
+
+def test_enable_refuses_a_probe_that_raises_and_reports_what_it_cost(monkeypatch):
+    def fails_past_the_first_step(q, k, v, n, chunk):
+        if n >= 1921:
+            raise RuntimeError("device lost")
+        return tfx.stand_in_tile(q, k, v, n, chunk)
+
+    tfx.tile_ready(monkeypatch)
+    _probe_setup(monkeypatch, fails_past_the_first_step)
+    status = _refusal(tfx.tiny_language_model())
+    assert "device lost" in status["reason"]
+    assert isinstance(status["probe_seconds"], float)
+    assert tileattn._active_splits == 0
+
+
+@pytest.mark.parametrize(
+    ("kind", "verify_status"),
+    [(None, None), ("dflash", {"state": "active", "reason": None, "probe_seconds": 0.21})],
+)
+def test_enable_activates_the_tile_when_the_probe_passes(monkeypatch, caplog, kind, verify_status):
+    tfx.tile_ready(monkeypatch)
+    lm = tfx.tiny_language_model()
+    seen: list = []
+
+    def passing(modules, splits, arch):
+        seen.append(([id(m) for m in modules], splits, arch))
+
+    monkeypatch.setattr(tileattn, "probe", passing)
+    with caplog.at_level(logging.INFO, logger="sous.engine.tileattn"):
+        status = tileattn.enable(lm, enabled=True, drafter_kind=kind, verify_status=verify_status)
+    assert status["state"] == "active" and status["reason"] is None
+    assert status["splits"] == 20 and isinstance(status["probe_seconds"], float)
+    assert seen == [([id(m) for m in verifyattn._attention_modules(lm)], 20, tileattn._arch())]
+    assert tileattn._active_splits == 20
+    assert getattr(_language_module().scaled_dot_product_attention, tileattn._HOOK_MARK, False)
+    assert [r.getMessage() for r in caplog.records if r.name == "sous.engine.tileattn"] == [
+        f"attention tile: 2 layers, 20 splits, probe {status['probe_seconds']:.2f}s"
+    ]
+
+
+@pytest.mark.slow
+def test_enable_goes_active_through_the_real_probe(monkeypatch):
+    tfx.tile_ready(monkeypatch)
+    status = tileattn.enable(
+        tfx.tiny_language_model(), enabled=True, drafter_kind=None, verify_status=None
+    )
+    assert status["state"] == "active" and status["splits"] == 20, status
+    assert isinstance(status["probe_seconds"], float)
+    assert tileattn._active_splits == 20
+    assert getattr(_language_module().scaled_dot_product_attention, tileattn._HOOK_MARK, False)
+
+
+@pytest.mark.parametrize("ending", ["disabled", "failed gate", "other model", "cleared"])
+def test_enable_then_a_later_load_or_clear_leaves_decode_and_verify_stock(monkeypatch, ending):
+    from mlx_vlm.models.base import scaled_dot_product_attention as original
+    from mlx_vlm.models.cache import KVCache
+
+    from sous.engine import gpucores
+
+    tfx.tile_ready(monkeypatch)
+    monkeypatch.setattr(tileattn, "probe", lambda modules, splits, arch: None)
+    lm = tfx.tiny_language_model()
+    tfx.verify_ready(monkeypatch, lm)
+    ids = mx.random.randint(0, tfx.VOCAB, (2003,), key=mx.random.key(5)).tolist()
+    cache = tfx.prefill_cache(lm, ids[:2000])
+    reference = tfx.verify_forward(lm, cache, ids[2000:])
+    queries, keys, values = tfx.serving_qkv(2000, 1)
+
+    def decode_row():
+        return _language_module().scaled_dot_product_attention(
+            queries, keys, values, cache=KVCache(), scale=tileattn.SCALE, mask=None
+        )
+
+    stock = original(queries, keys, values, cache=KVCache(), scale=tileattn.SCALE, mask=None)
+    status = tileattn.enable(lm, enabled=True, drafter_kind=None, verify_status=None)
+    assert status["state"] == "active"
+    before = dict(tileattn.calls)
+    mx.eval(decode_row())
+    tfx.verify_forward(lm, cache, ids[2000:])
+    # While active, both paths reach the tile: what follows is not vacuous.
+    assert tileattn.calls["decode_tile"] == before["decode_tile"] + 1
+    assert tileattn.calls["verify_rows_tile"] == before["verify_rows_tile"] + 2 * 3
+
+    if ending == "disabled":
+        tileattn.enable(lm, enabled=False, drafter_kind=None, verify_status=None)
+    elif ending == "failed gate":
+        device = str(mx.device_info()["device_name"])
+        monkeypatch.setattr(
+            tileattn.gpucores, "read", lambda: gpucores.GPUCores(16, device, None, "iokit")
+        )
+        _refusal(lm)
+    elif ending == "other model":
+        monkeypatch.setattr(lm, "model_type", "qwen3_5_moe")
+        _refusal(lm)
+    else:
+        tileattn.clear()
+
+    assert tileattn._active_splits == 0
+    before = dict(tileattn.calls)
+    assert mx.array_equal(decode_row(), stock).item()
+    after = tfx.verify_forward(lm, cache, ids[2000:])
+    assert all(mx.array_equal(a, r).item() for a, r in zip(after, reference, strict=True))
+    for key in ("decode_tile", "verify_calls", "verify_rows_tile"):
+        assert tileattn.calls[key] == before[key], key
+
+
+@tfx.nax
+def test_enable_activates_the_real_kernel_on_the_tiny_model(monkeypatch):
+    from sous.engine import gpucores
+
+    tfx.guard_tile_state(monkeypatch)
+    device = str(mx.device_info()["device_name"])
+    monkeypatch.setattr(
+        tileattn.gpucores, "read", lambda: gpucores.GPUCores(20, device, None, "iokit")
+    )
+    status = tileattn.enable(
+        tfx.tiny_language_model(), enabled=True, drafter_kind=None, verify_status=None
+    )
+    assert status["state"] == "active" and status["splits"] == 20, status
+
+
+# Patched before anything compiles the kernel: a built pair is cached by name
+# for the life of the process and a passing compile is remembered, so this
+# needs an interpreter of its own.
+_BROKEN_KERNEL = """
+import json
+
+import mlx.core as mx
+
+from sous.engine import gpucores, tileattn
+
+source = tileattn._kernel_text
+
+
+def broken(name):
+    text = source(name)
+    if name != "attention_tile.metal":
+        return text
+    split, reduce = text.split(tileattn._REDUCE_MARK)
+    split = "  int sous_broken = sous_undeclared_identifier;\\n" + split
+    return split + tileattn._REDUCE_MARK + reduce
+
+
+tileattn._kernel_text = broken
+from tests import tile_fixtures as tfx
+
+device = str(mx.device_info()["device_name"])
+gpucores.read = lambda: gpucores.GPUCores(20, device, None, "iokit")
+status = tileattn.enable(
+    tfx.tiny_language_model(), enabled=True, drafter_kind=None, verify_status=None
+)
+print(json.dumps(status))
+"""
+
+
+@tfx.nax
+@pytest.mark.slow
+def test_enable_reports_a_kernel_this_os_rejects_with_its_error_line():
+    done = subprocess.run(
+        [sys.executable, "-c", _BROKEN_KERNEL],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    status = json.loads(done.stdout.strip().splitlines()[-1])
+    assert status["state"] == "unavailable", status
+    assert status["reason"].startswith("kernel: ") and "error:" in status["reason"], status

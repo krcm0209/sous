@@ -5,6 +5,7 @@ at the 27B's attention shape, and the installers for both hooks.
 mlx is imported inside each helper, so importing this module needs only what
 `tileattn.availability()` itself imports."""
 
+import importlib
 from typing import Any
 
 import pytest
@@ -176,8 +177,6 @@ def verify_forward(lm: Any, cache: list, tokens: list[int]) -> list:
 def hooked(monkeypatch: pytest.MonkeyPatch, *, splits: int = 20, stand_in: bool = True) -> None:
     """The decode hook installed and the flag set for this test only; monkeypatch
     restores the language module's global and the flag afterwards."""
-    import importlib
-
     language = importlib.import_module("mlx_vlm.models.qwen3_5.language")
     current = language.scaled_dot_product_attention
     if not getattr(current, tileattn._HOOK_MARK, False):
@@ -203,3 +202,35 @@ def verify_ready(monkeypatch: pytest.MonkeyPatch, lm: Any) -> list:
     for module in modules:
         object.__setattr__(module, verifyattn._TAG, tileattn.GQA)
     return modules
+
+
+def guard_tile_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Registers restores for what enable() and the probe leave behind for the
+    rest of the process: mlx-vlm's decode global (the hook), the flag and the
+    remembered compile verdict. A test that activates the tile, or runs the
+    stand-in through the compile check, then cannot leak either into the next."""
+    language = importlib.import_module("mlx_vlm.models.qwen3_5.language")
+    monkeypatch.setattr(
+        language, "scaled_dot_product_attention", language.scaled_dot_product_attention
+    )
+    monkeypatch.setattr(tileattn, "_active_splits", tileattn._active_splits)
+    monkeypatch.setattr(tileattn, "_compile_ok", tileattn._compile_ok)
+
+
+def tile_ready(monkeypatch: pytest.MonkeyPatch, *, cores: int = 20) -> None:
+    """Every enable() guard that reads the machine passes on any GPU: the
+    platform rule, and a core count of `cores` under this GPU's own name. The
+    stand-in is the kernel, and the probe's far mark is one the stand-in
+    reaches in seconds."""
+    import mlx.core as mx
+
+    from sous.engine import gpucores
+
+    device = str(mx.device_info()["device_name"])
+    monkeypatch.setattr(tileattn.nax, "platform_reason", lambda: None)
+    monkeypatch.setattr(
+        tileattn.gpucores, "read", lambda: gpucores.GPUCores(cores, device, None, "iokit")
+    )
+    monkeypatch.setattr(tileattn, "tile", stand_in_tile)
+    monkeypatch.setattr(tileattn, "PROBE_FAR_KEYS", 3_000)
+    guard_tile_state(monkeypatch)
