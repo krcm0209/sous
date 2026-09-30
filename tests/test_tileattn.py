@@ -7,6 +7,7 @@ compile; the `nax`-marked tests run the real kernel where the tensor units are.
 
 import importlib
 import inspect
+import time
 from importlib.resources import files
 
 import pytest
@@ -681,3 +682,142 @@ def test_a_declined_verify_computes_todays_attention(tiny_verifier, monkeypatch,
     ours = tfx.verify_forward(lm, cache, tokens)
     assert _tile_counts_since(before) == {"verify_declined": 2}
     assert all(mx.array_equal(a, b).item() for a, b in zip(stock, ours, strict=True))
+
+
+# ---- the load-time probe -----------------------------------------------------------
+
+_REJECTED_BUILD = (
+    "[metal::Device] Unable to build metal library from source\n"
+    "program_source:12:3: error: use of undeclared identifier 'x'\n"
+)
+
+
+def _guard_probe(monkeypatch) -> None:
+    """Registers restores for every global a probe run touches, so a probe
+    that fails a test cannot leak a hook, a flag or a compile verdict into
+    the next one."""
+    language = _language_module()
+    monkeypatch.setattr(
+        language, "scaled_dot_product_attention", language.scaled_dot_product_attention
+    )
+    monkeypatch.setattr(tileattn, "_active_splits", tileattn._active_splits)
+    monkeypatch.setattr(tileattn, "_compile_ok", tileattn._compile_ok)
+
+
+def _probe_setup(monkeypatch, tile=tfx.stand_in_tile) -> list:
+    """`tile` as the kernel, a far mark of 3,201 keys instead of 57,601 (the
+    stand-in is plain mlx, far slower than the kernel), a compile check that
+    really runs, and the tiny model's full-attention modules."""
+    _guard_probe(monkeypatch)
+    monkeypatch.setattr(tileattn, "tile", tile)
+    monkeypatch.setattr(tileattn, "_compile_ok", False)
+    monkeypatch.setattr(tileattn, "PROBE_FAR_KEYS", 3_000)
+    return verifyattn._attention_modules(tfx.tiny_language_model())
+
+
+def _run_probe(modules, arch: str | None = None) -> str | None:
+    """probe() at S = 20, asserting it left the flag clear and the counters
+    and mlx-vlm's global as it found them, whatever it decided."""
+    installed = _language_module().scaled_dot_product_attention
+    before = dict(tileattn.calls)
+    reason = tileattn.probe(modules, 20, arch or tileattn._arch())
+    assert tileattn._active_splits == 0
+    assert tileattn.calls == before
+    assert _language_module().scaled_dot_product_attention is installed
+    return reason
+
+
+def test_probe_far_mark_is_the_first_step_boundary_at_or_past_the_probe_keys(monkeypatch):
+    assert tileattn.far_mark(20) == 57_601
+    assert tileattn.far_mark(10) == 57_281
+    monkeypatch.setattr(tileattn, "PROBE_FAR_KEYS", 3_000)
+    assert tileattn.far_mark(20) == 3_201
+    monkeypatch.setattr(tileattn, "PROBE_FAR_KEYS", 3_201)
+    assert tileattn.far_mark(20) == 3_201  # a boundary is its own far mark
+
+
+def test_probe_parity_cases_cover_the_first_steps_the_far_mark_and_stock_transitions():
+    marks, stock = tileattn.parity_cases(20, "applegpu_g17s")
+    assert marks == [1536, 1921, 2561, 57601]
+    # 's' parts change plan at 1024 and 1025 keys, both below N0: rows on both sides
+    assert stock == [(1021, 2), (1022, 1), (1022, 2), (1023, 1), (1023, 2), (1024, 1), (1024, 2)]
+    # 'g' parts change plan only at 4096 keys, where the tile serves
+    assert tileattn.parity_cases(20, "applegpu_g14g") == ([1536, 1921, 2561, 57601], [])
+
+
+@pytest.mark.slow
+def test_probe_passes_the_stand_in(monkeypatch):
+    assert _run_probe(_probe_setup(monkeypatch)) is None
+
+
+@pytest.mark.slow
+def test_probe_checks_the_stock_side_on_any_gpu_and_reuses_an_installed_hook(monkeypatch):
+    modules = _probe_setup(monkeypatch)
+    # The hook an earlier load installed, and the flag enable() cleared first.
+    tfx.hooked(monkeypatch, splits=20)
+    monkeypatch.setattr(tileattn, "_active_splits", 0)
+    hook = _language_module().scaled_dot_product_attention
+    assert tileattn.parity_cases(20, "applegpu_g17s")[1]  # the stock cases run on this GPU
+    assert _run_probe(modules, "applegpu_g17s") is None
+    assert _language_module().scaled_dot_product_attention is hook
+
+
+def test_probe_fails_parity_for_a_kernel_that_ignores_the_stepped_chunk(monkeypatch):
+    modules = _probe_setup(
+        monkeypatch, lambda q, k, v, n, chunk: tfx.stand_in_tile(q, k, v, n, -(-n // 20))
+    )
+    reason = _run_probe(modules)
+    assert reason is not None and reason.startswith("parity:"), reason
+
+
+def test_probe_fails_correctness_for_a_kernel_wrong_the_same_way_on_both_paths(monkeypatch):
+    def scaled(q, k, v, n, chunk):
+        out = tfx.stand_in_tile(q, k, v, n, chunk)
+        return (out.astype(mx.float32) * 1.1).astype(mx.bfloat16)
+
+    modules = _probe_setup(monkeypatch, scaled)
+    # Parity cannot see this kernel, so the sweep past N0 would only cost time.
+    monkeypatch.setattr(tileattn, "parity_cases", lambda splits, arch: ([tileattn.N0], []))
+    reason = _run_probe(modules)
+    assert reason is not None and reason.startswith("correctness:"), reason
+
+
+def test_probe_reports_a_kernel_that_fails_to_build_with_its_error_line(monkeypatch):
+    def rejected(q, k, v, n, chunk):
+        raise RuntimeError(_REJECTED_BUILD)
+
+    modules = _probe_setup(monkeypatch, rejected)
+    reason = _run_probe(modules)
+    assert reason == "kernel: program_source:12:3: error: use of undeclared identifier 'x'"
+
+
+def test_probe_refuses_a_module_that_never_reaches_the_tile(monkeypatch):
+    modules = _probe_setup(monkeypatch)
+    monkeypatch.setattr(tileattn, "parity_cases", lambda splits, arch: ([tileattn.N0], []))
+    monkeypatch.setattr(tileattn, "_plain_kv_cache", lambda cache: False)
+    assert _run_probe(modules) == "the model's attention module did not reach the tile"
+
+
+def test_probe_restores_what_it_touched_when_it_raises(monkeypatch):
+    def fails_past_the_first_step(q, k, v, n, chunk):
+        if n >= 1921:
+            raise RuntimeError("device lost")
+        return tfx.stand_in_tile(q, k, v, n, chunk)
+
+    modules = _probe_setup(monkeypatch, fails_past_the_first_step)
+    installed = _language_module().scaled_dot_product_attention
+    before = dict(tileattn.calls)
+    with pytest.raises(RuntimeError, match="device lost"):
+        tileattn.probe(modules, 20, tileattn._arch())
+    assert tileattn._active_splits == 0
+    assert tileattn.calls == before
+    assert _language_module().scaled_dot_product_attention is installed
+
+
+@tfx.nax
+def test_probe_passes_the_real_kernel(monkeypatch):
+    _guard_probe(monkeypatch)
+    modules = verifyattn._attention_modules(tfx.tiny_language_model())
+    start = time.perf_counter()
+    reason = _run_probe(modules)
+    assert reason is None, f"{reason} (after {time.perf_counter() - start:.2f}s)"

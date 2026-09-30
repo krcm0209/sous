@@ -32,6 +32,7 @@ from __future__ import annotations
 import functools
 import importlib
 import logging
+import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -411,3 +412,216 @@ def serve_verify(queries: Any, keys: Any, values: Any, splits: int) -> Any:
     if len(runs) > 1:
         calls["verify_straddles"] += 1
     return verify(queries, keys, values, splits)
+
+
+# The probe's far parity mark is the first step boundary at or past this many
+# keys: every row runs its full S splits there (from 11,553 keys at S = 20),
+# and the subagent turns the tile was measured on sit at 44-77K.
+PROBE_FAR_KEYS = 57_000
+# How far the probe lets the tile land from stock one-row SDPA, as a relative
+# RMS difference. The tile's error against a float64 reference is at or below
+# stock's, and one bf16 ulp of the output is about 4e-3.
+REL_RMS_BOUND = 1e-2
+
+
+def far_mark(splits: int) -> int:
+    """The first step boundary at or past PROBE_FAR_KEYS."""
+    reach = PROBE_FAR_KEYS + GRAN * splits  # no step is wider than GRAN * splits keys
+    return next(b for b in boundaries(reach, splits) if b >= PROBE_FAR_KEYS)
+
+
+def parity_cases(splits: int, arch: str) -> tuple[list[int], list[tuple[int, int]]]:
+    """(tile marks, stock cases). Each tile mark (N0, the next two step
+    boundaries and the far mark) is probed at T = 1..8 with rows below it,
+    straddling it and from it. The stock cases put T = 1 and 2 rows on both
+    sides of every verifyattn plan transition below N0, where verify runs
+    grouped_attention and must still equal stock one-row SDPA."""
+    from sous.engine.verifyattn import plan_transitions
+
+    first = boundaries(N0 + 2 * GRAN * splits, splits)
+    marks = sorted({first[0], first[1], first[2], far_mark(splits)})
+    stock = sorted(
+        {
+            (p, t)
+            for m in plan_transitions(arch, GQA)
+            if m < N0
+            for t in (1, 2)
+            for p in (m - t - 1, m - 1 - t // 2, m - 1)
+        }
+    )
+    return marks, stock
+
+
+def _rel_rms(got: Any, want: Any) -> float:
+    import mlx.core as mx
+
+    g = got.astype(mx.float32)
+    w = want.astype(mx.float32)
+    return float(mx.sqrt(mx.mean((g - w) ** 2)) / mx.sqrt(mx.mean(w**2)))
+
+
+def _close(got: Any, want: Any) -> bool:
+    """Finite and within REL_RMS_BOUND of `want`: a NaN anywhere fails, since
+    no comparison with NaN is true."""
+    import mlx.core as mx
+
+    return bool(mx.all(mx.isfinite(got)).item()) and _rel_rms(got, want) <= REL_RMS_BOUND
+
+
+def probe(modules: list[Any], splits: int, arch: str) -> str | None:
+    """None when the tile may serve `modules` on this GPU at `splits` splits,
+    else why not. Runs on the loading thread with the flag clear, and leaves
+    the flag clear and the counters and mlx-vlm's global as it found them.
+    Its arrays are gone before the cache is cleared, so the budget measured
+    next reads true."""
+    import mlx.core as mx
+
+    global _active_splits
+    language = importlib.import_module("mlx_vlm.models.qwen3_5.language")
+    installed = language.scaled_dot_product_attention
+    counted = dict(calls)
+    try:
+        return _probe_steps(modules, splits, arch, language)
+    except BaseException as e:
+        # The traceback holds the steps' frame, and every probe array in it,
+        # until the caller has handled the error: drop them now.
+        traceback.clear_frames(e.__traceback__)
+        raise
+    finally:
+        _active_splits = 0
+        language.scaled_dot_product_attention = installed
+        calls.update(counted)
+        mx.clear_cache()
+
+
+def _probe_steps(modules: list[Any], splits: int, arch: str, language: Any) -> str | None:
+    """Every input is made with GPU ops (no float64, which is CPU-only in mlx)
+    and evaluated before the first launch: a kernel failure with a CPU-stream
+    op in flight deadlocks mlx's exception path. Inputs are laid out as
+    serving lays them out: transposed query rows, K/V slices of 256-step
+    padded buffers."""
+    import mlx.core as mx
+
+    global _active_splits
+    # Every row variant compiles now, so no compile first happens mid-turn.
+    failed = _compile_probe()
+    if failed is not None:
+        return f"kernel: {failed}"
+
+    marks, stock_cases = parity_cases(splits, arch)
+    far = far_mark(splits)
+    first = boundaries(N0 + 2 * GRAN * splits, splits)
+    mid_step = (first[1] + first[2]) // 2
+    top = max(far + 16, max((p + t for p, t in stock_cases), default=0))
+    cap = -(-(top + 1) // 256) * 256
+    k_key, v_key, q_key, x_key, m_key = mx.random.split(mx.random.key(0), 5)
+    kb = mx.random.normal((1, HKV, cap, D), key=k_key).astype(mx.bfloat16)
+    vb = mx.random.normal((1, HKV, cap, D), key=v_key).astype(mx.bfloat16)
+    qpool = mx.random.normal((1, 20, HQ, D), key=q_key).astype(mx.bfloat16)
+    nan_tail = mx.full((1, HKV, 256, D), float("nan"), dtype=mx.bfloat16)
+    mx.eval(kb, vb, qpool, nan_tail)
+
+    def rows(start: int, t: int) -> Any:
+        return qpool[:, start : start + t].transpose(0, 2, 1, 3)
+
+    # Parity: every verify row equals decode() at its own key count.
+    def parity(point: int, cases: list[tuple[int, int]]) -> str | None:
+        base = point - 10  # query row i sits at position base + i and sees base + i + 1 keys
+        dec = {
+            pos + 1: decode(rows(pos - base, 1), kb[:, :, : pos + 1], vb[:, :, : pos + 1], splits)
+            for pos in range(base, base + 20)
+        }
+        for prefix, t in cases:
+            n = prefix + t
+            out = verify(rows(prefix - base, t), kb[:, :, :n], vb[:, :, :n], splits)
+            same = mx.stack(
+                [mx.array_equal(out[:, :, r], dec[prefix + r + 1][:, :, 0]) for r in range(t)]
+            )
+            if not mx.all(same).item():
+                return f"parity: verify rows at prefix {prefix}, T={t} differ from decode"
+        return None
+
+    for mark in marks:
+        cases = [
+            (p, t)
+            for t in range(1, MAX_RUN + 1)
+            for p in sorted({mark - t - 1, mark - 1 - t // 2, mark - 1})
+        ]
+        if (reason := parity(mark, cases)) is not None:
+            return reason
+    for prefix, t in stock_cases:
+        if (reason := parity(prefix + 1, [(prefix, t)])) is not None:
+            return reason
+
+    # Reads stay in [0, n): NaN past n in every KV head, and a buffer that
+    # ends exactly at n, give the clean result.
+    for n, t in ((N0, 1), (mid_step, 3), (far, MAX_RUN)):
+        want = verify(rows(0, t), kb[:, :, :n], vb[:, :, :n], splits)
+        k_nan = mx.concatenate([kb[:, :, :n], nan_tail], axis=2)
+        v_nan = mx.concatenate([vb[:, :, :n], nan_tail], axis=2)
+        k_end, v_end = mx.contiguous(kb[:, :, :n]), mx.contiguous(vb[:, :, :n])
+        mx.eval(want, k_nan, v_nan, k_end, v_end)
+        for keys, values in ((k_nan[:, :, :n], v_nan[:, :, :n]), (k_end, v_end)):
+            got = verify(rows(0, t), keys, values, splits)
+            if not (mx.array_equal(got, want).item() and mx.all(mx.isfinite(got)).item()):
+                return f"reads past n: T={t} at n={n} differs from the clean buffer"
+
+    # Correctness, which parity cannot see in a kernel wrong the same way on
+    # both paths: x8 queries, a dominant key at n - 1, and a second one at n,
+    # just past the live range, that the tile must not read.
+    q8 = (qpool[:, :1].astype(mx.float32) * 8).astype(mx.bfloat16).transpose(0, 2, 1, 3)
+    dominant = q8[:, :, 0].reshape(1, HKV, GQA, D)[:, :, :1]
+    ones = mx.ones((1, HKV, 1, D), dtype=mx.bfloat16)
+    for n in sorted({N0, mid_step, far}):
+        kp = mx.concatenate([kb[:, :, : n - 1], dominant, dominant, kb[:, :, n + 1 :]], axis=2)
+        vp = mx.concatenate([vb[:, :, : n - 1], ones, -ones, vb[:, :, n + 1 :]], axis=2)
+        mx.eval(kp, vp)
+        got = decode(q8, kp[:, :, :n], vp[:, :, :n], splits)
+        want = mx.fast.scaled_dot_product_attention(
+            q8, kp[:, :, :n], vp[:, :, :n], scale=SCALE, mask=None
+        )
+        if not _close(got, want):
+            rms = _rel_rms(got, want)
+            return f"correctness: n={n} is {rms:.3g} from stock (bound {REL_RMS_BOUND})"
+
+    # The loaded model's own module, with its projections and rope, through
+    # mlx-vlm's global, over a KVCache as a fork restore leaves it: keys,
+    # values and offset assigned, the padded buffer NaN past the live keys.
+    module = modules[0]
+    n = mid_step
+    x = mx.random.normal((1, 1, module.o_proj.weight.shape[0]), key=x_key).astype(mx.bfloat16)
+    capacity = -(-n // 256) * 256
+    kv_cache = importlib.import_module("mlx_vlm.models.cache").KVCache
+
+    def restored() -> Any:
+        cache = kv_cache()
+        k_rows, v_rows = mx.random.split(m_key)
+        tail = nan_tail[:, :, : capacity - n + 1]
+        live = (1, HKV, n - 1, D)
+        cache.keys = mx.concatenate(
+            [mx.random.normal(live, key=k_rows).astype(mx.bfloat16), tail], axis=2
+        )
+        cache.values = mx.concatenate(
+            [mx.random.normal(live, key=v_rows).astype(mx.bfloat16), tail], axis=2
+        )
+        cache.offset = n - 1
+        mx.eval(cache.keys, cache.values)
+        return cache
+
+    if not getattr(language.scaled_dot_product_attention, _HOOK_MARK, False):
+        language.scaled_dot_product_attention = _decode_wrapper(
+            language.scaled_dot_product_attention
+        )
+    _active_splits = 0
+    want = module(x, mask=None, cache=restored())
+    mx.eval(want)
+    before = calls["decode_tile"]
+    _active_splits = splits
+    got = module(x, mask=None, cache=restored())
+    mx.eval(got)
+    _active_splits = 0
+    if calls["decode_tile"] != before + 1:
+        return "the model's attention module did not reach the tile"
+    if not _close(got, want):
+        return f"correctness: the model's module is {_rel_rms(got, want):.3g} from stock"
+    return None
