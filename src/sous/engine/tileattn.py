@@ -141,6 +141,8 @@ def verify_plan(prefix: int, t: int, splits: int) -> list[tuple[int, int, int]]:
     return runs
 
 
+# Once per process: per-launch text work made the decode hot path 4-7% slower at 2-8K keys.
+@functools.cache
 def _kernel_pair() -> tuple[Callable[..., list[Any]], Callable[..., list[Any]]]:
     """The split and reduce kernels, built on first use. The split kernel reads K/V
     in place through their strides: a KVCache hands back a slice of its padded

@@ -121,7 +121,18 @@ def test_the_kernel_file_holds_a_split_body_and_a_reduce_body():
     assert "mpp::" not in reduce
 
 
-def test_both_kernels_are_built_with_safe_math_and_the_split_reads_strides(monkeypatch):
+@pytest.fixture
+def fresh_kernel_pair():
+    """_kernel_pair() built afresh inside the test, and forgotten after it, so the
+    recording kernels a test builds never serve a later one."""
+    tileattn._kernel_pair.cache_clear()
+    yield
+    tileattn._kernel_pair.cache_clear()
+
+
+def test_both_kernels_are_built_with_safe_math_and_the_split_reads_strides(
+    monkeypatch, fresh_kernel_pair
+):
     made = {}
 
     def metal_kernel(**kwargs):
@@ -148,6 +159,41 @@ def test_both_kernels_are_built_with_safe_math_and_the_split_reads_strides(monke
     assert split["compile_options"] == reduce["compile_options"] == {"math_mode": "safe"}
     assert "MetalPerformancePrimitives" in split["header"]
     assert "MetalPerformancePrimitives" not in reduce["header"]
+
+
+def test_launches_after_the_first_do_no_kernel_text_work(monkeypatch, fresh_kernel_pair):
+    """tile() runs once per full-attention layer per forward on the decode
+    path: the kernel sources are read, split and joined once per process,
+    and the kernels built once, never per launch."""
+    built, read = [], []
+
+    def metal_kernel(**kwargs):
+        built.append(kwargs["name"])
+
+        def launch(**call):
+            return [
+                mx.zeros(shape, dtype=dtype)
+                for shape, dtype in zip(call["output_shapes"], call["output_dtypes"], strict=True)
+            ]
+
+        return launch
+
+    source = tileattn._kernel_text
+
+    def counted(name):
+        read.append(name)
+        return source(name)
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", metal_kernel)
+    monkeypatch.setattr(int8prefill, "_kernels", {})
+    monkeypatch.setattr(tileattn, "_kernel_text", counted)
+    queries, keys, values = tfx.serving_qkv(2000, 3)
+    chunk = tileattn.chunk_for(2000, 20)
+    for _ in range(3):
+        out = tileattn.tile(queries, keys, values, 2000, chunk)
+        assert out.shape == (1, 3, tileattn.HQ, tileattn.D)
+    assert built == ["sous_attention_tile_split", "sous_attention_tile_reduce"]
+    assert read == ["attention_tile.metal", "common.h", "nax.h"]
 
 
 # ---- entries, with the stand-in (and the real kernel where it compiles) ----------
