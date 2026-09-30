@@ -1466,6 +1466,16 @@ def test_the_key_moves_with_the_tile_and_its_split_target():
     assert key_name(_vlm_fields(tile=unavailable)) == key_name(_vlm_fields())
 
 
+def test_the_key_ignores_what_a_tile_status_only_reports():
+    """probe_seconds differs on every load and a reason is prose: keyed on
+    either, every restart would start the store cold."""
+    later = {**_TILE_20, "reason": "noted", "probe_seconds": 1.7}
+    assert key_name(_vlm_fields(tile=later)) == key_name(_vlm_fields(tile=_TILE_20))
+    mac = {**_TILE_OFF, "state": "unavailable", "reason": "macOS 15.5 < 26.2"}
+    probe = {**mac, "reason": "correctness: n=1536 is 0.101 from stock", "probe_seconds": 0.5}
+    assert key_name(_vlm_fields(tile=mac)) == key_name(_vlm_fields(tile=probe))
+
+
 def test_the_os_build_is_in_every_key(monkeypatch):
     """Stock mlx-vlm already runs runtime-compiled Metal (its gated-delta
     kernel, mx.compile fusions, mlx's JIT kernels), so a macOS update can

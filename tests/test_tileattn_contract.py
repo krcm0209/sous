@@ -25,6 +25,7 @@ TILE_CASES = [
     (1700, 2),  # the DFlash round loop's last round
     (1700, 3),
     (1700, 8),
+    (1717, 5),  # where a kernel that ignores the schedule breaks parity (below)
     (1918, 5),  # straddles the first step boundary above N0 (1921 at S = 20)
 ]
 
