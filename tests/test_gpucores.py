@@ -94,6 +94,23 @@ def test_ioreg_services_parse_the_plist_from_an_absolute_path_with_a_timeout(mon
     assert kwargs["timeout"] == 5.0 and kwargs["check"] is True
 
 
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        plistlib.dumps([{"gpu-core-count": 8, "model": "Apple M2"}])[:60],  # truncated: ExpatError
+        b"<plist><key>a</key></plist>",  # a key without a value: IndexError
+    ],
+)
+def test_read_reports_a_malformed_ioreg_plist_instead_of_raising(monkeypatch, stdout):
+    """plistlib's parser leaks expat's and its own stack errors, none a ValueError."""
+    monkeypatch.setattr(gpucores, "_iokit_services", _unusable)
+    _fake_ioreg(monkeypatch, stdout)
+    reading = gpucores.read()
+    assert (reading.cores, reading.model, reading.source) == (None, None, "none")
+    assert reading.reason is not None
+    assert reading.reason.startswith("GPU core count unreadable")
+
+
 def test_ioreg_services_are_empty_when_nothing_matches(monkeypatch):
     _fake_ioreg(monkeypatch, b"")
     assert gpucores._ioreg_services() == []

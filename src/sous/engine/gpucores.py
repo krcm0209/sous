@@ -145,7 +145,7 @@ def read() -> GPUCores:
         pass
     try:
         return parse_services(_ioreg_services(), "ioreg")
-    except (OSError, ValueError, subprocess.SubprocessError, plistlib.InvalidFileException) as e:
+    except Exception as e:  # noqa: BLE001 — plistlib leaks ExpatError and IndexError; never raises
         return GPUCores(None, None, f"GPU core count unreadable: {e}", "none")
 
 
