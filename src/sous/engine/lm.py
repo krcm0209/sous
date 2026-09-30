@@ -49,6 +49,10 @@ class LMEngine:
         self._sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
         self._memo = PromptMemo()
         self._tokenize_lock = threading.Lock()
+        # The attention tile is an mlx-vlm qwen3_5 path that mlx-lm's models
+        # never reach; reported off so the load line and the status document
+        # read it from either backend.
+        self.attention_tile_status = {"state": "off", "reason": None}
         # Forks on disk, when the factory handed us a directory: built after
         # int8 has settled, since the key reads it. Tests and sous tune never
         # pass one, so nothing they build touches ~/.sous.

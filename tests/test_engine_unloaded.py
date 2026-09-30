@@ -88,6 +88,14 @@ def test_vlm_reset_prompt_cache_works_after_unload():
     assert engine.prompt_cache_stats()["hits"] == 0
 
 
+def test_vlm_unload_turns_the_attention_tile_off(monkeypatch):
+    from sous.engine import tileattn
+
+    monkeypatch.setattr(tileattn, "_active_splits", 20)
+    _unloaded_vlm().unload()
+    assert tileattn._active_splits == 0
+
+
 def test_lm_headroom_never_raises_without_mlx(monkeypatch):
     import sous.engine.base as base
 

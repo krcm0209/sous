@@ -119,8 +119,8 @@ class CountingEngine:
 
     def __getattr__(self, name: str):
         # drafter, positions, int8_prefill_status, verify_attention_status,
-        # draft_context_status: whatever the backend has, read through
-        # getattr(..., None) by ManagedEngine.
+        # draft_context_status, attention_tile_status: whatever the backend
+        # has, read through getattr(..., None) by ManagedEngine.
         return getattr(self._inner, name)
 
     def generate(

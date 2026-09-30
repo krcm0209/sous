@@ -249,6 +249,7 @@ def _default_factory(
     cache_budget: int | None = None,
     reserve_tokens: int = 0,
     int8_prefill: bool = False,
+    attention_tile: bool = False,
     fork_dir: Path | None = None,
     fork_budget: int | None = None,
 ) -> Engine:
@@ -309,12 +310,14 @@ def _default_factory(
             cache_budget=cache_budget,
             reserve_bytes=reserve_bytes,
             int8_prefill=int8_prefill,
+            attention_tile=attention_tile,
             fork_dir=fork_dir,
             fork_budget=fork_budget,
             weights_identity=weights,
         )
-    # The drafter settings stop here: speculative decoding is an mlx-vlm
-    # feature, and the mlx-lm backend has no parameter for it.
+    # The drafter settings and the attention tile stop here: speculative
+    # decoding and the tile's hooks are mlx-vlm paths, and the mlx-lm backend
+    # has no parameter for either.
     from sous.engine import lm
 
     return lm.LMEngine(
@@ -357,6 +360,7 @@ def default_engine_factory(config: SousConfig, *, forks: bool = True) -> Callabl
         ),
         reserve_tokens=config.max_context_tokens,
         int8_prefill=config.int8_prefill,
+        attention_tile=config.attention_tile,
         fork_dir=fork_dir,
         fork_budget=fork_budget,
     )
@@ -397,6 +401,12 @@ class ManagedEngine:
         # Optional on purpose, like verify_attention_status: the VLM backend's
         # word on whether its drafter is seeded with the prompt's hidden states.
         return getattr(self._inner, "draft_context_status", None)
+
+    @property
+    def attention_tile_status(self) -> dict | None:
+        # Optional on purpose: the VLM backend reports whether the tile serves
+        # this load, the LM backend reports it off, and fakes have neither.
+        return getattr(self._inner, "attention_tile_status", None)
 
     @property
     def positions(self) -> str | None:
@@ -679,6 +689,14 @@ class EngineManager:
             line += f" draft_context={context['state']}"
             if context["state"] == "active":
                 line += f" draft_context_window={context['window']}"
+        tile = engine.attention_tile_status
+        if tile is not None:
+            line += f" attention_tile={tile['state']}"
+            if tile["state"] == "active":
+                line += (
+                    f" attention_tile_splits={tile['splits']}"
+                    f" attention_tile_probe_s={tile['probe_seconds']}"
+                )
         _logger.info(line)
         return engine
 
@@ -995,6 +1013,9 @@ class EngineManager:
                         "reason": context["reason"],
                         "window": context["window"],
                     }
+                tile = self._engine.attention_tile_status
+                if tile is not None:
+                    out["attention_tile"] = {"state": tile["state"], "reason": tile["reason"]}
                 # Which side supplies the rotary positions behind a warm
                 # cache: the load line says it once, this says it for as long
                 # as the model is resident.

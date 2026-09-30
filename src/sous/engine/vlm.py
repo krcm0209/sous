@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
-from sous.engine import draftctx, forkio
+from sous.engine import draftctx, forkio, tileattn
 from sous.engine.base import Delta, OnDelta
 from sous.engine.forkstore import ForkStore, fork_key_fields
 from sous.engine.promptcache import (
@@ -69,6 +69,7 @@ class VLMEngine:
         cache_budget: int | None = None,
         reserve_bytes: int = 0,
         int8_prefill: bool = False,
+        attention_tile: bool = False,
         fork_dir: Path | None = None,
         fork_budget: int | None = None,
         weights_identity: str = "",
@@ -112,13 +113,24 @@ class VLMEngine:
         self.verify_attention_status = verifyattn.enable(
             self._model, enabled=self._draft is not None
         )
+        # After the verifier, whose status it reads: with a drafter, decode may
+        # take the tile only if verify does too, or output with the drafter
+        # would differ from output without it. Before the budget is measured,
+        # so the probe's transient K/V is already released.
+        self.attention_tile_status = tileattn.enable(
+            self._model,
+            enabled=attention_tile,
+            drafter_kind=self._draft_kind if self._draft is not None else None,
+            verify_status=self.verify_attention_status,
+        )
         # The drafter's context on the prompt-cache path: armed once the
         # drafter has settled, so one that failed to load leaves it off.
         self._draft_context = draftctx.enable(self._model, self._draft, self._draft_kind)
         self._speculation = Speculation()
         # Forks on disk, when the factory handed us a directory: built after
-        # the drafter and int8 have settled, since the key reads both. Tests
-        # and sous tune never pass one, so nothing they build touches ~/.sous.
+        # the drafter, int8 and the attention tile have settled, since the key
+        # reads them. Tests and sous tune never pass one, so nothing they build
+        # touches ~/.sous.
         self.fork_store: ForkStore | None = None
         if fork_dir is not None and prompt_cache:
             try:
@@ -543,5 +555,8 @@ class VLMEngine:
         # weights outlive the unload.
         self._draft_context.close()
         self._draft_context = draftctx.OFF
+        # Until the next load decides afresh, no one-row call may reach the
+        # tile on the strength of this model's gates.
+        tileattn.clear()
         gc.collect()
         mx.clear_cache()

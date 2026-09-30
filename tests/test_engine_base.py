@@ -1169,6 +1169,45 @@ def test_default_factory_passes_int8_prefill_to_both_engines(monkeypatch):
     assert seen["lm"]["int8_prefill"] is True
 
 
+@pytest.mark.parametrize("value", [True, False])
+def test_engine_manager_threads_attention_tile_into_default_factory(monkeypatch, tmp_path, value):
+    import sous.engine.base as base
+
+    seen: dict[str, dict] = {}
+
+    def fake_default_factory(model_id, *args, **kwargs):
+        seen["kwargs"] = kwargs
+        return FakeEngine([])
+
+    monkeypatch.setattr(base, "_default_factory", fake_default_factory)
+    EngineManager(_cfg(tmp_path, attention_tile=value)).get()
+    assert seen["kwargs"]["attention_tile"] is value
+
+
+def test_default_factory_passes_attention_tile_to_the_vlm_engine_only(monkeypatch):
+    from sous.engine import base, lm, vlm
+
+    seen: dict[str, dict] = {}
+
+    class RecordingVLM:
+        def __init__(self, model_id, **kwargs):
+            seen["vlm"] = kwargs
+
+    class RecordingLM:
+        def __init__(self, model_id, **kwargs):
+            seen["lm"] = kwargs
+
+    monkeypatch.setattr(vlm, "VLMEngine", RecordingVLM)
+    monkeypatch.setattr(lm, "LMEngine", RecordingLM)
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"vision_config": {}})
+    monkeypatch.setattr("sous.engine.window.kv_bytes_per_token", lambda cfg: 1024)
+    base._default_factory("m", 0.7, 0.8, 20, True, cache_budget=0, attention_tile=True)
+    assert seen["vlm"]["attention_tile"] is True
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"model_type": "qwen3_5"})
+    base._default_factory("m", 0.7, 0.8, 20, True, cache_budget=0, attention_tile=True)
+    assert "attention_tile" not in seen["lm"]
+
+
 def test_status_carries_the_int8_prefill_view_when_the_engine_reports_one(tmp_path):
     inner = FakeEngine([])
     manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
@@ -1296,6 +1335,72 @@ def test_lm_engine_enables_int8_prefill_on_the_loaded_model(monkeypatch):
     engine = LMEngine("test/model", cache_budget=0, int8_prefill=False)
     assert seen == {"model": model, "enabled": False}
     assert engine.int8_prefill_status["state"] == "unavailable"
+
+
+@pytest.mark.parametrize("drafter_loads", [True, False])
+def test_vlm_engine_enables_the_attention_tile_after_the_verifier_and_before_the_budget(
+    monkeypatch, drafter_loads
+):
+    from sous.engine import base, draftctx, tileattn, verifyattn, vlm
+
+    model = _positionless_model()
+    processor = types.SimpleNamespace(tokenizer=_RecordingTokenizer())
+    _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+
+    def load_drafter(m, draft_id):
+        if not drafter_loads:
+            raise RuntimeError("no such repo")
+        return types.SimpleNamespace(prefer_requested_block_size=False), "dflash"
+
+    monkeypatch.setattr(vlm, "_load_quantized_drafter", load_drafter)
+    order: list[str] = []
+    seen: dict[str, object] = {}
+    verifier_status = {"state": "active", "reason": None, "probe_seconds": 0.21}
+    tile_status = {"state": "active", "reason": None, "splits": 20, "probe_seconds": 0.43}
+
+    def verify_enable(m, *, enabled):
+        order.append("verify")
+        return verifier_status
+
+    def tile_enable(m, *, enabled, drafter_kind, verify_status):
+        order.append("tile")
+        seen.update(
+            model=m, enabled=enabled, drafter_kind=drafter_kind, verify_status=verify_status
+        )
+        return tile_status
+
+    def context_enable(m, d, kind):
+        order.append("draft_context")
+        return draftctx.OFF
+
+    def budget(reserve_bytes):
+        order.append("budget")
+        return 0
+
+    monkeypatch.setattr(verifyattn, "enable", verify_enable)
+    monkeypatch.setattr(tileattn, "enable", tile_enable)
+    monkeypatch.setattr(draftctx, "enable", context_enable)
+    monkeypatch.setattr(base, "measure_cache_budget", budget)
+    if drafter_loads:
+        engine = vlm.VLMEngine("test/model", draft_id="z-lab/drafter", attention_tile=True)
+    else:
+        with pytest.warns(UserWarning, match="speculative drafter"):
+            engine = vlm.VLMEngine("test/model", draft_id="z-lab/drafter", attention_tile=True)
+    assert order == ["verify", "tile", "draft_context", "budget"]
+    assert seen["model"] is model and seen["enabled"] is True
+    assert seen["drafter_kind"] == ("dflash" if drafter_loads else None)
+    assert seen["verify_status"] is engine.verify_attention_status is verifier_status
+    assert engine.attention_tile_status is tile_status
+
+
+def test_lm_engine_reports_the_attention_tile_off(monkeypatch):
+    from sous.engine.lm import LMEngine
+
+    _stub(monkeypatch, "mlx_lm", load=lambda model_id: (object(), _RecordingTokenizer()))
+    _stub(monkeypatch, "mlx_lm.sample_utils", make_sampler=lambda **kw: None)
+    engine = LMEngine("test/model", cache_budget=0)
+    assert engine.attention_tile_status == {"state": "off", "reason": None}
 
 
 # ---- streaming deltas (endpoint) ---------------------------------------------
@@ -1970,6 +2075,7 @@ def test_default_engine_factory_maps_every_model_value_onto_the_backend(monkeypa
         prompt_cache_gb=1.5,
         max_context_tokens=65536,
         int8_prefill=True,
+        attention_tile=False,
     )
     base.default_engine_factory(cfg)("org/m")
     assert seen["model_id"] == "org/m"
@@ -1980,6 +2086,7 @@ def test_default_engine_factory_maps_every_model_value_onto_the_backend(monkeypa
         "cache_budget": int(1.5 * (1 << 30)),
         "reserve_tokens": 65536,
         "int8_prefill": True,
+        "attention_tile": False,
         "fork_dir": None,
         "fork_budget": None,
     }
@@ -2298,3 +2405,52 @@ def test_status_carries_the_drafter_context_view_when_the_engine_reports_one(tmp
         "layers": 5,
     }
     assert manager.status()["draft_context"] == {"state": "active", "reason": None, "window": 2047}
+
+
+@pytest.mark.parametrize(
+    ("status", "tail"),
+    [
+        (
+            {"state": "active", "reason": None, "splits": 20, "probe_seconds": 0.43},
+            " positions=engine attention_tile=active attention_tile_splits=20"
+            " attention_tile_probe_s=0.43",
+        ),
+        (
+            {"state": "unavailable", "reason": "probe", "splits": None, "probe_seconds": 0.43},
+            " positions=engine attention_tile=unavailable",
+        ),
+        ({"state": "off", "reason": None}, " positions=engine attention_tile=off"),
+        (None, " model=fake/model positions=engine"),
+    ],
+)
+def test_get_logs_the_attention_tile_state(caplog, tmp_path, status, tail):
+    import logging
+
+    def factory(model_id):
+        engine = _positional_factory(model_id)
+        if status is not None:
+            engine.attention_tile_status = status  # ty: ignore[unresolved-attribute]
+        return engine
+
+    mgr = EngineManager(_cfg(tmp_path), engine_factory=factory)
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert len(lines) == 1 and lines[0].endswith(tail), lines
+
+
+def test_status_carries_the_attention_tile_view_when_the_engine_reports_one(tmp_path):
+    inner = FakeEngine([])
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    assert "attention_tile" not in manager.status(), "fakes without the attribute stay silent"
+    inner.attention_tile_status = {  # ty: ignore[unresolved-attribute]
+        "state": "unavailable",
+        "reason": "split target 16 not measured (measured: 20)",
+        "splits": None,
+        "probe_seconds": 0.43,
+    }
+    assert manager.status()["attention_tile"] == {
+        "state": "unavailable",
+        "reason": "split target 16 not measured (measured: 20)",
+    }

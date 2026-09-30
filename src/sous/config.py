@@ -29,6 +29,7 @@ _KNOWN = {
         "speculative_draft_id",
         "speculative_block_size",
         "int8_prefill",
+        "attention_tile",
     },
 }
 
@@ -100,6 +101,14 @@ class SousConfig:
     # tool-loop A/B says otherwise. Ignored, with a status reason, on GPUs
     # without neural accelerators (pre-M5) or macOS < 26.2.
     int8_prefill: bool = False
+    # Decode's one-row attention and the exact verifier's on the M5's tensor
+    # units, through one GQA-packed tile whose key partition steps with the
+    # context. On by default because it is as accurate as stock and greedy
+    # output is the same with the drafter on or off; it is not bit-identical
+    # to stock's kernels, hence the switch, and false runs the stock paths.
+    # Active only on a measured split target (the M5 Pro's 20 GPU cores),
+    # `unavailable` with the reason anywhere else. Read once, at daemon start.
+    attention_tile: bool = True
     # Reuse one KV cache across the turns of a conversation, prefilling only
     # what it gained, instead of re-prefilling from scratch every turn. Works
     # because mlx streams are thread-scoped (#34): a slot only survives
@@ -382,6 +391,20 @@ def _int8_prefill(model: dict) -> bool:
     return False
 
 
+def _attention_tile(model: dict) -> bool:
+    """[model].attention_tile: true or false; anything else warns and means
+    false, the stock attention paths, by _int8_prefill's rule that a typo must
+    not select changed numerics."""
+    value = model.get("attention_tile", True)
+    if isinstance(value, bool):
+        return value
+    warnings.warn(
+        f"sous config: [model].attention_tile {value!r} must be true or false; using false",
+        stacklevel=3,
+    )
+    return False
+
+
 # A registered name (letters, digits, dots, hyphens — RFC 3986's reg-name as
 # the DNS world actually spells it) or an IPv6 literal with its brackets
 # already stripped by urlsplit.
@@ -477,6 +500,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         speculative_draft_id=model.get("speculative_draft_id", "z-lab/Qwen3.8-27B-DFlash2"),
         speculative_block_size=_speculative_block_size(model),
         int8_prefill=_int8_prefill(model),
+        attention_tile=_attention_tile(model),
         data_dir=(path.parent if path.parent != Path(".") else DEFAULT_DATA_DIR),
         config_path=path,
     )
