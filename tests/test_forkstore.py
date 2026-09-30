@@ -1423,7 +1423,7 @@ def test_fork_key_fields_carry_everything_that_changes_the_kv(monkeypatch):
         tile_status={"state": "off", "reason": None},
     )
     assert off["int8"] == "off"  # off and unavailable ran the same numerics
-    assert off["tile"] == "off" and "os" not in off
+    assert off["tile"] == "off" and off["os"] == forkstore.os_release()
     monkeypatch.delenv("MLX_ENABLE_TF32")
     assert "env" not in fork_key_fields(
         backend="lm",
@@ -1466,15 +1466,18 @@ def test_the_key_moves_with_the_tile_and_its_split_target():
     assert key_name(_vlm_fields(tile=unavailable)) == key_name(_vlm_fields())
 
 
-def test_the_os_build_is_in_the_key_while_a_runtime_compiled_kernel_is_active(monkeypatch):
+def test_the_os_build_is_in_every_key(monkeypatch):
+    """Stock mlx-vlm already runs runtime-compiled Metal (its gated-delta
+    kernel, mx.compile fusions, mlx's JIT kernels), so a macOS update can
+    move a stock store's bits too."""
     int8 = {"state": "active", "reason": None, "routed": 336}
-    assert "os" not in _vlm_fields()
-    assert _vlm_fields(int8=int8)["os"] == forkstore.os_release()
-    assert _vlm_fields(tile=_TILE_20)["os"] == forkstore.os_release()
-    off, tiled = key_name(_vlm_fields()), key_name(_vlm_fields(tile=_TILE_20))
+    variants = [{}, {"int8": int8}, {"tile": _TILE_20}]
+    for variant in variants:
+        assert _vlm_fields(**variant)["os"] == forkstore.os_release()
+    before = [key_name(_vlm_fields(**variant)) for variant in variants]
     monkeypatch.setattr(forkstore, "os_release", lambda: "15.6 (24G84)")
-    assert key_name(_vlm_fields(tile=_TILE_20)) != tiled
-    assert key_name(_vlm_fields()) == off  # a macOS update leaves a stock store alone
+    after = [key_name(_vlm_fields(**variant)) for variant in variants]
+    assert all(a != b for a, b in zip(after, before, strict=True))
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="reads this Mac's build")

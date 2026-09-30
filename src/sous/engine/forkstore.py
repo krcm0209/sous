@@ -159,17 +159,21 @@ def fork_key_fields(
     the engine sources (epoch) and the file layout, which side supplies the
     rotary positions, whether int8 prefill actually ran, whether the
     attention tile served the load and at which split target, the macOS
-    build while either of those runtime-compiled kernels is active, and the
-    two mlx-core environment switches that change matmul precision and
-    attention accumulation.
+    build, and the two mlx-core environment switches that change matmul
+    precision and attention accumulation.
 
     The tile runs the one-row forward that ends every prefill segment, so it
     moves the last bits of that token's KV and, through its hidden state,
-    every later layer's KV and GDN state. Both kernels are compiled at load
-    against the OS's Metal toolchain, whose output can change with a macOS
-    update. For both, `unavailable` runs `off`'s numerics. The template,
-    tokenizer, sampling, drafter and window are deliberately absent: ids are
-    compared exactly, and none of them touches a prefill."""
+    every later layer's KV and GDN state. `unavailable` runs `off`'s
+    numerics for both kernels.
+
+    The macOS build is always part of the key: every stored KV depends on
+    runtime-compiled Metal (mlx-vlm's gated-delta kernel, its `mx.compile`
+    fusions, mlx's JIT-compiled kernels and the tile's and int8's kernels,
+    whose tensor-op header the OS supplies), and a macOS update can change
+    the last bits any of them produces. The template, tokenizer, sampling,
+    drafter and window are deliberately absent: ids are compared exactly,
+    and none of them touches a prefill."""
     from importlib.metadata import version
 
     int8_active = int8_status.get("state") == "active"
@@ -185,9 +189,8 @@ def fork_key_fields(
         "positions": positions,
         "int8": f"active:{int8_status.get('routed', 0)}" if int8_active else "off",
         "tile": f"active:{tile_status['splits']}" if tile_active else "off",
+        "os": os_release(),
     }
-    if int8_active or tile_active:
-        fields["os"] = os_release()
     env = ";".join(f"{k}={os.environ[k]}" for k in _NUMERIC_ENV if k in os.environ)
     if env:
         fields["env"] = env
