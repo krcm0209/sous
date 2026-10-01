@@ -53,7 +53,7 @@ What it will not do for you:
 
 - **It is not fast.** The default model (Qwen3.8-27B, 4-bit, with a DFlash2
   speculative drafter) decodes at about 31 tok/s with 2K tokens of context
-  and about 19.5 tok/s at 57K on an M5 Pro, sampling as shipped. It prefills
+  and about 23.5 tok/s at 57K on an M5 Pro, sampling as shipped. It prefills
   at about 480 tok/s on a 4K prompt and about 350 tok/s on a 61K one: a
   subagent's first turn takes about three minutes when nothing is cached,
   and 16 s from a fork. Its short-context decode speed, scaled to the same
@@ -145,7 +145,7 @@ Choose something else when:
   them with a placeholder.
 - **You want faster decode on Qwen:** LM Studio's Splash engine is faster
   than sous on an M5 Pro with the same weights and drafter — by an
-  estimated 1.2–1.5x at short context and 1.7–1.9x at 51–57K. It drafts and
+  estimated 1.2–1.5x at short context and 1.4–1.6x at 51–57K. It drafts and
   checks seven tokens per step in about 1.4 times the time sous takes for
   one plain decode step, and it loses less speed as the context grows.
   MTPLX and mlx-serve publish higher raw figures, on faster chips (M5 Max,

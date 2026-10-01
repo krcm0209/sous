@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import functools
 import logging
-import platform
-import re
 import warnings
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
 from importlib.resources import files
 from typing import Any, cast
+
+from sous.engine import nax
+from sous.engine.nax import Availability
 
 logger = logging.getLogger("sous.engine.int8prefill")
 
@@ -58,6 +58,9 @@ def _kernel(
     output_names: list[str],
     source: str,
     header: str,
+    *,
+    ensure_row_contiguous: bool = True,
+    compile_options: dict[str, str] | None = None,
 ) -> Callable[..., list[Any]]:
     """One metal_kernel object per name, built on first use. mlx compiles each
     (source, template) instantiation once per process behind it."""
@@ -65,6 +68,14 @@ def _kernel(
     if kernel is None:
         import mlx.core as mx
 
+        # Only what differs from mlx's defaults: an older mlx within the
+        # dependency floor may not take these keywords, and int8's kernels,
+        # which need neither, must keep building there.
+        options: dict[str, Any] = {}
+        if not ensure_row_contiguous:
+            options["ensure_row_contiguous"] = False
+        if compile_options is not None:
+            options["compile_options"] = compile_options
         kernel = cast(
             "Callable[..., list[Any]]",
             mx.fast.metal_kernel(
@@ -73,6 +84,7 @@ def _kernel(
                 output_names=output_names,
                 source=source,
                 header=header,
+                **options,
             ),
         )
         _kernels[name] = kernel
@@ -125,44 +137,14 @@ def stage_a(x: Any) -> tuple[Any, Any, Any]:
     return reorder_k(qa), sa, mx.contiguous(ra.T)
 
 
-@dataclass(frozen=True)
-class Availability:
-    available: bool
-    reason: str | None = None
-
-
-_ARCH = re.compile(r"applegpu_g(\d+)(\D?)$")
-
-
 def availability() -> Availability:
-    """mlx's own is_nax_available() (device.cpp, 0.32.2) — macOS >= 26.2 and an
-    Apple GPU of generation >= 17 (>= 18 for 'p'-suffix parts), the M5 family and
-    later — then `_gemm_probe()`, which compiles and runs the kernels, so this is
-    mlx work, not a device query. Older GPUs run the Metal-4 tensor ops on the
-    plain shader path, where int8 buys nothing, so they are `unavailable`, not
-    merely slow."""
-    if platform.system() != "Darwin":
-        return Availability(False, "not macOS")
-    try:
-        import mlx.core as mx
-    except ImportError as e:  # pragma: no cover - the lint job has no mlx
-        return Availability(False, f"mlx unavailable: {e}")
-    if not mx.metal.is_available():
-        return Availability(False, "Metal unavailable")
-    release = platform.mac_ver()[0]
-    parts = tuple(int(p) for p in release.split(".") if p.isdigit())
-    if parts[:2] < (26, 2):
-        return Availability(False, f"macOS {release} < 26.2")
-    arch = str(mx.device_info().get("architecture", ""))
-    match = _ARCH.match(arch)
-    if match is None:
-        return Availability(False, f"unrecognized GPU architecture {arch!r}")
-    gen = int(match.group(1))
-    need = 18 if match.group(2) == "p" else 17
-    if gen < need:
-        return Availability(
-            False, f"GPU {arch} predates the neural accelerators (gen {gen} < {need})"
-        )
+    """The tensor-unit rule int8 prefill shares with the attention tile
+    (`nax.platform_reason()`: macOS >= 26.2 and an M5-family or later GPU), then
+    `_gemm_probe()`, which compiles and runs the kernels, so this is mlx work, not
+    a device query."""
+    reason = nax.platform_reason()
+    if reason is not None:
+        return Availability(False, reason)
     rejected = _gemm_probe()
     if rejected is not None:
         return Availability(False, f"the int8 GEMM probe failed: {rejected}")
