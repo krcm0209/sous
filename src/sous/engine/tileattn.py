@@ -245,10 +245,17 @@ def decode(queries: Any, keys: Any, values: Any, splits: int) -> Any:
     return tile(queries, keys, values, n, chunk).transpose(0, 2, 1, 3)
 
 
-def verify(queries: Any, keys: Any, values: Any, splits: int) -> Any:
+def verify(
+    queries: Any,
+    keys: Any,
+    values: Any,
+    splits: int,
+    runs: list[tuple[int, int, int]] | None = None,
+) -> Any:
     """The verifier's T-row causal call, row r over keys [0, n - T + r], as
     [1, 24, T, 256]: one tile call per run of verify_plan(), grouped stock calls for
-    the runs below N0, concatenated in row order."""
+    the runs below N0, concatenated in row order. `runs` is that plan when the
+    caller already has it."""
     import mlx.core as mx
 
     from sous.engine.verifyattn import grouped_attention
@@ -256,7 +263,8 @@ def verify(queries: Any, keys: Any, values: Any, splits: int) -> Any:
     t = queries.shape[2]
     n = keys.shape[2]
     prefix = n - t
-    runs = verify_plan(prefix, t, splits)
+    if runs is None:
+        runs = verify_plan(prefix, t, splits)
     if len(runs) == 1 and runs[0][2]:
         return tile(queries, keys, values, n, runs[0][2]).transpose(0, 2, 1, 3)
     parts = []
@@ -333,13 +341,18 @@ def _bind(queries, keys, values, cache, scale, mask, sinks=None) -> tuple:
     return queries, keys, values, cache, scale, mask, sinks
 
 
+# Once per process: the decode hook asks on every one-row attention call.
+@functools.cache
+def _kv_cache_type() -> type:
+    return importlib.import_module("mlx_vlm.models.cache").KVCache
+
+
 def _plain_kv_cache(cache: Any) -> bool:
     """mlx-vlm's single-sequence KVCache itself (its subclasses keep other layouts),
     unquantized and without left padding. The left-padded helpers hand the global a
     None or batch cache, so they never pass."""
-    kv_cache = importlib.import_module("mlx_vlm.models.cache").KVCache
     return (
-        type(cache) is kv_cache
+        type(cache) is _kv_cache_type()
         and not hasattr(cache, "bits")
         and getattr(cache, "_qwen3_5_decode_left_padding", None) is None
         and getattr(cache, "left_padding", None) is None
@@ -415,7 +428,7 @@ def serve_verify(queries: Any, keys: Any, values: Any, splits: int) -> Any:
             calls["verify_rows_stock"] += k - j
     if len(runs) > 1:
         calls["verify_straddles"] += 1
-    return verify(queries, keys, values, splits)
+    return verify(queries, keys, values, splits, runs)
 
 
 # The dense Qwen3.5-family text model. The families that reuse its language
