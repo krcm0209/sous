@@ -9,9 +9,10 @@ from dataclasses import dataclass
 from sous.config import MIN_CONTEXT_TOKENS, SousConfig
 from sous.tune.candidates import Candidate, Checkpoint, Fit, drafter_compatible, fit
 
-# The verify depths worth measuring: 2 and 3 pay on this family's GQA ratio,
-# 5 is the most rows mlx's fused attention kernel takes.
-BLOCK_SIZES = (2, 3, 5)
+# The verify depths worth measuring per machine: 4 measured best on the M5 Pro
+# (#118), 2 and 3 for machines where a verify row costs more, and 5 is
+# config.SPECULATIVE_BLOCK_MAX.
+BLOCK_SIZES = (2, 3, 4, 5)
 
 
 @dataclass(frozen=True)

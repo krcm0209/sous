@@ -51,14 +51,14 @@ def test_on_the_m5_pro_every_model_gets_a_no_drafter_arm_and_one_per_block_size(
     assert len(by_model["mlx-community/Qwen3.5-9B-MLX-4bit"]) == 1 + len(BLOCK_SIZES)
     current = [a for a in arms if a.current]
     assert len(current) == 1
-    assert (current[0].drafter_id, current[0].block_size) == ("z-lab/Qwen3.8-27B-DFlash2", 3)
+    assert (current[0].drafter_id, current[0].block_size) == ("z-lab/Qwen3.8-27B-DFlash2", 4)
     assert current[0].config.speculative_draft_id == "z-lab/Qwen3.8-27B-DFlash2"
-    assert current[0].config.speculative_block_size == 3
+    assert current[0].config.speculative_block_size == 4
     assert current[0].window == user.max_context_tokens
     plain = [a for a in by_model["mlx-community/Qwen3.8-27B-4bit"] if not a.drafter_id][0]
     assert plain.block_size == 0 and plain.config.speculative_draft_id == ""
     assert plain.label == "Qwen3.8-27B-4bit"
-    assert current[0].label == "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @3"
+    assert current[0].label == "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @4"
 
 
 def test_on_the_m2_air_the_27b_is_refused_and_the_9b_runs_at_a_lowered_window(tmp_path):

@@ -84,16 +84,15 @@ class SousConfig:
     # Speculative decoding (VLM backend only): a DFlash-style drafter predicts
     # blocks the target verifies in one forward — ~1.8x decode on the default
     # affine-4bit model at short context with the shipped sampling
-    # (krcm0209/sous#55, #58); the greedy path is not yet measured in-tree
-    # (#118). Empty id disables it. The
+    # (krcm0209/sous#55, #58); greedy, 2.0x plain greedy decode on real
+    # subagent turns at 44–77K (#118). Empty id disables it. The
     # drafter must match the target architecture; when it doesn't (or fails to
-    # load), the engine logs and continues without it. Block size 3 measured
-    # best on the M5 Pro against the drafter's adaptive policy (+3% on prose,
-    # +13% on code re-emission); 0 hands the choice back to that policy. Above
-    # 5 is clamped: mlx's fused attention kernel takes at most 5 verify rows
-    # at the default model's GQA ratio, and 6–8 rows run 5–6x slower per layer.
+    # load), the engine logs and continues without it. Block size 4 measured
+    # best on the M5 Pro on real subagent turns (#118: +3–5% decode over 3;
+    # 2, 5 and 6 ran slower than 4); 0 hands the choice back to the drafter's
+    # adaptive policy. Above 5 is clamped (SPECULATIVE_BLOCK_MAX).
     speculative_draft_id: str = "z-lab/Qwen3.8-27B-DFlash2"
-    speculative_block_size: int = 3
+    speculative_block_size: int = 4
     # Prefill matmuls of affine-Q4/gs64 projections on the M5 tensor units with
     # int8 activations: ~1.4x prefill measured on the M5 Pro (2026-09-11), but
     # int8 activations change numerics (KL 0.033 vs stock on the standard prompt,
@@ -299,11 +298,12 @@ def _model_window(model: dict) -> int:
     return window
 
 
-SPECULATIVE_BLOCK_DEFAULT = 3
-# The largest verify block mlx's fused vector-attention kernel still takes at
-# the default model's GQA ratio (q_len <= 8 and q_len x gqa <= 32, gqa 6 →
-# 5 rows). 6–8 rows fall off the fused path and cost 5–6x per layer, which no
-# acceptance rate pays back.
+SPECULATIVE_BLOCK_DEFAULT = 4
+# The largest verify block that has paid. On the M5 Pro, where the attention
+# tile serves verify attention, a block-6 round costs twice a block-3 one and
+# block 6 ran 0.8x block 3 on real subagent turns (#118). Without the tile,
+# 6+ rows also leave mlx's fused vector-attention kernel (q_len x gqa <= 32:
+# 5 rows at the default model's gqa 6).
 SPECULATIVE_BLOCK_MAX = 5
 
 
@@ -327,8 +327,8 @@ def _speculative_block_size(model: dict) -> int:
     if value > SPECULATIVE_BLOCK_MAX:
         warnings.warn(
             f"sous config: [model].speculative_block_size {value!r} exceeds "
-            f"{SPECULATIVE_BLOCK_MAX}, the most verify rows mlx's fused attention kernel "
-            f"takes on this model; using {SPECULATIVE_BLOCK_MAX}",
+            f"{SPECULATIVE_BLOCK_MAX}, the largest verify block that pays on this model; "
+            f"using {SPECULATIVE_BLOCK_MAX}",
             stacklevel=3,
         )
         return SPECULATIVE_BLOCK_MAX
