@@ -157,7 +157,7 @@ speculative verify's attention on the M5 GPU's neural accelerators, as one
 GQA-packed tile whose key partition steps with the context (sous's own
 kernel, compiled at model load — no build step). Measured on an M5 Pro with
 the default model and drafter: the verify forward's attention at block 3 is
-2–2.6x faster than the grouped stock calls it replaces, and decode is 1.22x
+2–2.6x faster than the grouped stock calls it replaces, and decode is 1.21x
 faster on 64 real subagent turns at 44–77K of context. It serves attention
 over 1,536 keys or more; below that, decode and verify take the stock paths,
 which are as fast there. Greedy output with the drafter stays identical to
