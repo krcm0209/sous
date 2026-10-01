@@ -362,6 +362,8 @@ def _scope(
     tag=GQA,
     heads=24,
     kv_heads=4,
+    splits=0,
+    dtype=mx.float32,
 ):
     from mlx_vlm.models.cache import KVCache
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
@@ -374,9 +376,10 @@ def _scope(
     return verifyattn._in_scope(
         Qwen3_5BatchInvariantForward(),
         attention,
-        mx.zeros((batch, t, 8)),
+        mx.zeros((batch, t, 8), dtype=dtype),
         mask,
         KVCache() if cache is None else cache,
+        splits,
     )
 
 
@@ -418,6 +421,56 @@ def test_scope_refuses_kvcache_subclasses_quantized_and_left_padded_caches(monke
     padded._qwen3_5_decode_left_padding = [1]  # ty: ignore[unresolved-attribute]
     for cache in (Subclass(), quantized, padded):
         assert not _scope(monkeypatch, cache=cache), type(cache).__name__
+
+
+# The tile active at the M5 Pro's split target, over a bf16 model's hidden states.
+TILE_ACTIVE = {"splits": 20, "dtype": mx.bfloat16}
+
+
+def test_scope_with_the_tile_active_takes_every_t_from_one(monkeypatch):
+    assert _scope(monkeypatch, t=1, mask=None, **TILE_ACTIVE)
+    assert _scope(monkeypatch, t=2, **TILE_ACTIVE)
+    assert _scope(monkeypatch, t=16, **TILE_ACTIVE)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"t": 1},  # one row under a causal mask: not what the verifier builds
+        {"mask": None},
+        {"dtype": mx.float32},
+        {"batch": 2},
+        {"mask": "left_padded_decode"},
+        {"head_dim": 128},
+        {"tag": 0},
+        {"tag": 4},
+    ],
+)
+def test_scope_with_the_tile_active_refuses_everything_else(monkeypatch, overrides):
+    assert not _scope(monkeypatch, **{**TILE_ACTIVE, **overrides})
+
+
+def test_scope_with_the_tile_active_refuses_array_masks_and_other_caches(monkeypatch):
+    from mlx_vlm.models.cache import KVCache
+
+    class Subclass(KVCache):
+        pass
+
+    quantized = KVCache()
+    quantized.bits = 4  # ty: ignore[unresolved-attribute]
+    padded = KVCache()
+    padded._qwen3_5_decode_left_padding = [1]  # ty: ignore[unresolved-attribute]
+    assert not _scope(monkeypatch, mask=mx.ones((1, 1, 3, 3), dtype=mx.bool_), **TILE_ACTIVE)
+    for cache in (Subclass(), quantized, padded):
+        assert not _scope(monkeypatch, cache=cache, **TILE_ACTIVE), type(cache).__name__
+
+
+def test_scope_without_the_tile_keeps_three_to_eight_rows_for_bf16_too(monkeypatch):
+    bf16 = {"dtype": mx.bfloat16}
+    assert _scope(monkeypatch, t=3, **bf16) and _scope(monkeypatch, t=8, **bf16)
+    assert not _scope(monkeypatch, t=1, mask=None, **bf16)
+    assert not _scope(monkeypatch, t=2, **bf16)
+    assert not _scope(monkeypatch, t=9, **bf16)
 
 
 def _fresh_model():

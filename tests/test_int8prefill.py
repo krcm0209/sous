@@ -62,6 +62,41 @@ def test_kernel_sources_ship_as_package_files():
     assert "mpp::tensor_ops" in texts["q4_int8_gemm.metal"]
 
 
+def test_kernel_hands_mlx_only_the_arguments_it_was_given(monkeypatch):
+    """int8's kernels take mlx's defaults, so they pass neither of the keywords
+    the attention tile needs: an older mlx within the dependency floor may not
+    accept them, and a TypeError there would turn int8 prefill unavailable."""
+    made = {}
+
+    def metal_kernel(**kwargs):
+        made[kwargs["name"]] = kwargs
+        return lambda **launch: []
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", metal_kernel)
+    # A fresh cache: the recording kernels must not outlive this test.
+    monkeypatch.setattr(i8, "_kernels", {})
+    i8._kernel("sous_test_plain", ["x"], ["y"], "y[0] = x[0];", "")
+    i8._kernel(
+        "sous_test_strided",
+        ["x"],
+        ["y"],
+        "y[0] = x[0];",
+        "",
+        ensure_row_contiguous=False,
+        compile_options={"math_mode": "safe"},
+    )
+    assert set(made["sous_test_plain"]) == {
+        "name",
+        "input_names",
+        "output_names",
+        "source",
+        "header",
+    }
+    strided = made["sous_test_strided"]
+    assert strided["ensure_row_contiguous"] is False
+    assert strided["compile_options"] == {"math_mode": "safe"}
+
+
 # ---- Stage A --------------------------------------------------------------------
 
 

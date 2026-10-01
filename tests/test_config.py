@@ -187,6 +187,36 @@ def test_int8_prefill_rejects_non_booleans_with_a_warning(tmp_path: Path, bad: s
     assert cfg.int8_prefill is False
 
 
+# ---- [model].attention_tile ---------------------------------------------------
+
+
+def test_attention_tile_defaults_on(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nid = 'x/y'\n")
+    assert load_config(p).attention_tile is True
+    assert SousConfig().attention_tile is True
+
+
+def test_attention_tile_reads_false_without_an_unknown_key_warning(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nattention_tile = false\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cfg = load_config(p)
+    assert cfg.attention_tile is False
+
+
+@pytest.mark.parametrize("bad", ['"yes"', "1", "0.5"])
+def test_attention_tile_rejects_non_booleans_with_a_warning(tmp_path: Path, bad: str):
+    p = tmp_path / "config.toml"
+    p.write_text(f"[model]\nattention_tile = {bad}\n")
+    with pytest.warns(
+        UserWarning, match=r"\[model\]\.attention_tile .* must be true or false; using false"
+    ):
+        cfg = load_config(p)
+    assert cfg.attention_tile is False
+
+
 def test_speculative_defaults(tmp_path: Path):
     cfg = load_config(tmp_path / "nope.toml")
     assert cfg.speculative_draft_id == "z-lab/Qwen3.8-27B-DFlash2"

@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import shutil
 import struct
 import threading
@@ -54,7 +55,7 @@ MAX_FAILURES = 3
 # The modules whose bytes decide what KV a token id produces; hashed into
 # the identity key so a change to them can never be forgotten.
 _ENGINE_SOURCES = files("sous.engine")
-_EPOCH_FILES = ("vlm.py", "lm.py", "int8prefill.py")
+_EPOCH_FILES = ("vlm.py", "lm.py", "int8prefill.py", "tileattn.py")
 
 
 class ForkFileError(Exception):
@@ -151,17 +152,32 @@ def fork_key_fields(
     gpu: str,
     positions: str,
     int8_status: Mapping[str, Any],
+    tile_status: Mapping[str, Any],
 ) -> dict[str, str]:
     """Everything that changes the KV arrays behind identical token ids, and
     nothing else: the backend and its package, mlx, the GPU, the weights,
     the engine sources (epoch) and the file layout, which side supplies the
-    rotary positions, whether int8 prefill actually ran (`off` and
-    `unavailable` are the same numerics), and the two mlx-core environment
-    switches that change matmul precision and attention accumulation. The
-    template, tokenizer, sampling, drafter and window are deliberately
-    absent: ids are compared exactly, and none of them touches a prefill."""
+    rotary positions, whether int8 prefill actually ran, whether the
+    attention tile served the load and at which split target, the macOS
+    build, and the two mlx-core environment switches that change matmul
+    precision and attention accumulation.
+
+    The tile runs the one-row forward that ends every prefill segment, so it
+    moves the last bits of that token's KV and, through its hidden state,
+    every later layer's KV and GDN state. `unavailable` runs `off`'s
+    numerics for both kernels.
+
+    The macOS build is always part of the key: every stored KV depends on
+    runtime-compiled Metal (mlx-vlm's gated-delta kernel, its `mx.compile`
+    fusions, mlx's JIT-compiled kernels and the tile's and int8's kernels,
+    whose tensor-op header the OS supplies), and a macOS update can change
+    the last bits any of them produces. The template, tokenizer, sampling,
+    drafter and window are deliberately absent: ids are compared exactly,
+    and none of them touches a prefill."""
     from importlib.metadata import version
 
+    int8_active = int8_status.get("state") == "active"
+    tile_active = tile_status.get("state") == "active"
     fields = {
         "backend": backend,
         "backend_version": backend_version,
@@ -171,16 +187,45 @@ def fork_key_fields(
         "epoch": engine_epoch(),
         "layout": str(FORK_LAYOUT),
         "positions": positions,
-        "int8": (
-            f"active:{int8_status.get('routed', 0)}"
-            if int8_status.get("state") == "active"
-            else "off"
-        ),
+        "int8": f"active:{int8_status.get('routed', 0)}" if int8_active else "off",
+        "tile": f"active:{tile_status['splits']}" if tile_active else "off",
+        "os": os_release(),
     }
     env = ";".join(f"{k}={os.environ[k]}" for k in _NUMERIC_ENV if k in os.environ)
     if env:
         fields["env"] = env
     return fields
+
+
+@functools.cache
+def os_release() -> str:
+    """This Mac's macOS version and build, e.g. "15.5 (24F74)": the build
+    moves with every update, even one that keeps the version. "unknown" when
+    the build cannot be read, "" off macOS. A libc call, no subprocess."""
+    if platform.system() != "Darwin":
+        return ""
+    try:
+        import ctypes
+        import ctypes.util
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        # Declared, so `newlen` goes over as the size_t the call takes.
+        libc.sysctlbyname.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        libc.sysctlbyname.restype = ctypes.c_int
+        buf = ctypes.create_string_buffer(64)
+        size = ctypes.c_size_t(len(buf))
+        if libc.sysctlbyname(b"kern.osversion", buf, ctypes.byref(size), None, 0) != 0:
+            return "unknown"
+        build = buf.value.decode("ascii")
+    except Exception:  # noqa: BLE001 — a key field that degrades, never a failure
+        return "unknown"
+    return f"{platform.mac_ver()[0]} ({build})" if build else "unknown"
 
 
 @functools.cache
@@ -192,8 +237,9 @@ def engine_epoch() -> str:
     for name in _EPOCH_FILES:
         h.update(name.encode())
         h.update(_ENGINE_SOURCES.joinpath(name).read_bytes())
-    # The .h files are compiled into both kernels (the nibble-decode and
-    # K-order contract lives there), so they are part of the numerics too.
+    # The .h files are compiled into every kernel (int8's nibble-decode and
+    # K-order contract, the tile's lane layout), so they are part of the
+    # numerics too.
     kernels = _ENGINE_SOURCES.joinpath("kernels")
     for entry in sorted(kernels.iterdir(), key=lambda e: e.name):
         if entry.name.endswith((".metal", ".h")):

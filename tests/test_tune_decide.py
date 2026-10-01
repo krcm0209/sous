@@ -226,6 +226,7 @@ def _run(
         block_size=arm.block_size,
         int8_prefill=arm.int8_prefill,
         greedy=arm.greedy,
+        attention_tile=arm.attention_tile,
         window=arm.window,
         state=state,
         outcome="completed" if state == "done" else None,

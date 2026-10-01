@@ -3,6 +3,7 @@ project: the tools are real, a disallowed command is denied and counted, and
 every number in a run is read back from the transcript and the engine's
 deltas."""
 
+import dataclasses
 import json
 import os
 import sys
@@ -117,7 +118,7 @@ def test_run_one_grades_a_solved_task_and_reads_every_metric_from_the_run(tmp_pa
     assert Path(run.transcript_path).is_file()
     written = (tmp_path / "s" / "project" / "rpn.py").read_text()
     assert written == (task.solution / "rpn.py").read_text()
-    assert run.key == (*_arm(tmp_path).key, False, False)
+    assert run.key == (*_arm(tmp_path).key, False, False, True)
 
 
 def test_a_command_outside_the_allowlist_is_denied_and_counted(tmp_path):
@@ -421,7 +422,8 @@ def test_an_arm_that_merely_inherits_int8_runs_when_the_engine_cannot_route_it(t
     )
     assert len(outcome.runs) == 1
     assert outcome.error is None
-    assert any("runs stock" in line for line in lines)
+    # The inherited attention tile's notice says "runs stock" too: match int8's own line.
+    assert any("int8 prefill unavailable here (no tensor units)" in line for line in lines)
 
 
 def test_memory_is_judged_against_the_baseline_taken_before_the_load(tmp_path, monkeypatch):
@@ -518,6 +520,7 @@ def test_suite_runs_round_trip_through_dicts(tmp_path):
         block_size=0,
         int8_prefill=False,
         greedy=True,
+        attention_tile=False,
         window=8192,
         state="done",
         outcome="completed",
@@ -533,7 +536,7 @@ def test_suite_runs_round_trip_through_dicts(tmp_path):
         transcript_path=None,
     )
     assert SuiteRun.from_dict(json.loads(json.dumps(run.as_dict()))) == run
-    assert run.key == ("org/m", "", 0, False, True)
+    assert run.key == ("org/m", "", 0, False, True, False)
 
 
 def test_estimate_seconds_scales_with_the_measured_speeds(tmp_path):
@@ -583,3 +586,148 @@ def test_a_suite_arm_gets_no_fork_store(monkeypatch, tmp_path):
         active_memory=lambda: 0,
     )
     assert seen == {"forks": False}
+
+
+def test_a_row_written_before_the_attention_tile_existed_reads_as_stock(tmp_path):
+    arm = _arm(tmp_path)
+    row = SuiteRun(
+        task="t",
+        index=0,
+        label="m",
+        model_id="org/m",
+        drafter_id="",
+        block_size=0,
+        int8_prefill=False,
+        greedy=False,
+        attention_tile=True,
+        window=8192,
+        state="done",
+        outcome="completed",
+        turns=3,
+        seconds=12.5,
+        output_tokens=400,
+        malformed=0,
+        repetitions=0,
+        approvals_denied=0,
+        grade=1.0,
+        grade_detail="1/1",
+        error=None,
+        transcript_path=None,
+    ).as_dict()
+    del row["attention_tile"]
+    old = SuiteRun.from_dict(row)
+    assert old.attention_tile is False
+    # The arm inherits the tile's default, so a resume runs the task again
+    # rather than counting the stock row toward the tile arm.
+    assert arm.attention_tile is True
+    assert old.key == (*arm.key, False, False, False)
+    assert old.key != arm.suite_key
+
+
+class _TileUnavailable(FakeEngine):
+    drafter = ""
+    attention_tile_status = {
+        "state": "unavailable",
+        "reason": "macOS 15.5 < 26.2",
+        "splits": None,
+        "probe_seconds": None,
+    }
+
+
+def test_an_arm_that_inherits_the_tile_runs_stock_where_the_engine_cannot_serve_it(tmp_path):
+    """Every arm inherits attention_tile from the user's config, and none is
+    built to measure it: an engine that reports the tile unavailable must
+    not refuse the arm, since the daemon would serve that checkpoint with
+    stock attention."""
+    lines = []
+    outcome = run_suite(
+        _arm(tmp_path),
+        [_task()],
+        runs=1,
+        done=set(),
+        record=lambda r: None,
+        scratch=tmp_path / "s",
+        out=lines.append,
+        factory=lambda mid: _TileUnavailable([FINISH]),
+        python=PYTHON,
+        active_memory=lambda: 0,
+    )
+    assert len(outcome.runs) == 1 and outcome.error is None
+    assert outcome.runs[0].attention_tile is True
+    assert (
+        "  m: attention tile unavailable here (macOS 15.5 < 26.2); "
+        "the engine runs stock, as the daemon would"
+    ) in lines
+
+
+def test_no_tile_notice_when_the_tile_is_active_or_the_arm_runs_stock(tmp_path):
+    class Active(FakeEngine):
+        drafter = ""
+        attention_tile_status = {
+            "state": "active",
+            "reason": None,
+            "splits": 20,
+            "probe_seconds": 0.4,
+        }
+
+    arm = _arm(tmp_path)
+    stock = dataclasses.replace(
+        arm, attention_tile=False, config=dataclasses.replace(arm.config, attention_tile=False)
+    )
+    for case, engine in ((arm, Active), (stock, _TileUnavailable)):
+        lines = []
+        outcome = run_suite(
+            case,
+            [_task()],
+            runs=1,
+            done=set(),
+            record=lambda r: None,
+            scratch=tmp_path / f"s-{case.attention_tile}",
+            out=lines.append,
+            factory=lambda mid, engine=engine: engine([FINISH]),
+            python=PYTHON,
+            active_memory=lambda: 0,
+        )
+        assert len(outcome.runs) == 1 and outcome.error is None
+        assert outcome.runs[0].attention_tile is case.attention_tile
+        assert not any("attention tile" in line for line in lines), lines
+
+
+def test_the_tile_notice_is_only_for_an_engine_that_reports_it_unavailable(tmp_path):
+    """`off` is an engine with no tile at all (the mlx-lm backend), and an
+    engine that reports nothing has no tile either: neither is a machine
+    where the tile cannot run, so neither gets the notice."""
+
+    class Off(FakeEngine):
+        drafter = ""
+        attention_tile_status = {"state": "off", "reason": None}
+
+    class Silent(FakeEngine):
+        drafter = ""
+
+    class Unexplained(FakeEngine):
+        drafter = ""
+        attention_tile_status = {"state": "unavailable", "reason": None}
+
+    notice = "  m: attention tile unavailable here (no reason given); "
+    notice += "the engine runs stock, as the daemon would"
+    for name, engine, expected in (
+        ("off", Off, []),
+        ("silent", Silent, []),
+        ("unexplained", Unexplained, [notice]),
+    ):
+        lines = []
+        outcome = run_suite(
+            _arm(tmp_path),
+            [_task()],
+            runs=1,
+            done=set(),
+            record=lambda r: None,
+            scratch=tmp_path / f"s-{name}",
+            out=lines.append,
+            factory=lambda mid, engine=engine: engine([FINISH]),
+            python=PYTHON,
+            active_memory=lambda: 0,
+        )
+        assert len(outcome.runs) == 1 and outcome.error is None, name
+        assert [line for line in lines if "attention tile" in line] == expected, name

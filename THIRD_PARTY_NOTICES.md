@@ -10,6 +10,8 @@ work under other licenses and keep their original terms.
 `qwen35_oq_a8_nax.metal` and `oq_a8_decode.h` as merged in jundot/omlx#3548
 (author: PowerSpy), ported from an AOT-compiled extension to runtime-compiled
 `mx.fast.metal_kernel` sources with the Q5 and per-group-scaling variants removed.
+`attention_tile.metal` in the same directory is sous's own work and is not derived
+from oMLX.
 
 Attribution: oMLX contributors (the upstream files carry no copyright header).
 Licensed under the Apache License, Version 2.0 (a copy is in

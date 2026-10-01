@@ -29,22 +29,30 @@ def test_hooks_delegate_to_forkio(monkeypatch, cls, tmp_path: Path):
     assert [c[0] for c in calls] == ["eval", "persist", "restore"]
 
 
-def test_vlm_key_fields_read_positions_and_the_realised_int8_state(monkeypatch):
+def test_vlm_key_fields_read_positions_and_the_realised_int8_and_tile_states(monkeypatch):
     engine = vlm.VLMEngine.__new__(vlm.VLMEngine)
     engine._positional = True
     engine.int8_prefill_status = {"state": "active", "reason": None, "routed": 12}
+    engine.attention_tile_status = {
+        "state": "active",
+        "reason": None,
+        "splits": 20,
+        "probe_seconds": 0.43,
+    }
     fields = engine._fork_key_fields("sha")
     assert fields["backend"] == "vlm" and fields["positions"] == "engine"
     assert fields["int8"] == "active:12" and fields["weights"] == "sha"
+    assert fields["tile"] == "active:20"
     assert fields["gpu"]  # mx.device_info()["architecture"] on this Mac
 
 
 def test_lm_key_fields_name_the_lm_backend(monkeypatch):
     engine = lm.LMEngine.__new__(lm.LMEngine)
     engine.int8_prefill_status = {"state": "off", "reason": None, "routed": 0}
+    engine.attention_tile_status = {"state": "off", "reason": None}
     fields = engine._fork_key_fields("sha")
     assert fields["backend"] == "lm" and fields["positions"] == "model"
-    assert fields["int8"] == "off"
+    assert fields["int8"] == "off" and fields["tile"] == "off"
 
 
 class _Tokenizer:

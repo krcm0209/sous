@@ -35,6 +35,10 @@ class Arm:
     # from `config` so a row can be keyed without reading the config back.
     int8_prefill: bool = False
     greedy: bool = False
+    # Mirrored the same way but never measured: every arm inherits the
+    # user's setting. It still keys suite rows, because tile and stock
+    # attention differ in their last bits.
+    attention_tile: bool = True
     # True only for the winner stage's own int8 arm, built to *measure*
     # INT8 prefill: the engine refusing it must fail that arm. Every other
     # arm's int8_prefill is merely inherited from the user's config (every
@@ -52,10 +56,11 @@ class Arm:
         return (self.model_id, self.drafter_id, self.block_size)
 
     @property
-    def suite_key(self) -> tuple[str, str, int, bool, bool]:
+    def suite_key(self) -> tuple[str, str, int, bool, bool, bool]:
         """What identifies an arm across suite runs and a resume: the bench
-        key plus the two settings only the suite may change."""
-        return (*self.key, self.int8_prefill, self.greedy)
+        key, the two settings only the suite may change, and the attention
+        tile every arm inherits."""
+        return (*self.key, self.int8_prefill, self.greedy, self.attention_tile)
 
 
 @dataclass(frozen=True)
@@ -132,6 +137,7 @@ def _arm(
         fit_window=min(user.max_context_tokens, own.window),
         int8_prefill=user.int8_prefill,
         greedy=user.temperature == 0,
+        attention_tile=user.attention_tile,
     )
 
 
