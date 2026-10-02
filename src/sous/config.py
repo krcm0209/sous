@@ -89,8 +89,8 @@ class SousConfig:
     # drafter must match the target architecture; when it doesn't (or fails to
     # load), the engine logs and continues without it. Block size 4 measured
     # best on the M5 Pro on real subagent turns (#118: +3–5% decode over 3;
-    # 2, 5 and 6 ran slower than 4); 0 hands the choice back to the drafter's
-    # adaptive policy. Above 5 is clamped (SPECULATIVE_BLOCK_MAX).
+    # 2 and 6 ran clearly slower, 5 level with 3); 0 hands the choice back to
+    # the drafter's adaptive policy. Above 5 is clamped (SPECULATIVE_BLOCK_MAX).
     speculative_draft_id: str = "z-lab/Qwen3.8-27B-DFlash2"
     speculative_block_size: int = 4
     # Prefill matmuls of affine-Q4/gs64 projections on the M5 tensor units with
@@ -327,8 +327,8 @@ def _speculative_block_size(model: dict) -> int:
     if value > SPECULATIVE_BLOCK_MAX:
         warnings.warn(
             f"sous config: [model].speculative_block_size {value!r} exceeds "
-            f"{SPECULATIVE_BLOCK_MAX}, the largest verify block that pays on this model; "
-            f"using {SPECULATIVE_BLOCK_MAX}",
+            f"{SPECULATIVE_BLOCK_MAX}, the largest verify block that has paid in "
+            f"measurement (default model, M5 Pro); using {SPECULATIVE_BLOCK_MAX}",
             stacklevel=3,
         )
         return SPECULATIVE_BLOCK_MAX

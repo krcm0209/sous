@@ -6,13 +6,13 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 
-from sous.config import MIN_CONTEXT_TOKENS, SousConfig
+from sous.config import MIN_CONTEXT_TOKENS, SPECULATIVE_BLOCK_MAX, SousConfig
 from sous.tune.candidates import Candidate, Checkpoint, Fit, drafter_compatible, fit
 
-# The verify depths worth measuring per machine: 4 measured best on the M5 Pro
-# (#118), 2 and 3 for machines where a verify row costs more, and 5 is
-# config.SPECULATIVE_BLOCK_MAX.
-BLOCK_SIZES = (2, 3, 4, 5)
+# The verify depths worth measuring per machine, up to the config's clamp: 4
+# measured best on the M5 Pro (#118), 2 and 3 are for machines where a verify
+# row costs more.
+BLOCK_SIZES = tuple(range(2, SPECULATIVE_BLOCK_MAX + 1))
 
 
 @dataclass(frozen=True)
