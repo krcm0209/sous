@@ -220,9 +220,9 @@ def test_attention_tile_rejects_non_booleans_with_a_warning(tmp_path: Path, bad:
 def test_speculative_defaults(tmp_path: Path):
     cfg = load_config(tmp_path / "nope.toml")
     assert cfg.speculative_draft_id == "z-lab/Qwen3.8-27B-DFlash2"
-    # 3 measured best on the M5 Pro against the drafter's own adaptive policy
-    # (+3% on prose, +13% on code re-emission); 0 would hand the choice back.
-    assert cfg.speculative_block_size == 3
+    # 4 measured best on the M5 Pro on real subagent turns (#118); 0 would hand
+    # the choice back to the drafter's own adaptive policy.
+    assert cfg.speculative_block_size == 4
 
 
 def test_speculative_keys_from_toml_without_unknown_key_warnings(tmp_path: Path):
@@ -239,7 +239,7 @@ def test_speculative_keys_from_toml_without_unknown_key_warnings(tmp_path: Path)
 def test_speculative_block_size_one_or_negative_warns_and_uses_the_default(tmp_path: Path):
     """mlx-vlm treats the override as the total verify-block size and ends the
     round loop at <= 1 — a configured 1 would silently truncate every response
-    to one token. Invalid values degrade to the default (3) with a warning,
+    to one token. Invalid values degrade to the default (4) with a warning,
     matching the [context] policy stance."""
     for bad in ("1", "-3", "true", '"3"'):
         p = tmp_path / f"c{len(bad)}{bad[0]}.toml"
@@ -247,13 +247,13 @@ def test_speculative_block_size_one_or_negative_warns_and_uses_the_default(tmp_p
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             cfg = load_config(p)
-        assert cfg.speculative_block_size == 3, bad
+        assert cfg.speculative_block_size == 4, bad
         assert any("speculative_block_size" in str(w.message) for w in caught), bad
 
 
 def test_speculative_block_size_above_five_warns_and_is_clamped_to_five(tmp_path: Path):
-    """mlx's fused attention kernel takes at most 5 verify rows at the default
-    model's GQA ratio; 6–8 rows fall off it and run 5–6x slower per layer, so
+    """No block above 5 has paid (block 6 ran 0.8x block 3 on the M5 Pro, and
+    without the attention tile 6+ rows leave mlx's fused attention kernel), so
     a larger block is a net loss the user cannot see. Clamp, keeping the
     intent (as deep as pays), and say so."""
     for big in ("6", "9", "16"):

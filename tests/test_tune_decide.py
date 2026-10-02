@@ -67,7 +67,7 @@ def test_score_prefers_the_long_context_measurement():
 
 
 def test_a_faster_block_size_becomes_the_only_change(tmp_path):
-    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=3)
     arms = [_arm(user, "cur", current=True), _arm(user, "b2", block=2)]
     rows = [_row("cur", d16k=18.0), _row("b2", block=2, d16k=19.5)]
     choice = quick_decision(user, arms, rows)
@@ -77,7 +77,7 @@ def test_a_faster_block_size_becomes_the_only_change(tmp_path):
 
 
 def test_a_tie_keeps_the_current_arm_and_yields_no_changes(tmp_path):
-    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=3)
     arms = [_arm(user, "cur", current=True), _arm(user, "b2", block=2)]
     rows = [_row("cur", d16k=18.0), _row("b2", block=2, d16k=18.0)]
     choice = quick_decision(user, arms, rows)
@@ -85,7 +85,7 @@ def test_a_tie_keeps_the_current_arm_and_yields_no_changes(tmp_path):
 
 
 def test_no_drafter_winning_clears_the_drafter_key(tmp_path):
-    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=3)
     arms = [_arm(user, "cur", current=True), _arm(user, "plain", drafter="", block=0)]
     rows = [_row("cur", d16k=10.0), _row("plain", drafter="", block=0, d16k=12.0)]
     choice = quick_decision(user, arms, rows)
@@ -97,6 +97,7 @@ def test_a_window_the_arm_could_not_reach_is_written_back(tmp_path):
     user = SousConfig(
         data_dir=tmp_path,
         config_path=tmp_path / "c.toml",
+        speculative_block_size=3,
         max_context_tokens=262144,
     )
     arms = [_arm(user, "cur", current=True, window=65536)]
@@ -107,7 +108,7 @@ def test_a_window_the_arm_could_not_reach_is_written_back(tmp_path):
 
 
 def test_other_models_never_win_and_a_missing_current_model_is_none(tmp_path):
-    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=3)
     arms = [_arm(user, "cur", current=True), _arm(user, "moe", model="o/moe", drafter="", block=0)]
     rows = [_row("cur", d16k=18.0), _row("moe", model="o/moe", drafter="", block=0, d16k=60.0)]
     choice = quick_decision(user, arms, rows)
@@ -117,7 +118,7 @@ def test_other_models_never_win_and_a_missing_current_model_is_none(tmp_path):
 
 
 def test_a_row_whose_arm_is_gone_is_ignored(tmp_path):
-    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=3)
     arms = [_arm(user, "cur", current=True)]
     rows = [_row("cur", d16k=18.0), _row("ghost", block=2, d16k=99.0)]
     choice = quick_decision(user, arms, rows)
@@ -130,7 +131,7 @@ def test_without_a_current_arm_the_best_row_still_labels_the_choice_but_proposes
     all — so there is no baseline to diff the winner against; proposing
     `changes` from the winner's numbers alone would trust one arm's speed
     without ever knowing whether it beats what the user already has."""
-    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=3)
     arms = [_arm(user, "b2", block=2), _arm(user, "b5", block=5)]
     rows = [_row("b2", block=2, d16k=20.0), _row("b5", block=5, d16k=22.0)]
     choice = quick_decision(user, arms, rows)
@@ -141,7 +142,7 @@ def test_without_a_current_arm_the_best_row_still_labels_the_choice_but_proposes
 
 
 def test_a_failed_current_arm_proposes_no_change_but_names_the_failure(tmp_path):
-    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=3)
     arms = [_arm(user, "cur", current=True), _arm(user, "b2", block=2)]
     rows = [_row("cur", ok=False), _row("b2", block=2, d16k=19.5)]
     choice = quick_decision(user, arms, rows)
@@ -155,7 +156,7 @@ def test_every_compared_row_is_scored_in_one_unit(tmp_path):
     """A row without a 16K number must not be ranked on its 1K one against
     siblings ranked at 16K: the short context flatters a drafter, and the
     winner's settings get written to the config."""
-    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=3)
     arms = [_arm(user, "cur", current=True), _arm(user, "b2", block=2)]
     rows = [_row("cur", d1k=20.0, d16k=18.0), _row("b2", block=2, d1k=24.0, d16k=None)]
     choice = quick_decision(user, arms, rows)
@@ -168,7 +169,7 @@ def test_every_compared_row_is_scored_in_one_unit(tmp_path):
 def test_a_row_measured_at_another_window_is_not_compared(tmp_path):
     """A resumed run whose config changed in between carries rows of two
     windows; only this run's window counts, the rest is measured again."""
-    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=3)
     arms = [_arm(user, "cur", current=True), _arm(user, "b2", block=2)]
     rows = [_row("cur", d16k=18.0), _row("b2", block=2, d16k=30.0, window=16384)]
     choice = quick_decision(user, arms, rows)
@@ -178,7 +179,12 @@ def test_a_row_measured_at_another_window_is_not_compared(tmp_path):
 def test_arms_are_told_apart_by_model_drafter_and_block_not_by_label(tmp_path):
     """Two orgs' checkpoints with one repo basename share a label; the
     winner must resolve to the arm its row measured."""
-    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_draft_id="")
+    user = SousConfig(
+        data_dir=tmp_path,
+        config_path=tmp_path / "c.toml",
+        speculative_draft_id="",
+        speculative_block_size=3,
+    )
     other = "some-org/Qwen3.8-27B-4bit"
     arms = [
         _arm(user, "Qwen3.8-27B-4bit", drafter="", block=0, current=True),
@@ -196,6 +202,7 @@ def test_a_proposal_writes_the_arms_own_fit_window_not_the_shared_one(tmp_path):
     user = SousConfig(
         data_dir=tmp_path,
         config_path=tmp_path / "c.toml",
+        speculative_block_size=3,
         max_context_tokens=131072,
     )
     arms = [
@@ -247,7 +254,10 @@ def _runs(arm, grades, **kw):
     return [_run(arm, task=f"t{i}", grade=g, **kw) for i, g in enumerate(grades)]
 
 
+# Every user here keeps block 3, the block the fixtures' current arm and rows
+# are written for, so these tests do not move with the shipped default.
 def _user(tmp_path, **over):
+    over.setdefault("speculative_block_size", 3)
     return SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", **over)
 
 

@@ -192,6 +192,7 @@ def _deps(
 def _cfg(tmp_path, **over):
     p = tmp_path / "config.toml"
     p.write_text("# mine\n[model]\nspeculative_block_size = 3\n")
+    over.setdefault("speculative_block_size", 3)
     return SousConfig(data_dir=tmp_path, config_path=p, **over)
 
 

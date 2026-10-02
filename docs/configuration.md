@@ -23,7 +23,7 @@ prompt_cache = true
 # prompt_cache_gb = 8
 # prompt_cache_disk_gb = "auto"
 speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
-speculative_block_size = 3
+speculative_block_size = 4
 int8_prefill = false
 attention_tile = true
 ```
@@ -196,17 +196,19 @@ still argmaxes to the same wrong output every time.
 
 Speculative decoding (`speculative_draft_id`, `speculative_block_size`) is
 ~1.8x decode on the default model at short context with the shipped
-sampling; `""` disables it. The greedy path has not been measured in-tree
-yet (#118); an out-of-tree harness that loads sous's engine and runs
-mlx-vlm's greedy round loop measured it on the M5 Pro at 1.96x over plain
-greedy decode at 2K and 1.47x at 57K, block 3. The
-"~2.4x greedy" figure earlier versions quoted ran an argmax sampler through
-the sampled speculative walk, before the engine reached mlx-vlm's greedy
-branch, and that branch also drafts differently (#87). Block size 3 measured best on an
-M5 Pro (+3% on prose, +13% on code re-emission over the drafter's adaptive
-policy); 0 lets that policy pick the depth; anything above 5 is clamped,
-because mlx's fused attention kernel takes at most 5 verify rows on this
-model and 6–8 rows run 5–6x slower per layer. It auto-disables with a
+sampling; `""` disables it. Greedy (temperature 0) speculative decode ran
+2.0x plain greedy decode on an M5 Pro (27.1 against 13.6 tok/s at block 4;
+1.83x at block 3), on 64 real subagent turns at 44–77K tokens, with output
+identical to plain decode on every turn (#118).
+The "~2.4x greedy" figure earlier versions quoted ran an argmax sampler
+through the sampled speculative walk, before the engine reached mlx-vlm's
+greedy branch, and that branch also drafts differently (#87). Block size 4
+measured best on those turns, sampled and greedy: +3–5% decode over block 3,
+with 2 and 6 clearly slower (about 0.8x block 3) and 5 level with 3, its
+interval overlapping 4's (#118). 0 lets the drafter's adaptive policy
+pick the depth. Anything above 5 is clamped, because no larger block has
+paid: block 6 ran 0.8x block 3 on the M5 Pro, and without the attention tile
+6+ verify rows also leave mlx's fused attention kernel. It auto-disables with a
 warning when the drafter can't serve the configured model. On the prompt-cache
 path of a hybrid model the decode call itself prefills only the generation
 prompt, so the drafter is handed the newest window (2047 positions on the
