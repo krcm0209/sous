@@ -207,10 +207,9 @@ measured best on those turns, sampled and greedy: +3–5% decode over block 3,
 with 2 and 6 clearly slower (about 0.8x block 3) and 5 level with 3, its
 interval overlapping 4's (#118). 0 lets the drafter's adaptive policy
 pick the depth. Anything above 5 is clamped, because no larger block has
-paid: block 6 ran 0.8x block 3 on the M5 Pro, and without the attention
-tile 6+ verify rows also leave mlx's fused attention kernel. It
-auto-disables with a warning when the drafter can't serve the configured
-model. On the prompt-cache
+paid: block 6 ran 0.8x block 3 on the M5 Pro, and without the attention tile
+6+ verify rows also leave mlx's fused attention kernel. It auto-disables with a
+warning when the drafter can't serve the configured model. On the prompt-cache
 path of a hybrid model the decode call itself prefills only the generation
 prompt, so the drafter is handed the newest window (2047 positions on the
 default drafter) of the hidden states of everything the turn prefilled
