@@ -257,6 +257,16 @@ def main(
     if user.speculative_draft_id:
         ids.add(user.speculative_draft_id)
     checkpoints = _describe_all(ids, describe, out)
+    # Before any arm exists: the current-arm mark and every proposed change
+    # compare against the block the daemon would run, and an unset block
+    # resolves at load by whether the projection kernel can run here.
+    resolved = arms_mod.resolve_block(user, checkpoints)
+    if resolved.speculative_block_size != user.speculative_block_size:
+        out(
+            "speculative_block_size is unset and the projection kernel can run here: "
+            f"the configured arm is block {resolved.speculative_block_size}"
+        )
+    user = resolved
     arms, refusals = arms_mod.quick_arms(
         user, candidates, checkpoints, working_set_bytes=hardware.working_set_bytes
     )

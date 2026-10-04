@@ -62,6 +62,7 @@ class SuiteRun:
     int8_prefill: bool
     greedy: bool
     attention_tile: bool
+    projection_kernel: bool
     window: int
     state: str
     outcome: str | None
@@ -77,7 +78,7 @@ class SuiteRun:
     transcript_path: str | None
 
     @property
-    def key(self) -> tuple[str, str, int, bool, bool, bool]:
+    def key(self) -> tuple[str, str, int, bool, bool, bool, bool]:
         """The arm this run measured — `Arm.suite_key`, never the label."""
         return (
             self.model_id,
@@ -86,6 +87,7 @@ class SuiteRun:
             self.int8_prefill,
             self.greedy,
             self.attention_tile,
+            self.projection_kernel,
         )
 
     @property
@@ -97,9 +99,12 @@ class SuiteRun:
 
     @classmethod
     def from_dict(cls, d: dict) -> SuiteRun:
-        # A row written before the tile existed ran stock attention; without
-        # the fallback, resuming such a run would raise KeyError.
-        d = {"attention_tile": False, **d}
+        # A row written before a setting existed ran without what it switches
+        # on — stock attention, stock projections — on every machine, so it
+        # reads False, and a resume under an arm that has the setting runs
+        # the task again rather than pool the two. Without the fallback,
+        # resuming such a run would raise KeyError.
+        d = {"attention_tile": False, "projection_kernel": False, **d}
         return cls(**{f.name: d[f.name] for f in dataclasses.fields(cls)})
 
 
@@ -227,6 +232,7 @@ def _error_run(task: SuiteTask, index: int, arm: Arm, error: str) -> SuiteRun:
         int8_prefill=arm.int8_prefill,
         greedy=arm.greedy,
         attention_tile=arm.attention_tile,
+        projection_kernel=arm.projection_kernel,
         window=arm.window,
         state="error",
         outcome=None,
@@ -285,6 +291,7 @@ def run_one(
         int8_prefill=arm.int8_prefill,
         greedy=arm.greedy,
         attention_tile=arm.attention_tile,
+        projection_kernel=arm.projection_kernel,
         window=arm.window,
         state="failed" if failed else "done",
         outcome=None if failed else result.outcome,
@@ -341,6 +348,25 @@ def _check_tile(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> No
     reason = status.get("reason") or "no reason given"
     out(
         f"  {arm.label}: attention tile unavailable here ({reason}); "
+        "the engine runs stock, as the daemon would"
+    )
+
+
+def _check_proj(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> None:
+    """The projection kernel is inherited and unmeasured like the tile, so
+    the same holds: where the engine reports it unavailable, the daemon would
+    serve this checkpoint with stock projections, and the arm runs the same
+    way after a notice. Its block is unaffected — every drafter arm pins the
+    one its label names. `off`, or no status, is the setting switched off or
+    an engine without the kernel: no notice."""
+    if not arm.projection_kernel:
+        return
+    status = engine.projection_kernel_status or {}
+    if status.get("state") != "unavailable":
+        return
+    reason = status.get("reason") or "no reason given"
+    out(
+        f"  {arm.label}: projection kernel unavailable here ({reason}); "
         "the engine runs stock, as the daemon would"
     )
 
@@ -428,6 +454,7 @@ def _run_suite(
             _check_drafter(arm, engine)
             _check_int8(arm, engine, out)
             _check_tile(arm, engine, out)
+            _check_proj(arm, engine, out)
         except RuntimeError as e:
             check_error = str(e)
         if check_error is None:
