@@ -231,11 +231,12 @@ Speculative decoding (`speculative_draft_id`, `speculative_block_size`) is
 ~1.8x decode on the default model at short context with the shipped
 sampling; `""` disables it. Left unset, the block size is 5 where the
 projection kernel is active, 4 where only the attention tile is (an M5 Pro
-with `projection_kernel = false`) and 3 everywhere else; a value you set
+with `projection_kernel = false`, or one where the kernel is `unavailable`)
+and 3 everywhere else; a value you set
 always wins, and the model-load line's `draft_block=` says which block the
 engine runs. Earlier versions of the documented config set
-`speculative_block_size = 4` explicitly; remove that line to let the engine
-choose. The 3 matters off the M5 Pro: on an M2, mlx-vlm's exact verifier
+`speculative_block_size` explicitly (3 through v0.7.0, then 4); remove that
+line to let the engine choose. The 3 matters off the M5 Pro: on an M2, mlx-vlm's exact verifier
 collapses from 4 rows (a 9B verify forward costs 138 ms at 3 rows, 662 ms at 4
 and 1,098 ms at 5, against 65 ms for one), and a 9B with its drafter decoded
 3.56 tok/s at block 4 against 13.46 at block 3, with identical replies on 12

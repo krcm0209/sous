@@ -512,7 +512,8 @@ goal.
   false) resolves in `VLMEngine.__init__`, when a drafter loaded and before
   `_pin_block_size`, to `SPECULATIVE_BLOCK_KERNEL` = 5 where the kernel is
   `active`, else `SPECULATIVE_BLOCK_TILE` = 4 where the attention tile is
-  (the M5 Pro with the kernel switched off, where #118 measured 4), else
+  (the M5 Pro with the kernel switched off, where #118 measured 4, or with
+  a kernel that refused the load), else
   `SPECULATIVE_BLOCK_DEFAULT` = 3: mlx-vlm's exact verifier collapses from
   T=4 on the M2 (#156: 3.56 tok/s at block 4 against 13.46 at 3, identical
   replies), and no other GPU is measured. An explicit value always wins and

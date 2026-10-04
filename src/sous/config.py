@@ -70,9 +70,11 @@ _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 # Qwen3.5-9B with its drafter decoded 3.56 tok/s at block 4 against 13.46 at
 # block 3 there, with identical replies (#156). No other GPU is measured.
 SPECULATIVE_BLOCK_DEFAULT = 3
-# Where only the attention tile serves the load (the M5 Pro with
-# projection_kernel = false): block 4 measured +3-5% decode over 3 on real
-# subagent turns there (#118); 2 and 6 ran clearly slower, 5 level with 3.
+# Where only the attention tile serves the load: the M5 Pro with
+# projection_kernel = false, or with a kernel that refused the load (another
+# quantization, a drifted pin, a failed probe). Block 4 measured +3-5% decode
+# over 3 on real subagent turns there with the default model and the kernel
+# off (#118); 2 and 6 ran clearly slower, 5 level with 3.
 SPECULATIVE_BLOCK_TILE = 4
 # Where the projection kernel serves the load: its verify projections cost
 # about the same at 5 rows as at 4, so the deeper block's extra accepted
@@ -144,8 +146,8 @@ class SousConfig:
     # Decode without a drafter runs at about 0.78x. Not bit-identical to
     # stock's kernels, hence the switch; false runs the stock paths, and an
     # unset speculative_block_size then resolves to 4 where the tile is
-    # active, else 3. Active only where the attention tile is, `unavailable` with the
-    # reason anywhere else. Read once, at daemon start.
+    # active, else 3. Active only where the attention tile is, `unavailable`
+    # with the reason anywhere else. Read once, at daemon start.
     projection_kernel: bool = True
     # Reuse one KV cache across the turns of a conversation, prefilling only
     # what it gained, instead of re-prefilling from scratch every turn. Works
