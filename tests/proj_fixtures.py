@@ -8,7 +8,8 @@ from typing import Any
 
 import pytest
 
-from sous.engine import projkernel
+from sous.engine import int8prefill, projkernel
+from tests import tile_fixtures as tfx
 
 # Read once: a failed probe is not remembered, so each call would compile again.
 KERNEL = projkernel.kernel_available()
@@ -60,3 +61,56 @@ def stand_in_mma(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]
         y = mx.concatenate([rows[r : r + 1] @ dense.T for r in range(n_rows)], axis=0)
         outs.append(y.astype(mx.bfloat16).reshape(*x.shape[:-1], dense.shape[0]))
     return tuple(outs)
+
+
+def rand_module(n: int, k: int, seed: int) -> Any:
+    """rand_linear's projection as the module a model holds: an nn.QuantizedLinear,
+    affine 4-bit at group size 64, bf16 scales and biases, no bias term."""
+    import mlx.nn as nn
+
+    module = nn.QuantizedLinear(k, n, bias=False, group_size=64, bits=4)
+    module.weight, module.scales, module.biases = rand_linear(n, k, seed)
+    return module
+
+
+def tiny_quantized_model(*, seed: int = 0) -> Any:
+    """tile_fixtures' tiny qwen3_5 language model quantized as the 27B is: every
+    linear affine 4-bit at group size 64 with bf16 scales and biases, lm_head
+    included (31 QuantizedLinear modules), the embedding a QuantizedEmbedding.
+    Layers 0 and 2 are GatedDeltaNet, 1 and 3 full attention."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    lm = tfx.tiny_language_model(seed=seed)
+    nn.quantize(lm, group_size=64, bits=4)
+    mx.eval(lm.parameters())
+    return lm
+
+
+def guard_proj_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Registers restores for what install_hooks(), enable() and the probe leave
+    behind for the rest of the process: nn.QuantizedLinear.__call__ and the
+    verifier's _linear and _linears (the hooks), the flag, int8's install flag (a
+    test may install int8's wrapper in either order with ours) and the remembered
+    compile verdict. A test that installs or activates the kernel then cannot
+    leak any of them into the next."""
+    import mlx.nn as nn
+
+    verifier = projkernel._verifier_class()
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", nn.QuantizedLinear.__call__)
+    monkeypatch.setattr(verifier, "_linear", verifier._linear)
+    monkeypatch.setattr(verifier, "_linears", verifier._linears)
+    monkeypatch.setattr(projkernel, "_active", projkernel._active)
+    monkeypatch.setattr(
+        int8prefill, "_QUANTIZED_LINEAR_WRAPPED", int8prefill._QUANTIZED_LINEAR_WRAPPED
+    )
+    monkeypatch.setattr(projkernel, "_kernel_ok", projkernel._kernel_ok)
+
+
+def hooked(monkeypatch: pytest.MonkeyPatch, *, active: int = 1) -> None:
+    """Both hooks installed and the flag at `active` for this test only, with the
+    stand-in as the kernel; guard_proj_state's restores undo all of it."""
+    guard_proj_state(monkeypatch)
+    projkernel.install_hooks()
+    monkeypatch.setattr(projkernel, "_active", active)
+    monkeypatch.setattr(projkernel, "mma", stand_in_mma)

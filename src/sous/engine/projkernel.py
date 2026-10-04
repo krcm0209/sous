@@ -22,12 +22,14 @@ Apache License 2.0; see THIRD_PARTY_NOTICES.md.
 from __future__ import annotations
 
 import functools
+import importlib
 import logging
+import math
 from collections.abc import Callable
 from typing import Any
 
 from sous.engine import nax
-from sous.engine.int8prefill import _error_line, _kernel, _kernel_text
+from sous.engine.int8prefill import _error_line, _kernel, _kernel_text, _root
 
 logger = logging.getLogger("sous.engine.projkernel")
 
@@ -354,3 +356,207 @@ def kernel_available() -> nax.Availability:
         return nax.Availability(False, f"the projection kernel failed: {failed}")
     _kernel_ok = True
     return nax.Availability(True)
+
+
+# --------------------------------------------------------------------------------
+# Routing: the tags, the flag and the two hooks
+# --------------------------------------------------------------------------------
+
+# Set with object.__setattr__ so it lives in the module's __dict__: nn.Module's own
+# __setattr__ would put a bool INTO the parameter tree.
+_TAG = "_sous_projection_kernel"
+# Set on all three wrappers so a second install never wraps again. functools.wraps
+# copies the wrapped function's __dict__, so the mark is still found when int8's
+# wrapper of nn.QuantizedLinear.__call__ sits on top of ours.
+_HOOK_MARK = "_sous_projection_kernel_hook"
+# 1 while the kernel serves, else 0: set only by an enable() that reached active,
+# cleared first by every enable(), by clear() and by the probe on its way out. A
+# plain int, so nothing it holds outlives an unload.
+_active = 0
+# Per projection call, not per turn: the tests read deltas, and so can a harness
+# that wraps the daemon. Nothing is logged per turn.
+calls: dict[str, int] = {
+    "verify_kernel": 0,  # verifier _linear/_linears calls the kernel served
+    "verify_split": 0,  # of those, calls over MAX_ROWS rows cut into runs
+    "plain_kernel": 0,  # QuantizedLinear calls the kernel served
+    "declined": 0,  # flag set and every linear tagged, refused for dtype or shape
+}
+_VERIFIER_MODULE = "mlx_vlm.models.qwen3_5.speculative_verifier"
+
+
+def _verifier_class() -> Any:
+    return importlib.import_module(_VERIFIER_MODULE).Qwen3_5BatchInvariantForward
+
+
+def _tagged(module: Any) -> bool:
+    return bool(getattr(module, _TAG, False))
+
+
+def tag(model: Any) -> int:
+    """Tag every QuantizedLinear of the loaded target's language model, lm_head
+    included, and return how many; enable() has checked each one eligible. The
+    drafter's own linears live in its own tree and are never reached. The
+    lm_head DFlash binds into the drafter is the target's own object, so the
+    drafter's sampled head goes through the kernel too, which changes proposals
+    only."""
+    import mlx.nn as nn
+
+    seen: set[int] = set()
+    for _, module in _root(model).named_modules():
+        if isinstance(module, nn.QuantizedLinear) and id(module) not in seen:
+            object.__setattr__(module, _TAG, True)
+            seen.add(id(module))
+    return len(seen)
+
+
+def untag(model: Any) -> None:
+    """Take the tags off `model`; both hooks then hand its calls on."""
+    for _, module in _root(model).named_modules():
+        if _TAG in getattr(module, "__dict__", {}):
+            object.__setattr__(module, _TAG, False)
+
+
+def clear() -> None:
+    """Stop serving: both hooks hand every call on from here on. Tags left on an
+    unloaded model are inert while the flag is 0, and untagging it would need a
+    reference that keeps its weights alive."""
+    global _active
+    _active = 0
+
+
+def _weights(module: Any) -> tuple[Any, Any, Any]:
+    return module.weight, module.scales, module.biases
+
+
+def _run_mma(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]:
+    """mma over the call's linears, at most _MAX_LINEARS per launch: a fused
+    group's rows equal its singles', so where a longer list is cut changes no
+    bit. `mma` is read from the module at call time, the seam tests swap the
+    plain-mlx stand-in into."""
+    out: list[Any] = []
+    for i in range(0, len(weights), _MAX_LINEARS):
+        out.extend(mma(x, weights[i : i + _MAX_LINEARS]))
+    return tuple(out)
+
+
+def _serve_verify(linears: Any, x: Any) -> tuple[Any, ...] | None:
+    """The kernel's outputs for one verifier call while the flag is set, else
+    None, and the wrapper calls mlx-vlm's method with the call's own arguments.
+    A call of more than MAX_ROWS rows (block 0 lets the drafter's own policy
+    verify 16) is cut along T into runs of at most MAX_ROWS: a row's bits do not
+    depend on the rows beside it, so every run equals its rows computed one at a
+    time, as decode computes them."""
+    if not linears or not all(_tagged(m) for m in linears):
+        return None
+    import mlx.core as mx
+
+    if getattr(x, "ndim", 0) != 3 or x.dtype != mx.bfloat16:
+        calls["declined"] += 1
+        return None
+    batch, rows = x.shape[0], x.shape[1]
+    step = MAX_ROWS // batch if batch else 0
+    if not step or not rows:
+        calls["declined"] += 1
+        return None
+    weights = [_weights(m) for m in linears]
+    calls["verify_kernel"] += 1
+    if rows <= step:
+        return _run_mma(x, weights)
+    calls["verify_split"] += 1
+    runs = [_run_mma(x[:, j : j + step], weights) for j in range(0, rows, step)]
+    return tuple(mx.concatenate(list(parts), axis=1) for parts in zip(*runs, strict=True))
+
+
+def _serve_plain(module: Any, x: Any) -> Any | None:
+    """The kernel's output for one call of a tagged module while the flag is set,
+    else None, and the wrapper calls the method it wrapped: mlx's, or int8's,
+    which takes its own calls of 128 rows and more. Rows are the product of the
+    leading dimensions, so this serves one-row decode, a last prefill chunk of
+    at most MAX_ROWS rows and the one-row forward that ends every prefill
+    segment, and nothing longer."""
+    if not _tagged(module):
+        return None
+    import mlx.core as mx
+
+    shape = x.shape
+    if not 1 <= math.prod(shape[:-1]) <= MAX_ROWS:
+        return None
+    if len(shape) < 2 or x.dtype != mx.bfloat16:
+        calls["declined"] += 1
+        return None
+    calls["plain_kernel"] += 1
+    return _run_mma(x, [_weights(module)])[0]
+
+
+def _wrap_linear(original: Callable[..., Any]) -> Callable[..., Any]:
+    """The verifier hook for its single projections: o_proj, down_proj, out_proj
+    and the verify head."""
+
+    # functools.wraps: the source pins follow __wrapped__ back to mlx-vlm's body.
+    @functools.wraps(original)
+    def _linear(self: Any, linear: Any, x: Any) -> Any:
+        if _active:
+            out = _serve_verify((linear,), x)
+            if out is not None:
+                return out[0]
+        return original(self, linear, x)
+
+    setattr(_linear, _HOOK_MARK, True)
+    return _linear
+
+
+def _wrap_linears(original: Callable[..., Any]) -> Callable[..., Any]:
+    """The verifier hook for its fused groups: q+k+v, gate+up and qkv+z+b+a."""
+
+    @functools.wraps(original)
+    def _linears(self: Any, linears: Any, x: Any) -> Any:
+        if _active:
+            out = _serve_verify(linears, x)
+            if out is not None:
+                return out
+        return original(self, linears, x)
+
+    setattr(_linears, _HOOK_MARK, True)
+    return _linears
+
+
+def _wrap_call(original: Callable[..., Any]) -> Callable[..., Any]:
+    """The module hook: nn.QuantizedLinear.__call__, for every call on the target
+    outside the verifier."""
+
+    @functools.wraps(original)
+    def call(self: Any, x: Any) -> Any:
+        if _active:
+            out = _serve_plain(self, x)
+            if out is not None:
+                return out
+        return original(self, x)
+
+    setattr(call, _HOOK_MARK, True)
+    return call
+
+
+def install_hooks() -> None:
+    """Wrap the exact verifier's _linear and _linears and nn.QuantizedLinear's
+    __call__, once per process: a method already carrying the mark is left alone.
+    enable() calls this on the first activation only, and the wrappers are never
+    removed; while the flag is 0 each costs one int read per call.
+
+    The verifier is wrapped on the class because its projections reach mlx-vlm's
+    ops through names imported into its own module, and verifyattn's _attention
+    wrapper calls self._linears and self._linear, so it goes through the same
+    hook. gemma4's, nemotron_h's and qwen4_exp's verifiers inherit the wrap: only
+    the tags keep them stock. Each wrapper falls through to what it wrapped, so
+    int8's wrapper of nn.QuantizedLinear.__call__ may sit above or below this
+    one: int8 takes 128 rows and more, this one 8 and fewer."""
+    import mlx.nn as nn
+
+    verifier = _verifier_class()
+    if not getattr(verifier._linear, _HOOK_MARK, False):
+        verifier._linear = _wrap_linear(verifier._linear)
+    if not getattr(verifier._linears, _HOOK_MARK, False):
+        verifier._linears = _wrap_linears(verifier._linears)
+    # Any: ty would reject a wrapper assigned over the method's own signature.
+    quantized: Any = nn.QuantizedLinear
+    if not getattr(quantized.__call__, _HOOK_MARK, False):
+        quantized.__call__ = _wrap_call(quantized.__call__)

@@ -3,6 +3,9 @@ variant choice, eligibility, availability, and the arithmetic every routing
 decision rests on. The arithmetic tests run wherever the kernel compiles and
 probes right (CI's macos-15 GPU included) and skip elsewhere."""
 
+import importlib
+import inspect
+import types
 from importlib.resources import files
 
 import pytest
@@ -419,3 +422,371 @@ def test_the_kernel_rounds_like_a_float64_reference(forced):
         assert np.all(np.abs(y64 - ref) <= np.abs(ref) * 2.0**-8 + magnitude * 2.0**-16)
         rounded = _f64(mx.array(ref.astype(np.float32)).astype(mx.bfloat16))
         assert np.mean(rounded == y64) >= 0.995, forced
+
+
+# ---- routing: the tags, the flag and the two hooks ---------------------------------
+
+
+def _proj_counts_since(before):
+    """The counters that moved since `before`, by how much."""
+    return {k: n - before[k] for k, n in projkernel.calls.items() if n != before[k]}
+
+
+def _acts(*shape, dtype=None, seed=0):
+    """Random activations of `shape`, bf16 unless `dtype` says otherwise."""
+    x = mx.random.normal(shape, key=mx.random.key(seed))
+    return x.astype(mx.bfloat16 if dtype is None else dtype)
+
+
+def _tagged_linear(n, k, seed):
+    linear = pfx.rand_module(n, k, seed)
+    object.__setattr__(linear, projkernel._TAG, True)
+    return linear
+
+
+def _triples(*linears):
+    return [(m.weight, m.scales, m.biases) for m in linears]
+
+
+def _bitwise(a, b):
+    return mx.array_equal(a, b).item()
+
+
+def _no_kernel(x, weights):
+    raise AssertionError("a call that should have been handed on reached the kernel")
+
+
+@pytest.fixture(scope="module")
+def tiny_target():
+    return pfx.tiny_quantized_model()
+
+
+@pytest.fixture
+def fresh_target(tiny_target):
+    """The tiny quantized model, untagged again after the test."""
+    yield tiny_target
+    projkernel.untag(tiny_target)
+
+
+def test_the_counters_name_the_four_paths():
+    assert set(projkernel.calls) == {"verify_kernel", "verify_split", "plain_kernel", "declined"}
+
+
+def test_clear_drops_the_flag(monkeypatch):
+    monkeypatch.setattr(projkernel, "_active", 1)
+    projkernel.clear()
+    assert projkernel._active == 0
+
+
+def test_tag_marks_every_quantized_linear_of_the_language_model_and_nothing_else(fresh_target):
+    from mlx.utils import tree_flatten
+
+    # mlx-vlm's Model holds the text model as `language_model`, as enable() gets it.
+    model = types.SimpleNamespace(language_model=fresh_target)
+    assert projkernel.tag(model) == 31
+    for path, module in fresh_target.named_modules():
+        assert projkernel._tagged(module) == isinstance(module, nn.QuantizedLinear), path
+    assert not any(projkernel._TAG in key for key, _ in tree_flatten(fresh_target.parameters()))
+    projkernel.untag(model)
+    assert not any(projkernel._tagged(module) for _, module in fresh_target.named_modules())
+
+
+def test_the_drafters_own_linears_are_never_tagged(fresh_target):
+    """DFlash binds the target's lm_head into the drafter: that head is the target's
+    object and is tagged; every linear the drafter owns is not."""
+    from mlx_vlm.speculative.drafters.qwen3_dflash.config import DFlashConfig
+    from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import DFlashDraftModel
+
+    vocab = fresh_target.args.vocab_size
+    drafter = DFlashDraftModel(
+        DFlashConfig(
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=128,
+            vocab_size=vocab,
+            mask_token_id=vocab - 1,
+            target_layer_ids=[1],
+            num_target_layers=4,
+        )
+    )
+    drafter.set_dtype(mx.bfloat16)
+    nn.quantize(drafter, group_size=64, bits=4)  # as the engine loads a drafter
+    model = types.SimpleNamespace(language_model=fresh_target)
+    drafter.bind(model)
+    projkernel.tag(model)
+    assert drafter.lm_head is fresh_target.lm_head and projkernel._tagged(drafter.lm_head)
+    owned = [
+        module
+        for _, module in drafter.named_modules()
+        if isinstance(module, nn.QuantizedLinear) and module is not fresh_target.lm_head
+    ]
+    assert len(owned) == 8
+    assert not any(projkernel._tagged(module) for module in owned)
+
+
+def test_install_hooks_wraps_each_method_once_over_its_original(monkeypatch):
+    pfx.guard_proj_state(monkeypatch)
+    verifier = projkernel._verifier_class()
+
+    def methods():
+        return (verifier._linear, verifier._linears, nn.QuantizedLinear.__call__)
+
+    originals = [inspect.unwrap(method) for method in methods()]
+    projkernel.install_hooks()
+    first = methods()
+    projkernel.install_hooks()
+    assert all(now is then for now, then in zip(methods(), first, strict=True))
+    for hook, original in zip(first, originals, strict=True):
+        assert getattr(hook, projkernel._HOOK_MARK)
+        assert inspect.unwrap(hook) is original
+        # What the source pins hash on the next load in this process.
+        assert inspect.getsource(hook) == inspect.getsource(original)
+
+
+def test_the_verifier_hook_serves_tagged_verify_calls_through_the_class(monkeypatch):
+    pfx.hooked(monkeypatch)
+    verifier = projkernel._verifier_class()()
+    q, k, v = (_tagged_linear(n, 256, seed) for seed, n in enumerate((512, 128, 128)))
+    x = _acts(1, 5, 256)
+    before = dict(projkernel.calls)
+    single = verifier._linear(q, x)
+    group = verifier._linears((q, k, v), x)
+    assert _proj_counts_since(before) == {"verify_kernel": 2}
+    assert _bitwise(single, pfx.stand_in_mma(x, _triples(q))[0])
+    assert isinstance(group, tuple)
+    want = pfx.stand_in_mma(x, _triples(q, k, v))
+    assert all(_bitwise(got, w) for got, w in zip(group, want, strict=True))
+
+
+# case -> (flag, how many of the three linears are tagged, x, the counter it moves)
+_VERIFY_HANDED_ON = {
+    "flag clear": (0, 3, lambda: _acts(1, 3, 256), None),
+    "untagged": (1, 0, lambda: _acts(1, 3, 256), None),
+    "one linear untagged": (1, 2, lambda: _acts(1, 3, 256), None),
+    "float16": (1, 3, lambda: _acts(1, 3, 256, dtype=mx.float16), "declined"),
+    "float32": (1, 3, lambda: _acts(1, 3, 256, dtype=mx.float32), "declined"),
+    "two dimensions": (1, 3, lambda: _acts(3, 256), "declined"),
+    "a batch wider than eight rows": (1, 3, lambda: _acts(9, 1, 256), "declined"),
+    "no rows": (1, 3, lambda: _acts(1, 0, 256), "declined"),
+}
+
+
+@pytest.mark.parametrize("method", ["_linear", "_linears"])
+@pytest.mark.parametrize("case", list(_VERIFY_HANDED_ON))
+def test_the_verifier_hook_hands_every_other_call_to_mlx_vlm(monkeypatch, method, case):
+    """Checked against a recording original: the call's own arguments, and its
+    answer returned."""
+    flag, tagged, build, counter = _VERIFY_HANDED_ON[case]
+    seen = []
+
+    def original(self, linears, x):
+        seen.append((self, linears, x))
+        return "mlx-vlm's answer"
+
+    wrap = projkernel._wrap_linear if method == "_linear" else projkernel._wrap_linears
+    hook = wrap(original)
+    assert getattr(hook, projkernel._HOOK_MARK) and inspect.unwrap(hook) is original
+    monkeypatch.setattr(projkernel, "_active", flag)
+    monkeypatch.setattr(projkernel, "mma", _no_kernel)
+    group = [pfx.rand_module(128, 256, seed) for seed in range(3)]
+    for linear in group[3 - tagged :]:  # the first is the one _linear gets
+        object.__setattr__(linear, projkernel._TAG, True)
+    linears = group[0] if method == "_linear" else tuple(group)
+    verifier, x = object(), build()
+    before = dict(projkernel.calls)
+    assert hook(verifier, linears, x) == "mlx-vlm's answer"
+    ((got_self, got_linears, got_x),) = seen
+    assert got_self is verifier and got_linears is linears and got_x is x
+    assert _proj_counts_since(before) == ({} if counter is None else {counter: 1})
+
+
+@pytest.mark.parametrize(
+    ("shape", "launches"),
+    [((1, 9), [8, 1]), ((1, 12), [8, 4]), ((1, 16), [8, 8]), ((2, 6), [8, 4])],
+)
+def test_the_verifier_hook_cuts_a_long_verify_into_runs_equal_to_its_rows_alone(
+    monkeypatch, shape, launches
+):
+    """Block 0 lets the drafter's own policy verify up to 16 rows. Each run holds
+    at most eight rows, and every row equals the same row computed alone, as
+    one-row decode computes it."""
+    pfx.hooked(monkeypatch)
+    seen = []
+
+    def recording(x, weights):
+        seen.append(x.size // x.shape[-1])
+        return pfx.stand_in_mma(x, weights)
+
+    monkeypatch.setattr(projkernel, "mma", recording)
+    verifier = projkernel._verifier_class()()
+    group = [_tagged_linear(n, 256, seed) for seed, n in enumerate((256, 128))]
+    x = _acts(*shape, 256)
+    before = dict(projkernel.calls)
+    outputs = verifier._linears(tuple(group), x)
+    assert _proj_counts_since(before) == {"verify_kernel": 1, "verify_split": 1}
+    assert seen == launches
+    for out, linear in zip(outputs, group, strict=True):
+        assert out.shape == (*shape, linear.weight.shape[0])
+        for b in range(shape[0]):
+            for t in range(shape[1]):
+                (alone,) = pfx.stand_in_mma(x[b : b + 1, t : t + 1], _triples(linear))
+                assert _bitwise(out[b : b + 1, t : t + 1], alone), (b, t)
+
+
+@pytest.mark.parametrize("shape", [(1, 1), (1, 5), (1, 8), (2, 4), (8,)])
+def test_the_module_hook_serves_a_tagged_module_up_to_eight_rows(monkeypatch, shape):
+    pfx.hooked(monkeypatch)
+    linear = _tagged_linear(256, 256, 0)
+    x = _acts(*shape, 256)
+    before = dict(projkernel.calls)
+    got = linear(x)
+    assert _proj_counts_since(before) == {"plain_kernel": 1}
+    assert _bitwise(got, pfx.stand_in_mma(x, _triples(linear))[0])
+
+
+# case -> (flag, tagged, x, the counter it moves)
+_PLAIN_HANDED_ON = {
+    "flag clear": (0, True, lambda: _acts(1, 1, 256), None),
+    "untagged": (1, False, lambda: _acts(1, 1, 256), None),
+    "nine rows": (1, True, lambda: _acts(1, 9, 256), None),
+    "nine rows across the batch": (1, True, lambda: _acts(3, 3, 256), None),
+    "a prefill chunk": (1, True, lambda: _acts(1, 2048, 256), None),
+    "no rows": (1, True, lambda: _acts(1, 0, 256), None),
+    "float16": (1, True, lambda: _acts(1, 1, 256, dtype=mx.float16), "declined"),
+    "float32": (1, True, lambda: _acts(1, 3, 256, dtype=mx.float32), "declined"),
+    "one dimension": (1, True, lambda: _acts(256), "declined"),
+}
+
+
+@pytest.mark.parametrize("case", list(_PLAIN_HANDED_ON))
+def test_the_module_hook_hands_every_other_call_to_what_it_wrapped(monkeypatch, case):
+    flag, tagged, build, counter = _PLAIN_HANDED_ON[case]
+    seen = []
+
+    def original(self, x):
+        seen.append((self, x))
+        return "the wrapped method's answer"
+
+    hook = projkernel._wrap_call(original)
+    assert getattr(hook, projkernel._HOOK_MARK) and inspect.unwrap(hook) is original
+    monkeypatch.setattr(projkernel, "_active", flag)
+    monkeypatch.setattr(projkernel, "mma", _no_kernel)
+    linear = pfx.rand_module(256, 256, 0)
+    if tagged:
+        object.__setattr__(linear, projkernel._TAG, True)
+    x = build()
+    before = dict(projkernel.calls)
+    assert hook(linear, x) == "the wrapped method's answer"
+    ((got_self, got_x),) = seen
+    assert got_self is linear and got_x is x
+    assert _proj_counts_since(before) == ({} if counter is None else {counter: 1})
+
+
+def test_the_module_hook_leaves_untagged_modules_and_a_cleared_flag_on_mlx(monkeypatch):
+    pfx.hooked(monkeypatch)
+    stock = inspect.unwrap(nn.QuantizedLinear.__call__)
+    other = pfx.rand_module(256, 256, 1)  # never tagged: a drafter's, another model's
+    ours = _tagged_linear(256, 256, 2)
+    x = _acts(1, 1, 256)
+    before = dict(projkernel.calls)
+    assert _bitwise(other(x), stock(other, x))
+    projkernel.clear()
+    assert _bitwise(ours(x), stock(ours, x))
+    assert _proj_counts_since(before) == {}
+
+
+def test_a_verify_row_equals_the_plain_row_through_the_two_hooks(monkeypatch, fresh_target):
+    """The verifier's own _feed_forward at T = 5 against Qwen3_5MLP.__call__ one
+    row at a time: gate+up fused and down alone on one side, three module calls
+    on the other. A T- and group-invariant kernel gives both the same bits."""
+    pfx.hooked(monkeypatch)
+    projkernel.tag(fresh_target)
+    mlp = fresh_target.model.layers[0].mlp
+    x = _acts(1, 5, 256)
+    before = dict(projkernel.calls)
+    verify = projkernel._verifier_class()()._feed_forward(mlp, x)
+    assert _proj_counts_since(before) == {"verify_kernel": 2}
+    before = dict(projkernel.calls)
+    plain = [mlp(x[:, t : t + 1]) for t in range(5)]
+    assert _proj_counts_since(before) == {"plain_kernel": 15}
+    assert all(_bitwise(verify[:, t : t + 1], row) for t, row in enumerate(plain))
+
+
+_OTHER_VERIFIERS = {
+    "gemma4": ("mlx_vlm.models.gemma4.speculative_verifier", "Gemma4ExactSpeculativeVerifier"),
+    "nemotron_h": (
+        "mlx_vlm.models.nemotron_h.speculative_verifier",
+        "NemotronHExactSpeculativeVerifier",
+    ),
+    "qwen4_exp": ("mlx_vlm.models.qwen4_exp.language", "Qwen4ExpBatchInvariantForward"),
+}
+
+
+@pytest.mark.parametrize("family", list(_OTHER_VERIFIERS))
+def test_other_families_verifiers_inherit_the_hook_but_stay_stock_untagged(monkeypatch, family):
+    """gemma4's and qwen4_exp's verifiers inherit the wrapped methods and
+    nemotron_h's reaches them through super(): only the tags keep them stock."""
+    from mlx_vlm.speculative.ops.linear import _target_verify_linear, _target_verify_linears
+
+    module, name = _OTHER_VERIFIERS[family]
+    pfx.hooked(monkeypatch)
+    cls = getattr(importlib.import_module(module), name)
+    assert issubclass(cls, projkernel._verifier_class())
+    verifier = cls()
+    a, b = pfx.rand_module(256, 256, 1), pfx.rand_module(128, 256, 2)
+    x = _acts(1, 3, 256)
+    before = dict(projkernel.calls)
+    single = verifier._linear(a, x)
+    group = verifier._linears((a, b), x)
+    assert _proj_counts_since(before) == {}
+    assert _bitwise(single, _target_verify_linear(a, x))
+    stock = _target_verify_linears((a, b), x)
+    assert all(_bitwise(got, want) for got, want in zip(group, stock, strict=True))
+    for linear in (a, b):
+        object.__setattr__(linear, projkernel._TAG, True)
+    before = dict(projkernel.calls)
+    verifier._linear(a, x)
+    verifier._linears((a, b), x)
+    assert _proj_counts_since(before) == {"verify_kernel": 2}
+
+
+@pytest.mark.parametrize("order", ["int8 first", "kernel first"])
+def test_int8_and_the_kernel_share_quantized_linear_in_either_order(monkeypatch, order):
+    """int8 takes a tagged module's calls of 128 rows and more, the kernel its
+    calls of eight and fewer, and the rows between go to mlx, whichever wrapper
+    sits on top. int8's routing seam, linear_int8, is replaced by a recorder, so
+    no tensor unit is needed."""
+    pfx.guard_proj_state(monkeypatch)
+    stock = inspect.unwrap(nn.QuantizedLinear.__call__)
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", stock)
+    monkeypatch.setattr(int8prefill, "_QUANTIZED_LINEAR_WRAPPED", False)
+    installs = [lambda: int8prefill.install_wrappers([]), projkernel.install_hooks]
+    for install in installs if order == "int8 first" else installs[::-1]:
+        install()
+    top = nn.QuantizedLinear.__call__
+    assert getattr(top, projkernel._HOOK_MARK) and inspect.unwrap(top) is stock
+    projkernel.install_hooks()
+    assert nn.QuantizedLinear.__call__ is top, "the mark is found through int8's wrapper"
+
+    int8_rows = []
+
+    def int8_path(linear, x, stage=None):
+        int8_rows.append(x.shape[-2])
+        return mx.zeros((*x.shape[:-1], linear.weight.shape[0]), dtype=x.dtype)
+
+    monkeypatch.setattr(int8prefill, "linear_int8", int8_path)
+    monkeypatch.setattr(projkernel, "mma", pfx.stand_in_mma)
+    monkeypatch.setattr(projkernel, "_active", 1)
+    linear = _tagged_linear(128, 256, 0)
+    object.__setattr__(linear, int8prefill._TAG, True)
+    before = dict(projkernel.calls)
+    long, short, between = _acts(1, 130, 256), _acts(1, 3, 256), _acts(1, 20, 256)
+    assert _bitwise(linear(long), mx.zeros((1, 130, 128), dtype=mx.bfloat16))
+    assert int8_rows == [130]
+    assert _bitwise(linear(short), pfx.stand_in_mma(short, _triples(linear))[0])
+    assert _bitwise(linear(between), stock(linear, between))
+    assert int8_rows == [130]
+    assert _proj_counts_since(before) == {"plain_kernel": 1}
