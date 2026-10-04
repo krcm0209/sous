@@ -930,7 +930,14 @@ def test_enable_off_returns_before_any_guard(monkeypatch):
     def untouchable(*args, **kwargs):
         raise AssertionError("a guard ran while the kernel is off")
 
-    for name in ("_tile_reason", "_model_reason", "_pins_reason", "warm_up", "probe"):
+    for name in (
+        "_tile_reason",
+        "_model_reason",
+        "_greedy_verify_reason",
+        "_pins_reason",
+        "warm_up",
+        "probe",
+    ):
         monkeypatch.setattr(projkernel, name, untouchable)
     with warnings.catch_warnings(record=True) as caught, _gate_log() as records:
         warnings.simplefilter("always")
@@ -947,14 +954,17 @@ _GUARD_REASONS = [
     "macOS 15.5 < 26.2",
     "unsupported model type 'qwen3_5_moe' (qwen3_5 only)",
     "drafter kind 'mtp' (dflash only)",
+    "the language model defines speculative_verify_dflash_hidden: "
+    "greedy verify would take its tokens outside the kernel",
     "mlx 0.99.0 not validated",
     "warm-up: program_source:3:1: error: boom",
     "parity: verify row 2 of 5 differs from the one-row forward",
 ]
-# Which of them warn: a pinned dependency that drifted, a kernel this OS rejects
-# and a failed probe. The tile, the model and the drafter's kind only say the
-# kernel does not apply to this load.
-_GUARD_WARNS = [False, False, False, True, True, True]
+# Which of them warn: mlx-vlm drift (a greedy verify that leaves the hooks, a
+# pinned dependency that changed), a kernel this OS rejects and a failed probe.
+# The tile, the model and the drafter's kind only say the kernel does not apply
+# to this load.
+_GUARD_WARNS = [False, False, False, True, True, True, True]
 
 
 @pytest.mark.parametrize("first", range(len(_GUARD_REASONS)))
@@ -973,16 +983,17 @@ def test_enable_names_the_first_failing_guard(monkeypatch, first):
         ),
         lambda: monkeypatch.setattr(lm, "model_type", "qwen3_5_moe"),
         lambda: kwargs.update(drafter_kind="mtp"),
+        lambda: object.__setattr__(lm, "speculative_verify_dflash_hidden", lambda *a, **k: None),
         lambda: monkeypatch.setattr(mx, "__version__", "0.99.0"),
         lambda: monkeypatch.setattr(projkernel, "warm_up", broken_warm_up),
-        lambda: monkeypatch.setattr(projkernel, "probe", lambda model: _GUARD_REASONS[5]),
+        lambda: monkeypatch.setattr(projkernel, "probe", lambda model: _GUARD_REASONS[6]),
     ]
     for brk in breakers[first:]:
         brk()
     status = _refusal(lm, warned=_GUARD_WARNS[first], **kwargs)
     assert status["reason"] == _GUARD_REASONS[first]
     # The cost is reported once the warm-up has started.
-    assert (status["probe_seconds"] is None) == (first < 4)
+    assert (status["probe_seconds"] is None) == (first < 5)
 
 
 @pytest.mark.parametrize(
@@ -1065,11 +1076,12 @@ def test_enable_refuses_drafters_other_than_dflash(monkeypatch, kind):
 
 def test_enable_refuses_a_target_whose_greedy_verify_skips_the_head(monkeypatch):
     """mlx-vlm's greedy verify takes its tokens from quantized_argmax, which
-    neither hook sees, once the target defines this method."""
+    neither hook sees, once the target defines this method. No qwen3_5 target
+    defines it in the validated mlx-vlm, so it is drift and warns."""
     pfx.proj_ready(monkeypatch)
     lm = pfx.tiny_quantized_model()
     object.__setattr__(lm, "speculative_verify_dflash_hidden", lambda *args, **kwargs: None)
-    status = _refusal(lm, warned=False, drafter_kind="dflash")
+    status = _refusal(lm, warned=True, drafter_kind="dflash")
     assert status["reason"] == (
         "the language model defines speculative_verify_dflash_hidden: "
         "greedy verify would take its tokens outside the kernel"
@@ -1084,6 +1096,8 @@ def test_the_pins_hold_on_the_locked_mlx_and_mlx_vlm():
         "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._gated_delta",
         "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._model",
         "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward.__call__",
+        "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._layer",
+        "mlx_vlm.models.qwen3_5.language:Qwen3_5DecoderLayer.__call__",
         "mlx_vlm.models.qwen3_5.language:Qwen3_5MLP.__call__",
         "mlx_vlm.models.qwen3_5.language:Qwen3_5GatedDeltaNet.__call__",
         "mlx_vlm.models.qwen3_5.language:Qwen3_5GatedDeltaNet._project_gates",
@@ -1091,6 +1105,7 @@ def test_the_pins_hold_on_the_locked_mlx_and_mlx_vlm():
         "mlx.nn:QuantizedLinear.__call__",
         "mlx_vlm.speculative.dflash:_dflash_verify",
         "mlx_vlm.speculative.dflash:_dflash_verify_greedy",
+        "mlx_vlm.speculative.dflash:_dflash_rounds",
     }
     assert projkernel._pins_reason() is None
 
@@ -1112,6 +1127,11 @@ def test_enable_refuses_an_unvalidated_mlx(monkeypatch):
         (
             "mlx_vlm.speculative.dflash:_dflash_verify_greedy",
             "mlx-vlm _dflash_verify_greedy changed",
+        ),
+        ("mlx_vlm.speculative.dflash:_dflash_rounds", "mlx-vlm _dflash_rounds changed"),
+        (
+            "mlx_vlm.models.qwen3_5.language:Qwen3_5DecoderLayer.__call__",
+            "mlx-vlm Qwen3_5DecoderLayer.__call__ changed",
         ),
         ("mlx.nn:QuantizedLinear.__call__", "mlx QuantizedLinear.__call__ changed"),
     ],

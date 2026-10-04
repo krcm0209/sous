@@ -470,14 +470,16 @@ goal.
   kernel rides on the tile, inheriting its M5 Pro gate and, with a drafter,
   exact verify attention); the model (`qwen3_5`, every language-model
   `QuantizedLinear` affine 4-bit, group 64, bf16 scales and biases, no
-  `bias`); the drafter (none or `dflash`, and the target must not define
-  `speculative_verify_dflash_hidden`, which would send greedy verify's
-  tokens through `quantized_argmax`, past both hooks); the source pins
+  `bias`); the drafter's kind (none or `dflash`); a target that does not
+  define `speculative_verify_dflash_hidden`, which would send greedy
+  verify's tokens through `quantized_argmax`, past both hooks, and which a
+  qwen3_5 target gains only through mlx-vlm drift; the source pins
   (`VALIDATED_PROJ_SOURCES`: the verifier's `_linear`, `_linears`,
-  `_feed_forward`, `_gated_delta`, `_model` and `__call__`, `Qwen3_5MLP`
-  and `Qwen3_5GatedDeltaNet`, `generate_step`,
-  `nn.QuantizedLinear.__call__`, `_dflash_verify` and
-  `_dflash_verify_greedy`) and `verifyattn.VALIDATED_MLX`; a warm-up that
+  `_feed_forward`, `_gated_delta`, `_layer`, `_model` and `__call__`,
+  `Qwen3_5DecoderLayer`, `Qwen3_5MLP` and `Qwen3_5GatedDeltaNet`,
+  `generate_step`, `nn.QuantizedLinear.__call__`, `_dflash_verify`,
+  `_dflash_verify_greedy` and `_dflash_rounds`) and
+  `verifyattn.VALIDATED_MLX`; a warm-up that
   compiles every pipeline the model's dispatch keys need at T = 1..8; then
   the tags, the hooks and the probe, on the `sous-model-load` thread. The
   probe drives layer 3's verifier `_feed_forward` at T = 5 and the same
@@ -489,10 +491,11 @@ goal.
   `quantized_matmul` (parity cannot catch a kernel that is wrong the same
   way on both paths) and a NaN in one row leaving the others alone. It
   restores `calls`, leaves the flag 0 and calls `mx.clear_cache()` in
-  `finally`. A refusal at the tile, model or drafter step only says the
-  kernel does not apply to this load: one INFO line, `projection kernel
-  unavailable: <reason>`. Pin drift, a compile or probe failure and any
-  exception (logged with its traceback) say it should have run: one
+  `finally`. A refusal at the tile, model or drafter-kind step only says
+  the kernel does not apply to this load: one INFO line, `projection kernel
+  unavailable: <reason>`. A target defining
+  `speculative_verify_dflash_hidden`, pin drift, a compile or probe failure
+  and any exception (logged with its traceback) say it should have run: one
   `warnings.warn`, `sous: projection kernel unavailable (…)`. Both are
   `unavailable`; `off` is never a refusal. Parity still rests on one thing
   the probe cannot cover: drafter-off greedy takes its argmax over bf16

@@ -601,6 +601,14 @@ VALIDATED_PROJ_SOURCES: dict[str, str] = {
     "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward.__call__": (
         "969ac680c045372ddc2dfc4abfac22503ad04f30b8102528f9d3a6c499e6309c"
     ),
+    # Dispatches each verify layer to _gated_delta, _attention and _feed_forward.
+    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._layer": (
+        "3c097499afff39b8bcf44c56d70b7a1f2803cf4d67ad905119fafca1d167891a"
+    ),
+    # Reaches linear_attn, self_attn and mlp as module calls in decode and prefill.
+    "mlx_vlm.models.qwen3_5.language:Qwen3_5DecoderLayer.__call__": (
+        "9feda6407e1129df917a478e5687d2bc7f53ea21c7986f641468b5749a90e10a"
+    ),
     "mlx_vlm.models.qwen3_5.language:Qwen3_5MLP.__call__": (
         "dc08d40bfdf18cf60619caad43c76a1094f3de1b14d2c53b9e2228fa698bc40a"
     ),
@@ -622,6 +630,10 @@ VALIDATED_PROJ_SOURCES: dict[str, str] = {
     ),
     "mlx_vlm.speculative.dflash:_dflash_verify_greedy": (
         "1b472dc300554ab6017495bdeb18480be431578aa6958ff7b35c0145e8412971"
+    ),
+    # Picks the verify call each round makes and takes its tokens from its logits.
+    "mlx_vlm.speculative.dflash:_dflash_rounds": (
+        "eee8dc9ab95a74ed87c74064607736003b7d0dafbdafc32c9fba91dc190d2b32"
     ),
 }
 # The probe's through-the-hooks rows: a verify depth above today's block of 4.
@@ -897,13 +909,11 @@ def _model_reason(model: Any) -> str | None:
     return None
 
 
-def _drafter_reason(model: Any, drafter_kind: str | None) -> str | None:
-    """A drafter whose verify could leave the hooks, or None. A target that
-    defines speculative_verify_dflash_hidden would have greedy verify take its
-    tokens from quantized_argmax, which neither hook sees."""
-    reason = _drafter_kind_reason(drafter_kind)
-    if reason is not None:
-        return reason
+def _greedy_verify_reason(model: Any) -> str | None:
+    """Why greedy verify would leave the hooks, or None. A target that defines
+    speculative_verify_dflash_hidden would have it take its tokens from
+    quantized_argmax, which neither hook sees. No qwen3_5 language model
+    defines it in the validated mlx-vlm, so meeting it means mlx-vlm moved."""
     if hasattr(_root(model), "speculative_verify_dflash_hidden"):
         return (
             "the language model defines speculative_verify_dflash_hidden: "
@@ -951,10 +961,10 @@ def enable(
         reason = _tile_reason(tile_status)
         if reason is not None:
             return _refuse(reason, expected=True)
-        reason = _model_reason(model) or _drafter_reason(model, drafter_kind)
+        reason = _model_reason(model) or _drafter_kind_reason(drafter_kind)
         if reason is not None:
             return _refuse(reason, expected=True)
-        reason = _pins_reason()
+        reason = _greedy_verify_reason(model) or _pins_reason()
         if reason is not None:
             return _refuse(reason)
         tagged = 0
