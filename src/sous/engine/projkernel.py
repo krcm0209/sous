@@ -21,15 +21,19 @@ Apache License 2.0; see THIRD_PARTY_NOTICES.md.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import importlib
 import logging
 import math
+import time
+import traceback
+import warnings
 from collections.abc import Callable
 from typing import Any
 
-from sous.engine import nax
-from sous.engine.int8prefill import _error_line, _kernel, _kernel_text, _root
+from sous.engine import nax, tileattn, verifyattn
+from sous.engine.int8prefill import _error_line, _kernel, _kernel_text, _model_type, _root
 
 logger = logging.getLogger("sous.engine.projkernel")
 
@@ -560,3 +564,486 @@ def install_hooks() -> None:
     quantized: Any = nn.QuantizedLinear
     if not getattr(quantized.__call__, _HOOK_MARK, False):
         quantized.__call__ = _wrap_call(quantized.__call__)
+
+
+# ---- the gates, the pins, the warm-up, the probe and enable() ---------------------
+
+# The dense Qwen3.5-family text model. The MoE variant reuses the exact verifier's
+# class and the dense MLP for its shared expert, beside routed experts the kernel
+# never serves, so it is refused by model type rather than by class.
+SUPPORTED_MODEL_TYPES = frozenset({"qwen3_5"})
+# DFlash drafts with modules of its own, which are never tagged, and verifies
+# through the exact verifier's _linear and _linears. Other drafters are unmeasured.
+SUPPORTED_DRAFTER_KINDS = frozenset({"dflash"})
+# What decides that every target projection of at most MAX_ROWS rows reaches one
+# of the two hooks, and that greedy verify takes its tokens from the hooked head:
+# sha256 of inspect.getsource, keyed "module:qualname". getsource follows
+# __wrapped__ through both hooks and int8's wrappers, so these are mlx's and
+# mlx-vlm's own sources whatever is installed over them. Validated on mlx 0.32.2
+# and mlx-vlm 0.7.2; add a digest only after re-reading that function against
+# both hooks.
+VALIDATED_PROJ_SOURCES: dict[str, str] = {
+    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._linear": (
+        "668b9a7064f30c63348028fb72f22119b73e2897e2d246024c80fbe54e0404dd"
+    ),
+    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._linears": (
+        "5cdaf151d00f3ab314f4722b475eec88a5228060be36c321c1363314ab249e0a"
+    ),
+    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._feed_forward": (
+        "df7c1083833e60422732d7b1b5dfabfb6a45f5ef073c8d1416810588dbf95434"
+    ),
+    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._gated_delta": (
+        "3df1521798b530554798c23f5b2d386de0e88e2ac50fb9f391c5035d4cf8f30e"
+    ),
+    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._model": (
+        "cec9745522cd79893849777daa1a22cfd7736f10309ecd480db7e4f7d4778fbb"
+    ),
+    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward.__call__": (
+        "969ac680c045372ddc2dfc4abfac22503ad04f30b8102528f9d3a6c499e6309c"
+    ),
+    "mlx_vlm.models.qwen3_5.language:Qwen3_5MLP.__call__": (
+        "dc08d40bfdf18cf60619caad43c76a1094f3de1b14d2c53b9e2228fa698bc40a"
+    ),
+    "mlx_vlm.models.qwen3_5.language:Qwen3_5GatedDeltaNet.__call__": (
+        "0ab0be71156568f50a248f898d431b657b36b399166e29e25c16c7a45f6cc81b"
+    ),
+    # Defined on Qwen3_5GatedDeltaNet itself in 0.7.2: decode's b and a projections.
+    "mlx_vlm.models.qwen3_5.language:Qwen3_5GatedDeltaNet._project_gates": (
+        "3d1f08bfeaa29f50a1d95aa6d5dda3766a93bc7068e81f9ce99b75b304bdbee6"
+    ),
+    "mlx_vlm.generate.ar:generate_step": (
+        "ace632f74028d998d34c8b867b44632c13816e0db4567d37401a0bc657dc7a6a"
+    ),
+    "mlx.nn:QuantizedLinear.__call__": (
+        "f43bed1629a938c0f00e37b4a9c85db84be59dc93b49a27de97c44228e264b8b"
+    ),
+    "mlx_vlm.speculative.dflash:_dflash_verify": (
+        "39e4a6cd343ae7e054ae3584ff6879fc895494e413041f099ce08da14e3fc097"
+    ),
+    "mlx_vlm.speculative.dflash:_dflash_verify_greedy": (
+        "1b472dc300554ab6017495bdeb18480be431578aa6958ff7b35c0145e8412971"
+    ),
+}
+# The probe's through-the-hooks rows: a verify depth above today's block of 4.
+_PROBE_ROWS = 5
+# The row the probe plants a NaN in: inside every T = MAX_ROWS call, at neither end.
+_NAN_ROW = 3
+
+
+def _in_features(module: Any) -> int:
+    """K of an eligible projection, read off its per-group scales."""
+    return module.scales.shape[1] * _GROUP
+
+
+def _dispatch_key(group: tuple[Any, ...]) -> tuple[int, tuple[int, ...]]:
+    """What picks a pipeline: K and each linear's N, in order. The variant follows
+    from K and their sum, and T is the template's own argument."""
+    return _in_features(group[0]), tuple(m.weight.shape[0] for m in group)
+
+
+def _dispatch_groups(root: Any) -> list[tuple[Any, ...]]:
+    """One linear group per dispatch key the model's projections can reach: the
+    exact verifier's three fused groups, and every projection alone, the way
+    decode, a short prefill tail and the verifier's singles call them."""
+    import mlx.nn as nn
+
+    groups: list[tuple[Any, ...]] = []
+    for layer in root.model.layers:
+        if layer.is_linear:
+            gdn = layer.linear_attn
+            groups.append((gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a))
+        else:
+            attention = layer.self_attn
+            groups.append((attention.q_proj, attention.k_proj, attention.v_proj))
+        groups.append((layer.mlp.gate_proj, layer.mlp.up_proj))
+    groups += [(m,) for _, m in root.named_modules() if isinstance(m, nn.QuantizedLinear)]
+    unique: dict[tuple[int, tuple[int, ...]], tuple[Any, ...]] = {}
+    for group in groups:
+        unique.setdefault(_dispatch_key(group), group)
+    return list(unique.values())
+
+
+def warm_up(model: Any) -> None:
+    """Compile and run every pipeline the model's projections can reach, each
+    dispatch key at T = 1..MAX_ROWS: no compile first happens mid-turn, and a
+    Metal toolchain that rejects the kernel fails here, inside enable()'s
+    refusal path, rather than inside a user's turn. The inputs are zeros built
+    on the GPU and evaluated before the first launch: a compile failure with a
+    CPU-stream op in flight deadlocks mlx's exception path instead of raising."""
+    import mlx.core as mx
+
+    groups = _dispatch_groups(_root(model))
+    inputs = {
+        k: mx.zeros((1, MAX_ROWS, k), dtype=mx.bfloat16)
+        for k in sorted({_in_features(group[0]) for group in groups})
+    }
+    mx.eval(list(inputs.values()))
+    for group in groups:
+        weights = [(m.weight, m.scales, m.biases) for m in group]
+        x = inputs[_in_features(group[0])]
+        mx.eval([mma(x[:, :t], weights) for t in range(1, MAX_ROWS + 1)])
+
+
+def _stock_distance(got: Any, want: Any) -> float:
+    """The relative RMS distance of `got` from `want` in fp32; infinite when
+    `got` is not finite everywhere. A NaN `want` gives NaN, which fails any
+    `<=` bound, as it must."""
+    import mlx.core as mx
+
+    if not mx.all(mx.isfinite(got)).item():
+        return float("inf")
+    return _relative_rms(got, want)
+
+
+def _check_group(group: tuple[Any, ...], names: list[str], key: Any) -> str | None:
+    """One dispatch on its real weights: every row at T = 1..MAX_ROWS equals the
+    row alone, each linear fused equals it alone, the result sits within
+    REL_RMS_BOUND of stock quantized_matmul (parity cannot see a kernel wrong
+    the same way on every call), and a NaN row leaves the others untouched."""
+    import mlx.core as mx
+
+    weights = [(m.weight, m.scales, m.biases) for m in group]
+    x = mx.random.normal((1, MAX_ROWS, _in_features(group[0])), key=key).astype(mx.bfloat16)
+    nan = mx.array(float("nan"), dtype=mx.bfloat16)
+    x_nan = mx.where(mx.arange(MAX_ROWS)[None, :, None] == _NAN_ROW, nan, x)
+    mx.eval(x, x_nan)
+    alone = [mma(x[:, r : r + 1], weights) for r in range(MAX_ROWS)]
+    refs = [mx.concatenate([rows[i] for rows in alone], axis=1) for i in range(len(group))]
+    mx.eval(refs)
+    del alone
+    label = "+".join(names)
+    full: tuple[Any, ...] = ()
+    for t in range(1, MAX_ROWS + 1):
+        full = mma(x[:, :t], weights)
+        same = mx.stack([mx.array_equal(o, ref[:, :t]) for o, ref in zip(full, refs, strict=True)])
+        if not mx.all(same).item():
+            return f"T-invariance: {label} at T={t} differs from its rows alone"
+    if len(group) > 1:
+        for i, name in enumerate(names):
+            (single,) = mma(x, [weights[i]])
+            if not mx.array_equal(single, full[i]).item():
+                return f"grouping: {name} fused in {label} differs from {name} alone"
+    for (w, scales, biases), got, name in zip(weights, full, names, strict=True):
+        want = mx.quantized_matmul(
+            x, w, scales=scales, biases=biases, transpose=True, group_size=_GROUP, bits=4
+        )
+        distance = _stock_distance(got, want)
+        if not distance <= REL_RMS_BOUND:
+            return f"correctness: {name} is {distance:.3g} from stock (bound {REL_RMS_BOUND})"
+    keep = mx.array([r for r in range(MAX_ROWS) if r != _NAN_ROW])
+    for got, clean, name in zip(mma(x_nan, weights), full, names, strict=True):
+        if not mx.array_equal(mx.take(got, keep, axis=1), mx.take(clean, keep, axis=1)).item():
+            return f"isolation: a NaN in row {_NAN_ROW} changed the other rows of {name}"
+    return None
+
+
+def _probe_steps(root: Any) -> str | None:
+    """Every input is made with GPU ops and evaluated before the launches that
+    read it, for the deadlock warm_up() describes."""
+    import mlx.core as mx
+
+    global _active
+    layers = list(root.model.layers)
+    full = next((layer for layer in layers if not layer.is_linear), None)
+    linear = next((layer for layer in layers if layer.is_linear), None)
+    if full is None or linear is None:
+        return "the model lacks a full-attention or a linear-attention layer"
+    names = {id(module): path for path, module in root.named_modules()}
+
+    # Through both hooks, on the first full-attention layer (layer 3 of the
+    # 27B): the exact verifier's feed-forward over _PROBE_ROWS rows (gate+up
+    # fused, then down) against the plain MLP one row at a time, as decode
+    # calls it. Its rows must be identical, which is what greedy parity rests on.
+    mlp = full.mlp
+    verifier = importlib.import_module(
+        "mlx_vlm.models.qwen3_5.speculative_verifier"
+    ).Qwen3_5BatchInvariantForward()
+    x = mx.random.normal((1, _PROBE_ROWS, _in_features(mlp.gate_proj)), key=mx.random.key(0))
+    x = x.astype(mx.bfloat16)
+    mx.eval(x)
+    before = dict(calls)
+    _active = 1
+    verified = verifier._feed_forward(mlp, x)
+    mx.eval(verified)
+    middle = dict(calls)
+    plain = [mlp(x[:, r : r + 1]) for r in range(_PROBE_ROWS)]
+    mx.eval(plain)
+    _active = 0
+    if middle["verify_kernel"] - before["verify_kernel"] != 2:
+        return "the exact verifier's projections did not reach the kernel"
+    if calls["plain_kernel"] - middle["plain_kernel"] != 3 * _PROBE_ROWS:
+        return "the model's own projections did not reach the kernel"
+    for r in range(_PROBE_ROWS):
+        if not mx.array_equal(verified[:, r : r + 1], plain[r]).item():
+            return f"parity: verify row {r} of {_PROBE_ROWS} differs from the one-row forward"
+    del x, verified, plain
+
+    # Directly, on real weights: the full-attention layer's q+k+v, o, gate+up and
+    # down, the first linear-attention layer's qkv+z+b+a and out_proj (layer 0
+    # of the 27B), and the head, which covers the staged variants.
+    attention, gdn = full.self_attn, linear.linear_attn
+    groups: list[tuple[Any, ...]] = [
+        (attention.q_proj, attention.k_proj, attention.v_proj),
+        (attention.o_proj,),
+        (mlp.gate_proj, mlp.up_proj),
+        (mlp.down_proj,),
+        (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a),
+        (gdn.out_proj,),
+    ]
+    head = getattr(root, "lm_head", None)
+    if head is not None:
+        groups.append((head,))
+    for seed, group in enumerate(groups, start=1):
+        reason = _check_group(group, [names.get(id(m), "?") for m in group], mx.random.key(seed))
+        if reason is not None:
+            return reason
+    return None
+
+
+def probe(model: Any) -> str | None:
+    """None when the kernel may serve `model`'s projections on this GPU, else
+    why not. Runs on the loading thread after enable() has tagged the model and
+    installed the hooks; raises the flag only around the calls that must reach
+    them, and leaves the flag clear and the counters as it found them. Its
+    arrays are gone before the cache is cleared, so the budget measured next
+    reads true."""
+    import mlx.core as mx
+
+    global _active
+    counted = dict(calls)
+    try:
+        return _probe_steps(_root(model))
+    except BaseException as e:
+        # The traceback holds the steps' frames, and every probe array in them,
+        # until the caller has handled the error: drop them now.
+        traceback.clear_frames(e.__traceback__)
+        raise
+    finally:
+        _active = 0
+        calls.update(counted)
+        mx.clear_cache()
+
+
+def _refuse(
+    reason: str, probe_seconds: float | None = None, *, expected: bool = False
+) -> dict[str, Any]:
+    """This load cannot use the kernel: report why. An `expected` refusal says
+    only that the kernel does not apply here (the tile, the model, the
+    drafter), which is how most Macs load a default-on kernel: one INFO line,
+    and the reason in the status. Any other refusal means it should have run
+    and did not (a pinned dependency that drifted, a kernel this OS rejects, a
+    failed probe): one warning, since a switch that is silently inert there
+    hides a fault."""
+    # A compiler error runs to dozens of lines; the status needs the one naming it.
+    reason = _error_line(reason)
+    if expected:
+        logger.info("projection kernel unavailable: %s", reason)
+    else:
+        warnings.warn(
+            f"sous: projection kernel unavailable ({reason}); "
+            "verify and decode run the stock projections",
+            stacklevel=3,
+        )
+    return {"state": "unavailable", "reason": reason, "probe_seconds": probe_seconds}
+
+
+def _tile_reason(tile_status: dict[str, Any] | None) -> str | None:
+    """The kernel rides on the attention tile: the platform, the core count and,
+    with a drafter, exact verify attention are all the tile's gates, and block
+    5 was measured only beside it."""
+    state = (tile_status or {}).get("state")
+    if state == "active":
+        return None
+    if state == "off":
+        return "attention tile off"
+    return (tile_status or {}).get("reason") or f"attention tile {state or 'unknown'}"
+
+
+def _model_type_reason(model_type: Any) -> str | None:
+    """Shared by enable(), which reads the loaded model's type, and static_reason(),
+    which reads config.json's: one text for both."""
+    if model_type in SUPPORTED_MODEL_TYPES:
+        return None
+    return f"unsupported model type {model_type or 'unknown'!r} (qwen3_5 only)"
+
+
+def _drafter_kind_reason(drafter_kind: str | None) -> str | None:
+    """Shared by enable() and static_reason(), as _model_type_reason is."""
+    if drafter_kind is None or drafter_kind in SUPPORTED_DRAFTER_KINDS:
+        return None
+    return f"drafter kind {drafter_kind!r} (dflash only)"
+
+
+def _model_reason(model: Any) -> str | None:
+    """Why this model's projections are not the ones the kernel takes, or None:
+    every quantized projection of the language model must be eligible, since
+    decode and verify route them all, and the activations must be bf16."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    reason = _model_type_reason(_model_type(model))
+    if reason is not None:
+        return reason
+    root = _root(model)
+    projections = [(p, m) for p, m in root.named_modules() if isinstance(m, nn.QuantizedLinear)]
+    if not projections:
+        return "no quantized projections"
+    for path, module in projections:
+        if not eligible(module):
+            return f"projection {path} is not affine 4-bit gs64 with bf16 scales and no bias"
+    dtype = root.model.norm.weight.dtype
+    if dtype != mx.bfloat16:
+        return f"activation dtype {dtype} is not bfloat16"
+    return None
+
+
+def _drafter_reason(model: Any, drafter_kind: str | None) -> str | None:
+    """A drafter whose verify could leave the hooks, or None. A target that
+    defines speculative_verify_dflash_hidden would have greedy verify take its
+    tokens from quantized_argmax, which neither hook sees."""
+    reason = _drafter_kind_reason(drafter_kind)
+    if reason is not None:
+        return reason
+    if hasattr(_root(model), "speculative_verify_dflash_hidden"):
+        return (
+            "the language model defines speculative_verify_dflash_hidden: "
+            "greedy verify would take its tokens outside the kernel"
+        )
+    return None
+
+
+def _pins_reason() -> str | None:
+    """Which pinned dependency drifted, or None."""
+    import mlx.core as mx
+
+    version = mx.__version__  # ty: ignore[unresolved-attribute]
+    if version not in verifyattn.VALIDATED_MLX:
+        return f"mlx {version} not validated"
+    for key, digest in VALIDATED_PROJ_SOURCES.items():
+        module, qualname = key.split(":")
+        if verifyattn._source_digest(module, qualname) != digest:
+            owner = "mlx" if module.split(".")[0] == "mlx" else "mlx-vlm"
+            return f"{owner} {qualname} changed"
+    return None
+
+
+def enable(
+    model: Any,
+    *,
+    enabled: bool,
+    drafter_kind: str | None,
+    tile_status: dict[str, Any],
+) -> dict[str, Any]:
+    """Decide whether this load's small-row target projections run on the
+    kernel. Returns the status the engine exposes and never raises: a model
+    load must not fail because an accelerator is missing. probe_seconds covers
+    the warm-up and the probe, the kernel's whole cost to a load."""
+    global _active
+    # First, on every call: a flag left from an earlier load must never serve
+    # this one, whatever happens below. Tags left on an earlier model are inert
+    # while it is clear, and a reference kept to untag them would keep that
+    # model's weights alive past its unload, so they stay.
+    _active = 0
+    if not enabled:
+        return {"state": "off", "reason": None, "probe_seconds": None}
+    seconds: float | None = None
+    try:
+        reason = _tile_reason(tile_status)
+        if reason is not None:
+            return _refuse(reason, expected=True)
+        reason = _model_reason(model) or _drafter_reason(model, drafter_kind)
+        if reason is not None:
+            return _refuse(reason, expected=True)
+        reason = _pins_reason()
+        if reason is not None:
+            return _refuse(reason)
+        tagged = 0
+        start = time.perf_counter()
+        try:
+            try:
+                warm_up(model)
+            except Exception as e:  # noqa: BLE001 — a kernel this OS rejects refuses the load
+                # The one-line reason cannot carry a compiler's full report; the log can.
+                logger.warning("projection kernel: the warm-up failed", exc_info=True)
+                reason = f"warm-up: {_error_line(str(e) or type(e).__name__)}"
+            else:
+                tagged = tag(model)
+                install_hooks()
+                reason = probe(model)
+        finally:
+            seconds = round(time.perf_counter() - start, 2)
+        if reason is not None:
+            untag(model)
+            return _refuse(reason, seconds)
+        _active = 1
+        logger.info("projection kernel: %d projections, probe %.2fs", tagged, seconds)
+        return {"state": "active", "reason": None, "probe_seconds": seconds}
+    except Exception as e:  # noqa: BLE001 — degrade, never block the model
+        _active = 0
+        with contextlib.suppress(Exception):
+            untag(model)
+        # The warning carries one line; the traceback goes to the log.
+        logger.warning("projection kernel: enabling failed", exc_info=True)
+        return _refuse(str(e) or type(e).__name__, seconds)
+
+
+def static_reason(config: Any, model_config: dict, drafter_kind: str | None) -> str | None:
+    """Why the kernel would not be active for this config, model and drafter,
+    or None when it would be, decided without loading anything: sous tune
+    resolves the block an unset speculative_block_size runs at by it. It
+    mirrors enable()'s order (the switches, then the tile's machine and model
+    gates, then the kernel's own) and reads the model from its config.json. A
+    refusal only a load can see, a probe failure, pin drift or exact verify
+    attention missing beside the drafter, is beyond it."""
+    if not config.projection_kernel:
+        return "projection kernel off"
+    if not config.attention_tile:
+        return "attention tile off"
+    reason = nax.platform_reason()
+    if reason is not None:
+        return reason
+    import mlx.core as mx
+
+    _, reason = tileattn._split_target(str(mx.device_info().get("device_name", "")))
+    if reason is not None:
+        return reason
+    reason = _model_type_reason(model_config.get("model_type"))
+    if reason is not None:
+        return reason
+    text = model_config.get("text_config", model_config)
+    shape = (
+        text.get("num_attention_heads"),
+        text.get("num_key_value_heads"),
+        text.get("head_dim"),
+    )
+    if shape != (tileattn.HQ, tileattn.HKV, tileattn.D):
+        return f"unsupported attention shape {shape[0]}/{shape[1]}/{shape[2]} (24/4/256 only)"
+    reason = _quantization_reason(model_config.get("quantization"))
+    if reason is not None:
+        return reason
+    return _drafter_kind_reason(drafter_kind)
+
+
+def _quantization_reason(quantization: Any) -> str | None:
+    """The config.json side of _model_reason's eligibility: the checkpoint's
+    default and every per-projection override under the language model must be
+    affine 4-bit gs64. Embeddings never reach the kernel, so their overrides
+    do not count; nor does the vision tower's."""
+    if not isinstance(quantization, dict):
+        return "unquantized weights (affine 4-bit gs64 only)"
+
+    def spec(entry: dict) -> tuple[Any, Any, Any]:
+        return entry.get("mode", "affine"), entry.get("bits"), entry.get("group_size")
+
+    mode, bits, group = spec(quantization)
+    if (mode, bits, group) != ("affine", 4, _GROUP):
+        return f"quantization {mode} {bits}-bit gs{group} (affine 4-bit gs64 only)"
+    for path, entry in quantization.items():
+        if not (isinstance(entry, dict) and path.startswith("language_model.")):
+            continue
+        if path.endswith("embed_tokens"):
+            continue
+        mode, bits, group = spec(entry)
+        if (mode, bits, group) != ("affine", 4, _GROUP):
+            return f"projection {path} is {mode} {bits}-bit gs{group} (affine 4-bit gs64 only)"
+    return None

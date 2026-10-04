@@ -74,14 +74,37 @@ def rand_module(n: int, k: int, seed: int) -> Any:
 
 
 def tiny_quantized_model(*, seed: int = 0) -> Any:
-    """tile_fixtures' tiny qwen3_5 language model quantized as the 27B is: every
-    linear affine 4-bit at group size 64 with bf16 scales and biases, lm_head
-    included (31 QuantizedLinear modules), the embedding a QuantizedEmbedding.
-    Layers 0 and 2 are GatedDeltaNet, 1 and 3 full attention."""
+    """A random qwen3_5 language model quantized as the 27B is (affine 4-bit,
+    group 64, bf16 scales, no bias, lm_head untied). Linear-attention layers 0
+    and 2, full-attention layers 1 and 3, and 31 quantized projections, every
+    one with K >= 256 so that each of the plain variant's four K splits gets a
+    whole group. Its K/N shapes give nine dispatch keys."""
     import mlx.core as mx
     import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5.config import TextConfig
+    from mlx_vlm.models.qwen3_5.language import LanguageModel
 
-    lm = tfx.tiny_language_model(seed=seed)
+    args = TextConfig(
+        model_type="qwen3_5",
+        hidden_size=256,
+        intermediate_size=512,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_conv_kernel_dim=4,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        rms_norm_eps=1e-6,
+        vocab_size=tfx.VOCAB,
+        num_key_value_heads=2,
+        max_position_embeddings=65536,
+        head_dim=256,
+        full_attention_interval=2,
+    )
+    mx.random.seed(seed)
+    lm = LanguageModel(args)
+    lm.set_dtype(mx.bfloat16)
     nn.quantize(lm, group_size=64, bits=4)
     mx.eval(lm.parameters())
     return lm
@@ -114,3 +137,32 @@ def hooked(monkeypatch: pytest.MonkeyPatch, *, active: int = 1) -> None:
     projkernel.install_hooks()
     monkeypatch.setattr(projkernel, "_active", active)
     monkeypatch.setattr(projkernel, "mma", stand_in_mma)
+
+
+# The attention tile's status as an active load reports it; enable() rides on it.
+ACTIVE_TILE: dict[str, Any] = {
+    "state": "active",
+    "reason": None,
+    "splits": 20,
+    "probe_seconds": 0.5,
+}
+
+
+def proj_ready(monkeypatch: pytest.MonkeyPatch, *, real_pins: bool = False) -> dict[str, Any]:
+    """Every enable() and static_reason() guard that reads the machine passes
+    on any GPU: the platform rule, and a core count of 20 under this GPU's own
+    name. The stand-in is the kernel, and the pins pass unless `real_pins` (for
+    the tests about the pins themselves). Registers guard_proj_state's restores
+    and returns the attention tile's status to hand enable()."""
+    import mlx.core as mx
+
+    from sous.engine import gpucores, nax
+
+    guard_proj_state(monkeypatch)
+    device = str(mx.device_info()["device_name"])
+    monkeypatch.setattr(nax, "platform_reason", lambda: None)
+    monkeypatch.setattr(gpucores, "read", lambda: gpucores.GPUCores(20, device, None, "iokit"))
+    monkeypatch.setattr(projkernel, "mma", stand_in_mma)
+    if not real_pins:
+        monkeypatch.setattr(projkernel, "_pins_reason", lambda: None)
+    return dict(ACTIVE_TILE)

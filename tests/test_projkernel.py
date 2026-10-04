@@ -3,9 +3,13 @@ variant choice, eligibility, availability, and the arithmetic every routing
 decision rests on. The arithmetic tests run wherever the kernel compiles and
 probes right (CI's macos-15 GPU included) and skip elsewhere."""
 
+import contextlib
+import copy
 import importlib
 import inspect
+import logging
 import types
+import warnings
 from importlib.resources import files
 
 import pytest
@@ -14,8 +18,9 @@ mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 np = pytest.importorskip("numpy")
 
-from sous.engine import int8prefill, nax, projkernel  # noqa: E402 — after the guards
+from sous.engine import gpucores, int8prefill, nax, projkernel  # noqa: E402 — after the guards
 from tests import proj_fixtures as pfx  # noqa: E402
+from tests import tile_fixtures as tfx  # noqa: E402
 
 # ---- kernel source ---------------------------------------------------------------
 
@@ -790,3 +795,816 @@ def test_int8_and_the_kernel_share_quantized_linear_in_either_order(monkeypatch,
     assert _bitwise(linear(between), stock(linear, between))
     assert int8_rows == [130]
     assert _proj_counts_since(before) == {"plain_kernel": 1}
+
+
+# ---- the gates, the pins, the warm-up, the probe and enable() -----------------------
+
+# The tiny model's quantized projections: a one-row forward makes one hook-2 call
+# for each. A verify forward makes 17 hook-1 calls: four per layer, then the head.
+_PROJECTIONS = 31
+_VERIFY_CALLS = 17
+_BUILD_ERROR = "Unable to build metal library\nprogram_source:3:1: error: boom"
+
+
+def _verifier_cls():
+    return importlib.import_module(
+        "mlx_vlm.models.qwen3_5.speculative_verifier"
+    ).Qwen3_5BatchInvariantForward
+
+
+def _projections(model) -> list:
+    root = getattr(model, "language_model", model)
+    return [m for _, m in root.named_modules() if isinstance(m, nn.QuantizedLinear)]
+
+
+def _tagged_count(model) -> int:
+    return sum(bool(getattr(m, projkernel._TAG, False)) for m in _projections(model))
+
+
+def _hooks_in_place() -> bool:
+    cls = _verifier_cls()
+    return all(
+        getattr(f, projkernel._HOOK_MARK, False)
+        for f in (nn.QuantizedLinear.__call__, cls._linear, cls._linears)
+    )
+
+
+class _GateRecords(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@contextlib.contextmanager
+def _gate_log():
+    """Every record the kernel's logger emits inside the block, INFO included.
+    Records still propagate, so a test's own caplog sees them too."""
+    logger = logging.getLogger("sous.engine.projkernel")
+    handler, level = _GateRecords(), logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield handler.records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+
+
+def _refusal(model, *, warned: bool, untagged: bool = True, **kwargs) -> dict:
+    """enable() on `model`, expected to refuse, leaving the flag clear. A load
+    the kernel does not apply to (the tile, the model, the drafter) is one INFO
+    line and no warning, since most Macs load that way; one where it should
+    have run and did not is exactly one warning, on one line, in the kernel's
+    words. Unless the model kept its tags from an earlier activation, nothing
+    on it is tagged afterwards."""
+    kwargs = {"drafter_kind": None, "tile_status": dict(pfx.ACTIVE_TILE), **kwargs}
+    with warnings.catch_warnings(record=True) as caught, _gate_log() as records:
+        warnings.simplefilter("always")
+        status = projkernel.enable(model, enabled=True, **kwargs)
+    messages = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    infos = [r.getMessage() for r in records if r.levelno == logging.INFO]
+    assert status["state"] == "unavailable"
+    if warned:
+        assert len(messages) == 1, messages
+        assert messages[0].startswith("sous: projection kernel unavailable (")
+        assert "\n" not in messages[0]
+        assert not any(m.startswith("projection kernel unavailable") for m in infos), infos
+    else:
+        assert messages == []
+        assert infos == [f"projection kernel unavailable: {status['reason']}"]
+    assert projkernel._active == 0
+    if untagged:
+        assert _tagged_count(model) == 0
+    return status
+
+
+def _enabling_failures(caplog) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == "sous.engine.projkernel"
+        and r.getMessage() == "projection kernel: enabling failed"
+    ]
+
+
+def test_enable_off_returns_before_any_guard(monkeypatch):
+    pfx.proj_ready(monkeypatch)
+    monkeypatch.setattr(projkernel, "_active", 1)
+
+    def untouchable(*args, **kwargs):
+        raise AssertionError("a guard ran while the kernel is off")
+
+    for name in ("_tile_reason", "_model_reason", "_pins_reason", "warm_up", "probe"):
+        monkeypatch.setattr(projkernel, name, untouchable)
+    with warnings.catch_warnings(record=True) as caught, _gate_log() as records:
+        warnings.simplefilter("always")
+        status = projkernel.enable(
+            types.SimpleNamespace(), enabled=False, drafter_kind="mtp", tile_status={}
+        )
+    assert status == {"state": "off", "reason": None, "probe_seconds": None}
+    assert [w for w in caught if issubclass(w.category, UserWarning)] == []
+    assert records == []
+    assert projkernel._active == 0
+
+
+_GUARD_REASONS = [
+    "macOS 15.5 < 26.2",
+    "unsupported model type 'qwen3_5_moe' (qwen3_5 only)",
+    "drafter kind 'mtp' (dflash only)",
+    "mlx 0.99.0 not validated",
+    "warm-up: program_source:3:1: error: boom",
+    "parity: verify row 2 of 5 differs from the one-row forward",
+]
+# Which of them warn: a pinned dependency that drifted, a kernel this OS rejects
+# and a failed probe. The tile, the model and the drafter's kind only say the
+# kernel does not apply to this load.
+_GUARD_WARNS = [False, False, False, True, True, True]
+
+
+@pytest.mark.parametrize("first", range(len(_GUARD_REASONS)))
+def test_enable_names_the_first_failing_guard(monkeypatch, first):
+    """Guard `first` and every guard after it fail; the reason is guard `first`'s."""
+    tile = pfx.proj_ready(monkeypatch, real_pins=True)
+    lm = pfx.tiny_quantized_model()
+    kwargs: dict = {"drafter_kind": None, "tile_status": tile}
+
+    def broken_warm_up(model):
+        raise RuntimeError(_BUILD_ERROR)
+
+    breakers = [
+        lambda: kwargs.update(
+            tile_status={"state": "unavailable", "reason": _GUARD_REASONS[0], "splits": None}
+        ),
+        lambda: monkeypatch.setattr(lm, "model_type", "qwen3_5_moe"),
+        lambda: kwargs.update(drafter_kind="mtp"),
+        lambda: monkeypatch.setattr(mx, "__version__", "0.99.0"),
+        lambda: monkeypatch.setattr(projkernel, "warm_up", broken_warm_up),
+        lambda: monkeypatch.setattr(projkernel, "probe", lambda model: _GUARD_REASONS[5]),
+    ]
+    for brk in breakers[first:]:
+        brk()
+    status = _refusal(lm, warned=_GUARD_WARNS[first], **kwargs)
+    assert status["reason"] == _GUARD_REASONS[first]
+    # The cost is reported once the warm-up has started.
+    assert (status["probe_seconds"] is None) == (first < 4)
+
+
+@pytest.mark.parametrize(
+    ("tile_status", "reason"),
+    [
+        ({"state": "off", "reason": None, "splits": None}, "attention tile off"),
+        (
+            {"state": "unavailable", "reason": "split target 16 not measured (measured: 20)"},
+            "split target 16 not measured (measured: 20)",
+        ),
+        ({"state": "unavailable", "reason": None}, "attention tile unavailable"),
+    ],
+)
+def test_enable_rides_on_the_attention_tile(monkeypatch, tile_status, reason):
+    pfx.proj_ready(monkeypatch)
+    status = _refusal(pfx.tiny_quantized_model(), warned=False, tile_status=tile_status)
+    assert status["reason"] == reason and status["probe_seconds"] is None
+
+
+def test_enable_refuses_other_model_types(monkeypatch):
+    pfx.proj_ready(monkeypatch)
+    lm = pfx.tiny_quantized_model()
+    # The MoE variant reuses the verifier class and the dense MLP.
+    monkeypatch.setattr(lm, "model_type", "qwen3_5_moe")
+    status = _refusal(lm, warned=False)
+    assert status["reason"] == "unsupported model type 'qwen3_5_moe' (qwen3_5 only)"
+
+
+def test_enable_refuses_a_model_without_quantized_projections(monkeypatch):
+    pfx.proj_ready(monkeypatch)
+    status = _refusal(tfx.tiny_language_model(), warned=False)
+    assert status["reason"] == "no quantized projections"
+
+
+def _replace(lm, case: str) -> str:
+    """Swap one projection for one the kernel cannot take; returns its path."""
+    if case == "8-bit":
+        head = nn.QuantizedLinear(256, tfx.VOCAB, bias=False, group_size=64, bits=8)
+        head.set_dtype(mx.bfloat16)
+        lm.lm_head = head
+        return "lm_head"
+    if case == "bias":
+        out = nn.QuantizedLinear(256, 256, bias=True, group_size=64, bits=4)
+        out.set_dtype(mx.bfloat16)
+        lm.model.layers[0].linear_attn.out_proj = out
+        return "model.layers.0.linear_attn.out_proj"
+    down = nn.QuantizedLinear(512, 256, bias=False, group_size=64, bits=4)
+    down.set_dtype(mx.float16)
+    lm.model.layers[1].mlp.down_proj = down
+    return "model.layers.1.mlp.down_proj"
+
+
+@pytest.mark.parametrize("case", ["8-bit", "bias", "fp16 scales"])
+def test_enable_refuses_a_projection_the_kernel_cannot_take(monkeypatch, case):
+    """Decode and verify route every projection of the language model, so one
+    the kernel cannot take refuses the load rather than leaving it stock."""
+    pfx.proj_ready(monkeypatch)
+    lm = pfx.tiny_quantized_model()
+    path = _replace(lm, case)
+    status = _refusal(lm, warned=False)
+    assert status["reason"] == (
+        f"projection {path} is not affine 4-bit gs64 with bf16 scales and no bias"
+    )
+
+
+def test_enable_refuses_activations_that_are_not_bf16(monkeypatch):
+    pfx.proj_ready(monkeypatch)
+    lm = pfx.tiny_quantized_model()
+    lm.model.norm.set_dtype(mx.float16)
+    status = _refusal(lm, warned=False)
+    assert status["reason"] == f"activation dtype {mx.float16} is not bfloat16"
+
+
+@pytest.mark.parametrize("kind", ["mtp", "eagle3"])
+def test_enable_refuses_drafters_other_than_dflash(monkeypatch, kind):
+    pfx.proj_ready(monkeypatch)
+    status = _refusal(pfx.tiny_quantized_model(), warned=False, drafter_kind=kind)
+    assert status["reason"] == f"drafter kind {kind!r} (dflash only)"
+
+
+def test_enable_refuses_a_target_whose_greedy_verify_skips_the_head(monkeypatch):
+    """mlx-vlm's greedy verify takes its tokens from quantized_argmax, which
+    neither hook sees, once the target defines this method."""
+    pfx.proj_ready(monkeypatch)
+    lm = pfx.tiny_quantized_model()
+    object.__setattr__(lm, "speculative_verify_dflash_hidden", lambda *args, **kwargs: None)
+    status = _refusal(lm, warned=False, drafter_kind="dflash")
+    assert status["reason"] == (
+        "the language model defines speculative_verify_dflash_hidden: "
+        "greedy verify would take its tokens outside the kernel"
+    )
+
+
+def test_the_pins_hold_on_the_locked_mlx_and_mlx_vlm():
+    assert set(projkernel.VALIDATED_PROJ_SOURCES) == {
+        "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._linear",
+        "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._linears",
+        "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._feed_forward",
+        "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._gated_delta",
+        "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._model",
+        "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward.__call__",
+        "mlx_vlm.models.qwen3_5.language:Qwen3_5MLP.__call__",
+        "mlx_vlm.models.qwen3_5.language:Qwen3_5GatedDeltaNet.__call__",
+        "mlx_vlm.models.qwen3_5.language:Qwen3_5GatedDeltaNet._project_gates",
+        "mlx_vlm.generate.ar:generate_step",
+        "mlx.nn:QuantizedLinear.__call__",
+        "mlx_vlm.speculative.dflash:_dflash_verify",
+        "mlx_vlm.speculative.dflash:_dflash_verify_greedy",
+    }
+    assert projkernel._pins_reason() is None
+
+
+def test_enable_refuses_an_unvalidated_mlx(monkeypatch):
+    pfx.proj_ready(monkeypatch, real_pins=True)
+    monkeypatch.setattr(mx, "__version__", "0.99.0")
+    status = _refusal(pfx.tiny_quantized_model(), warned=True)
+    assert status["reason"] == "mlx 0.99.0 not validated"
+
+
+@pytest.mark.parametrize(
+    ("key", "reason"),
+    [
+        (
+            "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._linears",
+            "mlx-vlm Qwen3_5BatchInvariantForward._linears changed",
+        ),
+        (
+            "mlx_vlm.speculative.dflash:_dflash_verify_greedy",
+            "mlx-vlm _dflash_verify_greedy changed",
+        ),
+        ("mlx.nn:QuantizedLinear.__call__", "mlx QuantizedLinear.__call__ changed"),
+    ],
+)
+def test_enable_refuses_a_changed_source(monkeypatch, key, reason):
+    pfx.proj_ready(monkeypatch, real_pins=True)
+    monkeypatch.setitem(projkernel.VALIDATED_PROJ_SOURCES, key, "0" * 64)
+    assert _refusal(pfx.tiny_quantized_model(), warned=True)["reason"] == reason
+
+
+@pytest.mark.parametrize("order", ["int8 first", "int8 after"])
+def test_the_pins_follow_int8s_wrappers_and_the_hooks_to_the_originals(monkeypatch, order):
+    """int8 prefill wraps nn.QuantizedLinear.__call__, Qwen3_5MLP.__call__ and
+    Qwen3_5GatedDeltaNet.__call__, all three pinned here, in either order with
+    the hooks. With int8 after, its wrapper sits on hook 2 and carries the mark,
+    so a later load neither re-wraps nor reads the pins as drifted."""
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5GatedDeltaNet, Qwen3_5MLP
+
+    tile = pfx.proj_ready(monkeypatch, real_pins=True)
+    for cls in (Qwen3_5MLP, Qwen3_5GatedDeltaNet):
+        monkeypatch.setattr(cls, "__call__", cls.__call__)
+    monkeypatch.setattr(int8prefill, "_WRAPPED", set())
+    monkeypatch.setattr(int8prefill, "_QUANTIZED_LINEAR_WRAPPED", False)
+
+    def install_int8() -> None:
+        int8prefill.install_wrappers([(Qwen3_5MLP, "mlp"), (Qwen3_5GatedDeltaNet, "gdn")])
+
+    if order == "int8 first":
+        install_int8()
+    status = projkernel.enable(
+        pfx.tiny_quantized_model(), enabled=True, drafter_kind="dflash", tile_status=tile
+    )
+    assert status["state"] == "active", status
+    if order == "int8 after":
+        install_int8()
+    installed = nn.QuantizedLinear.__call__
+    projkernel.clear()
+    status = projkernel.enable(
+        pfx.tiny_quantized_model(seed=1), enabled=True, drafter_kind="dflash", tile_status=tile
+    )
+    assert status["state"] == "active", status
+    assert nn.QuantizedLinear.__call__ is installed
+    assert projkernel._pins_reason() is None
+
+
+def test_a_second_load_activates_again_on_the_hooks_the_first_installed(monkeypatch):
+    """An idle unload and reload, or sous tune's arms, enable a fresh model in a
+    process whose hooks are in place: the pins follow __wrapped__ through them
+    to mlx-vlm's and mlx's own sources, and nothing is wrapped twice."""
+    tile = pfx.proj_ready(monkeypatch, real_pins=True)
+    first = projkernel.enable(
+        pfx.tiny_quantized_model(), enabled=True, drafter_kind="dflash", tile_status=tile
+    )
+    assert first["state"] == "active", first
+    cls = _verifier_cls()
+    hooks = (nn.QuantizedLinear.__call__, cls.__dict__["_linear"], cls.__dict__["_linears"])
+    projkernel.clear()
+    second = projkernel.enable(
+        pfx.tiny_quantized_model(seed=1), enabled=True, drafter_kind="dflash", tile_status=tile
+    )
+    assert second["state"] == "active", second
+    now = (nn.QuantizedLinear.__call__, cls.__dict__["_linear"], cls.__dict__["_linears"])
+    assert all(a is b for a, b in zip(now, hooks, strict=True))
+
+
+def test_enable_refuses_a_kernel_the_warm_up_cannot_build(monkeypatch, caplog):
+    pfx.proj_ready(monkeypatch)
+    error = RuntimeError(_BUILD_ERROR)
+
+    def broken(model):
+        raise error
+
+    def untouchable(model):
+        raise AssertionError("probed after a failed warm-up")
+
+    monkeypatch.setattr(projkernel, "warm_up", broken)
+    monkeypatch.setattr(projkernel, "probe", untouchable)
+    status = _refusal(pfx.tiny_quantized_model(), warned=True)
+    assert status["reason"] == "warm-up: program_source:3:1: error: boom"
+    assert isinstance(status["probe_seconds"], float)
+    # The warning keeps one line; the log keeps the compiler's whole report.
+    (record,) = [
+        r
+        for r in caplog.records
+        if r.name == "sous.engine.projkernel"
+        and r.getMessage() == "projection kernel: the warm-up failed"
+    ]
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is not None and record.exc_info[1] is error
+
+
+def test_warm_up_runs_every_dispatch_key_at_every_row_count(monkeypatch):
+    pfx.guard_proj_state(monkeypatch)
+    seen: list = []
+
+    def spy(x, weights):
+        seen.append((x.shape[-1], tuple(w.shape[0] for w, _, _ in weights), x.shape[1], x.dtype))
+        return pfx.stand_in_mma(x, weights)
+
+    monkeypatch.setattr(projkernel, "mma", spy)
+    projkernel.warm_up(pfx.tiny_quantized_model())
+    keys = [
+        (256, (2048, 512, 512)),  # q+k+v
+        (256, (512, 512)),  # gate+up
+        (256, (512, 256, 4, 4)),  # in_proj qkv+z+b+a
+        (256, (512,)),  # lm_head, gate, up, k, v and in_proj_qkv alone
+        (256, (2048,)),  # q alone
+        (256, (256,)),  # in_proj_z and out_proj alone
+        (256, (4,)),  # in_proj_b and in_proj_a alone
+        (512, (256,)),  # down
+        (1024, (256,)),  # o
+    ]
+    expected = sorted((k, n, t) for k, n in keys for t in range(1, projkernel.MAX_ROWS + 1))
+    assert sorted((k, n, t) for k, n, t, _ in seen) == expected
+    assert {dtype for *_, dtype in seen} == {mx.bfloat16}
+
+
+def _probe_model(monkeypatch, mma=None):
+    """A tiny model as enable() hands it to the probe: tagged, both hooks in
+    place, the flag clear, and `mma` (the stand-in by default) as the kernel."""
+    lm = pfx.tiny_quantized_model()
+    pfx.guard_proj_state(monkeypatch)
+    pfx.hooked(monkeypatch)
+    if mma is not None:
+        monkeypatch.setattr(projkernel, "mma", mma)
+    monkeypatch.setattr(projkernel, "_active", 0)
+    projkernel.tag(lm)
+    return lm
+
+
+def _run_probe(lm) -> str | None:
+    """probe(), asserting it left the flag clear and the counters as it found
+    them, whatever it decided."""
+    before = dict(projkernel.calls)
+    reason = projkernel.probe(lm)
+    assert projkernel._active == 0
+    assert projkernel.calls == before
+    return reason
+
+
+def _rows(x) -> int:
+    rows = 1
+    for d in x.shape[:-1]:
+        rows *= d
+    return rows
+
+
+def _scaled(outs, factor: float) -> tuple:
+    return tuple((o.astype(mx.float32) * factor).astype(mx.bfloat16) for o in outs)
+
+
+def test_probe_passes_the_stand_in(monkeypatch):
+    assert _run_probe(_probe_model(monkeypatch)) is None
+
+
+@pfx.kernel
+def test_probe_passes_the_real_kernel(monkeypatch):
+    assert _run_probe(_probe_model(monkeypatch, projkernel.linears)) is None
+
+
+def test_probe_refuses_projections_that_never_reach_the_kernel(monkeypatch):
+    lm = _probe_model(monkeypatch)
+    projkernel.untag(lm)
+    assert _run_probe(lm) == "the exact verifier's projections did not reach the kernel"
+
+
+def test_probe_refuses_when_the_models_own_calls_skip_hook_two(monkeypatch):
+    lm = _probe_model(monkeypatch)
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", inspect.unwrap(nn.QuantizedLinear.__call__))
+    assert _run_probe(lm) == "the model's own projections did not reach the kernel"
+
+
+def test_probe_fails_parity_for_a_kernel_whose_rows_move_with_the_row_count(monkeypatch):
+    def by_rows(x, weights):
+        return _scaled(pfx.stand_in_mma(x, weights), 1 + _rows(x) / 64)
+
+    reason = _run_probe(_probe_model(monkeypatch, by_rows))
+    assert reason == "parity: verify row 0 of 5 differs from the one-row forward"
+
+
+def test_probe_fails_t_invariance_past_the_rows_the_hooks_step_used(monkeypatch):
+    def past_five(x, weights):
+        return _scaled(pfx.stand_in_mma(x, weights), 1 + (_rows(x) > 5) / 16)
+
+    reason = _run_probe(_probe_model(monkeypatch, past_five))
+    assert reason == (
+        "T-invariance: model.layers.1.self_attn.q_proj+model.layers.1.self_attn.k_proj"
+        "+model.layers.1.self_attn.v_proj at T=6 differs from its rows alone"
+    )
+
+
+def test_probe_fails_grouping_for_a_kernel_whose_rows_move_with_the_group(monkeypatch):
+    def by_group(x, weights):
+        return _scaled(pfx.stand_in_mma(x, weights), 1 + (len(weights) > 2) / 16)
+
+    reason = _run_probe(_probe_model(monkeypatch, by_group))
+    assert reason is not None and reason.startswith(
+        "grouping: model.layers.1.self_attn.q_proj fused in "
+    ), reason
+
+
+def test_probe_fails_correctness_for_a_kernel_wrong_the_same_way_everywhere(monkeypatch):
+    def scaled(x, weights):
+        return _scaled(pfx.stand_in_mma(x, weights), 1.1)
+
+    reason = _run_probe(_probe_model(monkeypatch, scaled))
+    assert reason is not None and reason.startswith(
+        "correctness: model.layers.1.self_attn.q_proj is "
+    ), reason
+
+
+def test_probe_fails_isolation_for_a_kernel_that_mixes_rows(monkeypatch):
+    def mixes_rows(x, weights):
+        return tuple(
+            o + 0 * mx.sum(o, axis=-2, keepdims=True) for o in pfx.stand_in_mma(x, weights)
+        )
+
+    reason = _run_probe(_probe_model(monkeypatch, mixes_rows))
+    assert reason == (
+        "isolation: a NaN in row 3 changed the other rows of model.layers.1.self_attn.q_proj"
+    )
+
+
+def test_the_stock_distance_fails_every_bound_on_a_nan():
+    want = mx.ones((1, 8, 64), dtype=mx.bfloat16)
+    got = mx.where(mx.arange(64) == 7, mx.array(float("nan"), dtype=mx.bfloat16), want)
+    assert projkernel._stock_distance(got, want) == float("inf")
+    assert not projkernel._stock_distance(want, got) <= projkernel.REL_RMS_BOUND
+    assert projkernel._stock_distance(want, want) == 0.0
+
+
+def test_probe_restores_the_flag_and_the_counters_when_it_raises(monkeypatch):
+    def fails_through_the_hooks(x, weights):
+        if projkernel._active:
+            raise RuntimeError("device lost")
+        return pfx.stand_in_mma(x, weights)
+
+    lm = _probe_model(monkeypatch, fails_through_the_hooks)
+    before = dict(projkernel.calls)
+    with pytest.raises(RuntimeError, match="device lost"):
+        projkernel.probe(lm)
+    assert projkernel._active == 0
+    assert projkernel.calls == before
+
+
+def test_enable_refuses_a_failed_probe_with_its_cost_and_untags_the_model(monkeypatch):
+    pfx.proj_ready(monkeypatch)
+    lm = pfx.tiny_quantized_model()
+    tagged_when_probed: list = []
+
+    def failing(model):
+        tagged_when_probed.append(_tagged_count(model))
+        return "correctness: lm_head is 0.101 from stock (bound 0.01)"
+
+    monkeypatch.setattr(projkernel, "probe", failing)
+    status = _refusal(lm, warned=True)
+    assert status["reason"] == "correctness: lm_head is 0.101 from stock (bound 0.01)"
+    assert isinstance(status["probe_seconds"], float)
+    assert tagged_when_probed == [_PROJECTIONS]
+
+
+def test_a_failed_probe_untags_only_the_model_it_was_given(monkeypatch):
+    tile = pfx.proj_ready(monkeypatch)
+    earlier = pfx.tiny_quantized_model()
+    status = projkernel.enable(earlier, enabled=True, drafter_kind=None, tile_status=tile)
+    assert status["state"] == "active", status
+    monkeypatch.setattr(
+        projkernel,
+        "probe",
+        lambda model: "parity: verify row 0 of 5 differs from the one-row forward",
+    )
+    _refusal(pfx.tiny_quantized_model(seed=1), warned=True)
+    # An earlier load's tags are inert while the flag is clear, and never touched.
+    assert _tagged_count(earlier) == _PROJECTIONS
+
+
+def test_enable_refuses_an_exception_in_a_guard_with_its_error_line(monkeypatch, caplog):
+    pfx.proj_ready(monkeypatch)
+    monkeypatch.setattr(projkernel, "_active", 1)
+    error = RuntimeError(_BUILD_ERROR)
+
+    def broken(model):
+        raise error
+
+    monkeypatch.setattr(projkernel, "_model_reason", broken)
+    status = _refusal(pfx.tiny_quantized_model(), warned=True)
+    assert status["reason"] == "program_source:3:1: error: boom"
+    assert status["probe_seconds"] is None
+    # The warning keeps one line; the log keeps where it was raised.
+    (record,) = _enabling_failures(caplog)
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is not None and record.exc_info[1] is error
+
+
+def test_enable_refuses_a_probe_that_raises_and_reports_what_it_cost(monkeypatch, caplog):
+    pfx.proj_ready(monkeypatch)
+
+    def fails_through_the_hooks(x, weights):
+        if projkernel._active:
+            raise RuntimeError("device lost")
+        return pfx.stand_in_mma(x, weights)
+
+    monkeypatch.setattr(projkernel, "mma", fails_through_the_hooks)
+    status = _refusal(pfx.tiny_quantized_model(), warned=True)
+    assert status["reason"] == "device lost"
+    assert isinstance(status["probe_seconds"], float)
+    (record,) = _enabling_failures(caplog)
+    assert record.exc_info is not None and "device lost" in str(record.exc_info[1])
+
+
+@pytest.mark.parametrize("kind", [None, "dflash"])
+def test_enable_warms_up_untagged_then_tags_hooks_and_probes(monkeypatch, caplog, kind):
+    tile = pfx.proj_ready(monkeypatch)
+    lm = pfx.tiny_quantized_model()
+    order: list = []
+    monkeypatch.setattr(
+        projkernel, "warm_up", lambda model: order.append(("warm-up", _tagged_count(model)))
+    )
+    monkeypatch.setattr(
+        projkernel,
+        "probe",
+        lambda model: order.append(("probe", _tagged_count(model), _hooks_in_place())),
+    )
+    with caplog.at_level(logging.INFO, logger="sous.engine.projkernel"):
+        status = projkernel.enable(lm, enabled=True, drafter_kind=kind, tile_status=tile)
+    assert status == {"state": "active", "reason": None, "probe_seconds": status["probe_seconds"]}
+    assert isinstance(status["probe_seconds"], float)
+    assert order == [("warm-up", 0), ("probe", _PROJECTIONS, True)]
+    assert projkernel._active == 1
+    assert [r.getMessage() for r in caplog.records if r.name == "sous.engine.projkernel"] == [
+        f"projection kernel: {_PROJECTIONS} projections, probe {status['probe_seconds']:.2f}s"
+    ]
+
+
+def test_enable_goes_active_through_the_real_warm_up_and_probe(monkeypatch):
+    tile = pfx.proj_ready(monkeypatch, real_pins=True)
+    status = projkernel.enable(
+        pfx.tiny_quantized_model(), enabled=True, drafter_kind="dflash", tile_status=tile
+    )
+    assert status["state"] == "active", status
+    assert isinstance(status["probe_seconds"], float)
+    assert projkernel._active == 1
+
+
+@pytest.mark.parametrize(
+    "ending", ["disabled", "failed gate", "other model", "failed probe", "cleared"]
+)
+def test_enable_then_a_later_load_or_clear_leaves_verify_and_decode_stock(monkeypatch, ending):
+    tile = pfx.proj_ready(monkeypatch)
+    lm = pfx.tiny_quantized_model()
+    ids = mx.random.randint(0, tfx.VOCAB, (43,), key=mx.random.key(5)).tolist()
+
+    def verify() -> list:
+        return tfx.verify_forward(lm, tfx.prefill_cache(lm, ids[:40]), ids[40:])
+
+    def decode():
+        cache = tfx.prefill_cache(lm, ids[:40])
+        logits = lm(mx.array([ids[40:41]], dtype=mx.int32), cache=cache).logits
+        mx.eval(logits)
+        return logits
+
+    verify_stock, decode_stock = verify(), decode()
+    status = projkernel.enable(lm, enabled=True, drafter_kind=None, tile_status=tile)
+    assert status["state"] == "active", status
+    before = dict(projkernel.calls)
+    verify()
+    decode()
+    # While active, both paths reach the kernel: what follows is not vacuous.
+    assert projkernel.calls["verify_kernel"] - before["verify_kernel"] == _VERIFY_CALLS
+    assert projkernel.calls["plain_kernel"] - before["plain_kernel"] == _PROJECTIONS
+
+    if ending == "disabled":
+        projkernel.enable(lm, enabled=False, drafter_kind=None, tile_status=tile)
+    elif ending == "failed gate":
+        _refusal(lm, warned=False, untagged=False, tile_status={"state": "off"})
+    elif ending == "other model":
+        monkeypatch.setattr(lm, "model_type", "qwen3_5_moe")
+        _refusal(lm, warned=False, untagged=False)
+    elif ending == "failed probe":
+        monkeypatch.setattr(projkernel, "probe", lambda model: "parity: verify row 0 of 5 differs")
+        _refusal(lm, warned=True)
+    else:
+        projkernel.clear()
+
+    assert projkernel._active == 0
+    before = dict(projkernel.calls)
+    assert all(mx.array_equal(a, b).item() for a, b in zip(verify(), verify_stock, strict=True))
+    assert mx.array_equal(decode(), decode_stock).item()
+    for key in ("verify_kernel", "verify_split", "plain_kernel"):
+        assert projkernel.calls[key] == before[key], key
+
+
+_CONFIG_27B = {
+    "model_type": "qwen3_5",
+    "quantization": {"group_size": 64, "bits": 4, "mode": "affine"},
+    "text_config": {"num_attention_heads": 24, "num_key_value_heads": 4, "head_dim": 256},
+}
+
+
+def _model_config(**changes) -> dict:
+    config = copy.deepcopy(_CONFIG_27B)
+    for key, value in changes.items():
+        config[key] = value
+    return config
+
+
+_STATIC_CASES = {
+    "dflash": ({}, _CONFIG_27B, "dflash", None),
+    "no drafter": ({}, _CONFIG_27B, None, None),
+    "text-only layout": (
+        {},
+        {"model_type": "qwen3_5", "quantization": _CONFIG_27B["quantization"]}
+        | _CONFIG_27B["text_config"],
+        "dflash",
+        None,
+    ),
+    "kernel off": ({"projection_kernel": False}, _CONFIG_27B, "dflash", "projection kernel off"),
+    "tile off": ({"attention_tile": False}, _CONFIG_27B, "dflash", "attention tile off"),
+    "another model type": (
+        {},
+        _model_config(model_type="qwen3_5_moe"),
+        "dflash",
+        "unsupported model type 'qwen3_5_moe' (qwen3_5 only)",
+    ),
+    "another attention shape": (
+        {},
+        _model_config(
+            text_config={"num_attention_heads": 16, "num_key_value_heads": 4, "head_dim": 256}
+        ),
+        "dflash",
+        "unsupported attention shape 16/4/256 (24/4/256 only)",
+    ),
+    "unquantized": (
+        {},
+        {k: v for k, v in _CONFIG_27B.items() if k != "quantization"},
+        "dflash",
+        "unquantized weights (affine 4-bit gs64 only)",
+    ),
+    "mxfp4": (
+        {},
+        _model_config(quantization={"group_size": 32, "bits": 4, "mode": "mxfp4"}),
+        "dflash",
+        "quantization mxfp4 4-bit gs32 (affine 4-bit gs64 only)",
+    ),
+    "an 8-bit projection": (
+        {},
+        _model_config(
+            quantization={
+                "group_size": 64,
+                "bits": 4,
+                "mode": "affine",
+                "language_model.model.layers.0.linear_attn.in_proj_qkv": {
+                    "bits": 8,
+                    "group_size": 64,
+                },
+            }
+        ),
+        "dflash",
+        "projection language_model.model.layers.0.linear_attn.in_proj_qkv is affine 8-bit gs64"
+        " (affine 4-bit gs64 only)",
+    ),
+    "an 8-bit embedding": (
+        {},
+        _model_config(
+            quantization={
+                "group_size": 64,
+                "bits": 4,
+                "mode": "affine",
+                "language_model.model.embed_tokens": {"bits": 8, "group_size": 64},
+                "vision_tower.blocks.0.attn.qkv": {"bits": 8, "group_size": 64},
+            }
+        ),
+        "dflash",
+        None,
+    ),
+    "mtp drafter": ({}, _CONFIG_27B, "mtp", "drafter kind 'mtp' (dflash only)"),
+}
+
+
+@pytest.mark.parametrize("case", list(_STATIC_CASES))
+def test_static_reason_reads_the_config_the_model_and_the_drafter(monkeypatch, case):
+    pfx.proj_ready(monkeypatch)
+    switches, model_config, drafter_kind, reason = _STATIC_CASES[case]
+    config = types.SimpleNamespace(
+        **{"attention_tile": True, "projection_kernel": True, **switches}
+    )
+    assert projkernel.static_reason(config, model_config, drafter_kind) == reason
+
+
+@pytest.mark.parametrize("case", ["platform", "unreadable", "another GPU", "unmeasured"])
+def test_static_reason_reads_the_machine_as_the_tile_does(monkeypatch, case):
+    pfx.proj_ready(monkeypatch)
+    device = str(mx.device_info()["device_name"])
+    if case == "platform":
+        monkeypatch.setattr(nax, "platform_reason", lambda: "macOS 15.5 < 26.2")
+        reason = "macOS 15.5 < 26.2"
+    else:
+        reading, reason = {
+            "unreadable": (
+                gpucores.GPUCores(None, None, "GPU core count unreadable: timed out", "none"),
+                "GPU core count unreadable: timed out",
+            ),
+            "another GPU": (
+                gpucores.GPUCores(20, "Apple M9 Ultra", None, "iokit"),
+                f"IORegistry GPU 'Apple M9 Ultra' is not mlx's {device!r}",
+            ),
+            "unmeasured": (
+                gpucores.GPUCores(16, device, None, "iokit"),
+                "split target 16 not measured (measured: 20)",
+            ),
+        }[case]
+        monkeypatch.setattr(gpucores, "read", lambda: reading)
+    config = types.SimpleNamespace(attention_tile=True, projection_kernel=True)
+    assert projkernel.static_reason(config, _CONFIG_27B, "dflash") == reason
+
+
+def test_static_reason_reads_nothing_while_either_switch_is_off(monkeypatch):
+    pfx.proj_ready(monkeypatch)
+
+    def untouchable():
+        raise AssertionError("read the machine for a switched-off kernel")
+
+    monkeypatch.setattr(nax, "platform_reason", untouchable)
+    monkeypatch.setattr(gpucores, "read", untouchable)
+    for switches in ({"projection_kernel": False}, {"attention_tile": False}):
+        config = types.SimpleNamespace(
+            **{"attention_tile": True, "projection_kernel": True, **switches}
+        )
+        assert projkernel.static_reason(config, {}, "mtp") is not None
