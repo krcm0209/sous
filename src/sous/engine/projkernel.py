@@ -1029,6 +1029,11 @@ def static_reason(config: Any, model_config: dict, drafter_kind: str | None) -> 
     reason = tileattn.static_reason(config, model_config, None)
     if reason is not None:
         return reason
+    # The tile's check answered for the tile's model types; enable() also
+    # asks the kernel's own (_model_reason), which is a separate set.
+    reason = _model_type_reason(model_config.get("model_type"))
+    if reason is not None:
+        return reason
     reason = _quantization_reason(model_config.get("quantization"))
     if reason is not None:
         return reason

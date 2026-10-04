@@ -1698,3 +1698,20 @@ def test_static_reason_asks_the_tile_first_and_names_the_drafter_last(monkeypatc
     assert projkernel.static_reason(config, moe, "mtp") == (
         "unsupported model type 'qwen3_5_moe' (qwen3_5 only)"
     )
+
+
+def test_static_reason_keeps_the_kernels_own_model_types(monkeypatch):
+    """The tile's set and the kernel's are separate: a type only the tile
+    takes must still be refused here, as enable() refuses it."""
+    from sous.engine import tileattn
+
+    pfx.proj_ready(monkeypatch)
+    monkeypatch.setattr(
+        tileattn, "SUPPORTED_MODEL_TYPES", tileattn.SUPPORTED_MODEL_TYPES | {"qwen3_5_moe"}
+    )
+    config = types.SimpleNamespace(attention_tile=True, projection_kernel=True)
+    moe = _model_config(model_type="qwen3_5_moe")
+    assert tileattn.static_reason(config, moe, "dflash") is None
+    assert projkernel.static_reason(config, moe, "dflash") == (
+        "unsupported model type 'qwen3_5_moe' (qwen3_5 only)"
+    )
