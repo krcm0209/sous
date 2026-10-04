@@ -1353,3 +1353,114 @@ def test_enable_reports_a_kernel_this_os_rejects_with_its_error_line():
     status = json.loads(done.stdout.strip().splitlines()[-1])
     assert status["state"] == "unavailable", status
     assert status["reason"].startswith("kernel: ") and "error:" in status["reason"], status
+
+
+# ---- static_reason: the tile's gates read from config.json ---------------------
+
+_TILE_CONFIG_27B = {
+    "model_type": "qwen3_5",
+    "text_config": {"num_attention_heads": 24, "num_key_value_heads": 4, "head_dim": 256},
+}
+
+
+def _tile_machine(monkeypatch, cores: int = 20) -> str:
+    """A GPU the tile's platform rule and split target pass on, under this
+    machine's own device name; returns that name."""
+    from sous.engine import gpucores
+
+    device = str(mx.device_info()["device_name"])
+    monkeypatch.setattr(nax, "platform_reason", lambda: None)
+    monkeypatch.setattr(gpucores, "read", lambda: gpucores.GPUCores(cores, device, None, "iokit"))
+    return device
+
+
+def _tile_config(**switches):
+    return types.SimpleNamespace(**{"attention_tile": True, **switches})
+
+
+_TILE_STATIC_CASES = {
+    "dflash": (_TILE_CONFIG_27B, "dflash", None),
+    "no drafter": (_TILE_CONFIG_27B, None, None),
+    "text-only layout": (
+        {"model_type": "qwen3_5"} | _TILE_CONFIG_27B["text_config"],
+        "dflash",
+        None,
+    ),
+    "another model type": (
+        {**_TILE_CONFIG_27B, "model_type": "qwen3_5_moe"},
+        "dflash",
+        "unsupported model type 'qwen3_5_moe' (qwen3_5 only)",
+    ),
+    "no model type": (
+        {"text_config": _TILE_CONFIG_27B["text_config"]},
+        "dflash",
+        "unsupported model type 'unknown' (qwen3_5 only)",
+    ),
+    "another attention shape": (
+        {
+            **_TILE_CONFIG_27B,
+            "text_config": {
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "head_dim": 256,
+            },
+        },
+        "dflash",
+        "unsupported attention shape 16/4/256 (24/4/256 only)",
+    ),
+    "mtp drafter": (_TILE_CONFIG_27B, "mtp", "drafter kind 'mtp' (dflash only)"),
+}
+
+
+@pytest.mark.parametrize("case", list(_TILE_STATIC_CASES))
+def test_static_reason_reads_the_model_and_the_drafter(monkeypatch, case):
+    _tile_machine(monkeypatch)
+    model_config, drafter_kind, reason = _TILE_STATIC_CASES[case]
+    assert tileattn.static_reason(_tile_config(), model_config, drafter_kind) == reason
+
+
+def test_static_reason_names_the_switch_before_reading_the_machine(monkeypatch):
+    from sous.engine import gpucores
+
+    def untouchable():
+        raise AssertionError("read the machine for a switched-off tile")
+
+    monkeypatch.setattr(nax, "platform_reason", untouchable)
+    monkeypatch.setattr(gpucores, "read", untouchable)
+    config = _tile_config(attention_tile=False)
+    assert tileattn.static_reason(config, {}, "mtp") == "attention tile off"
+
+
+@pytest.mark.parametrize("case", ["platform", "unreadable", "another GPU", "unmeasured"])
+def test_static_reason_reads_the_machine_as_enable_does(monkeypatch, case):
+    from sous.engine import gpucores
+
+    device = _tile_machine(monkeypatch)
+    if case == "platform":
+        monkeypatch.setattr(nax, "platform_reason", lambda: "macOS 15.5 < 26.2")
+        reason = "macOS 15.5 < 26.2"
+    else:
+        reading, reason = {
+            "unreadable": (
+                gpucores.GPUCores(None, None, "GPU core count unreadable: timed out", "none"),
+                "GPU core count unreadable: timed out",
+            ),
+            "another GPU": (
+                gpucores.GPUCores(20, "Apple M9 Ultra", None, "iokit"),
+                f"IORegistry GPU 'Apple M9 Ultra' is not mlx's {device!r}",
+            ),
+            "unmeasured": (
+                gpucores.GPUCores(16, device, None, "iokit"),
+                "split target 16 not measured (measured: 20)",
+            ),
+        }[case]
+        monkeypatch.setattr(gpucores, "read", lambda: reading)
+    assert tileattn.static_reason(_tile_config(), _TILE_CONFIG_27B, "dflash") == reason
+
+
+def test_static_reason_asks_the_machine_before_the_model(monkeypatch):
+    _tile_machine(monkeypatch, cores=16)
+    config = {**_TILE_CONFIG_27B, "model_type": "qwen3_5_moe"}
+    assert tileattn.static_reason(_tile_config(), config, "mtp") == (
+        "split target 16 not measured (measured: 20)"
+    )

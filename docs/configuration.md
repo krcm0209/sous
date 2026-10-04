@@ -23,7 +23,7 @@ prompt_cache = true
 # prompt_cache_gb = 8
 # prompt_cache_disk_gb = "auto"
 speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
-# speculative_block_size = 5  # unset: 5 where the projection kernel is active, else 4
+# speculative_block_size = 5  # unset: 5 with the projection kernel, 4 with only the attention tile, else 3
 int8_prefill = false
 attention_tile = true
 projection_kernel = true
@@ -209,9 +209,10 @@ are affine 4-bit at group size 64, no drafter or a DFlash one, and the mlx and
 mlx-vlm sources it was validated with. Anywhere else the model-load line reads
 `projection_kernel=unavailable` (`off` on the mlx-lm backend), the status
 document's `projection_kernel` block carries the reason, the projections run
-stock and an unset block stays 4. As with the tile, that is one INFO line, and
-a `WARNING` saying `sous: projection kernel unavailable (…)` means the kernel
-should have run here and did not. The on-disk forks are keyed by it: where it
+stock and an unset block is 4 where the tile is active, else 3. As with the
+tile, that is one INFO line, and a `WARNING` saying
+`sous: projection kernel unavailable (…)` means the kernel should have run here
+and did not. The on-disk forks are keyed by it: where it
 is active, changing the setting starts the fork store cold once. The daemon
 reads it at startup, so a change takes effect on its next start.
 
@@ -229,11 +230,18 @@ still argmaxes to the same wrong output every time.
 Speculative decoding (`speculative_draft_id`, `speculative_block_size`) is
 ~1.8x decode on the default model at short context with the shipped
 sampling; `""` disables it. Left unset, the block size is 5 where the
-projection kernel is active and 4 elsewhere; a value you set always wins, and
-the model-load line's `draft_block=` says which block the engine runs.
-Earlier versions of the documented config set `speculative_block_size = 4`
-explicitly; remove that line to let the engine choose 5 where the projection
-kernel runs.
+projection kernel is active, 4 where only the attention tile is (an M5 Pro
+with `projection_kernel = false`, or one where the kernel is `unavailable`)
+and 3 everywhere else; a value you set
+always wins, and the model-load line's `draft_block=` says which block the
+engine runs. Earlier versions of the documented config set
+`speculative_block_size` explicitly (3 through v0.7.0, then 4); remove that
+line to let the engine choose. The 3 matters off the M5 Pro: on an M2, mlx-vlm's exact verifier
+collapses from 4 rows (a 9B verify forward costs 138 ms at 3 rows, 662 ms at 4
+and 1,098 ms at 5, against 65 ms for one), and a 9B with its drafter decoded
+3.56 tok/s at block 4 against 13.46 at block 3, with identical replies on 12
+real turns (#156). No other GPU is measured, so M1, M3 and M4 stay at 3 until
+someone does.
 Greedy (temperature 0) speculative decode at block 5 with the projection
 kernel ran about 2.3x stock plain greedy decode on an M5 Pro — stock meaning
 drafter-off decode with `projection_kernel = false`, 13.6 tok/s on 64 real
@@ -245,8 +253,8 @@ slower (see `projection_kernel` above), the same runs are about 2.9x.
 The "~2.4x greedy" figure earlier versions quoted ran an argmax sampler
 through the sampled speculative walk, before the engine reached mlx-vlm's
 greedy branch, and that branch also drafts differently (#87). Without the
-projection kernel, block 4 measured best on those turns, sampled and greedy:
-+3–5% decode over block 3, with 2 and 6 clearly slower (about 0.8x block 3)
+projection kernel, block 4 measured best on those turns on the M5 Pro, sampled
+and greedy: +3–5% decode over block 3, with 2 and 6 clearly slower (about 0.8x block 3)
 and 5 level with 3, its interval overlapping 4's (#118); with it, block 5 is
 the faster one. 0 lets the drafter's adaptive policy pick the depth. Anything
 above 5 is clamped: block 6 ran 0.8x block 3 on the M5 Pro without the

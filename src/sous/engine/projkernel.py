@@ -1018,33 +1018,22 @@ def static_reason(config: Any, model_config: dict, drafter_kind: str | None) -> 
     """Why the kernel would not be active for this config, model and drafter,
     or None when it would be, decided without loading anything: sous tune
     resolves the block an unset speculative_block_size runs at by it. It
-    mirrors enable()'s order (the switches, then the tile's machine and model
+    mirrors enable()'s order (the switch, then the tile's machine and model
     gates, then the kernel's own) and reads the model from its config.json. A
     refusal only a load can see, a probe failure, pin drift or exact verify
     attention missing beside the drafter, is beyond it."""
     if not config.projection_kernel:
         return "projection kernel off"
-    if not config.attention_tile:
-        return "attention tile off"
-    reason = nax.platform_reason()
+    # No drafter kind: the kernel's own checks come first, and its drafter
+    # rule (the same text) follows them.
+    reason = tileattn.static_reason(config, model_config, None)
     if reason is not None:
         return reason
-    import mlx.core as mx
-
-    _, reason = tileattn._split_target(str(mx.device_info().get("device_name", "")))
-    if reason is not None:
-        return reason
+    # The tile's check answered for the tile's model types; enable() also
+    # asks the kernel's own (_model_reason), which is a separate set.
     reason = _model_type_reason(model_config.get("model_type"))
     if reason is not None:
         return reason
-    text = model_config.get("text_config", model_config)
-    shape = (
-        text.get("num_attention_heads"),
-        text.get("num_key_value_heads"),
-        text.get("head_dim"),
-    )
-    if shape != (tileattn.HQ, tileattn.HKV, tileattn.D):
-        return f"unsupported attention shape {shape[0]}/{shape[1]}/{shape[2]} (24/4/256 only)"
     reason = _quantization_reason(model_config.get("quantization"))
     if reason is not None:
         return reason

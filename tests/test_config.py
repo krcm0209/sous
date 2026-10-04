@@ -251,21 +251,29 @@ def test_speculative_defaults(tmp_path: Path):
     cfg = load_config(tmp_path / "nope.toml")
     assert cfg.speculative_draft_id == "z-lab/Qwen3.8-27B-DFlash2"
     # Unset, the block is the engine's to resolve at load: 5 where the
-    # projection kernel serves the load, 4 elsewhere. 0 would hand the choice
-    # back to the drafter's own adaptive policy.
-    assert cfg.speculative_block_size == 4
+    # projection kernel serves the load, 4 where only the attention tile does,
+    # 3 elsewhere. 0 would hand the choice back to the drafter's own adaptive
+    # policy.
+    assert cfg.speculative_block_size == 3
+    assert SousConfig().speculative_block_size == 3
     assert cfg.speculative_block_explicit is False
     assert SousConfig().speculative_block_explicit is False
 
 
-def test_speculative_block_kernel_is_five_within_the_clamp():
+def test_speculative_block_resolutions_are_three_four_five_within_the_clamp():
     from sous.config import (
         SPECULATIVE_BLOCK_DEFAULT,
         SPECULATIVE_BLOCK_KERNEL,
         SPECULATIVE_BLOCK_MAX,
+        SPECULATIVE_BLOCK_TILE,
     )
 
-    assert (SPECULATIVE_BLOCK_DEFAULT, SPECULATIVE_BLOCK_KERNEL, SPECULATIVE_BLOCK_MAX) == (4, 5, 5)
+    assert (
+        SPECULATIVE_BLOCK_DEFAULT,
+        SPECULATIVE_BLOCK_TILE,
+        SPECULATIVE_BLOCK_KERNEL,
+        SPECULATIVE_BLOCK_MAX,
+    ) == (3, 4, 5, 5)
 
 
 def test_speculative_keys_from_toml_without_unknown_key_warnings(tmp_path: Path):
@@ -293,7 +301,7 @@ def test_speculative_block_size_one_or_negative_warns_and_uses_the_default(tmp_p
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             cfg = load_config(p)
-        assert cfg.speculative_block_size == 4, bad
+        assert cfg.speculative_block_size == 3, bad
         assert cfg.speculative_block_explicit is False, bad
         assert any(
             "speculative_block_size" in str(w.message)

@@ -9,7 +9,7 @@ import sys
 from collections.abc import Callable
 from datetime import date
 
-from sous.config import SousConfig, load_config
+from sous.config import SPECULATIVE_BLOCK_KERNEL, SousConfig, load_config
 from sous.tune import arms as arms_mod
 from sous.tune import bench as bench_mod
 from sous.tune import candidates as cand_mod
@@ -259,11 +259,16 @@ def main(
     checkpoints = _describe_all(ids, describe, out)
     # Before any arm exists: the current-arm mark and every proposed change
     # compare against the block the daemon would run, and an unset block
-    # resolves at load by whether the projection kernel can run here.
+    # resolves at load by whether the projection kernel, or only the attention
+    # tile, can run here.
     resolved = arms_mod.resolve_block(user, checkpoints)
     if resolved.speculative_block_size != user.speculative_block_size:
+        if resolved.speculative_block_size == SPECULATIVE_BLOCK_KERNEL:
+            can_run = "the projection kernel can run here"
+        else:
+            can_run = "the attention tile can run here (the projection kernel cannot)"
         out(
-            "speculative_block_size is unset and the projection kernel can run here: "
+            f"speculative_block_size is unset and {can_run}: "
             f"the configured arm is block {resolved.speculative_block_size}"
         )
     user = resolved

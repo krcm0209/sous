@@ -1521,10 +1521,11 @@ def test_lm_engine_reports_the_projection_kernel_off(monkeypatch):
     assert engine.projection_kernel_status == {"state": "off", "reason": None}
 
 
-def _drafted_vlm(monkeypatch, proj_state: str, **kwargs):
-    """A VLMEngine over stubs whose drafter loads and whose projection kernel
-    reports `proj_state`; returned with its drafter and the blocks pinned."""
-    from sous.engine import draftctx, projkernel, verifyattn, vlm
+def _drafted_vlm(monkeypatch, proj_state: str, tile_state: str = "off", **kwargs):
+    """A VLMEngine over stubs whose drafter loads, whose attention tile reports
+    `tile_state` and whose projection kernel reports `proj_state`; returned
+    with its drafter and the blocks pinned."""
+    from sous.engine import draftctx, projkernel, tileattn, verifyattn, vlm
 
     model = _positionless_model()
     processor = types.SimpleNamespace(tokenizer=_RecordingTokenizer())
@@ -1537,6 +1538,8 @@ def _drafted_vlm(monkeypatch, proj_state: str, **kwargs):
         "enable",
         lambda m, *, enabled: {"state": "active", "reason": None, "probe_seconds": 0.21},
     )
+    tile = {"state": tile_state, "reason": None, "splits": None, "probe_seconds": None}
+    monkeypatch.setattr(tileattn, "enable", lambda m, *, enabled, drafter_kind, verify_status: tile)
     status = {"state": proj_state, "reason": None, "probe_seconds": None}
     monkeypatch.setattr(
         projkernel, "enable", lambda m, *, enabled, drafter_kind, tile_status: status
@@ -1557,21 +1560,37 @@ def _drafted_vlm(monkeypatch, proj_state: str, **kwargs):
 
 
 @pytest.mark.parametrize(
-    ("explicit", "proj_state", "block", "expected"),
+    ("explicit", "tile_state", "proj_state", "block", "expected"),
     [
-        (False, "active", 4, 5),
-        (False, "unavailable", 4, 4),
-        (False, "off", 4, 4),
-        (True, "active", 4, 4),
-        (True, "active", 3, 3),
-        (True, "active", 0, 0),
+        # The kernel serves only where the tile does; the kernel's block wins.
+        (False, "active", "active", 3, 5),
+        # Only the tile: the M5 Pro with the kernel switched off.
+        (False, "active", "unavailable", 3, 4),
+        (False, "active", "off", 3, 4),
+        # Neither: every other Mac, where the exact verifier collapses from T=4.
+        (False, "unavailable", "unavailable", 3, 3),
+        (False, "off", "off", 3, 3),
+        (False, "unavailable", "off", 3, 3),
+        # The resolution does not lean on the block the config carried in.
+        (False, "off", "off", 4, 3),
+        (False, "active", "active", 2, 5),
+        # An explicit block, 0 included, always wins.
+        (True, "active", "active", 3, 3),
+        (True, "active", "active", 4, 4),
+        (True, "active", "off", 5, 5),
+        (True, "active", "active", 0, 0),
+        (True, "off", "off", 4, 4),
     ],
 )
-def test_vlm_engine_resolves_an_unset_draft_block_to_five_only_where_the_kernel_is_active(
-    monkeypatch, explicit, proj_state, block, expected
+def test_vlm_engine_resolves_an_unset_draft_block_by_what_is_active(
+    monkeypatch, explicit, tile_state, proj_state, block, expected
 ):
     engine, drafter, pinned = _drafted_vlm(
-        monkeypatch, proj_state, draft_block_size=block, draft_block_explicit=explicit
+        monkeypatch,
+        proj_state,
+        tile_state,
+        draft_block_size=block,
+        draft_block_explicit=explicit,
     )
     assert engine._draft_block_size == expected and engine.draft_block == expected
     assert pinned == [expected], "the pin must see the resolved block"
@@ -1581,7 +1600,7 @@ def test_vlm_engine_resolves_an_unset_draft_block_to_five_only_where_the_kernel_
 def test_vlm_engine_built_directly_keeps_the_draft_block_it_was_given(monkeypatch):
     """Tests and scripts that build an engine themselves pass no flag; the
     block they ask for is the block they get, kernel or not."""
-    engine, _, pinned = _drafted_vlm(monkeypatch, "active", draft_block_size=4)
+    engine, _, pinned = _drafted_vlm(monkeypatch, "active", "active", draft_block_size=4)
     assert engine.draft_block == 4 and pinned == [4]
 
 
@@ -1594,8 +1613,9 @@ def test_vlm_engine_reports_no_draft_block_without_a_drafter(monkeypatch):
         load=lambda model_id: (_positionless_model(), _RecordingTokenizer()),
     )
     _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
-    engine = VLMEngine("test/model", cache_budget=0, draft_block_size=4, draft_block_explicit=False)
-    assert engine.draft_block is None and engine._draft_block_size == 4
+    # 2: no resolution yields it, so a block resolved without a drafter shows.
+    engine = VLMEngine("test/model", cache_budget=0, draft_block_size=2, draft_block_explicit=False)
+    assert engine.draft_block is None and engine._draft_block_size == 2
     # The constructor's default keeps the stock projections.
     assert engine.projection_kernel_status["state"] == "off"
 

@@ -211,7 +211,8 @@ a load the kernel cannot serve, every load whose attention tile is not
 `WARNING` the way it does for the tile), and, whenever a drafter loaded,
 `draft_block=` (the verify block the engine pinned: the configured
 `speculative_block_size`, or for an unset one 5 where the projection kernel
-is active and 4 elsewhere, 0 being the drafter's own policy; the status
+is active, 4 where only the attention tile is and 3 elsewhere, 0 being the
+drafter's own policy; the status
 document's engine block carries it as `draft_block`). One
 more line names the Anthropic tool *types* a turn dropped, when any.
 Each forwarded request logs one line too: `upstream`, method, path, the
