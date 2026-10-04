@@ -1,13 +1,15 @@
 """The small-row projection kernel (sous.engine.projkernel): its Metal source, the
 variant choice, eligibility, availability, and the arithmetic every routing
 decision rests on. The arithmetic tests run wherever the kernel compiles and
-probes right (CI's macos-15 GPU included) and skip elsewhere."""
+probes right (CI's macos-15 GPU included) and skip elsewhere; where Metal is and
+the probe refuses, test_the_kernel_is_available_wherever_metal_is fails instead."""
 
 import contextlib
 import copy
 import importlib
 import inspect
 import logging
+import os
 import types
 import warnings
 from importlib.resources import files
@@ -291,10 +293,17 @@ def test_the_probe_refuses_a_row_that_depends_on_the_row_count(monkeypatch):
     assert projkernel._kernel_probe() == "plain: a row alone differs from the same row among eight"
 
 
-@pfx.kernel
-def test_the_real_probe_passes(monkeypatch):
-    monkeypatch.setattr(projkernel, "_kernel_ok", False)
-    assert projkernel._kernel_probe() is None
+def test_the_kernel_is_available_wherever_metal_is():
+    """The arithmetic tests below skip when kernel_available() is False, and its
+    probe answers False for wrong numbers as well as for no Metal: a kernel that
+    computes wrong must fail here rather than turn them into skips. On a GPU the
+    kernel has not been probed on, SOUS_TEST_SKIP_KERNEL_CHECK=1 skips this test
+    (the arithmetic tests then skip with the probe's reason)."""
+    if not mx.metal.is_available():
+        pytest.skip("no Metal")
+    if os.environ.get("SOUS_TEST_SKIP_KERNEL_CHECK") == "1":
+        pytest.skip("SOUS_TEST_SKIP_KERNEL_CHECK=1")
+    assert pfx.KERNEL.available, pfx.KERNEL.reason
 
 
 # ---- arithmetic (the real kernel) ------------------------------------------------
@@ -310,60 +319,63 @@ def forced(request, monkeypatch):
 
 
 @pfx.kernel
+@pytest.mark.parametrize("layout", pfx.LAYOUTS)
 @pytest.mark.parametrize("k", [1024, 2048])
-def test_rows_do_not_depend_on_the_row_count(forced, k):
+def test_rows_do_not_depend_on_the_row_count(forced, k, layout):
     """Each row of a T-row call, T = 1..8, equals the same row of the eight-row
     call and the same row computed alone."""
-    weights = [pfx.rand_linear(n, k, i) for i, n in enumerate((72, 48))]
-    x = pfx.activations(8, k, seed=1)
+    x, weights = pfx.projection_inputs(layout, 8, k, (72, 48), x_seed=1, w_seed=0)
     full = projkernel.linears(x, weights)
     for t in range(1, 9):
         part = projkernel.linears(x[:t], weights)
         for got, want in zip(part, full, strict=True):
             assert got.shape == (t, want.shape[1]) and got.dtype == mx.bfloat16
-            assert mx.array_equal(got, want[:t]).item(), (forced, k, t)
+            assert mx.array_equal(got, want[:t]).item(), (forced, layout, k, t)
     for r in range(8):
         alone = projkernel.linears(x[r : r + 1], weights)
         for got, want in zip(alone, full, strict=True):
-            assert mx.array_equal(got, want[r : r + 1]).item(), (forced, k, r)
+            assert mx.array_equal(got, want[r : r + 1]).item(), (forced, layout, k, r)
 
 
 @pfx.kernel
-def test_the_plain_kernel_splits_an_uneven_k_the_same_way_for_every_row_count():
+@pytest.mark.parametrize("layout", pfx.LAYOUTS)
+def test_the_plain_kernel_splits_an_uneven_k_the_same_way_for_every_row_count(layout):
     """K / 64 = 17 does not divide by the four K simdgroups: the split is uneven
     but depends on K alone."""
-    weights = [pfx.rand_linear(n, 1088, 10 + i) for i, n in enumerate((40, 48))]
-    x = pfx.activations(8, 1088, seed=7)
+    x, weights = pfx.projection_inputs(layout, 8, 1088, (40, 48), x_seed=7, w_seed=10)
     full = projkernel.linears(x, weights)
     for t in range(1, 9):
         for got, want in zip(projkernel.linears(x[:t], weights), full, strict=True):
-            assert mx.array_equal(got, want[:t]).item(), t
+            assert mx.array_equal(got, want[:t]).item(), (layout, t)
 
 
 @pfx.kernel
+@pytest.mark.parametrize("layout", pfx.LAYOUTS)
 @pytest.mark.parametrize("ns", [(72, 48), (40, 48, 8), (100, 48, 48, 72)])
-def test_a_fused_call_equals_its_linears_one_at_a_time(forced, ns):
-    weights = [pfx.rand_linear(n, 1024, 20 + i) for i, n in enumerate(ns)]
-    x = pfx.activations(5, 1024, seed=2)
+def test_a_fused_call_equals_its_linears_one_at_a_time(forced, ns, layout):
+    x, weights = pfx.projection_inputs(layout, 5, 1024, ns, x_seed=2, w_seed=20)
     fused = projkernel.linears(x, weights)
     for i, w in enumerate(weights):
         assert fused[i].shape == (5, ns[i])
-        assert mx.array_equal(fused[i], projkernel.linear(x, *w)).item(), (forced, ns, i)
+        assert mx.array_equal(fused[i], projkernel.linear(x, *w)).item(), (forced, layout, ns, i)
 
 
 @pfx.kernel
+@pytest.mark.parametrize("layout", pfx.LAYOUTS)
 @pytest.mark.parametrize("t", [1, 3, 8])
-def test_the_three_variants_agree_bitwise(monkeypatch, t):
-    """K = 2048 gives each K simdgroup two staging stages."""
-    weights = [pfx.rand_linear(n, 2048, 30 + i) for i, n in enumerate((136, 48, 40))]
-    x = pfx.activations(t, 2048, seed=3)
+def test_the_three_variants_agree_bitwise(monkeypatch, t, layout):
+    """K = 2048 gives each K simdgroup two staging stages. Decode and verify can
+    serve one projection on different variants (the choice reads the summed N of
+    the call), so a variant that adds its K partials or its group sums in another
+    order breaks greedy parity: the cancelling layouts are what show it."""
+    x, weights = pfx.projection_inputs(layout, t, 2048, (136, 48, 40), x_seed=3, w_seed=30)
     outs = {}
     for kind in projkernel.VARIANTS:
         monkeypatch.setattr(projkernel, "variant", lambda k, n_sum, kind=kind: kind)
         outs[kind] = projkernel.linears(x, weights)
     for kind in ("staged", "staged_ps"):
         for got, want in zip(outs[kind], outs["plain"], strict=True):
-            assert mx.array_equal(got, want).item(), (kind, t)
+            assert mx.array_equal(got, want).item(), (kind, layout, t)
 
 
 @pfx.kernel
@@ -427,6 +439,27 @@ def test_the_kernel_rounds_like_a_float64_reference(forced):
         assert np.all(np.abs(y64 - ref) <= np.abs(ref) * 2.0**-8 + magnitude * 2.0**-16)
         rounded = _f64(mx.array(ref.astype(np.float32)).astype(mx.bfloat16))
         assert np.mean(rounded == y64) >= 0.995, forced
+
+
+@pytest.mark.parametrize(("layout", "k"), [("quarters", 2048), ("quarters", 1088), ("group", 1024)])
+def test_the_cancelling_layouts_cancel_term_by_term(layout, k):
+    """What makes them sensitive to summation order: each mirror span's products
+    are exactly the negated products of its source span (same codes, same scales,
+    negated activations), and they dwarf the rest of the sum."""
+    x, ((w, scales, biases),) = pfx.projection_inputs(layout, 4, k, (40,), x_seed=9, w_seed=90)
+    xs, dense = _f64(x), _dequantize_f64(w, scales, biases)
+    terms = xs[:, None, :] * dense[None, :, :]
+    spans = pfx._mirrors(k, layout)
+    mirrored = np.zeros(k, dtype=bool)
+    for src, dst, width in spans:
+        assert np.array_equal(terms[..., dst : dst + width], -terms[..., src : src + width])
+        mirrored[src : src + width] = mirrored[dst : dst + width] = True
+    if layout == "quarters":
+        (a, b), _, _, (c, _) = pfx.k_quarters(k)
+        assert spans == [(a, c, b - a)]
+    big = np.abs(terms[..., mirrored]).sum(axis=-1)
+    rest = np.abs(terms[..., ~mirrored]).sum(axis=-1)
+    assert np.all(big > 100 * rest)
 
 
 # ---- routing: the tags, the flag and the two hooks ---------------------------------

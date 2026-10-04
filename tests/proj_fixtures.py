@@ -39,6 +39,77 @@ def activations(rows: int, k: int, seed: int) -> Any:
     return x
 
 
+# The bitwise tests' inputs. Random activations leave a reordered fp32 sum one bf16
+# rounding away from the same bits almost everywhere; the two cancelling layouts
+# make the order show. "quarters" cancels the first K simdgroup's partial against
+# the last's (the order the K partials are added in), "group" cancels inside every
+# quant group (the order of the group's activation sum, in-line or presummed).
+LAYOUTS = ("random", "quarters", "group")
+_CANCEL = 256.0
+_SMALL = 1e-2
+
+
+def k_quarters(k: int) -> list[tuple[int, int]]:
+    """The column range each of the kernel's four K simdgroups sums, split by whole
+    quant groups as the kernel splits them (g0 = sk * G // 4)."""
+    g = k // 64
+    return [(64 * (sk * g // 4), 64 * ((sk + 1) * g // 4)) for sk in range(4)]
+
+
+def _mirrors(k: int, layout: str) -> list[tuple[int, int, int]]:
+    """(source, mirror, width) column spans a cancelling layout pairs up."""
+    if layout == "quarters":
+        (a, b), _, _, (c, _) = k_quarters(k)
+        return [(a, c, b - a)]  # the last quarter is never narrower than the first
+    if layout == "group":
+        return [(g, g + 48, 16) for g in range(0, k, 64)]
+    raise ValueError(layout)
+
+
+def cancelling_activations(rows: int, k: int, layout: str, seed: int) -> Any:
+    """[rows, K] bf16 activations, +c·v over each source span and exactly -c·v over
+    its mirror, small values elsewhere: the large terms cancel, so the result is
+    small and a reordered fp32 sum lands on another bf16. Built on the GPU and
+    evaluated."""
+    import mlx.core as mx
+
+    keys = mx.random.split(mx.random.key(seed), 2)
+    x = (mx.random.normal((rows, k), key=keys[0]) * _SMALL).astype(mx.bfloat16)
+    big = (mx.random.normal((rows, k), key=keys[1]) * _CANCEL).astype(mx.bfloat16)
+    for src, dst, width in _mirrors(k, layout):
+        x[:, src : src + width] = big[:, src : src + width]
+        x[:, dst : dst + width] = -big[:, src : src + width]
+    mx.eval(x)
+    return x
+
+
+def cancelling_linear(n: int, k: int, layout: str, seed: int) -> tuple[Any, Any, Any]:
+    """rand_linear's projection with each mirror span's weight columns copied from
+    its source span, so the two spans' products cancel term by term. The spans are
+    whole quant groups or the same columns of one group, so both quantize to the
+    same codes."""
+    import mlx.core as mx
+
+    dense = (mx.random.normal((n, k), key=mx.random.key(seed)) * 0.02).astype(mx.bfloat16)
+    for src, dst, width in _mirrors(k, layout):
+        dense[:, dst : dst + width] = dense[:, src : src + width]
+    w, scales, biases = mx.quantize(dense, group_size=64, bits=4)
+    mx.eval(w, scales, biases)
+    return w, scales, biases
+
+
+def projection_inputs(
+    layout: str, rows: int, k: int, ns: tuple[int, ...], *, x_seed: int, w_seed: int
+) -> tuple[Any, list[tuple[Any, Any, Any]]]:
+    """(activations, one linear per N in `ns`, linear i seeded `w_seed + i`) in one
+    of LAYOUTS; "random" is activations() and rand_linear()."""
+    if layout == "random":
+        x = activations(rows, k, x_seed)
+        return x, [rand_linear(n, k, w_seed + i) for i, n in enumerate(ns)]
+    weights = [cancelling_linear(n, k, layout, w_seed + i) for i, n in enumerate(ns)]
+    return cancelling_activations(rows, k, layout, x_seed), weights
+
+
 def stand_in_mma(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]:
     """A plain-mlx model of projkernel.mma's contract: every linear dequantized in
     fp32 and applied to each row on its own (the same one-row matmul whatever the
