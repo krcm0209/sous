@@ -11,6 +11,7 @@ from sous.config import (
     MIN_CONTEXT_TOKENS,
     SPECULATIVE_BLOCK_KERNEL,
     SPECULATIVE_BLOCK_MAX,
+    SPECULATIVE_BLOCK_TILE,
     SousConfig,
 )
 from sous.tune.candidates import Candidate, Checkpoint, Fit, drafter_compatible, fit
@@ -143,13 +144,14 @@ def drafter_kind(config: dict) -> str:
 def resolve_block(user: SousConfig, checkpoints: dict[str, Checkpoint]) -> SousConfig:
     """The user's configuration with the verify block the daemon would run.
     An unset speculative_block_size resolves at load to
-    SPECULATIVE_BLOCK_KERNEL where the projection kernel goes active and stays
-    at the default elsewhere; the tune cannot load a model to find out, so it
-    puts the kernel's static check to the checkpoints it already described.
+    SPECULATIVE_BLOCK_KERNEL where the projection kernel goes active,
+    SPECULATIVE_BLOCK_TILE where only the attention tile does and stays at the
+    default elsewhere; the tune cannot load a model to find out, so it puts
+    the two static checks to the checkpoints it already described.
     The current-arm mark, the user's own block among the measured ones and
     every proposed change then compare against what the daemon runs. A
     refusal the static check cannot see (a failed probe, a drifted source
-    pin) leaves the mark one block off; the arms themselves are unaffected,
+    pin) leaves the mark a block or two off; the arms themselves are unaffected,
     since each pins the block its label names."""
     if user.speculative_block_explicit or not user.speculative_draft_id:
         return user
@@ -162,11 +164,14 @@ def resolve_block(user: SousConfig, checkpoints: dict[str, Checkpoint]) -> SousC
     # block is resolved for it.
     if target.backend != "vlm" or not drafter_compatible(target, drafter)[0]:
         return user
-    from sous.engine import projkernel
+    from sous.engine import projkernel, tileattn
 
-    if projkernel.static_reason(user, target.config, drafter_kind(drafter.config)) is not None:
-        return user
-    return dataclasses.replace(user, speculative_block_size=SPECULATIVE_BLOCK_KERNEL)
+    kind = drafter_kind(drafter.config)
+    if projkernel.static_reason(user, target.config, kind) is None:
+        return dataclasses.replace(user, speculative_block_size=SPECULATIVE_BLOCK_KERNEL)
+    if tileattn.static_reason(user, target.config, kind) is None:
+        return dataclasses.replace(user, speculative_block_size=SPECULATIVE_BLOCK_TILE)
+    return user
 
 
 def _arm(

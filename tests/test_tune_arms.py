@@ -2,7 +2,12 @@ import dataclasses
 import sys
 import types
 
-from sous.config import SPECULATIVE_BLOCK_KERNEL, SousConfig
+from sous.config import (
+    SPECULATIVE_BLOCK_DEFAULT,
+    SPECULATIVE_BLOCK_KERNEL,
+    SPECULATIVE_BLOCK_TILE,
+    SousConfig,
+)
 from sous.tune.arms import (
     BLOCK_SIZES,
     Arm,
@@ -60,14 +65,14 @@ def test_on_the_m5_pro_every_model_gets_a_no_drafter_arm_and_one_per_block_size(
     assert len(by_model["mlx-community/Qwen3.5-9B-MLX-4bit"]) == 1 + len(BLOCK_SIZES)
     current = [a for a in arms if a.current]
     assert len(current) == 1
-    assert (current[0].drafter_id, current[0].block_size) == ("z-lab/Qwen3.8-27B-DFlash2", 4)
+    assert (current[0].drafter_id, current[0].block_size) == ("z-lab/Qwen3.8-27B-DFlash2", 3)
     assert current[0].config.speculative_draft_id == "z-lab/Qwen3.8-27B-DFlash2"
-    assert current[0].config.speculative_block_size == 4
+    assert current[0].config.speculative_block_size == 3
     assert current[0].window == user.max_context_tokens
     plain = [a for a in by_model["mlx-community/Qwen3.8-27B-4bit"] if not a.drafter_id][0]
     assert plain.block_size == 0 and plain.config.speculative_draft_id == ""
     assert plain.label == "Qwen3.8-27B-4bit"
-    assert current[0].label == "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @4"
+    assert current[0].label == "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @3"
 
 
 def test_on_the_m2_air_the_27b_is_refused_and_the_9b_runs_at_a_lowered_window(tmp_path):
@@ -387,25 +392,36 @@ def test_the_winner_stage_carries_the_attention_tile_and_adds_no_arm_for_it(tmp_
     assert [a.suite_key[5] for a in arms] == [False, False]
 
 
-def _static_check(monkeypatch, reason=None):
-    """Stand in for the projection kernel's static check, recording what the
-    tune asked it: the real one reads this machine's GPU."""
-    from sous.engine import projkernel
+def _static_check(monkeypatch, reason=None, tile_reason="same", asked_tile=None):
+    """Stand in for the projection kernel's static check and the attention
+    tile's, recording what the tune asked each (the tile's calls in
+    `asked_tile`, when given): the real ones read this machine's GPU. The
+    tile's answer is the kernel's unless given."""
+    from sous.engine import projkernel, tileattn
 
     asked = []
+    if asked_tile is None:
+        asked_tile = []
+    tile_answer = reason if tile_reason == "same" else tile_reason
 
     def static_reason(config, model_config, drafter_kind):
         asked.append((config, model_config, drafter_kind))
         return reason
 
+    def tile_static_reason(config, model_config, drafter_kind):
+        asked_tile.append((config, model_config, drafter_kind))
+        return tile_answer
+
     monkeypatch.setattr(projkernel, "static_reason", static_reason)
+    monkeypatch.setattr(tileattn, "static_reason", tile_static_reason)
     return asked
 
 
 def test_an_unset_block_resolves_to_the_kernels_where_the_static_check_passes(
     tmp_path, monkeypatch
 ):
-    asked = _static_check(monkeypatch)
+    asked_tile = []
+    asked = _static_check(monkeypatch, asked_tile=asked_tile)
     user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
     assert user.speculative_block_explicit is False
     resolved = resolve_block(user, _checkpoints())
@@ -413,6 +429,7 @@ def test_an_unset_block_resolves_to_the_kernels_where_the_static_check_passes(
     # Still unset: a proposal must never write the resolved block back.
     assert resolved.speculative_block_explicit is False
     assert asked == [(user, fx.qwen_27b(), "dflash")]
+    assert asked_tile == [], "the kernel's block needs no second look at the tile"
     arms, _ = quick_arms(
         resolved, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
     )
@@ -421,10 +438,30 @@ def test_an_unset_block_resolves_to_the_kernels_where_the_static_check_passes(
     assert current[0].label == "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @5"
 
 
-def test_an_unset_block_stays_at_the_default_where_the_static_check_refuses(tmp_path, monkeypatch):
-    _static_check(monkeypatch, reason="attention tile off")
+def test_an_unset_block_resolves_to_the_tiles_where_only_the_tile_can_run(tmp_path, monkeypatch):
+    asked_tile = []
+    _static_check(
+        monkeypatch, reason="projection kernel off", tile_reason=None, asked_tile=asked_tile
+    )
     user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    resolved = resolve_block(user, _checkpoints())
+    assert resolved.speculative_block_size == SPECULATIVE_BLOCK_TILE == 4
+    assert resolved.speculative_block_explicit is False
+    assert asked_tile == [(user, fx.qwen_27b(), "dflash")]
+    arms, _ = quick_arms(
+        resolved, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
+    )
+    current = [a for a in arms if a.current]
+    assert [(a.drafter_id, a.block_size) for a in current] == [("z-lab/Qwen3.8-27B-DFlash2", 4)]
+
+
+def test_an_unset_block_stays_at_the_default_where_the_static_checks_refuse(tmp_path, monkeypatch):
+    asked_tile = []
+    asked = _static_check(monkeypatch, reason="attention tile off", asked_tile=asked_tile)
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    assert user.speculative_block_size == SPECULATIVE_BLOCK_DEFAULT == 3
     assert resolve_block(user, _checkpoints()) is user
+    assert len(asked) == 1 and len(asked_tile) == 1
 
 
 def test_only_an_unset_block_with_a_described_model_and_drafter_is_resolved(tmp_path, monkeypatch):

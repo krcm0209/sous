@@ -702,6 +702,14 @@ def _refuse(
     }
 
 
+def _model_type_reason(model_type: Any) -> str | None:
+    """Shared by _model_reason(), which reads the loaded model's type, and
+    static_reason(), which reads config.json's: one text for both."""
+    if model_type in SUPPORTED_MODEL_TYPES:
+        return None
+    return f"unsupported model type {model_type or 'unknown'!r} (qwen3_5 only)"
+
+
 def _model_reason(model: Any) -> str | None:
     """Why this model's attention is not the one the kernel is specialised
     for, or None."""
@@ -709,9 +717,9 @@ def _model_reason(model: Any) -> str | None:
 
     from sous.engine import verifyattn
 
-    model_type = _model_type(model)
-    if model_type not in SUPPORTED_MODEL_TYPES:
-        return f"unsupported model type {model_type or 'unknown'!r} (qwen3_5 only)"
+    reason = _model_type_reason(_model_type(model))
+    if reason is not None:
+        return reason
     modules = verifyattn._attention_modules(model)
     if not modules:
         return "no full-attention layers"
@@ -770,6 +778,40 @@ def _split_target(device_name: str) -> tuple[int | None, str | None]:
         measured = ", ".join(str(s) for s in sorted(MEASURED_SPLITS))
         return None, f"split target {cores} not measured (measured: {measured})"
     return cores, None
+
+
+def static_reason(config: Any, model_config: dict, drafter_kind: str | None) -> str | None:
+    """Why the tile would not be active for this config, model and drafter, or
+    None when it would be, decided without loading anything: sous tune
+    resolves the block an unset speculative_block_size runs at by it, and the
+    projection kernel's own static check starts from it. It reads the model
+    from its config.json, in the order the kernel's check has always used: the
+    switch, the machine (platform rule, split target), then the model's type,
+    its attention shape and the drafter's kind. A refusal only a load can see,
+    a probe failure, pin drift or exact verify attention missing beside the
+    drafter, is beyond it."""
+    if not config.attention_tile:
+        return "attention tile off"
+    reason = nax.platform_reason()
+    if reason is not None:
+        return reason
+    import mlx.core as mx
+
+    _, reason = _split_target(str(mx.device_info().get("device_name", "")))
+    if reason is not None:
+        return reason
+    reason = _model_type_reason(model_config.get("model_type"))
+    if reason is not None:
+        return reason
+    text = model_config.get("text_config", model_config)
+    shape = (
+        text.get("num_attention_heads"),
+        text.get("num_key_value_heads"),
+        text.get("head_dim"),
+    )
+    if shape != (HQ, HKV, D):
+        return f"unsupported attention shape {shape[0]}/{shape[1]}/{shape[2]} (24/4/256 only)"
+    return _drafter_reason(drafter_kind)
 
 
 def enable(
