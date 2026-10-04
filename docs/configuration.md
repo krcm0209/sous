@@ -210,8 +210,9 @@ mlx-vlm sources it was validated with. Anywhere else the model-load line reads
 `projection_kernel=unavailable` (`off` on the mlx-lm backend), the status
 document's `projection_kernel` block carries the reason, the projections run
 stock and an unset block is 4 where the tile is active, else 3. As with the
-tile, that is one INFO line, and a `WARNING` saying `sous: projection kernel unavailable (…)` means the kernel
-should have run here and did not. The on-disk forks are keyed by it: where it
+tile, that is one INFO line, and a `WARNING` saying
+`sous: projection kernel unavailable (…)` means the kernel should have run here
+and did not. The on-disk forks are keyed by it: where it
 is active, changing the setting starts the fork store cold once. The daemon
 reads it at startup, so a change takes effect on its next start.
 
@@ -251,8 +252,8 @@ slower (see `projection_kernel` above), the same runs are about 2.9x.
 The "~2.4x greedy" figure earlier versions quoted ran an argmax sampler
 through the sampled speculative walk, before the engine reached mlx-vlm's
 greedy branch, and that branch also drafts differently (#87). Without the
-projection kernel, block 4 measured best on those turns on the M5 Pro, sampled and greedy:
-+3–5% decode over block 3, with 2 and 6 clearly slower (about 0.8x block 3)
+projection kernel, block 4 measured best on those turns on the M5 Pro, sampled
+and greedy: +3–5% decode over block 3, with 2 and 6 clearly slower (about 0.8x block 3)
 and 5 level with 3, its interval overlapping 4's (#118); with it, block 5 is
 the faster one. 0 lets the drafter's adaptive policy pick the depth. Anything
 above 5 is clamped: block 6 ran 0.8x block 3 on the M5 Pro without the

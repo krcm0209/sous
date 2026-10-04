@@ -144,7 +144,7 @@ class SousConfig:
     # Decode without a drafter runs at about 0.78x. Not bit-identical to
     # stock's kernels, hence the switch; false runs the stock paths, and an
     # unset speculative_block_size then resolves to 4 where the tile is
-    # active. Active only where the attention tile is, `unavailable` with the
+    # active, else 3. Active only where the attention tile is, `unavailable` with the
     # reason anywhere else. Read once, at daemon start.
     projection_kernel: bool = True
     # Reuse one KV cache across the turns of a conversation, prefilling only

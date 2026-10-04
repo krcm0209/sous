@@ -151,7 +151,7 @@ def resolve_block(user: SousConfig, checkpoints: dict[str, Checkpoint]) -> SousC
     The current-arm mark, the user's own block among the measured ones and
     every proposed change then compare against what the daemon runs. A
     refusal the static check cannot see (a failed probe, a drifted source
-    pin) leaves the mark one block off; the arms themselves are unaffected,
+    pin) leaves the mark a block or two off; the arms themselves are unaffected,
     since each pins the block its label names."""
     if user.speculative_block_explicit or not user.speculative_draft_id:
         return user

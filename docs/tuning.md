@@ -68,15 +68,15 @@ tune after either.
 Every drafter arm runs exactly the block its label names. Your configured arm
 is the block the daemon would run: with `speculative_block_size` unset, that
 is 5 where the projection kernel can run, 4 where only the attention tile can
-and 3 elsewhere. The tune decides which without loading the model — from the platform rule, the GPU's core
-count, `attention_tile` and `projection_kernel`, the model's config and the
-drafter's kind — and prints a line when the unset block resolves to 5 or 4. A
-refusal only a load would show (a failed probe, a pinned mlx-vlm source that
-changed) leaves that mark one block off; the measurements themselves are
-unaffected. A proposal then leaves an unset block alone when the winner runs
-the block it already resolves to, writes any other block explicitly, and
-always writes the block of a winner with another model or drafter, since an
-unset block could resolve differently for it.
+and 3 elsewhere. The tune decides which without loading the model — from the
+platform rule, the GPU's core count, `attention_tile` and `projection_kernel`,
+the model's config and the drafter's kind — and prints a line when the unset
+block resolves to 5 or 4. A refusal only a load would show (a failed probe, a
+pinned mlx-vlm source that changed) leaves that mark a block or two off; the
+measurements themselves are unaffected. A proposal then leaves an unset block
+alone when the winner runs the block it already resolves to, writes any other
+block explicitly, and always writes the block of a winner with another model
+or drafter, since an unset block could resolve differently for it.
 
 The daemon is asked to release the model first (`POST /sous/unload`) and
 refuses while a `sous claude` session holds it, a turn is in flight, or a
