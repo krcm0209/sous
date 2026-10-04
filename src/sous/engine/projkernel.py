@@ -119,20 +119,26 @@ def _header(presum: bool) -> str:
     return _kernel_text("common.h") + switch + _kernel_text("projection_mma.h")
 
 
-def _projection_kernel(kind: str, nl: int) -> Callable[..., list[Any]]:
-    """One kernel per variant and linear count: int8prefill's builder caches by name,
-    and each count generates a different selection."""
+@functools.cache
+def _kernel_spec(kind: str, nl: int) -> tuple[str, list[str], list[str], str, str]:
+    """A variant's name, input names, output names, source and header at one
+    linear count: text only, so a launch does not build it again."""
     inputs = ["x", "sums"] if kind == "staged_ps" else ["x"]
     for i in range(nl):
         inputs += [f"w{i}", f"s{i}", f"b{i}"]
-    return _kernel(
+    return (
         f"sous_proj_{kind}_n{nl}",
         inputs,
         [f"y{i}" for i in range(nl)],
         _source(kind, nl),
         _header(kind == "staged_ps"),
-        compile_options=_SAFE_MATH,
     )
+
+
+def _projection_kernel(kind: str, nl: int) -> Callable[..., list[Any]]:
+    """One kernel per variant and linear count: int8prefill's builder caches by name,
+    and each count generates a different selection."""
+    return _kernel(*_kernel_spec(kind, nl), compile_options=_SAFE_MATH)
 
 
 def _group_sums_kernel() -> Callable[..., list[Any]]:
@@ -211,31 +217,39 @@ def _group_sums(x2: Any) -> Any:
     return sums
 
 
-def _launch(kind: str, x2: Any, weights: list[tuple[Any, Any, Any]]) -> list[Any]:
-    """One dispatch of one variant over [T, K] rows and 1..4 linears; [T, N_i] bf16
-    each. Tiles are laid out linear by linear, a partial last tile per linear."""
+@functools.cache
+def _dispatch(rows: int, k: int, ns: tuple[int, ...]) -> dict[str, Any]:
+    """The launch arguments that T, K and each linear's N fix, built once per
+    shape: a decoded token launches every projection of the model, and
+    rebuilding these cost more Python than the launch itself. Tiles are laid
+    out linear by linear, a partial last tile per linear."""
     import mlx.core as mx
 
-    rows, k = x2.shape
-    nl = len(weights)
-    ns = [int(w.shape[0]) for w, _, _ in weights]
+    nl = len(ns)
     ct = [0]
     for n in ns:
         ct.append(ct[-1] + -(-n // _COLS))
-    inputs = [x2, _group_sums(x2)] if kind == "staged_ps" else [x2]
-    for w, scales, biases in weights:
-        inputs += [w, scales, biases]
     template: list[tuple[str, Any]] = [("TR", rows), ("KD", k), ("NLIN", nl)]
     template += [(f"N{i}", ns[i] if i < nl else 0) for i in range(_MAX_LINEARS)]
     template += [(f"CT{i}", ct[i] if i < nl else 1 << 30) for i in (1, 2, 3)]
-    return _projection_kernel(kind, nl)(
-        inputs=inputs,
-        template=template,
-        grid=(_THREADS, ct[-1], 1),
-        threadgroup=(_THREADS, 1, 1),
-        output_shapes=[(rows, n) for n in ns],
-        output_dtypes=[mx.bfloat16] * nl,
-    )
+    return {
+        "template": template,
+        "grid": (_THREADS, ct[-1], 1),
+        "threadgroup": (_THREADS, 1, 1),
+        "output_shapes": [(rows, n) for n in ns],
+        "output_dtypes": [mx.bfloat16] * nl,
+    }
+
+
+def _launch(kind: str, x2: Any, weights: list[tuple[Any, Any, Any]]) -> list[Any]:
+    """One dispatch of one variant over [T, K] rows and 1..4 linears; [T, N_i] bf16
+    each."""
+    rows, k = x2.shape
+    inputs = [x2, _group_sums(x2)] if kind == "staged_ps" else [x2]
+    for w, scales, biases in weights:
+        inputs += [w, scales, biases]
+    dispatch = _dispatch(rows, k, tuple(w.shape[0] for w, _, _ in weights))
+    return _projection_kernel(kind, len(weights))(inputs=inputs, **dispatch)
 
 
 def linears(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]:
