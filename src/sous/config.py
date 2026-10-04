@@ -86,7 +86,8 @@ class SousConfig:
     # blocks the target verifies in one forward — ~1.8x decode on the default
     # affine-4bit model at short context with the shipped sampling
     # (krcm0209/sous#55, #58); greedy, 2.0x plain greedy decode on real
-    # subagent turns at 44–77K (#118). Empty id disables it. The
+    # subagent turns at 44–77K at block 4 without the projection kernel
+    # (#118), about 2.3x at block 5 with it (#148). Empty id disables it. The
     # drafter must match the target architecture; when it doesn't (or fails to
     # load), the engine logs and continues without it. Left unset, the block
     # is resolved at load: SPECULATIVE_BLOCK_KERNEL where the projection
@@ -323,9 +324,10 @@ SPECULATIVE_BLOCK_DEFAULT = 4
 # kernel serves the load: its verify projections cost about the same at 5
 # rows as at 4, so the deeper block's extra accepted tokens come nearly free.
 SPECULATIVE_BLOCK_KERNEL = 5
-# The largest verify block that has paid. On the M5 Pro, where the attention
-# tile serves verify attention, a block-6 round costs twice a block-3 one and
-# block 6 ran 0.8x block 3 on real subagent turns (#118). Without the tile,
+# The largest verify block sous has validated in-tree. On the M5 Pro without
+# the projection kernel, a block-6 round cost twice a block-3 one and block 6
+# ran 0.8x block 3 on real subagent turns (#118); with the kernel, block 6 has
+# been measured only in an out-of-tree spike. Without the attention tile,
 # 6+ rows also leave mlx's fused vector-attention kernel (q_len x gqa <= 32:
 # 5 rows at the default model's gqa 6).
 SPECULATIVE_BLOCK_MAX = 5
@@ -339,10 +341,10 @@ def _speculative_block_size(model: dict) -> tuple[int, bool]:
     size and ends its round loop when it is <= 1, so a configured 1 (or a
     negative) would cap every response at a single token without any error.
     Above the maximum is clamped rather than defaulted: the intent ("as deep
-    as pays") is clear, only the number is past where it pays, so a clamped
-    value still counts as set. An invalid one does not: it falls back to the
-    default, which the engine resolves at load as it does an unset one, so
-    the warning names no number."""
+    as validated") is clear, only the number is past the largest block sous
+    has validated, so a clamped value still counts as set. An invalid one
+    does not: it falls back to the default, which the engine resolves at load
+    as it does an unset one, so the warning names no number."""
     if "speculative_block_size" not in model:
         return SPECULATIVE_BLOCK_DEFAULT, False
     value = model["speculative_block_size"]
@@ -356,8 +358,8 @@ def _speculative_block_size(model: dict) -> tuple[int, bool]:
     if value > SPECULATIVE_BLOCK_MAX:
         warnings.warn(
             f"sous config: [model].speculative_block_size {value!r} exceeds "
-            f"{SPECULATIVE_BLOCK_MAX}, the largest verify block that has paid in "
-            f"measurement (default model, M5 Pro); using {SPECULATIVE_BLOCK_MAX}",
+            f"{SPECULATIVE_BLOCK_MAX}, the largest verify block sous has validated "
+            f"in-tree; using {SPECULATIVE_BLOCK_MAX}",
             stacklevel=3,
         )
         return SPECULATIVE_BLOCK_MAX, True

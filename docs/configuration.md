@@ -231,6 +231,9 @@ Speculative decoding (`speculative_draft_id`, `speculative_block_size`) is
 sampling; `""` disables it. Left unset, the block size is 5 where the
 projection kernel is active and 4 elsewhere; a value you set always wins, and
 the model-load line's `draft_block=` says which block the engine runs.
+Earlier versions of the documented config set `speculative_block_size = 4`
+explicitly; remove that line to let the engine choose 5 where the projection
+kernel runs.
 Greedy (temperature 0) speculative decode at block 5 with the projection
 kernel ran about 2.3x stock plain greedy decode on an M5 Pro — stock meaning
 drafter-off decode with `projection_kernel = false`, 13.6 tok/s on 64 real

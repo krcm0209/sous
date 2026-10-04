@@ -59,7 +59,11 @@ and no arm changes them; suite rows are keyed by both, so a `--resume` after
 either was flipped runs those arms again instead of mixing kernel and stock
 rows, and where the engine reports one `unavailable`, the arm prints a notice
 with the reason and runs stock, as the daemon would (an `off` engine, such as
-the mlx-lm backend's, gets no notice).
+the mlx-lm backend's, gets no notice). Bench rows are keyed only by model,
+drafter, block and window, so a `--resume` across a sous upgrade or a flip of
+`attention_tile` or `projection_kernel` reuses decode and prefill timings
+measured before it, which can rank the blocks the other way: start a fresh
+tune after either.
 
 Every drafter arm runs exactly the block its label names. Your configured arm
 is the block the daemon would run: with `speculative_block_size` unset, that

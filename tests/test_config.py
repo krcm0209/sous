@@ -303,10 +303,11 @@ def test_speculative_block_size_one_or_negative_warns_and_uses_the_default(tmp_p
 
 
 def test_speculative_block_size_above_five_warns_and_is_clamped_to_five(tmp_path: Path):
-    """No block above 5 has paid (block 6 ran 0.8x block 3 on the M5 Pro, and
-    without the attention tile 6+ rows leave mlx's fused attention kernel), so
-    a larger block is a net loss the user cannot see. Clamp, keeping the
-    intent (as deep as pays), and say so."""
+    """No block above 5 is validated in-tree (block 6 ran 0.8x block 3 on the M5
+    Pro without the projection kernel, and without the attention tile 6+ rows
+    leave mlx's fused attention kernel), so a larger block may be a loss the
+    user cannot see. Clamp, keeping the intent (as deep as validated), and say
+    so."""
     for big in ("6", "9", "16"):
         p = tmp_path / f"c{big}.toml"
         p.write_text(f"[model]\nspeculative_block_size = {big}\n")
@@ -316,7 +317,10 @@ def test_speculative_block_size_above_five_warns_and_is_clamped_to_five(tmp_path
         assert cfg.speculative_block_size == 5, big
         assert cfg.speculative_block_explicit is True, big  # the intent stands
         assert any(
-            "speculative_block_size" in str(w.message) and "5" in str(w.message) for w in caught
+            str(w.message)
+            == f"sous config: [model].speculative_block_size {big} exceeds 5, the largest "
+            "verify block sous has validated in-tree; using 5"
+            for w in caught
         ), big
 
 
