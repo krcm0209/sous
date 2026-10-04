@@ -63,6 +63,24 @@ DEFAULT_UPSTREAM = "https://api.anthropic.com"
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
+# What an unset speculative_block_size resolves to where neither the projection
+# kernel nor the attention tile serves the load: M1-M4, older macOS, other
+# models. mlx-vlm's exact verifier collapses from T=4 on the M2 (a 9B verify
+# forward: 138 ms at T=3, 662 ms at T=4, against 65 ms for one row), and
+# Qwen3.5-9B with its drafter decoded 3.56 tok/s at block 4 against 13.46 at
+# block 3 there, with identical replies (#156). No other GPU is measured.
+SPECULATIVE_BLOCK_DEFAULT = 3
+# Where only the attention tile serves the load (the M5 Pro with
+# projection_kernel = false): block 4 measured +3-5% decode over 3 on real
+# subagent turns there (#118); 2 and 6 ran clearly slower, 5 level with 3.
+SPECULATIVE_BLOCK_TILE = 4
+# Where the projection kernel serves the load: its verify projections cost
+# about the same at 5 rows as at 4, so the deeper block's extra accepted
+# tokens come nearly free (1.10x block 4 without the kernel on the M5 Pro,
+# #148).
+SPECULATIVE_BLOCK_KERNEL = 5
+
+
 @dataclass(frozen=True)
 class SousConfig:
     server_port: int = 8383
@@ -90,14 +108,14 @@ class SousConfig:
     # (#118), about 2.3x at block 5 with it (#148). Empty id disables it. The
     # drafter must match the target architecture; when it doesn't (or fails to
     # load), the engine logs and continues without it. Left unset, the block
-    # is resolved at load: SPECULATIVE_BLOCK_KERNEL where the projection
-    # kernel serves the load, SPECULATIVE_BLOCK_DEFAULT where it does not.
-    # Without the kernel, block size 4 measured best on the M5 Pro on real
-    # subagent turns (#118: +3–5% decode over 3; 2 and 6 ran clearly slower,
-    # 5 level with 3). 0 hands the choice back to the drafter's adaptive
-    # policy. Above 5 is clamped (SPECULATIVE_BLOCK_MAX).
+    # is resolved at load by what is active: SPECULATIVE_BLOCK_KERNEL where
+    # the projection kernel serves the load, SPECULATIVE_BLOCK_TILE where only
+    # the attention tile does, SPECULATIVE_BLOCK_DEFAULT everywhere else (the
+    # field's own default, which is that last value). 0 hands the choice back
+    # to the drafter's adaptive policy. Above 5 is clamped
+    # (SPECULATIVE_BLOCK_MAX).
     speculative_draft_id: str = "z-lab/Qwen3.8-27B-DFlash2"
-    speculative_block_size: int = 4
+    speculative_block_size: int = SPECULATIVE_BLOCK_DEFAULT
     # Whether [model].speculative_block_size was set, a clamped value
     # included: only a block the user left unset is the engine's to resolve.
     speculative_block_explicit: bool = False
@@ -125,9 +143,9 @@ class SousConfig:
     # block 4 without the kernel on real subagent turns at 44-77K (M5 Pro).
     # Decode without a drafter runs at about 0.78x. Not bit-identical to
     # stock's kernels, hence the switch; false runs the stock paths, and an
-    # unset speculative_block_size then resolves to 4. Active only where the
-    # attention tile is, `unavailable` with the reason anywhere else. Read
-    # once, at daemon start.
+    # unset speculative_block_size then resolves to 4 where the tile is
+    # active. Active only where the attention tile is, `unavailable` with the
+    # reason anywhere else. Read once, at daemon start.
     projection_kernel: bool = True
     # Reuse one KV cache across the turns of a conversation, prefilling only
     # what it gained, instead of re-prefilling from scratch every turn. Works
@@ -319,11 +337,6 @@ def _model_window(model: dict) -> int:
     return window
 
 
-SPECULATIVE_BLOCK_DEFAULT = 4
-# What an unset speculative_block_size resolves to where the projection
-# kernel serves the load: its verify projections cost about the same at 5
-# rows as at 4, so the deeper block's extra accepted tokens come nearly free.
-SPECULATIVE_BLOCK_KERNEL = 5
 # The largest verify block sous has validated in-tree. On the M5 Pro without
 # the projection kernel, a block-6 round cost twice a block-3 one and block 6
 # ran 0.8x block 3 on real subagent turns (#118); with the kernel, block 6 has

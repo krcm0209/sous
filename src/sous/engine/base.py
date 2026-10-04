@@ -726,7 +726,8 @@ class EngineManager:
             if proj["state"] == "active":
                 line += f" projection_kernel_probe_s={proj['probe_seconds']}"
         # Resolved at load, so the config alone cannot say which block runs:
-        # an unset one is 5 where the kernel is active and 4 elsewhere.
+        # an unset one is 5 where the kernel is active, 4 where only the
+        # attention tile is and 3 elsewhere.
         if engine.draft_block is not None:
             line += f" draft_block={engine.draft_block}"
         _logger.info(line)

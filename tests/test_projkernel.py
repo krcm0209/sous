@@ -1683,3 +1683,18 @@ def test_static_reason_reads_nothing_while_either_switch_is_off(monkeypatch):
             **{"attention_tile": True, "projection_kernel": True, **switches}
         )
         assert projkernel.static_reason(config, {}, "mtp") is not None
+
+
+def test_static_reason_asks_the_tile_first_and_names_the_drafter_last(monkeypatch):
+    """The kernel's check is the tile's plus its own: a refusal the tile
+    makes comes first, then the quantization, then the drafter kind."""
+    pfx.proj_ready(monkeypatch)
+    config = types.SimpleNamespace(attention_tile=True, projection_kernel=True)
+    mxfp4 = _model_config(quantization={"group_size": 32, "bits": 4, "mode": "mxfp4"})
+    assert projkernel.static_reason(config, mxfp4, "mtp") == (
+        "quantization mxfp4 4-bit gs32 (affine 4-bit gs64 only)"
+    )
+    moe = _model_config(model_type="qwen3_5_moe", quantization=mxfp4["quantization"])
+    assert projkernel.static_reason(config, moe, "mtp") == (
+        "unsupported model type 'qwen3_5_moe' (qwen3_5 only)"
+    )

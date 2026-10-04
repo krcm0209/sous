@@ -654,18 +654,23 @@ def test_progress_lines_are_flushed_as_they_are_printed(monkeypatch):
     assert recorded == [{"flush": True}]
 
 
-def _static_check(monkeypatch, reason=None):
-    """Stand in for the projection kernel's static check: the real one reads
-    this machine's GPU, and these tests must not move with it."""
-    from sous.engine import projkernel
+def _static_check(monkeypatch, reason=None, tile_reason="same"):
+    """Stand in for the projection kernel's static check and the attention
+    tile's: the real ones read this machine's GPU, and these tests must not
+    move with it. The tile's answer is the kernel's unless given."""
+    from sous.engine import projkernel, tileattn
 
     asked = []
+    tile_answer = reason if tile_reason == "same" else tile_reason
 
     def static_reason(config, model_config, drafter_kind):
         asked.append((config.model_id, model_config, drafter_kind))
         return reason
 
     monkeypatch.setattr(projkernel, "static_reason", static_reason)
+    monkeypatch.setattr(
+        tileattn, "static_reason", lambda config, model_config, drafter_kind: tile_answer
+    )
     return asked
 
 
@@ -676,6 +681,7 @@ def _unset(tmp_path):
     return SousConfig(data_dir=tmp_path, config_path=p)
 
 
+B3 = CUR
 B4 = "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @4"
 B5 = "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @5"
 
@@ -705,16 +711,29 @@ def test_a_block_faster_than_the_resolved_one_is_written_explicitly(tmp_path, ca
     assert written.speculative_block_size == 4 and written.speculative_block_explicit is True
 
 
-def test_an_unset_block_stays_at_the_default_where_the_kernel_cannot_run(
+def test_an_unset_block_is_measured_as_four_where_only_the_tile_can_run(
     tmp_path, capsys, monkeypatch
 ):
-    _static_check(monkeypatch, reason="attention tile off")
+    _static_check(monkeypatch, reason="projection kernel off", tile_reason=None)
     deps, _ = _deps(tmp_path, scores={B4: 20.0}, cached=(M, D, N))
     assert main(_args(), config=_unset(tmp_path), **deps) == 0
     out = capsys.readouterr().out
-    assert "projection kernel can run here" not in out
+    assert "speculative_block_size is unset and the attention tile can run here" in out
+    assert "the configured arm is block 4" in out
     choice = out.split("## Choice", 1)[1]
-    assert f"  {B4}" in choice.splitlines() and "no config change" in choice
+    assert f"  {B4}" in choice.splitlines()
+    assert "the current arm is already the fastest measured" in choice
+    assert "no config change" in choice
+
+
+def test_an_unset_block_stays_at_the_default_where_neither_can_run(tmp_path, capsys, monkeypatch):
+    _static_check(monkeypatch, reason="attention tile off")
+    deps, _ = _deps(tmp_path, scores={B3: 20.0}, cached=(M, D, N))
+    assert main(_args(), config=_unset(tmp_path), **deps) == 0
+    out = capsys.readouterr().out
+    assert "can run here" not in out
+    choice = out.split("## Choice", 1)[1]
+    assert f"  {B3}" in choice.splitlines() and "no config change" in choice
 
 
 def test_a_block_the_file_sets_is_never_resolved(tmp_path, capsys, monkeypatch):

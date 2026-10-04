@@ -67,10 +67,10 @@ tune after either.
 
 Every drafter arm runs exactly the block its label names. Your configured arm
 is the block the daemon would run: with `speculative_block_size` unset, that
-is 5 where the projection kernel can run and 4 elsewhere. The tune decides
-which without loading the model — from the platform rule, the GPU's core
+is 5 where the projection kernel can run, 4 where only the attention tile can
+and 3 elsewhere. The tune decides which without loading the model — from the platform rule, the GPU's core
 count, `attention_tile` and `projection_kernel`, the model's config and the
-drafter's kind — and prints a line when the unset block resolves to 5. A
+drafter's kind — and prints a line when the unset block resolves to 5 or 4. A
 refusal only a load would show (a failed probe, a pinned mlx-vlm source that
 changed) leaves that mark one block off; the measurements themselves are
 unaffected. A proposal then leaves an unset block alone when the winner runs

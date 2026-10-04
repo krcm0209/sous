@@ -8,7 +8,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
-from sous.config import SPECULATIVE_BLOCK_KERNEL
+from sous.config import (
+    SPECULATIVE_BLOCK_DEFAULT,
+    SPECULATIVE_BLOCK_KERNEL,
+    SPECULATIVE_BLOCK_TILE,
+)
 from sous.engine import draftctx, forkio, projkernel, tileattn
 from sous.engine.base import Delta, OnDelta
 from sous.engine.forkstore import ForkStore, fork_key_fields
@@ -136,17 +140,20 @@ class VLMEngine:
             drafter_kind=self._draft_kind if self._draft is not None else None,
             tile_status=self.attention_tile_status,
         )
-        # An unset block resolves only now that the kernel has settled: with
-        # the kernel a 5-row verify round's projections cost about what a
-        # 4-row round's do, so block 5 pays; without it 4 does. The pin
-        # follows the resolution, and moving it this late changes nothing
-        # above: neither the verifier's nor the tile's gates read the pin.
-        if (
-            not draft_block_explicit
-            and self._draft is not None
-            and self.projection_kernel_status["state"] == "active"
-        ):
-            self._draft_block_size = SPECULATIVE_BLOCK_KERNEL
+        # An unset block resolves only now that the tile and the kernel have
+        # settled: with the kernel a 5-row verify round's projections cost
+        # about what a 4-row round's do, so block 5 pays; with only the tile 4
+        # does (M5 Pro); anywhere else mlx-vlm's exact verifier collapses from
+        # T=4 (M2: 3.8x slower decode at 4 than at 3), so 3. The pin follows
+        # the resolution, and moving it this late changes nothing above:
+        # neither the verifier's nor the tile's gates read the pin.
+        if not draft_block_explicit and self._draft is not None:
+            if self.projection_kernel_status["state"] == "active":
+                self._draft_block_size = SPECULATIVE_BLOCK_KERNEL
+            elif self.attention_tile_status["state"] == "active":
+                self._draft_block_size = SPECULATIVE_BLOCK_TILE
+            else:
+                self._draft_block_size = SPECULATIVE_BLOCK_DEFAULT
         _pin_block_size(self._draft, self._draft_block_size)
         # The drafter's context on the prompt-cache path: armed once the
         # drafter has settled, so one that failed to load leaves it off.

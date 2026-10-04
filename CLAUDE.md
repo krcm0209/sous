@@ -509,12 +509,19 @@ goal.
   divergence is read at the first differing token's top-2 logit gap before
   the kernel is blamed. Because the kernel makes a deeper block pay, an
   unset `[model].speculative_block_size` (`speculative_block_explicit`
-  false) resolves in `VLMEngine.__init__` to `SPECULATIVE_BLOCK_KERNEL` = 5
-  when a drafter loaded and the kernel is `active`, before
-  `_pin_block_size`; an explicit value always wins and 0 keeps its meaning.
-  `sous tune` cannot load a model to ask, so `arms.resolve_block` puts
-  `projkernel.static_reason` to the checkpoints it described, and `_arm`
-  marks every drafter arm's block explicit, or every arm would measure 5.
+  false) resolves in `VLMEngine.__init__`, when a drafter loaded and before
+  `_pin_block_size`, to `SPECULATIVE_BLOCK_KERNEL` = 5 where the kernel is
+  `active`, else `SPECULATIVE_BLOCK_TILE` = 4 where the attention tile is
+  (the M5 Pro with the kernel switched off, where #118 measured 4), else
+  `SPECULATIVE_BLOCK_DEFAULT` = 3: mlx-vlm's exact verifier collapses from
+  T=4 on the M2 (#156: 3.56 tok/s at block 4 against 13.46 at 3, identical
+  replies), and no other GPU is measured. An explicit value always wins and
+  0 keeps its meaning. `sous tune` cannot load a model to ask, so
+  `arms.resolve_block` puts `projkernel.static_reason` and then
+  `tileattn.static_reason` (the tile's half of the kernel's check, which
+  `projkernel.static_reason` calls first) to the checkpoints it described,
+  and `_arm` marks every drafter arm's block explicit, or every arm would
+  measure the resolved one.
   The engine constructors default it off
   (`VLMEngine(projection_kernel=False, draft_block_explicit=True)`); only
   `default_engine_factory` hands them the config. Nothing is logged per
