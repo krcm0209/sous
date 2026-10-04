@@ -392,17 +392,16 @@ def test_the_winner_stage_carries_the_attention_tile_and_adds_no_arm_for_it(tmp_
     assert [a.suite_key[5] for a in arms] == [False, False]
 
 
-def _static_check(monkeypatch, reason=None, tile_reason="same"):
+def _static_check(monkeypatch, reason=None, tile_reason="same", asked_tile=None):
     """Stand in for the projection kernel's static check and the attention
-    tile's, recording what the tune asked each: the real ones read this
-    machine's GPU. The tile's answer is the kernel's unless given."""
+    tile's, recording what the tune asked each (the tile's calls in
+    `asked_tile`, when given): the real ones read this machine's GPU. The
+    tile's answer is the kernel's unless given."""
     from sous.engine import projkernel, tileattn
 
-    class Asked(list):
-        tile: list
-
-    asked = Asked()
-    asked_tile = []
+    asked = []
+    if asked_tile is None:
+        asked_tile = []
     tile_answer = reason if tile_reason == "same" else tile_reason
 
     def static_reason(config, model_config, drafter_kind):
@@ -415,14 +414,14 @@ def _static_check(monkeypatch, reason=None, tile_reason="same"):
 
     monkeypatch.setattr(projkernel, "static_reason", static_reason)
     monkeypatch.setattr(tileattn, "static_reason", tile_static_reason)
-    asked.tile = asked_tile
     return asked
 
 
 def test_an_unset_block_resolves_to_the_kernels_where_the_static_check_passes(
     tmp_path, monkeypatch
 ):
-    asked = _static_check(monkeypatch)
+    asked_tile = []
+    asked = _static_check(monkeypatch, asked_tile=asked_tile)
     user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
     assert user.speculative_block_explicit is False
     resolved = resolve_block(user, _checkpoints())
@@ -430,7 +429,7 @@ def test_an_unset_block_resolves_to_the_kernels_where_the_static_check_passes(
     # Still unset: a proposal must never write the resolved block back.
     assert resolved.speculative_block_explicit is False
     assert asked == [(user, fx.qwen_27b(), "dflash")]
-    assert asked.tile == [], "the kernel's block needs no second look at the tile"
+    assert asked_tile == [], "the kernel's block needs no second look at the tile"
     arms, _ = quick_arms(
         resolved, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
     )
@@ -440,12 +439,15 @@ def test_an_unset_block_resolves_to_the_kernels_where_the_static_check_passes(
 
 
 def test_an_unset_block_resolves_to_the_tiles_where_only_the_tile_can_run(tmp_path, monkeypatch):
-    asked = _static_check(monkeypatch, reason="projection kernel off", tile_reason=None)
+    asked_tile = []
+    _static_check(
+        monkeypatch, reason="projection kernel off", tile_reason=None, asked_tile=asked_tile
+    )
     user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
     resolved = resolve_block(user, _checkpoints())
     assert resolved.speculative_block_size == SPECULATIVE_BLOCK_TILE == 4
     assert resolved.speculative_block_explicit is False
-    assert asked.tile == [(user, fx.qwen_27b(), "dflash")]
+    assert asked_tile == [(user, fx.qwen_27b(), "dflash")]
     arms, _ = quick_arms(
         resolved, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
     )
@@ -454,11 +456,12 @@ def test_an_unset_block_resolves_to_the_tiles_where_only_the_tile_can_run(tmp_pa
 
 
 def test_an_unset_block_stays_at_the_default_where_the_static_checks_refuse(tmp_path, monkeypatch):
-    asked = _static_check(monkeypatch, reason="attention tile off")
+    asked_tile = []
+    asked = _static_check(monkeypatch, reason="attention tile off", asked_tile=asked_tile)
     user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
     assert user.speculative_block_size == SPECULATIVE_BLOCK_DEFAULT == 3
     assert resolve_block(user, _checkpoints()) is user
-    assert len(asked) == 1 and len(asked.tile) == 1
+    assert len(asked) == 1 and len(asked_tile) == 1
 
 
 def test_only_an_unset_block_with_a_described_model_and_drafter_is_resolved(tmp_path, monkeypatch):

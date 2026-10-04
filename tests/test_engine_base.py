@@ -1613,8 +1613,9 @@ def test_vlm_engine_reports_no_draft_block_without_a_drafter(monkeypatch):
         load=lambda model_id: (_positionless_model(), _RecordingTokenizer()),
     )
     _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
-    engine = VLMEngine("test/model", cache_budget=0, draft_block_size=3, draft_block_explicit=False)
-    assert engine.draft_block is None and engine._draft_block_size == 3
+    # 2: no resolution yields it, so a block resolved without a drafter shows.
+    engine = VLMEngine("test/model", cache_budget=0, draft_block_size=2, draft_block_explicit=False)
+    assert engine.draft_block is None and engine._draft_block_size == 2
     # The constructor's default keeps the stock projections.
     assert engine.projection_kernel_status["state"] == "off"
 
