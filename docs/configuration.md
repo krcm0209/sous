@@ -23,9 +23,10 @@ prompt_cache = true
 # prompt_cache_gb = 8
 # prompt_cache_disk_gb = "auto"
 speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
-speculative_block_size = 4
+# speculative_block_size = 5  # unset: 5 where the projection kernel is active, else 4
 int8_prefill = false
 attention_tile = true
+projection_kernel = true
 ```
 
 Every value is optional. Swap `[model].id` for any MLX text or vision model
@@ -183,6 +184,37 @@ starts the fork store cold once, and elsewhere it changes nothing (any macOS
 update starts the store cold, whatever the setting). The daemon reads it at
 startup, so a change takes effect on its next start.
 
+`[model].projection_kernel` (default `true`) runs the target model's quantized
+projections through one small-row kernel for every speculative verify and for
+every call of eight rows or fewer outside it: each decode step, and the short
+tail that ends a prefill (sous's simdgroup-matrix kernel, derived in part from
+Splash under Apache-2.0 — see `THIRD_PARTY_NOTICES.md` — and compiled at model
+load, no build step). Its cost stays nearly flat from one verify row to eight,
+which is what makes a deeper verify block pay: on an M5 Pro with the default
+model and drafter, a block-5 round with the kernel cost 5 ms more than a
+block-4 round without it (115 against 110 ms) and produced 3.46 tokens against
+3.00, so sampled decode at block 5 ran 1.10x block 4 without the kernel (95% CI
+1.07–1.14) on 64 real subagent turns at 44–77K of context (#148). That is why
+an unset `speculative_block_size` is 5 wherever the kernel is active. Each
+row's output is bitwise independent of how many rows a call carries and of
+which projections share it, so greedy output with the drafter stays identical
+to output without it — and that is also why plain decode goes through the
+kernel, at a cost: with no drafter, decode runs about 0.78x what it does with
+`false` (10.7 against 13.6 tok/s on those turns). The kernel is closer to an
+exact reference than mlx's own one-row kernel, but not bit-identical to it, so
+a near-tie can resolve the other way than with `false`, which runs the stock
+paths. It is active only where the attention tile is active, which so far
+means a 20-core M5 Pro, with a dense Qwen3.5-family model whose projections
+are affine 4-bit at group size 64, no drafter or a DFlash one, and the mlx and
+mlx-vlm sources it was validated with. Anywhere else the model-load line reads
+`projection_kernel=unavailable` (`off` on the mlx-lm backend), the status
+document's `projection_kernel` block carries the reason, the projections run
+stock and an unset block stays 4. As with the tile, that is one INFO line, and
+a `WARNING` saying `sous: projection kernel unavailable (…)` means the kernel
+should have run here and did not. The on-disk forks are keyed by it: where it
+is active, changing the setting starts the fork store cold once. The daemon
+reads it at startup, so a change takes effect on its next start.
+
 `[server].generation_timeout_minutes` bounds a turn at both ends: how long it
 may wait for a generation slot before the endpoint answers `529`, and how long
 one generation may run before the turn abandons it and answers `500` (the
@@ -196,19 +228,28 @@ still argmaxes to the same wrong output every time.
 
 Speculative decoding (`speculative_draft_id`, `speculative_block_size`) is
 ~1.8x decode on the default model at short context with the shipped
-sampling; `""` disables it. Greedy (temperature 0) speculative decode ran
-2.0x plain greedy decode on an M5 Pro (27.1 against 13.6 tok/s at block 4;
-1.83x at block 3), on 64 real subagent turns at 44–77K tokens, with output
-identical to plain decode on every turn (#118).
+sampling; `""` disables it. Left unset, the block size is 5 where the
+projection kernel is active and 4 elsewhere; a value you set always wins, and
+the model-load line's `draft_block=` says which block the engine runs.
+Greedy (temperature 0) speculative decode at block 5 with the projection
+kernel ran about 2.3x stock plain greedy decode on an M5 Pro — stock meaning
+drafter-off decode with `projection_kernel = false`, 13.6 tok/s on 64 real
+subagent turns at 44–77K tokens — against 2.0x at block 4 without the kernel
+(27.1 against 13.6 tok/s; 1.83x at block 3). Either way, output with the
+drafter was identical to plain decode under the same setting on every turn
+(#118, #148). Measured against the kernel's own drafter-off decode, which is
+slower (see `projection_kernel` above), the same runs are about 2.9x.
 The "~2.4x greedy" figure earlier versions quoted ran an argmax sampler
 through the sampled speculative walk, before the engine reached mlx-vlm's
-greedy branch, and that branch also drafts differently (#87). Block size 4
-measured best on those turns, sampled and greedy: +3–5% decode over block 3,
-with 2 and 6 clearly slower (about 0.8x block 3) and 5 level with 3, its
-interval overlapping 4's (#118). 0 lets the drafter's adaptive policy
-pick the depth. Anything above 5 is clamped, because no larger block has
-paid: block 6 ran 0.8x block 3 on the M5 Pro, and without the attention tile
-6+ verify rows also leave mlx's fused attention kernel. It auto-disables with a
+greedy branch, and that branch also drafts differently (#87). Without the
+projection kernel, block 4 measured best on those turns, sampled and greedy:
++3–5% decode over block 3, with 2 and 6 clearly slower (about 0.8x block 3)
+and 5 level with 3, its interval overlapping 4's (#118); with it, block 5 is
+the faster one. 0 lets the drafter's adaptive policy pick the depth. Anything
+above 5 is clamped: block 6 ran 0.8x block 3 on the M5 Pro without the
+projection kernel, has been measured with it only in an out-of-tree spike, and
+without the attention tile 6+ verify rows also leave mlx's fused attention
+kernel. It auto-disables with a
 warning when the drafter can't serve the configured model. On the prompt-cache
 path of a hybrid model the decode call itself prefills only the generation
 prompt, so the drafter is handed the newest window (2047 positions on the
