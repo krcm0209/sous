@@ -333,6 +333,19 @@ def _check_int8(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> No
     )
 
 
+def _notice_unavailable(arm: Arm, what: str, status: dict | None, out: Callable[..., None]) -> None:
+    """The notice for a setting the arm inherits and the engine reports
+    unavailable; any other state, or no status, prints nothing."""
+    status = status or {}
+    if status.get("state") != "unavailable":
+        return
+    reason = status.get("reason") or "no reason given"
+    out(
+        f"  {arm.label}: {what} unavailable here ({reason}); "
+        "the engine runs stock, as the daemon would"
+    )
+
+
 def _check_tile(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> None:
     """Every arm inherits the attention tile from the user's config and none
     exists to measure it, so unlike int8 there is nothing to fail: where the
@@ -340,16 +353,8 @@ def _check_tile(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> No
     checkpoint with stock attention, and the arm runs the same way after a
     notice. `off`, or no status, is an engine with no tile (the mlx-lm
     backend), not a machine the tile cannot run on: no notice."""
-    if not arm.attention_tile:
-        return
-    status = engine.attention_tile_status or {}
-    if status.get("state") != "unavailable":
-        return
-    reason = status.get("reason") or "no reason given"
-    out(
-        f"  {arm.label}: attention tile unavailable here ({reason}); "
-        "the engine runs stock, as the daemon would"
-    )
+    if arm.attention_tile:
+        _notice_unavailable(arm, "attention tile", engine.attention_tile_status, out)
 
 
 def _check_proj(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> None:
@@ -359,16 +364,8 @@ def _check_proj(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> No
     way after a notice. Its block is unaffected — every drafter arm pins the
     one its label names. `off`, or no status, is the setting switched off or
     an engine without the kernel: no notice."""
-    if not arm.projection_kernel:
-        return
-    status = engine.projection_kernel_status or {}
-    if status.get("state") != "unavailable":
-        return
-    reason = status.get("reason") or "no reason given"
-    out(
-        f"  {arm.label}: projection kernel unavailable here ({reason}); "
-        "the engine runs stock, as the daemon would"
-    )
+    if arm.projection_kernel:
+        _notice_unavailable(arm, "projection kernel", engine.projection_kernel_status, out)
 
 
 def _slug(label: str) -> str:
