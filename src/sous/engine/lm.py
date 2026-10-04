@@ -94,6 +94,7 @@ class LMEngine:
             positions="model",
             int8_status=self.int8_prefill_status,
             tile_status=self.attention_tile_status,
+            proj_status=self.projection_kernel_status,
         )
 
     def _loaded(self) -> tuple:

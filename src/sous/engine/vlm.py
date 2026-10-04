@@ -153,9 +153,9 @@ class VLMEngine:
         self._draft_context = draftctx.enable(self._model, self._draft, self._draft_kind)
         self._speculation = Speculation()
         # Forks on disk, when the factory handed us a directory: built after
-        # the drafter, int8 and the attention tile have settled, since the key
-        # reads them. Tests and sous tune never pass one, so nothing they build
-        # touches ~/.sous.
+        # the drafter, int8, the attention tile and the projection kernel have
+        # settled, since the key reads them. Tests and sous tune never pass
+        # one, so nothing they build touches ~/.sous.
         self.fork_store: ForkStore | None = None
         if fork_dir is not None and prompt_cache:
             try:
@@ -229,6 +229,7 @@ class VLMEngine:
             positions=self.positions,
             int8_status=self.int8_prefill_status,
             tile_status=self.attention_tile_status,
+            proj_status=self.projection_kernel_status,
         )
 
     def _loaded(self) -> tuple:
