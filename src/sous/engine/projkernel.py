@@ -309,14 +309,6 @@ _PROBE_ROW = 3
 _kernel_ok = False
 
 
-def _relative_rms(got: Any, want: Any) -> float:
-    import mlx.core as mx
-
-    g = got.astype(mx.float32)
-    w = want.astype(mx.float32)
-    return float(mx.sqrt(mx.mean((g - w) ** 2)) / mx.sqrt(mx.mean(w**2)))
-
-
 def _kernel_probe() -> str | None:
     """Compile and run every variant and linear count once on eight rows, plus each
     variant on one row alone; None when every output is right, else why not. Every
@@ -348,7 +340,7 @@ def _kernel_probe() -> str | None:
         base = _launch("plain", x, weights)
         mx.eval(base)
         for i, (got, ref) in enumerate(zip(base, refs, strict=True)):
-            error = _relative_rms(got, ref)
+            error = tileattn._rel_rms(got, ref)
             if not error <= REL_RMS_BOUND:
                 return f"linear {i} is off its reference by relative RMS {error:.3g}"
         for kind in VARIANTS:
@@ -718,7 +710,7 @@ def warm_up(model: Any) -> None:
     }
     mx.eval(list(inputs.values()))
     for group in groups:
-        weights = [(m.weight, m.scales, m.biases) for m in group]
+        weights = [_weights(m) for m in group]
         x = inputs[_in_features(group[0])]
         mx.eval([mma(x[:, :t], weights) for t in range(1, MAX_ROWS + 1)])
 
@@ -731,7 +723,7 @@ def _stock_distance(got: Any, want: Any) -> float:
 
     if not mx.all(mx.isfinite(got)).item():
         return float("inf")
-    return _relative_rms(got, want)
+    return tileattn._rel_rms(got, want)
 
 
 def _check_group(group: tuple[Any, ...], names: list[str], key: Any) -> str | None:
@@ -741,7 +733,7 @@ def _check_group(group: tuple[Any, ...], names: list[str], key: Any) -> str | No
     the same way on every call), and a NaN row leaves the others untouched."""
     import mlx.core as mx
 
-    weights = [(m.weight, m.scales, m.biases) for m in group]
+    weights = [_weights(m) for m in group]
     x = mx.random.normal((1, MAX_ROWS, _in_features(group[0])), key=key).astype(mx.bfloat16)
     nan = mx.array(float("nan"), dtype=mx.bfloat16)
     x_nan = mx.where(mx.arange(MAX_ROWS)[None, :, None] == _NAN_ROW, nan, x)
@@ -794,9 +786,7 @@ def _probe_steps(root: Any) -> str | None:
     # fused, then down) against the plain MLP one row at a time, as decode
     # calls it. Its rows must be identical, which is what greedy parity rests on.
     mlp = full.mlp
-    verifier = importlib.import_module(
-        "mlx_vlm.models.qwen3_5.speculative_verifier"
-    ).Qwen3_5BatchInvariantForward()
+    verifier = _verifier_class()()
     x = mx.random.normal((1, _PROBE_ROWS, _in_features(mlp.gate_proj)), key=mx.random.key(0))
     x = x.astype(mx.bfloat16)
     mx.eval(x)
