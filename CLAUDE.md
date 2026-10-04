@@ -161,8 +161,8 @@ goal.
   on disk written by a build with wrong KV would survive a restart, which is
   why the fork store's identity key hashes the engine sources
   (`forkstore.engine_epoch`: vlm.py, lm.py, int8prefill.py, tileattn.py,
-  kernels/*.metal and *.h) beside the versions, the GPU and the weights
-  snapshot — any
+  projkernel.py, kernels/*.metal and *.h) beside the versions, the GPU and
+  the weights snapshot — any
   change to what a token id produces invalidates every file; `rm -rf
   ~/.sous/forks` is the manual eraser.
 - Prompt-cache per-turn gauges (`promptcache.TURN_GAUGES`, reset by
@@ -411,6 +411,133 @@ goal.
   monkeypatch, monkeypatch S (never IOKit) and swap the plain-mlx stand-in
   in for `tileattn.tile`; the `nax` tests skip on
   `tileattn.availability()`, never int8's.
+- `engine/projkernel.py` serves the target model's small-row quantized
+  projections from one simdgroup-matrix MMA kernel
+  (`kernels/projection_mma.metal` and `.h`: plain, staged and group-sums
+  bodies split at `// STAGED` and `// GROUP_SUMS`; no MPP and no `nax.h`,
+  so it compiles on any Metal GPU and CI runs its arithmetic tests): every
+  exact-verifier projection and the verify head, and every target call of
+  1–8 rows outside the verifier — one-row decode, a prefill's last chunk of
+  ≤ 8 rows and the one-row forward that ends every prefill segment, and the
+  sampled DFlash drafter's call of the target's shared `lm_head`. Greedy
+  parity with the drafter on or off holds only because the kernel's rows
+  are bitwise independent of the row count T and of which linears share a
+  dispatch: weights dequantize exactly (`as_type<half2>(nibble |
+  0x64006400) - 1024`) against bf16 activations widened to fp32, so every
+  product is exact; each 8×8×8 `simdgroup_multiply_accumulate` sums in a
+  fixed order in fp32; each quant group's epilogue is
+  `acc = fma(dot, scale, acc); acc = fma(sum_x, bias, acc)`; the four K
+  partials reduce as `sk0 + sk1 + sk2 + sk3`; rows ≥ T are zeroed with
+  their x pointers clamped; each tile serves exactly one linear; and the
+  variant (plain, staged, staged over presummed x) depends only on K and
+  the summed N of the call's linears, never on T, the three being bitwise
+  equal. That is why a fused verify group (q+k+v, gate+up, qkv+z+b+a)
+  equals the same projections decoded one at a time. F = 4, NSG = 1,
+  KS = 4, GB = 4 (staged), CH = 1, SPLITS = 1, PF = 1 and SBV = 1 are
+  frozen: another KS, or CH or SPLITS above 1, changes the summation order
+  and the bits. Two hooks, each a `functools.wraps` wrapper carrying
+  `_HOOK_MARK`, installed once per process on the first activation and
+  never removed (int8's three wrappers carry `wraps` too, so every source
+  pin follows `__wrapped__` to mlx's and mlx-vlm's own code whatever is
+  wrapped on top): hook 1 wraps `Qwen3_5BatchInvariantForward._linear` and
+  `_linears` on the class and routes when the flag is set, every linear in
+  the call is tagged and x is bf16 with ndim 3, cutting a call of more than
+  8 rows (block 0, the drafter's own policy, verifies up to 16) along T
+  into runs of ≤ 8, exact because the kernel is T-invariant; hook 2 wraps
+  `nn.QuantizedLinear.__call__` and routes when the flag is set, the module
+  is tagged, x is bf16 and its rows (the product of the leading
+  dimensions) are 1–8. Anything else falls through to what was wrapped,
+  and both reach the kernel through `projkernel.mma`, looked up per call.
+  The Gemma4, NemotronH and Qwen4Exp verifiers subclass
+  `Qwen3_5BatchInvariantForward` and inherit hook 1, so only the tag keeps
+  them stock. Tags (`_TAG`, set with `object.__setattr__` so they stay out
+  of mlx's parameter tree) go on every `QuantizedLinear` of the loaded
+  target's language model, `lm_head` included (497 on the default 27B);
+  the drafter's own linears are never tagged, and the greedy drafter's
+  head argmax (`quantized_argmax`) stays stock, since it shapes proposals
+  only. int8 prefill wraps the same `__call__` for its own tags at ≥ 128
+  rows on `shape[-2]`: the row ranges are disjoint and each wrapper falls
+  through to what it wrapped, so install order does not matter — keep the
+  two gates disjoint if either moves. The flag `_active` is a plain int, 1
+  or 0, never a model reference: the first statement of every `enable()`
+  clears it, only an `active` result sets it, the probe raises it only
+  while it runs, and `VLMEngine.unload()` clears it through
+  `projkernel.clear()` beside `tileattn.clear()`. A failed probe untags the
+  model it was given; tags left on an unloaded model are inert while the
+  flag is 0, and holding a reference to untag it would keep its weights
+  alive. `enable()` checks, in order: the config (`off`); the attention
+  tile (`active`, else the tile's reason or `attention tile off` — the
+  kernel rides on the tile, inheriting its M5 Pro gate and, with a drafter,
+  exact verify attention); the model (`qwen3_5`, every language-model
+  `QuantizedLinear` affine 4-bit, group 64, bf16 scales and biases, no
+  `bias`, and at least 8 scale values — mlx binds a kernel input of fewer
+  elements `constant`, which the bodies' device pointers cannot compile
+  against); the drafter's kind (none or `dflash`); a target that does not
+  define `speculative_verify_dflash_hidden`, which would send greedy
+  verify's tokens through `quantized_argmax`, past both hooks, and which a
+  qwen3_5 target gains only through mlx-vlm drift; the source pins
+  (`VALIDATED_PROJ_SOURCES`: the verifier's `_linear`, `_linears`,
+  `_feed_forward`, `_gated_delta`, `_layer`, `_model` and `__call__`,
+  `Qwen3_5DecoderLayer`, `Qwen3_5MLP` and `Qwen3_5GatedDeltaNet`,
+  `generate_step`, `nn.QuantizedLinear.__call__`, `_dflash_verify`,
+  `_dflash_verify_greedy` and `_dflash_rounds`) and
+  `verifyattn.VALIDATED_MLX`; a warm-up that
+  compiles every pipeline the model's dispatch keys need at T = 1..8; then
+  the tags, the hooks and the probe, on the `sous-model-load` thread. The
+  probe drives layer 3's verifier `_feed_forward` at T = 5 and the same
+  layer's plain modules at T = 1 through both hooks (`calls` must show
+  both) and requires the rows `array_equal`; then, on real linears (layer
+  3's q+k+v, o and gate+up+down, layer 0's qkv+z+b+a and out_proj,
+  `lm_head`), every row at T = 1..8 equal to its one-row single, every
+  fused group equal to its singles, relative RMS within 1e-2 of stock
+  `quantized_matmul` (parity cannot catch a kernel that is wrong the same
+  way on both paths) and a NaN in one row leaving the others alone. It
+  restores `calls`, leaves the flag 0 and calls `mx.clear_cache()` in
+  `finally`. A refusal at the tile, model or drafter-kind step only says
+  the kernel does not apply to this load: one INFO line, `projection kernel
+  unavailable: <reason>`. A target defining
+  `speculative_verify_dflash_hidden`, pin drift, a compile or probe failure
+  and any exception (logged with its traceback) say it should have run: one
+  `warnings.warn`, `sous: projection kernel unavailable (…)`. Both are
+  `unavailable`; `off` is never a refusal. Parity still rests on one thing
+  the probe cannot cover: drafter-off greedy takes its argmax over bf16
+  `logits − logsumexp(logits)` (`generate/ar.py`) and greedy verify over
+  raw logits (`sampler(logits)` in `dflash.py`), so the two can differ only
+  where the subtraction rounds the top two logits into a tie, in a flat row
+  whose top logit sits below half the logsumexp. Stock and the tile rest on
+  the same; parity runs on real turns are its only witness, and a
+  divergence is read at the first differing token's top-2 logit gap before
+  the kernel is blamed. Because the kernel makes a deeper block pay, an
+  unset `[model].speculative_block_size` (`speculative_block_explicit`
+  false) resolves in `VLMEngine.__init__` to `SPECULATIVE_BLOCK_KERNEL` = 5
+  when a drafter loaded and the kernel is `active`, before
+  `_pin_block_size`; an explicit value always wins and 0 keeps its meaning.
+  `sous tune` cannot load a model to ask, so `arms.resolve_block` puts
+  `projkernel.static_reason` to the checkpoints it described, and `_arm`
+  marks every drafter arm's block explicit, or every arm would measure 5.
+  The engine constructors default it off
+  (`VLMEngine(projection_kernel=False, draft_block_explicit=True)`); only
+  `default_engine_factory` hands them the config. Nothing is logged per
+  turn; `projkernel.calls` (`verify_kernel`, `verify_split`,
+  `plain_kernel`, `declined`) counts every path for the tests and for
+  harnesses, and the load line carries `projection_kernel=` and, with a
+  drafter, `draft_block=`. The fork key records `proj` (`active`, else
+  `off`) and `projkernel.py` is in `_EPOCH_FILES`: the one-row forward that
+  ends every prefill segment, and any tail of ≤ 8 rows, runs on the
+  kernel, so stored KV and GDN state depend on it, while routing never
+  depends on whether a drafter loaded, so the drafter stays out of the
+  key. Every kernel edit, and every change to the pins or `VALIDATED_MLX`,
+  re-runs the exactness tests (`tests/test_projkernel.py`, and `uv run
+  pytest -m model tests/test_projkernel_model.py` on the M5 Pro) and the
+  timing check — the 12 dispatch keys at T = 1..8 against the kernel before
+  the edit, interleaved in one process with an A/A pair for the noise
+  floor, the per-forward sum within ±2%: the bits are the parity contract
+  and the speed is the only reason the kernel exists. Tests install the
+  hooks through `pfx.guard_proj_state` and `pfx.hooked`, swap the plain-mlx
+  stand-in in for `projkernel.mma`, and skip the kernel's own tests on
+  `projkernel.kernel_available()`, which compiles and runs every variant
+  once and remembers success only: the lane map was probed on Apple GPUs,
+  so a GPU where it differs skips rather than fails.
 - `engine/draftctx.py` hands the DFlash drafter the prompt's hidden states on
   the hybrid prompt-cache path (#142). mlx-vlm's round loop
   (`speculative/dflash.py:_dflash_rounds`) gives the drafter, on its first

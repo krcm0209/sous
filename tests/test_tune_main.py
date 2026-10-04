@@ -132,6 +132,7 @@ def _suite(grades, seconds, seen):
                     int8_prefill=arm.int8_prefill,
                     greedy=arm.greedy,
                     attention_tile=arm.attention_tile,
+                    projection_kernel=arm.projection_kernel,
                     window=arm.window,
                     state="done",
                     outcome="completed",
@@ -192,7 +193,10 @@ def _deps(
 def _cfg(tmp_path, **over):
     p = tmp_path / "config.toml"
     p.write_text("# mine\n[model]\nspeculative_block_size = 3\n")
+    # The file sets the block, which load_config records as explicit: no test
+    # built on it moves with how the daemon would resolve an unset one.
     over.setdefault("speculative_block_size", 3)
+    over.setdefault("speculative_block_explicit", True)
     return SousConfig(data_dir=tmp_path, config_path=p, **over)
 
 
@@ -556,6 +560,7 @@ def test_a_stopped_suite_still_reports_the_runs_it_recorded(tmp_path, capsys):
             int8_prefill=arm.int8_prefill,
             greedy=arm.greedy,
             attention_tile=arm.attention_tile,
+            projection_kernel=arm.projection_kernel,
             window=arm.window,
             state="done",
             outcome="completed",
@@ -647,3 +652,74 @@ def test_progress_lines_are_flushed_as_they_are_printed(monkeypatch):
     monkeypatch.setattr("builtins.print", recording_print)
     _print_now("x")
     assert recorded == [{"flush": True}]
+
+
+def _static_check(monkeypatch, reason=None):
+    """Stand in for the projection kernel's static check: the real one reads
+    this machine's GPU, and these tests must not move with it."""
+    from sous.engine import projkernel
+
+    asked = []
+
+    def static_reason(config, model_config, drafter_kind):
+        asked.append((config.model_id, model_config, drafter_kind))
+        return reason
+
+    monkeypatch.setattr(projkernel, "static_reason", static_reason)
+    return asked
+
+
+def _unset(tmp_path):
+    """A config file that leaves the block to the daemon."""
+    p = tmp_path / "config.toml"
+    p.write_text("# mine\n[model]\n")
+    return SousConfig(data_dir=tmp_path, config_path=p)
+
+
+B4 = "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @4"
+B5 = "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @5"
+
+
+def test_an_unset_block_is_measured_as_the_block_the_daemon_would_run(
+    tmp_path, capsys, monkeypatch
+):
+    asked = _static_check(monkeypatch)
+    deps, _ = _deps(tmp_path, scores={B5: 20.0}, cached=(M, D, N))
+    assert main(_args(), config=_unset(tmp_path), **deps) == 0
+    out = capsys.readouterr().out
+    assert asked == [(M, fx.qwen_27b(), "dflash")]
+    assert "speculative_block_size is unset and the projection kernel can run here" in out
+    choice = out.split("## Choice", 1)[1]
+    assert f"  {B5}" in choice.splitlines()
+    assert "the current arm is already the fastest measured" in choice
+    assert "no config change" in choice and "Apply these changes" not in out
+    assert (tmp_path / "config.toml").read_text() == "# mine\n[model]\n"
+
+
+def test_a_block_faster_than_the_resolved_one_is_written_explicitly(tmp_path, capsys, monkeypatch):
+    _static_check(monkeypatch)
+    deps, _ = _deps(tmp_path, scores={B4: 20.0}, cached=(M, D, N), answers=("y",))
+    assert main(_args(), config=_unset(tmp_path), **deps) == 0
+    assert "+speculative_block_size = 4" in capsys.readouterr().out
+    written = load_config(tmp_path / "config.toml")
+    assert written.speculative_block_size == 4 and written.speculative_block_explicit is True
+
+
+def test_an_unset_block_stays_at_the_default_where_the_kernel_cannot_run(
+    tmp_path, capsys, monkeypatch
+):
+    _static_check(monkeypatch, reason="attention tile off")
+    deps, _ = _deps(tmp_path, scores={B4: 20.0}, cached=(M, D, N))
+    assert main(_args(), config=_unset(tmp_path), **deps) == 0
+    out = capsys.readouterr().out
+    assert "projection kernel can run here" not in out
+    choice = out.split("## Choice", 1)[1]
+    assert f"  {B4}" in choice.splitlines() and "no config change" in choice
+
+
+def test_a_block_the_file_sets_is_never_resolved(tmp_path, capsys, monkeypatch):
+    asked = _static_check(monkeypatch)
+    deps, _ = _deps(tmp_path, scores={CUR: 20.0}, cached=(M, D, N))
+    assert main(_args(), config=_cfg(tmp_path), **deps) == 0
+    assert asked == []
+    assert "no config change" in capsys.readouterr().out.split("## Choice", 1)[1]

@@ -96,21 +96,30 @@ def test_vlm_unload_turns_the_attention_tile_off(monkeypatch):
     assert tileattn._active_splits == 0
 
 
+def test_vlm_unload_turns_the_projection_kernel_off(monkeypatch):
+    from sous.engine import projkernel
+
+    monkeypatch.setattr(projkernel, "_active", 1)
+    _unloaded_vlm().unload()
+    assert projkernel._active == 0
+
+
 class _ContextThatFailsToClose:
     def close(self) -> None:
         raise RuntimeError("close failed")
 
 
 @pytest.mark.parametrize("failing", ["prompt cache", "draft context"])
-def test_vlm_unload_turns_the_attention_tile_off_before_anything_that_can_raise(
+def test_vlm_unload_clears_the_tile_and_projection_kernel_before_anything_can_raise(
     monkeypatch, failing
 ):
-    from sous.engine import tileattn
+    from sous.engine import projkernel, tileattn
 
     def fails(*args, **kwargs):
         raise RuntimeError("reset failed")
 
     monkeypatch.setattr(tileattn, "_active_splits", 20)
+    monkeypatch.setattr(projkernel, "_active", 1)
     engine = _unloaded_vlm()
     if failing == "prompt cache":
         monkeypatch.setattr(engine, "reset_prompt_cache", fails)
@@ -119,6 +128,7 @@ def test_vlm_unload_turns_the_attention_tile_off_before_anything_that_can_raise(
     with pytest.raises(RuntimeError, match="failed"):
         engine.unload()
     assert tileattn._active_splits == 0
+    assert projkernel._active == 0
 
 
 def test_lm_headroom_never_raises_without_mlx(monkeypatch):

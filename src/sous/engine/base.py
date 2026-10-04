@@ -246,10 +246,15 @@ def _default_factory(
     prompt_cache: bool = True,
     draft_id: str = "",
     draft_block_size: int = 0,
+    # False only from the config, for a block the user left unset: the VLM
+    # engine resolves that one at load. A direct caller's block is taken as
+    # given.
+    draft_block_explicit: bool = True,
     cache_budget: int | None = None,
     reserve_tokens: int = 0,
     int8_prefill: bool = False,
     attention_tile: bool = False,
+    projection_kernel: bool = False,
     fork_dir: Path | None = None,
     fork_budget: int | None = None,
 ) -> Engine:
@@ -307,17 +312,19 @@ def _default_factory(
             prompt_cache=prompt_cache,
             draft_id=draft_id,
             draft_block_size=draft_block_size,
+            draft_block_explicit=draft_block_explicit,
             cache_budget=cache_budget,
             reserve_bytes=reserve_bytes,
             int8_prefill=int8_prefill,
             attention_tile=attention_tile,
+            projection_kernel=projection_kernel,
             fork_dir=fork_dir,
             fork_budget=fork_budget,
             weights_identity=weights,
         )
-    # The drafter settings and the attention tile stop here: speculative
-    # decoding and the tile's hooks are mlx-vlm paths, and the mlx-lm backend
-    # has no parameter for either.
+    # The drafter settings, the attention tile and the projection kernel stop
+    # here: speculative decoding and both kernels' hooks are mlx-vlm paths,
+    # and the mlx-lm backend has no parameter for any of them.
     from sous.engine import lm
 
     return lm.LMEngine(
@@ -355,12 +362,14 @@ def default_engine_factory(config: SousConfig, *, forks: bool = True) -> Callabl
         config.prompt_cache,
         draft_id=config.speculative_draft_id,
         draft_block_size=config.speculative_block_size,
+        draft_block_explicit=config.speculative_block_explicit,
         cache_budget=(
             None if config.prompt_cache_gb is None else int(config.prompt_cache_gb * (1 << 30))
         ),
         reserve_tokens=config.max_context_tokens,
         int8_prefill=config.int8_prefill,
         attention_tile=config.attention_tile,
+        projection_kernel=config.projection_kernel,
         fork_dir=fork_dir,
         fork_budget=fork_budget,
     )
@@ -407,6 +416,20 @@ class ManagedEngine:
         # Optional on purpose: the VLM backend reports whether the tile serves
         # this load, the LM backend reports it off, and fakes have neither.
         return getattr(self._inner, "attention_tile_status", None)
+
+    @property
+    def projection_kernel_status(self) -> dict | None:
+        # Optional on purpose, like attention_tile_status: the VLM backend
+        # reports whether the kernel serves this load, the LM backend reports
+        # it off, and fakes have neither.
+        return getattr(self._inner, "projection_kernel_status", None)
+
+    @property
+    def draft_block(self) -> int | None:
+        """The verify block the drafter runs with, as the engine resolved it
+        at load (0 is the drafter's own policy): None without a drafter, and
+        from a backend or a fake that has no notion of one."""
+        return getattr(self._inner, "draft_block", None)
 
     @property
     def positions(self) -> str | None:
@@ -697,6 +720,15 @@ class EngineManager:
                     f" attention_tile_splits={tile['splits']}"
                     f" attention_tile_probe_s={tile['probe_seconds']}"
                 )
+        proj = engine.projection_kernel_status
+        if proj is not None:
+            line += f" projection_kernel={proj['state']}"
+            if proj["state"] == "active":
+                line += f" projection_kernel_probe_s={proj['probe_seconds']}"
+        # Resolved at load, so the config alone cannot say which block runs:
+        # an unset one is 5 where the kernel is active and 4 elsewhere.
+        if engine.draft_block is not None:
+            line += f" draft_block={engine.draft_block}"
         _logger.info(line)
         return engine
 
@@ -1016,6 +1048,14 @@ class EngineManager:
                 tile = self._engine.attention_tile_status
                 if tile is not None:
                     out["attention_tile"] = {"state": tile["state"], "reason": tile["reason"]}
+                proj = self._engine.projection_kernel_status
+                if proj is not None:
+                    out["projection_kernel"] = {"state": proj["state"], "reason": proj["reason"]}
+                # The block the drafter runs, as resolved at load: present
+                # whenever the backend knows drafters, None while it runs
+                # without one.
+                if self._engine.drafter is not None:
+                    out["draft_block"] = self._engine.draft_block
                 # Which side supplies the rotary positions behind a warm
                 # cache: the load line says it once, this says it for as long
                 # as the model is resident.

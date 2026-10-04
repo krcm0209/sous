@@ -1,3 +1,4 @@
+import dataclasses
 from datetime import date
 
 from sous.config import MIN_CONTEXT_TOKENS
@@ -182,3 +183,11 @@ def test_a_lowered_window_says_what_it_costs_the_prompt_cache():
         working_set_bytes=fx.M2_AIR_WORKING_SET,
     )
     assert f.fits and "prompt-cache" in f.detail
+
+
+def test_describe_keeps_the_config_it_read_for_checks_that_read_more_of_it():
+    cp = describe("t", config_fn=lambda m: fx.qwen_27b(), size_fn=lambda m: 1)
+    assert cp.config == fx.qwen_27b()
+    # Equality and the hash stay about the summarised fields.
+    assert cp == dataclasses.replace(cp, config={})
+    assert hash(cp) == hash(dataclasses.replace(cp, config={}))

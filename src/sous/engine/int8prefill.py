@@ -27,7 +27,8 @@ logger = logging.getLogger("sous.engine.int8prefill")
 GROUP = 64
 # Below this many rows the Stage-A pass costs more than the faster GEMM saves
 # (crossover measured between 4 and 8 rows; 1.6x by 128). Set well above the
-# crossover so decode (1 row) and speculative verify (<= 6 rows) never route.
+# crossover so decode (1 row) and a speculative verify (one drafted block, at
+# most 16 rows under the drafter's own policy) never route.
 MIN_ROWS = 128
 # The PR's best Q4 tile: BM = 2 * 16 * WM rows, BN = 32 * WN columns, 32 * WM * WN
 # threads per threadgroup. The seven tile variants are within ~3% of each other.
@@ -377,6 +378,9 @@ def _wrap_mlp(cls: type) -> None:
 
     orig = cls.__call__
 
+    # wraps() keeps the original reachable through __wrapped__: source pins taken
+    # with inspect.getsource follow it, and would otherwise hash this wrapper.
+    @functools.wraps(orig)
     def call(self: Any, x: Any, *args: Any, **kwargs: Any) -> Any:
         if (
             _rows_ok(x)
@@ -396,6 +400,7 @@ def _wrap_mlp(cls: type) -> None:
 def _wrap_gdn(cls: type) -> None:
     orig = cls.__call__
 
+    @functools.wraps(orig)
     def call(self: Any, inputs: Any, *args: Any, **kwargs: Any) -> Any:
         share = [
             proj
@@ -421,6 +426,7 @@ def _wrap_quantized_linear() -> None:
 
     orig = nn.QuantizedLinear.__call__
 
+    @functools.wraps(orig)
     def call(self: Any, x: Any) -> Any:
         if _tagged(self) and _rows_ok(x):
             handed = getattr(self, _STAGE, None)
@@ -430,7 +436,7 @@ def _wrap_quantized_linear() -> None:
             return linear_int8(self, x, stage)
         return orig(self, x)
 
-    nn.QuantizedLinear.__call__ = call
+    nn.QuantizedLinear.__call__ = call  # ty: ignore[invalid-assignment]
 
 
 def install_wrappers(classes: Iterable[tuple[type, str]] | None = None) -> None:

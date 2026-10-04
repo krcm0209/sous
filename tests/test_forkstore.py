@@ -135,7 +135,7 @@ def test_engine_epoch_is_stable_and_16_hex(monkeypatch):
 def test_engine_epoch_changes_when_a_source_byte_changes(monkeypatch, tmp_path: Path):
     src = tmp_path / "engine"
     (src / "kernels").mkdir(parents=True)
-    for name in ("vlm.py", "lm.py", "int8prefill.py", "tileattn.py"):
+    for name in ("vlm.py", "lm.py", "int8prefill.py", "tileattn.py", "projkernel.py"):
         (src / name).write_text(f"# {name}\n")
     (src / "kernels" / "a.metal").write_text("kernel\n")
     (src / "kernels" / "common.h").write_text("header\n")
@@ -153,11 +153,19 @@ def test_engine_epoch_changes_when_a_source_byte_changes(monkeypatch, tmp_path: 
     (src / "tileattn.py").write_text("# tileattn.py changed\n")
     forkstore.engine_epoch.cache_clear()
     assert engine_epoch() != changed  # the tile's schedule decides which kernel runs
+    changed = engine_epoch()
+    (src / "projkernel.py").write_text("# projkernel.py changed\n")
+    forkstore.engine_epoch.cache_clear()
+    assert engine_epoch() != changed  # its routing decides which calls the kernel serves
     forkstore.engine_epoch.cache_clear()
 
 
 def test_the_attention_tile_module_is_an_epoch_file():
     assert "tileattn.py" in forkstore._EPOCH_FILES
+
+
+def test_the_projection_kernel_module_is_an_epoch_file():
+    assert "projkernel.py" in forkstore._EPOCH_FILES
 
 
 def test_weights_identity_is_the_snapshot_sha_for_a_hub_layout(tmp_path: Path):
@@ -1406,12 +1414,14 @@ def test_fork_key_fields_carry_everything_that_changes_the_kv(monkeypatch):
         positions="engine",
         int8_status={"state": "active", "reason": None, "routed": 336},
         tile_status={"state": "active", "reason": None, "splits": 20, "probe_seconds": 0.43},
+        proj_status={"state": "active", "reason": None, "probe_seconds": 0.37},
     )
     assert f["backend"] == "vlm" and f["backend_version"] == "0.7.1"
     assert f["mlx"] and f["weights"] == "sha" and f["gpu"] == "applegpu_g16s"
     assert f["epoch"] == engine_epoch() and f["layout"] == str(FORK_LAYOUT)
     assert f["positions"] == "engine" and f["int8"] == "active:336"
     assert f["tile"] == "active:20" and f["os"] == forkstore.os_release()
+    assert f["proj"] == "active"
     assert f["env"] == "MLX_ENABLE_TF32=1"
     off = fork_key_fields(
         backend="lm",
@@ -1421,9 +1431,11 @@ def test_fork_key_fields_carry_everything_that_changes_the_kv(monkeypatch):
         positions="model",
         int8_status={"state": "unavailable", "reason": "no tensor units", "routed": 0},
         tile_status={"state": "off", "reason": None},
+        proj_status={"state": "off", "reason": None},
     )
     assert off["int8"] == "off"  # off and unavailable ran the same numerics
     assert off["tile"] == "off" and off["os"] == forkstore.os_release()
+    assert off["proj"] == "off"
     monkeypatch.delenv("MLX_ENABLE_TF32")
     assert "env" not in fork_key_fields(
         backend="lm",
@@ -1433,15 +1445,18 @@ def test_fork_key_fields_carry_everything_that_changes_the_kv(monkeypatch):
         positions="model",
         int8_status={"state": "off", "reason": None, "routed": 0},
         tile_status={"state": "off", "reason": None},
+        proj_status={"state": "off", "reason": None},
     )
 
 
 _TILE_OFF = {"state": "off", "reason": None, "splits": None, "probe_seconds": None}
 _TILE_20 = {"state": "active", "reason": None, "splits": 20, "probe_seconds": 0.43}
 _INT8_OFF = {"state": "off", "reason": None, "routed": 0}
+_PROJ_OFF = {"state": "off", "reason": None, "probe_seconds": None}
+_PROJ_ON = {"state": "active", "reason": None, "probe_seconds": 0.37}
 
 
-def _vlm_fields(*, tile=_TILE_OFF, int8=_INT8_OFF) -> dict[str, str]:
+def _vlm_fields(*, tile=_TILE_OFF, int8=_INT8_OFF, proj=_PROJ_OFF) -> dict[str, str]:
     from sous.engine.forkstore import fork_key_fields
 
     return fork_key_fields(
@@ -1452,6 +1467,7 @@ def _vlm_fields(*, tile=_TILE_OFF, int8=_INT8_OFF) -> dict[str, str]:
         positions="engine",
         int8_status=int8,
         tile_status=tile,
+        proj_status=proj,
     )
 
 
@@ -1476,12 +1492,25 @@ def test_the_key_ignores_what_a_tile_status_only_reports():
     assert key_name(_vlm_fields(tile=mac)) == key_name(_vlm_fields(tile=probe))
 
 
+def test_the_key_moves_with_the_projection_kernel():
+    """A store written with the kernel is never restored without it. An
+    unavailable kernel ran off's numerics, so it shares off's key, and the
+    probe's time and the reason are reports, not numerics."""
+    unavailable = {"state": "unavailable", "reason": "attention tile off", "probe_seconds": None}
+    assert _vlm_fields(proj=_PROJ_ON)["proj"] == "active"
+    assert _vlm_fields(proj=unavailable)["proj"] == "off"
+    assert key_name(_vlm_fields(proj=_PROJ_ON)) != key_name(_vlm_fields())
+    assert key_name(_vlm_fields(proj=unavailable)) == key_name(_vlm_fields())
+    later = {**_PROJ_ON, "reason": "noted", "probe_seconds": 1.2}
+    assert key_name(_vlm_fields(proj=later)) == key_name(_vlm_fields(proj=_PROJ_ON))
+
+
 def test_the_os_build_is_in_every_key(monkeypatch):
     """Stock mlx-vlm already runs runtime-compiled Metal (its gated-delta
     kernel, mx.compile fusions, mlx's JIT kernels), so a macOS update can
     move a stock store's bits too."""
     int8 = {"state": "active", "reason": None, "routed": 336}
-    variants = [{}, {"int8": int8}, {"tile": _TILE_20}]
+    variants = [{}, {"int8": int8}, {"tile": _TILE_20}, {"proj": _PROJ_ON}]
     for variant in variants:
         assert _vlm_fields(**variant)["os"] == forkstore.os_release()
     before = [key_name(_vlm_fields(**variant)) for variant in variants]

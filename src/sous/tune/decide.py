@@ -54,7 +54,16 @@ def _changes(user: SousConfig, arm: Arm, *, full: bool = False) -> dict[str, dic
         model["id"] = arm.model_id
     if arm.drafter_id != user.speculative_draft_id:
         model["speculative_draft_id"] = arm.drafter_id
-    if arm.drafter_id and arm.block_size != user.speculative_block_size:
+    # `user` arrives with its block resolved (arms.resolve_block): an unset
+    # block already reads as the one the daemon runs for the user's own model
+    # and drafter, so a winner at that block writes nothing. For another pair
+    # an unset block could resolve differently at load, so a drafter arm that
+    # changes the pair writes its block whatever the number.
+    other_pair = (arm.model_id, arm.drafter_id) != (user.model_id, user.speculative_draft_id)
+    if arm.drafter_id and (
+        arm.block_size != user.speculative_block_size
+        or (other_pair and not user.speculative_block_explicit)
+    ):
         model["speculative_block_size"] = arm.block_size
     # The arm's own fit, not the model's shared measurement window: that one
     # reserves memory for the heaviest drafter, which this arm may not load.
@@ -148,7 +157,7 @@ def quick_decision(user: SousConfig, arms: list[Arm], rows: list[BenchRow]) -> Q
 @dataclass(frozen=True)
 class ArmSummary:
     label: str
-    key: tuple[str, str, int, bool, bool, bool]
+    key: tuple[str, str, int, bool, bool, bool, bool]
     model_id: str
     runs: int
     completed: int

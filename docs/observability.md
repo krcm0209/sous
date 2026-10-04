@@ -199,7 +199,20 @@ means `[model].attention_tile = false` or the mlx-lm backend, and
 `unavailable` a load the tile cannot serve — the status document's
 `attention_tile` block carries the reason; the log has it as one INFO line
 where the tile does not apply to the Mac, the model or the drafter, and as
-a `WARNING py.warnings` line where it should have run and did not). One
+a `WARNING py.warnings` line where it should have run and did not), then
+`projection_kernel=active|unavailable|off` (whether the target's quantized
+projections for speculative verify and for every call of up to eight rows —
+decode and short prefill tails — run on the small-row projection kernel, with
+`projection_kernel_probe_s=` when they do; `off` means
+`[model].projection_kernel = false` or the mlx-lm backend, and `unavailable`
+a load the kernel cannot serve, every load whose attention tile is not
+`active` included, since the kernel rides on the tile — the status document's
+`projection_kernel` block carries the reason, and the log splits INFO and
+`WARNING` the way it does for the tile), and, whenever a drafter loaded,
+`draft_block=` (the verify block the engine pinned: the configured
+`speculative_block_size`, or for an unset one 5 where the projection kernel
+is active and 4 elsewhere, 0 being the drafter's own policy; the status
+document's engine block carries it as `draft_block`). One
 more line names the Anthropic tool *types* a turn dropped, when any.
 Each forwarded request logs one line too: `upstream`, method, path, the
 model id when the body named one, the upstream's status, and seconds to

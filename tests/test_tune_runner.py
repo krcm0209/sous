@@ -118,7 +118,7 @@ def test_run_one_grades_a_solved_task_and_reads_every_metric_from_the_run(tmp_pa
     assert Path(run.transcript_path).is_file()
     written = (tmp_path / "s" / "project" / "rpn.py").read_text()
     assert written == (task.solution / "rpn.py").read_text()
-    assert run.key == (*_arm(tmp_path).key, False, False, True)
+    assert run.key == (*_arm(tmp_path).key, False, False, True, True)
 
 
 def test_a_command_outside_the_allowlist_is_denied_and_counted(tmp_path):
@@ -521,6 +521,7 @@ def test_suite_runs_round_trip_through_dicts(tmp_path):
         int8_prefill=False,
         greedy=True,
         attention_tile=False,
+        projection_kernel=False,
         window=8192,
         state="done",
         outcome="completed",
@@ -536,7 +537,7 @@ def test_suite_runs_round_trip_through_dicts(tmp_path):
         transcript_path=None,
     )
     assert SuiteRun.from_dict(json.loads(json.dumps(run.as_dict()))) == run
-    assert run.key == ("org/m", "", 0, False, True, False)
+    assert run.key == ("org/m", "", 0, False, True, False, False)
 
 
 def test_estimate_seconds_scales_with_the_measured_speeds(tmp_path):
@@ -600,6 +601,7 @@ def test_a_row_written_before_the_attention_tile_existed_reads_as_stock(tmp_path
         int8_prefill=False,
         greedy=False,
         attention_tile=True,
+        projection_kernel=True,
         window=8192,
         state="done",
         outcome="completed",
@@ -620,7 +622,7 @@ def test_a_row_written_before_the_attention_tile_existed_reads_as_stock(tmp_path
     # The arm inherits the tile's default, so a resume runs the task again
     # rather than counting the stock row toward the tile arm.
     assert arm.attention_tile is True
-    assert old.key == (*arm.key, False, False, False)
+    assert old.key == (*arm.key, False, False, False, True)
     assert old.key != arm.suite_key
 
 
@@ -731,3 +733,121 @@ def test_the_tile_notice_is_only_for_an_engine_that_reports_it_unavailable(tmp_p
         )
         assert len(outcome.runs) == 1 and outcome.error is None, name
         assert [line for line in lines if "attention tile" in line] == expected, name
+
+
+def test_a_row_written_before_the_projection_kernel_existed_reads_as_stock(tmp_path):
+    arm = _arm(tmp_path)
+    row = SuiteRun(
+        task="t",
+        index=0,
+        label="m",
+        model_id="org/m",
+        drafter_id="",
+        block_size=0,
+        int8_prefill=False,
+        greedy=False,
+        attention_tile=True,
+        projection_kernel=True,
+        window=8192,
+        state="done",
+        outcome="completed",
+        turns=3,
+        seconds=12.5,
+        output_tokens=400,
+        malformed=0,
+        repetitions=0,
+        approvals_denied=0,
+        grade=1.0,
+        grade_detail="1/1",
+        error=None,
+        transcript_path=None,
+    ).as_dict()
+    del row["projection_kernel"]
+    old = SuiteRun.from_dict(row)
+    # No run from before the setting existed went through the kernel, on any
+    # machine: the row is a stock-projection row.
+    assert old.projection_kernel is False and old.attention_tile is True
+    # The arm inherits the kernel's default, so a resume runs the task again
+    # rather than counting the stock row toward the kernel arm.
+    assert arm.projection_kernel is True
+    assert old.key == (*arm.key, False, False, True, False)
+    assert old.key != arm.suite_key
+    del row["attention_tile"]
+    older = SuiteRun.from_dict(row)
+    assert (older.attention_tile, older.projection_kernel) == (False, False)
+
+
+class _ProjUnavailable(FakeEngine):
+    drafter = ""
+    projection_kernel_status = {
+        "state": "unavailable",
+        "reason": "attention tile off",
+        "probe_seconds": None,
+    }
+
+
+def test_an_arm_that_inherits_the_kernel_runs_stock_where_the_engine_cannot_serve_it(tmp_path):
+    """Like the tile, the projection kernel is inherited from the user's
+    config and no arm measures it: an engine that reports it unavailable
+    runs the arm stock after a notice, as the daemon would."""
+    lines = []
+    outcome = run_suite(
+        _arm(tmp_path),
+        [_task()],
+        runs=1,
+        done=set(),
+        record=lambda r: None,
+        scratch=tmp_path / "s",
+        out=lines.append,
+        factory=lambda mid: _ProjUnavailable([FINISH]),
+        python=PYTHON,
+        active_memory=lambda: 0,
+    )
+    assert len(outcome.runs) == 1 and outcome.error is None
+    assert outcome.runs[0].projection_kernel is True
+    assert (
+        "  m: projection kernel unavailable here (attention tile off); "
+        "the engine runs stock, as the daemon would"
+    ) in lines
+
+
+def test_no_kernel_notice_when_it_is_active_off_unreported_or_not_inherited(tmp_path):
+    class Active(FakeEngine):
+        drafter = ""
+        projection_kernel_status = {"state": "active", "reason": None, "probe_seconds": 0.3}
+
+    class Off(FakeEngine):
+        drafter = ""
+        projection_kernel_status = {"state": "off", "reason": None}
+
+    class Silent(FakeEngine):
+        drafter = ""
+
+    arm = _arm(tmp_path)
+    stock = dataclasses.replace(
+        arm,
+        projection_kernel=False,
+        config=dataclasses.replace(arm.config, projection_kernel=False),
+    )
+    for name, case, engine in (
+        ("active", arm, Active),
+        ("off", arm, Off),
+        ("silent", arm, Silent),
+        ("stock", stock, _ProjUnavailable),
+    ):
+        lines = []
+        outcome = run_suite(
+            case,
+            [_task()],
+            runs=1,
+            done=set(),
+            record=lambda r: None,
+            scratch=tmp_path / f"s-{name}",
+            out=lines.append,
+            factory=lambda mid, engine=engine: engine([FINISH]),
+            python=PYTHON,
+            active_memory=lambda: 0,
+        )
+        assert len(outcome.runs) == 1 and outcome.error is None, name
+        assert outcome.runs[0].projection_kernel is case.projection_kernel, name
+        assert not any("projection kernel" in line for line in lines), (name, lines)

@@ -30,6 +30,7 @@ _KNOWN = {
         "speculative_block_size",
         "int8_prefill",
         "attention_tile",
+        "projection_kernel",
     },
 }
 
@@ -85,14 +86,21 @@ class SousConfig:
     # blocks the target verifies in one forward — ~1.8x decode on the default
     # affine-4bit model at short context with the shipped sampling
     # (krcm0209/sous#55, #58); greedy, 2.0x plain greedy decode on real
-    # subagent turns at 44–77K (#118). Empty id disables it. The
+    # subagent turns at 44–77K at block 4 without the projection kernel
+    # (#118), about 2.3x at block 5 with it (#148). Empty id disables it. The
     # drafter must match the target architecture; when it doesn't (or fails to
-    # load), the engine logs and continues without it. Block size 4 measured
-    # best on the M5 Pro on real subagent turns (#118: +3–5% decode over 3;
-    # 2 and 6 ran clearly slower, 5 level with 3); 0 hands the choice back to
-    # the drafter's adaptive policy. Above 5 is clamped (SPECULATIVE_BLOCK_MAX).
+    # load), the engine logs and continues without it. Left unset, the block
+    # is resolved at load: SPECULATIVE_BLOCK_KERNEL where the projection
+    # kernel serves the load, SPECULATIVE_BLOCK_DEFAULT where it does not.
+    # Without the kernel, block size 4 measured best on the M5 Pro on real
+    # subagent turns (#118: +3–5% decode over 3; 2 and 6 ran clearly slower,
+    # 5 level with 3). 0 hands the choice back to the drafter's adaptive
+    # policy. Above 5 is clamped (SPECULATIVE_BLOCK_MAX).
     speculative_draft_id: str = "z-lab/Qwen3.8-27B-DFlash2"
     speculative_block_size: int = 4
+    # Whether [model].speculative_block_size was set, a clamped value
+    # included: only a block the user left unset is the engine's to resolve.
+    speculative_block_explicit: bool = False
     # Prefill matmuls of affine-Q4/gs64 projections on the M5 tensor units with
     # int8 activations: ~1.4x prefill measured on the M5 Pro (2026-09-11), but
     # int8 activations change numerics (KL 0.033 vs stock on the standard prompt,
@@ -108,6 +116,19 @@ class SousConfig:
     # Active only on a measured split target (the M5 Pro's 20 GPU cores),
     # `unavailable` with the reason anywhere else. Read once, at daemon start.
     attention_tile: bool = True
+    # The target's small-row quantized projections through one simdgroup-MMA
+    # kernel whose rows do not depend on how many rows or linears share the
+    # call: every verify forward's and, so that greedy output stays the same
+    # with the drafter on or off, every other target call of up to 8 rows,
+    # decode included. With it a 5-row verify round's projections cost about
+    # what 4 rows' do, which makes block 5 pay: 1.10x sampled decode over
+    # block 4 without the kernel on real subagent turns at 44-77K (M5 Pro).
+    # Decode without a drafter runs at about 0.78x. Not bit-identical to
+    # stock's kernels, hence the switch; false runs the stock paths, and an
+    # unset speculative_block_size then resolves to 4. Active only where the
+    # attention tile is, `unavailable` with the reason anywhere else. Read
+    # once, at daemon start.
+    projection_kernel: bool = True
     # Reuse one KV cache across the turns of a conversation, prefilling only
     # what it gained, instead of re-prefilling from scratch every turn. Works
     # because mlx streams are thread-scoped (#34): a slot only survives
@@ -299,40 +320,50 @@ def _model_window(model: dict) -> int:
 
 
 SPECULATIVE_BLOCK_DEFAULT = 4
-# The largest verify block that has paid. On the M5 Pro, where the attention
-# tile serves verify attention, a block-6 round costs twice a block-3 one and
-# block 6 ran 0.8x block 3 on real subagent turns (#118). Without the tile,
+# What an unset speculative_block_size resolves to where the projection
+# kernel serves the load: its verify projections cost about the same at 5
+# rows as at 4, so the deeper block's extra accepted tokens come nearly free.
+SPECULATIVE_BLOCK_KERNEL = 5
+# The largest verify block sous has validated in-tree. On the M5 Pro without
+# the projection kernel, a block-6 round cost twice a block-3 one and block 6
+# ran 0.8x block 3 on real subagent turns (#118); with the kernel, block 6 has
+# been measured only in an out-of-tree spike. Without the attention tile,
 # 6+ rows also leave mlx's fused vector-attention kernel (q_len x gqa <= 32:
 # 5 rows at the default model's gqa 6).
 SPECULATIVE_BLOCK_MAX = 5
 
 
-def _speculative_block_size(model: dict) -> int:
-    """Validated [model].speculative_block_size: 0 (the drafter's own policy)
-    or 2..5, degrading to the default with a warning — same stance as the rest
-    of the file. This one is a silent-truncation knob: mlx-vlm treats the value
-    as the total verify-block size and ends its round loop when it is <= 1,
-    so a configured 1 (or a negative) would cap every response at a single
-    token without any error. Above the maximum is clamped rather than
-    defaulted: the intent ("as deep as pays") is clear, only the number is
-    past where it pays."""
-    value = model.get("speculative_block_size", SPECULATIVE_BLOCK_DEFAULT)
+def _speculative_block_size(model: dict) -> tuple[int, bool]:
+    """Validated [model].speculative_block_size, and whether it was set: 0
+    (the drafter's own policy) or 2..5, degrading to the default with a
+    warning — same stance as the rest of the file. This one is a
+    silent-truncation knob: mlx-vlm treats the value as the total verify-block
+    size and ends its round loop when it is <= 1, so a configured 1 (or a
+    negative) would cap every response at a single token without any error.
+    Above the maximum is clamped rather than defaulted: the intent ("as deep
+    as validated") is clear, only the number is past the largest block sous
+    has validated, so a clamped value still counts as set. An invalid one
+    does not: it falls back to the default, which the engine resolves at load
+    as it does an unset one, so the warning names no number."""
+    if "speculative_block_size" not in model:
+        return SPECULATIVE_BLOCK_DEFAULT, False
+    value = model["speculative_block_size"]
     if isinstance(value, bool) or not isinstance(value, int) or value == 1 or value < 0:
         warnings.warn(
             f"sous config: [model].speculative_block_size {value!r} must be 0 (auto) "
-            f"or an integer from 2 to {SPECULATIVE_BLOCK_MAX}; using {SPECULATIVE_BLOCK_DEFAULT}",
+            f"or an integer from 2 to {SPECULATIVE_BLOCK_MAX}; using the default",
             stacklevel=3,
         )
-        return SPECULATIVE_BLOCK_DEFAULT
+        return SPECULATIVE_BLOCK_DEFAULT, False
     if value > SPECULATIVE_BLOCK_MAX:
         warnings.warn(
             f"sous config: [model].speculative_block_size {value!r} exceeds "
-            f"{SPECULATIVE_BLOCK_MAX}, the largest verify block that has paid in "
-            f"measurement (default model, M5 Pro); using {SPECULATIVE_BLOCK_MAX}",
+            f"{SPECULATIVE_BLOCK_MAX}, the largest verify block sous has validated "
+            f"in-tree; using {SPECULATIVE_BLOCK_MAX}",
             stacklevel=3,
         )
-        return SPECULATIVE_BLOCK_MAX
-    return value
+        return SPECULATIVE_BLOCK_MAX, True
+    return value, True
 
 
 def _gib_or_auto(model: dict, key: str, *, stacklevel: int = 3) -> float | None:
@@ -400,6 +431,20 @@ def _attention_tile(model: dict) -> bool:
         return value
     warnings.warn(
         f"sous config: [model].attention_tile {value!r} must be true or false; using false",
+        stacklevel=3,
+    )
+    return False
+
+
+def _projection_kernel(model: dict) -> bool:
+    """[model].projection_kernel: true or false; anything else warns and means
+    false, the stock projections, by _int8_prefill's rule that a typo must not
+    select changed numerics."""
+    value = model.get("projection_kernel", True)
+    if isinstance(value, bool):
+        return value
+    warnings.warn(
+        f"sous config: [model].projection_kernel {value!r} must be true or false; using false",
         stacklevel=3,
     )
     return False
@@ -483,6 +528,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
     window = _model_window(model)
     _warn_obsolete(raw, window)
     local_models, generation_timeout = _server_values(server)
+    block, block_explicit = _speculative_block_size(model)
     return SousConfig(
         server_port=_server_port(server),
         upstream_url=_upstream_url(server),
@@ -498,9 +544,11 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         prompt_cache_gb=_gib_or_auto(model, "prompt_cache_gb"),
         prompt_cache_disk_gb=_prompt_cache_disk_gb(model),
         speculative_draft_id=model.get("speculative_draft_id", "z-lab/Qwen3.8-27B-DFlash2"),
-        speculative_block_size=_speculative_block_size(model),
+        speculative_block_size=block,
+        speculative_block_explicit=block_explicit,
         int8_prefill=_int8_prefill(model),
         attention_tile=_attention_tile(model),
+        projection_kernel=_projection_kernel(model),
         data_dir=(path.parent if path.parent != Path(".") else DEFAULT_DATA_DIR),
         config_path=path,
     )

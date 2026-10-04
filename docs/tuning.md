@@ -54,12 +54,29 @@ exact-match verify run). A setting lands in the diff only when its own
 measured arm is eligible and faster — that is why there is no `--greedy`
 flag to understand. The full run may therefore change `[model].id`, the
 drafter and block size, the window, `int8_prefill` and `temperature`.
-Every arm inherits `[model].attention_tile` and no arm changes it; suite
-rows are keyed by it, so a `--resume` after it was flipped runs those arms
-again instead of mixing tile and stock rows, and where the engine reports
-the tile `unavailable`, the arm prints a notice with the reason and runs
-stock, as the daemon would (an `off` engine, such as the mlx-lm backend's,
-gets no notice).
+Every arm inherits `[model].attention_tile` and `[model].projection_kernel`
+and no arm changes them; suite rows are keyed by both, so a `--resume` after
+either was flipped runs those arms again instead of mixing kernel and stock
+rows, and where the engine reports one `unavailable`, the arm prints a notice
+with the reason and runs stock, as the daemon would (an `off` engine, such as
+the mlx-lm backend's, gets no notice). Bench rows are keyed only by model,
+drafter, block and window, so a `--resume` across a sous upgrade or a flip of
+`attention_tile` or `projection_kernel` reuses decode and prefill timings
+measured before it, which can rank the blocks the other way: start a fresh
+tune after either.
+
+Every drafter arm runs exactly the block its label names. Your configured arm
+is the block the daemon would run: with `speculative_block_size` unset, that
+is 5 where the projection kernel can run and 4 elsewhere. The tune decides
+which without loading the model — from the platform rule, the GPU's core
+count, `attention_tile` and `projection_kernel`, the model's config and the
+drafter's kind — and prints a line when the unset block resolves to 5. A
+refusal only a load would show (a failed probe, a pinned mlx-vlm source that
+changed) leaves that mark one block off; the measurements themselves are
+unaffected. A proposal then leaves an unset block alone when the winner runs
+the block it already resolves to, writes any other block explicitly, and
+always writes the block of a winner with another model or drafter, since an
+unset block could resolve differently for it.
 
 The daemon is asked to release the model first (`POST /sous/unload`) and
 refuses while a `sous claude` session holds it, a turn is in flight, or a

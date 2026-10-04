@@ -234,6 +234,7 @@ def _run(
         int8_prefill=arm.int8_prefill,
         greedy=arm.greedy,
         attention_tile=arm.attention_tile,
+        projection_kernel=arm.projection_kernel,
         window=arm.window,
         state=state,
         outcome="completed" if state == "done" else None,
@@ -254,10 +255,12 @@ def _runs(arm, grades, **kw):
     return [_run(arm, task=f"t{i}", grade=g, **kw) for i, g in enumerate(grades)]
 
 
-# Every user here keeps block 3, the block the fixtures' current arm and rows
-# are written for, so these tests do not move with the shipped default.
+# Every user here sets block 3, the block the fixtures' current arm and rows
+# are written for, so these tests move neither with the shipped default nor
+# with how an unset block resolves.
 def _user(tmp_path, **over):
     over.setdefault("speculative_block_size", 3)
+    over.setdefault("speculative_block_explicit", True)
     return SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", **over)
 
 
@@ -541,3 +544,37 @@ def test_a_graded_but_failed_reference_still_constrains_the_grade(tmp_path):
     assert any("note: the reference completed no run" in r for r in choice.reasons)
     line = next(r for r in choice.reasons if r.startswith("9:"))
     assert line.endswith("not eligible: grade 0.50 < 0.55")
+
+
+def test_a_resolved_unset_block_proposes_only_a_block_the_daemon_would_not_run(tmp_path):
+    """The tune hands decide the user's block as the daemon resolves it
+    (arms.resolve_block): an unset block where the projection kernel runs is
+    already 5, so a block-5 winner changes nothing and any other is written."""
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=5)
+    assert user.speculative_block_explicit is False
+    arms = [_arm(user, "b5", block=5, current=True), _arm(user, "b4", block=4)]
+    rows = [_row("b5", block=5, d16k=20.0), _row("b4", block=4, d16k=19.0)]
+    choice = quick_decision(user, arms, rows)
+    assert choice is not None and choice.label == "b5" and choice.changes == {}
+    rows = [_row("b5", block=5, d16k=20.0), _row("b4", block=4, d16k=21.0)]
+    choice = quick_decision(user, arms, rows)
+    assert choice is not None and choice.changes == {"model": {"speculative_block_size": 4}}
+
+
+def test_a_drafter_arm_of_another_pair_writes_its_block_when_the_users_is_unset(tmp_path):
+    """The resolved block is the daemon's for the user's own model and drafter
+    only: an unset block could resolve differently for another pair, so its
+    block is written even when the numbers match."""
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=5)
+    cur = _arm(user, "27 @5", block=5, current=True, fit_window=131072)
+    nine = _arm(user, "9 + d @5", drafter="z/9d", block=5, model=M9, fit_window=131072)
+    runs = _runs(cur, [1.0], seconds=100.0) + _runs(nine, [1.0], seconds=50.0)
+    choice = full_decision(user, [cur, nine], runs, [], runs_per_task=1)
+    assert choice is not None and choice.label == "9 + d @5"
+    assert choice.changes == {
+        "model": {"id": M9, "speculative_draft_id": "z/9d", "speculative_block_size": 5}
+    }
+    explicit = dataclasses.replace(user, speculative_block_explicit=True)
+    choice = full_decision(explicit, [cur, nine], runs, [], runs_per_task=1)
+    assert choice is not None
+    assert choice.changes == {"model": {"id": M9, "speculative_draft_id": "z/9d"}}
