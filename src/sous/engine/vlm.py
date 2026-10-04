@@ -8,7 +8,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
-from sous.engine import draftctx, forkio, tileattn
+from sous.config import SPECULATIVE_BLOCK_KERNEL
+from sous.engine import draftctx, forkio, projkernel, tileattn
 from sous.engine.base import Delta, OnDelta
 from sous.engine.forkstore import ForkStore, fork_key_fields
 from sous.engine.promptcache import (
@@ -66,10 +67,12 @@ class VLMEngine:
         prompt_cache: bool = False,
         draft_id: str = "",
         draft_block_size: int = 0,
+        draft_block_explicit: bool = True,
         cache_budget: int | None = None,
         reserve_bytes: int = 0,
         int8_prefill: bool = False,
         attention_tile: bool = False,
+        projection_kernel: bool = False,
         fork_dir: Path | None = None,
         fork_budget: int | None = None,
         weights_identity: str = "",
@@ -106,7 +109,6 @@ class VLMEngine:
                     f" {model_id} ({e}); generating without it",
                     stacklevel=2,
                 )
-            _pin_block_size(self._draft, draft_block_size)
         # Only speculation runs the verifier, so only a drafter that loaded
         # earns the probe; before the budget is measured, so the probe's
         # transient K/V is already released.
@@ -123,6 +125,29 @@ class VLMEngine:
             drafter_kind=self._draft_kind if self._draft is not None else None,
             verify_status=self.verify_attention_status,
         )
+        # After the tile, whose status it reads: the kernel serves only where
+        # the tile does, so it inherits the tile's GPU gate and, with a
+        # drafter, exact verify attention. Before the fork-store key, which
+        # reads it, and before the budget, so the probe's transient arrays are
+        # already released when the budget is measured.
+        self.projection_kernel_status = projkernel.enable(
+            self._model,
+            enabled=projection_kernel,
+            drafter_kind=self._draft_kind if self._draft is not None else None,
+            tile_status=self.attention_tile_status,
+        )
+        # An unset block resolves only now that the kernel has settled: with
+        # the kernel a 5-row verify round's projections cost about what a
+        # 4-row round's do, so block 5 pays; without it 4 does. The pin
+        # follows the resolution, and moving it this late changes nothing
+        # above: neither the verifier's nor the tile's gates read the pin.
+        if (
+            not draft_block_explicit
+            and self._draft is not None
+            and self.projection_kernel_status["state"] == "active"
+        ):
+            self._draft_block_size = SPECULATIVE_BLOCK_KERNEL
+        _pin_block_size(self._draft, self._draft_block_size)
         # The drafter's context on the prompt-cache path: armed once the
         # drafter has settled, so one that failed to load leaves it off.
         self._draft_context = draftctx.enable(self._model, self._draft, self._draft_kind)
@@ -176,6 +201,13 @@ class VLMEngine:
         none was asked for or the one asked for failed to load, which the
         engine survives with a warning rather than an error."""
         return self._draft_id
+
+    @property
+    def draft_block(self) -> int | None:
+        """The verify block speculative decoding runs with, as resolved at
+        load (0 is the drafter's own policy), or None without a drafter: the
+        model-load line's and the status document's `draft_block`."""
+        return self._draft_block_size if self._draft is not None else None
 
     @property
     def draft_context_status(self) -> dict:
@@ -548,9 +580,11 @@ class VLMEngine:
         import mlx.core as mx
 
         # First, before anything below can raise: until the next load decides
-        # afresh, no one-row call may reach the tile on the strength of this
-        # model's gates.
+        # afresh, no call may reach the tile or the projection kernel on the
+        # strength of this model's gates. The kernel's tags stay on this
+        # model's modules, inert while its flag is clear.
         tileattn.clear()
+        projkernel.clear()
         self.reset_prompt_cache()
         self._model = None
         self._processor = None

@@ -1208,6 +1208,91 @@ def test_default_factory_passes_attention_tile_to_the_vlm_engine_only(monkeypatc
     assert "attention_tile" not in seen["lm"]
 
 
+@pytest.mark.parametrize("value", [True, False])
+def test_engine_manager_threads_projection_kernel_into_default_factory(
+    monkeypatch, tmp_path, value
+):
+    import sous.engine.base as base
+
+    seen: dict[str, dict] = {}
+
+    def fake_default_factory(model_id, *args, **kwargs):
+        seen["kwargs"] = kwargs
+        return FakeEngine([])
+
+    monkeypatch.setattr(base, "_default_factory", fake_default_factory)
+    EngineManager(_cfg(tmp_path, projection_kernel=value)).get()
+    assert seen["kwargs"]["projection_kernel"] is value
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_engine_manager_threads_the_block_flag_into_default_factory(
+    monkeypatch, tmp_path, explicit
+):
+    import sous.engine.base as base
+
+    seen: dict[str, dict] = {}
+
+    def fake_default_factory(model_id, *args, **kwargs):
+        seen["kwargs"] = kwargs
+        return FakeEngine([])
+
+    monkeypatch.setattr(base, "_default_factory", fake_default_factory)
+    EngineManager(_cfg(tmp_path, speculative_block_explicit=explicit)).get()
+    assert seen["kwargs"]["draft_block_explicit"] is explicit
+
+
+def test_default_factory_passes_projection_kernel_and_the_block_flag_to_the_vlm_engine_only(
+    monkeypatch,
+):
+    from sous.engine import base, lm, vlm
+
+    seen: dict[str, dict] = {}
+
+    class RecordingVLM:
+        def __init__(self, model_id, **kwargs):
+            seen["vlm"] = kwargs
+
+    class RecordingLM:
+        def __init__(self, model_id, **kwargs):
+            seen["lm"] = kwargs
+
+    monkeypatch.setattr(vlm, "VLMEngine", RecordingVLM)
+    monkeypatch.setattr(lm, "LMEngine", RecordingLM)
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"vision_config": {}})
+    monkeypatch.setattr("sous.engine.window.kv_bytes_per_token", lambda cfg: 1024)
+    base._default_factory(
+        "m", 0.7, 0.8, 20, True, cache_budget=0, projection_kernel=True, draft_block_explicit=False
+    )
+    assert seen["vlm"]["projection_kernel"] is True
+    assert seen["vlm"]["draft_block_explicit"] is False
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"model_type": "qwen3_5"})
+    base._default_factory(
+        "m", 0.7, 0.8, 20, True, cache_budget=0, projection_kernel=True, draft_block_explicit=False
+    )
+    assert "projection_kernel" not in seen["lm"]
+    assert "draft_block_explicit" not in seen["lm"]
+
+
+def test_default_factory_takes_a_direct_callers_block_as_an_explicit_block(monkeypatch):
+    """Scripts and tests that call the factory themselves get the block they
+    pass, and the stock projections unless they ask for the kernel."""
+    from sous.engine import base, vlm
+
+    seen: dict[str, dict] = {}
+
+    class RecordingVLM:
+        def __init__(self, model_id, **kwargs):
+            seen["vlm"] = kwargs
+
+    monkeypatch.setattr(vlm, "VLMEngine", RecordingVLM)
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"vision_config": {}})
+    monkeypatch.setattr("sous.engine.window.kv_bytes_per_token", lambda cfg: 1024)
+    base._default_factory("m", 0.7, 0.8, 20, True, cache_budget=0, draft_block_size=4)
+    assert seen["vlm"]["draft_block_explicit"] is True
+    assert seen["vlm"]["projection_kernel"] is False
+
+
 def test_status_carries_the_int8_prefill_view_when_the_engine_reports_one(tmp_path):
     inner = FakeEngine([])
     manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
@@ -1338,10 +1423,10 @@ def test_lm_engine_enables_int8_prefill_on_the_loaded_model(monkeypatch):
 
 
 @pytest.mark.parametrize("drafter_loads", [True, False])
-def test_vlm_engine_enables_the_attention_tile_after_the_verifier_and_before_the_budget(
+def test_vlm_engine_enables_the_tile_then_the_projection_kernel_then_pins_the_block(
     monkeypatch, drafter_loads
 ):
-    from sous.engine import base, draftctx, tileattn, verifyattn, vlm
+    from sous.engine import base, draftctx, projkernel, tileattn, verifyattn, vlm
 
     model = _positionless_model()
     processor = types.SimpleNamespace(tokenizer=_RecordingTokenizer())
@@ -1358,6 +1443,7 @@ def test_vlm_engine_enables_the_attention_tile_after_the_verifier_and_before_the
     seen: dict[str, object] = {}
     verifier_status = {"state": "active", "reason": None, "probe_seconds": 0.21}
     tile_status = {"state": "active", "reason": None, "splits": 20, "probe_seconds": 0.43}
+    proj_status = {"state": "active", "reason": None, "probe_seconds": 0.37}
 
     def verify_enable(m, *, enabled):
         order.append("verify")
@@ -1370,6 +1456,19 @@ def test_vlm_engine_enables_the_attention_tile_after_the_verifier_and_before_the
         )
         return tile_status
 
+    def proj_enable(m, *, enabled, drafter_kind, tile_status):
+        order.append("projection_kernel")
+        seen.update(
+            proj_model=m,
+            proj_enabled=enabled,
+            proj_drafter_kind=drafter_kind,
+            proj_tile_status=tile_status,
+        )
+        return proj_status
+
+    def pin(drafter, block_size):
+        order.append("pin")
+
     def context_enable(m, d, kind):
         order.append("draft_context")
         return draftctx.OFF
@@ -1380,18 +1479,28 @@ def test_vlm_engine_enables_the_attention_tile_after_the_verifier_and_before_the
 
     monkeypatch.setattr(verifyattn, "enable", verify_enable)
     monkeypatch.setattr(tileattn, "enable", tile_enable)
+    monkeypatch.setattr(projkernel, "enable", proj_enable)
+    monkeypatch.setattr(vlm, "_pin_block_size", pin)
     monkeypatch.setattr(draftctx, "enable", context_enable)
     monkeypatch.setattr(base, "measure_cache_budget", budget)
     if drafter_loads:
-        engine = vlm.VLMEngine("test/model", draft_id="z-lab/drafter", attention_tile=True)
+        engine = vlm.VLMEngine(
+            "test/model", draft_id="z-lab/drafter", attention_tile=True, projection_kernel=True
+        )
     else:
         with pytest.warns(UserWarning, match="speculative drafter"):
-            engine = vlm.VLMEngine("test/model", draft_id="z-lab/drafter", attention_tile=True)
-    assert order == ["verify", "tile", "draft_context", "budget"]
+            engine = vlm.VLMEngine(
+                "test/model", draft_id="z-lab/drafter", attention_tile=True, projection_kernel=True
+            )
+    assert order == ["verify", "tile", "projection_kernel", "pin", "draft_context", "budget"]
     assert seen["model"] is model and seen["enabled"] is True
     assert seen["drafter_kind"] == ("dflash" if drafter_loads else None)
     assert seen["verify_status"] is engine.verify_attention_status is verifier_status
     assert engine.attention_tile_status is tile_status
+    assert seen["proj_model"] is model and seen["proj_enabled"] is True
+    assert seen["proj_drafter_kind"] == ("dflash" if drafter_loads else None)
+    assert seen["proj_tile_status"] is tile_status
+    assert engine.projection_kernel_status is proj_status
 
 
 def test_lm_engine_reports_the_attention_tile_off(monkeypatch):
@@ -1401,6 +1510,94 @@ def test_lm_engine_reports_the_attention_tile_off(monkeypatch):
     _stub(monkeypatch, "mlx_lm.sample_utils", make_sampler=lambda **kw: None)
     engine = LMEngine("test/model", cache_budget=0)
     assert engine.attention_tile_status == {"state": "off", "reason": None}
+
+
+def test_lm_engine_reports_the_projection_kernel_off(monkeypatch):
+    from sous.engine.lm import LMEngine
+
+    _stub(monkeypatch, "mlx_lm", load=lambda model_id: (object(), _RecordingTokenizer()))
+    _stub(monkeypatch, "mlx_lm.sample_utils", make_sampler=lambda **kw: None)
+    engine = LMEngine("test/model", cache_budget=0)
+    assert engine.projection_kernel_status == {"state": "off", "reason": None}
+
+
+def _drafted_vlm(monkeypatch, proj_state: str, **kwargs):
+    """A VLMEngine over stubs whose drafter loads and whose projection kernel
+    reports `proj_state`; returned with its drafter and the blocks pinned."""
+    from sous.engine import draftctx, projkernel, verifyattn, vlm
+
+    model = _positionless_model()
+    processor = types.SimpleNamespace(tokenizer=_RecordingTokenizer())
+    _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+    drafter = types.SimpleNamespace(prefer_requested_block_size=False)
+    monkeypatch.setattr(vlm, "_load_quantized_drafter", lambda m, draft_id: (drafter, "dflash"))
+    monkeypatch.setattr(
+        verifyattn,
+        "enable",
+        lambda m, *, enabled: {"state": "active", "reason": None, "probe_seconds": 0.21},
+    )
+    status = {"state": proj_state, "reason": None, "probe_seconds": None}
+    monkeypatch.setattr(
+        projkernel, "enable", lambda m, *, enabled, drafter_kind, tile_status: status
+    )
+    monkeypatch.setattr(draftctx, "enable", lambda m, d, kind: draftctx.OFF)
+    pinned: list[int] = []
+    real_pin = vlm._pin_block_size
+
+    def pin(d, block_size):
+        pinned.append(block_size)
+        real_pin(d, block_size)
+
+    monkeypatch.setattr(vlm, "_pin_block_size", pin)
+    engine = vlm.VLMEngine(
+        "test/model", cache_budget=0, draft_id="z-lab/drafter", projection_kernel=True, **kwargs
+    )
+    return engine, drafter, pinned
+
+
+@pytest.mark.parametrize(
+    ("explicit", "proj_state", "block", "expected"),
+    [
+        (False, "active", 4, 5),
+        (False, "unavailable", 4, 4),
+        (False, "off", 4, 4),
+        (True, "active", 4, 4),
+        (True, "active", 3, 3),
+        (True, "active", 0, 0),
+    ],
+)
+def test_vlm_engine_resolves_an_unset_draft_block_to_five_only_where_the_kernel_is_active(
+    monkeypatch, explicit, proj_state, block, expected
+):
+    engine, drafter, pinned = _drafted_vlm(
+        monkeypatch, proj_state, draft_block_size=block, draft_block_explicit=explicit
+    )
+    assert engine._draft_block_size == expected and engine.draft_block == expected
+    assert pinned == [expected], "the pin must see the resolved block"
+    assert drafter.prefer_requested_block_size is (expected > 0)
+
+
+def test_vlm_engine_built_directly_keeps_the_draft_block_it_was_given(monkeypatch):
+    """Tests and scripts that build an engine themselves pass no flag; the
+    block they ask for is the block they get, kernel or not."""
+    engine, _, pinned = _drafted_vlm(monkeypatch, "active", draft_block_size=4)
+    assert engine.draft_block == 4 and pinned == [4]
+
+
+def test_vlm_engine_reports_no_draft_block_without_a_drafter(monkeypatch):
+    from sous.engine.vlm import VLMEngine
+
+    _stub(
+        monkeypatch,
+        "mlx_vlm",
+        load=lambda model_id: (_positionless_model(), _RecordingTokenizer()),
+    )
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+    engine = VLMEngine("test/model", cache_budget=0, draft_block_size=4, draft_block_explicit=False)
+    assert engine.draft_block is None and engine._draft_block_size == 4
+    # The constructor's default keeps the stock projections.
+    assert engine.projection_kernel_status["state"] == "off"
 
 
 # ---- streaming deltas (endpoint) ---------------------------------------------
@@ -2076,6 +2273,8 @@ def test_default_engine_factory_maps_every_model_value_onto_the_backend(monkeypa
         max_context_tokens=65536,
         int8_prefill=True,
         attention_tile=False,
+        projection_kernel=False,
+        speculative_block_explicit=True,
     )
     base.default_engine_factory(cfg)("org/m")
     assert seen["model_id"] == "org/m"
@@ -2083,10 +2282,12 @@ def test_default_engine_factory_maps_every_model_value_onto_the_backend(monkeypa
     assert seen["kwargs"] == {
         "draft_id": "z/d",
         "draft_block_size": 2,
+        "draft_block_explicit": True,
         "cache_budget": int(1.5 * (1 << 30)),
         "reserve_tokens": 65536,
         "int8_prefill": True,
         "attention_tile": False,
+        "projection_kernel": False,
         "fork_dir": None,
         "fork_budget": None,
     }
