@@ -720,6 +720,15 @@ class EngineManager:
                     f" attention_tile_splits={tile['splits']}"
                     f" attention_tile_probe_s={tile['probe_seconds']}"
                 )
+        proj = engine.projection_kernel_status
+        if proj is not None:
+            line += f" projection_kernel={proj['state']}"
+            if proj["state"] == "active":
+                line += f" projection_kernel_probe_s={proj['probe_seconds']}"
+        # Resolved at load, so the config alone cannot say which block runs:
+        # an unset one is 5 where the kernel is active and 4 elsewhere.
+        if engine.draft_block is not None:
+            line += f" draft_block={engine.draft_block}"
         _logger.info(line)
         return engine
 
@@ -1039,6 +1048,14 @@ class EngineManager:
                 tile = self._engine.attention_tile_status
                 if tile is not None:
                     out["attention_tile"] = {"state": tile["state"], "reason": tile["reason"]}
+                proj = self._engine.projection_kernel_status
+                if proj is not None:
+                    out["projection_kernel"] = {"state": proj["state"], "reason": proj["reason"]}
+                # The block the drafter runs, as resolved at load: present
+                # whenever the backend knows drafters, None while it runs
+                # without one.
+                if self._engine.drafter is not None:
+                    out["draft_block"] = self._engine.draft_block
                 # Which side supplies the rotary positions behind a warm
                 # cache: the load line says it once, this says it for as long
                 # as the model is resident.

@@ -2655,3 +2655,98 @@ def test_status_carries_the_attention_tile_view_when_the_engine_reports_one(tmp_
         "state": "unavailable",
         "reason": "split target 16 not measured (measured: 20)",
     }
+
+
+@pytest.mark.parametrize(
+    ("status", "tail"),
+    [
+        (
+            {"state": "active", "reason": None, "probe_seconds": 0.37},
+            " positions=engine projection_kernel=active projection_kernel_probe_s=0.37",
+        ),
+        (
+            {"state": "unavailable", "reason": "attention tile off", "probe_seconds": None},
+            " positions=engine projection_kernel=unavailable",
+        ),
+        (
+            {"state": "unavailable", "reason": "probe: row 3 differs", "probe_seconds": 0.37},
+            " positions=engine projection_kernel=unavailable",
+        ),
+        ({"state": "off", "reason": None}, " positions=engine projection_kernel=off"),
+        (None, " model=fake/model positions=engine"),
+    ],
+)
+def test_get_logs_the_projection_kernel_state(caplog, tmp_path, status, tail):
+    import logging
+
+    def factory(model_id):
+        engine = _positional_factory(model_id)
+        if status is not None:
+            engine.projection_kernel_status = status  # ty: ignore[unresolved-attribute]
+        return engine
+
+    mgr = EngineManager(_cfg(tmp_path), engine_factory=factory)
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert len(lines) == 1 and lines[0].endswith(tail), lines
+
+
+@pytest.mark.parametrize(
+    ("block", "tail"),
+    [
+        (5, " projection_kernel=active projection_kernel_probe_s=0.37 draft_block=5"),
+        (0, " projection_kernel=active projection_kernel_probe_s=0.37 draft_block=0"),
+        (None, " projection_kernel=active projection_kernel_probe_s=0.37"),
+    ],
+)
+def test_get_logs_the_resolved_draft_block_after_the_kernel_tokens(caplog, tmp_path, block, tail):
+    """The tile's tokens, then the kernel's, then the block whenever a drafter
+    loaded, 0 (the drafter's own policy) included: the config alone cannot
+    say which block runs once the engine resolves an unset one."""
+    import logging
+
+    def factory(model_id):
+        engine = _positional_factory(model_id)
+        engine.attention_tile_status = {  # ty: ignore[unresolved-attribute]
+            "state": "active",
+            "reason": None,
+            "splits": 20,
+            "probe_seconds": 0.43,
+        }
+        engine.projection_kernel_status = {  # ty: ignore[unresolved-attribute]
+            "state": "active",
+            "reason": None,
+            "probe_seconds": 0.37,
+        }
+        engine.draft_block = block  # ty: ignore[unresolved-attribute]
+        return engine
+
+    mgr = EngineManager(_cfg(tmp_path), engine_factory=factory)
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    expected = " attention_tile=active attention_tile_splits=20 attention_tile_probe_s=0.43" + tail
+    assert len(lines) == 1 and lines[0].endswith(expected), lines
+
+
+def test_status_carries_the_projection_kernel_and_the_draft_block(tmp_path):
+    inner = FakeEngine([])
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    status = manager.status()
+    assert "projection_kernel" not in status, "fakes without the attribute stay silent"
+    assert "draft_block" not in status, "as does a backend with no notion of a drafter"
+    inner.projection_kernel_status = {  # ty: ignore[unresolved-attribute]
+        "state": "unavailable",
+        "reason": "attention tile off",
+        "probe_seconds": None,
+    }
+    inner.drafter = ""  # ty: ignore[unresolved-attribute]
+    inner.draft_block = None  # ty: ignore[unresolved-attribute]
+    status = manager.status()
+    assert status["projection_kernel"] == {"state": "unavailable", "reason": "attention tile off"}
+    assert status["draft_block"] is None  # a backend that knows drafters, running without one
+    inner.drafter = "z-lab/drafter"  # ty: ignore[unresolved-attribute]
+    inner.draft_block = 5  # ty: ignore[unresolved-attribute]
+    assert manager.status()["draft_block"] == 5
