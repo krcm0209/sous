@@ -55,7 +55,7 @@ MAX_FAILURES = 3
 # The modules whose bytes decide what KV a token id produces; hashed into
 # the identity key so a change to them can never be forgotten.
 _ENGINE_SOURCES = files("sous.engine")
-_EPOCH_FILES = ("vlm.py", "lm.py", "int8prefill.py", "tileattn.py")
+_EPOCH_FILES = ("vlm.py", "lm.py", "int8prefill.py", "tileattn.py", "projkernel.py")
 
 
 class ForkFileError(Exception):
@@ -153,19 +153,22 @@ def fork_key_fields(
     positions: str,
     int8_status: Mapping[str, Any],
     tile_status: Mapping[str, Any],
+    proj_status: Mapping[str, Any],
 ) -> dict[str, str]:
     """Everything that changes the KV arrays behind identical token ids, and
     nothing else: the backend and its package, mlx, the GPU, the weights,
     the engine sources (epoch) and the file layout, which side supplies the
     rotary positions, whether int8 prefill actually ran, whether the
-    attention tile served the load and at which split target, the macOS
-    build, and the two mlx-core environment switches that change matmul
-    precision and attention accumulation.
+    attention tile served the load and at which split target, whether the
+    projection kernel served it, the macOS build, and the two mlx-core
+    environment switches that change matmul precision and attention
+    accumulation.
 
-    The tile runs the one-row forward that ends every prefill segment, so it
-    moves the last bits of that token's KV and, through its hidden state,
-    every later layer's KV and GDN state. `unavailable` runs `off`'s
-    numerics for both kernels.
+    The tile and the projection kernel both run the one-row forward that
+    ends every prefill segment, and the projection kernel any prefill tail
+    of up to 8 rows too, so each moves the last bits of those tokens' KV
+    and, through their hidden states, every later layer's KV and GDN state.
+    `unavailable` runs `off`'s numerics for all three kernels.
 
     The macOS build is always part of the key: every stored KV depends on
     runtime-compiled Metal (mlx-vlm's gated-delta kernel, its `mx.compile`
@@ -173,7 +176,8 @@ def fork_key_fields(
     whose tensor-op header the OS supplies), and a macOS update can change
     the last bits any of them produces. The template, tokenizer, sampling,
     drafter and window are deliberately absent: ids are compared exactly,
-    and none of them touches a prefill."""
+    and none of them touches a prefill (the projection kernel routes a
+    prefill the same with a drafter loaded or without one)."""
     from importlib.metadata import version
 
     int8_active = int8_status.get("state") == "active"
@@ -189,6 +193,7 @@ def fork_key_fields(
         "positions": positions,
         "int8": f"active:{int8_status.get('routed', 0)}" if int8_active else "off",
         "tile": f"active:{tile_status['splits']}" if tile_active else "off",
+        "proj": "active" if proj_status.get("state") == "active" else "off",
         "os": os_release(),
     }
     env = ";".join(f"{k}={os.environ[k]}" for k in _NUMERIC_ENV if k in os.environ)
@@ -238,8 +243,8 @@ def engine_epoch() -> str:
         h.update(name.encode())
         h.update(_ENGINE_SOURCES.joinpath(name).read_bytes())
     # The .h files are compiled into every kernel (int8's nibble-decode and
-    # K-order contract, the tile's lane layout), so they are part of the
-    # numerics too.
+    # K-order contract, the tile's lane layout, the projection kernel's MMA
+    # helper), so they are part of the numerics too.
     kernels = _ENGINE_SOURCES.joinpath("kernels")
     for entry in sorted(kernels.iterdir(), key=lambda e: e.name):
         if entry.name.endswith((".metal", ".h")):

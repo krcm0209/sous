@@ -62,6 +62,7 @@ class SuiteRun:
     int8_prefill: bool
     greedy: bool
     attention_tile: bool
+    projection_kernel: bool
     window: int
     state: str
     outcome: str | None
@@ -77,7 +78,7 @@ class SuiteRun:
     transcript_path: str | None
 
     @property
-    def key(self) -> tuple[str, str, int, bool, bool, bool]:
+    def key(self) -> tuple[str, str, int, bool, bool, bool, bool]:
         """The arm this run measured — `Arm.suite_key`, never the label."""
         return (
             self.model_id,
@@ -86,6 +87,7 @@ class SuiteRun:
             self.int8_prefill,
             self.greedy,
             self.attention_tile,
+            self.projection_kernel,
         )
 
     @property
@@ -97,9 +99,12 @@ class SuiteRun:
 
     @classmethod
     def from_dict(cls, d: dict) -> SuiteRun:
-        # A row written before the tile existed ran stock attention; without
-        # the fallback, resuming such a run would raise KeyError.
-        d = {"attention_tile": False, **d}
+        # A row written before a setting existed ran without what it switches
+        # on — stock attention, stock projections — on every machine, so it
+        # reads False, and a resume under an arm that has the setting runs
+        # the task again rather than pool the two. Without the fallback,
+        # resuming such a run would raise KeyError.
+        d = {"attention_tile": False, "projection_kernel": False, **d}
         return cls(**{f.name: d[f.name] for f in dataclasses.fields(cls)})
 
 
@@ -129,9 +134,10 @@ class CountingEngine:
         return self._inner.model_id
 
     def __getattr__(self, name: str):
-        # drafter, positions, int8_prefill_status, verify_attention_status,
-        # draft_context_status, attention_tile_status: whatever the backend
-        # has, read through getattr(..., None) by ManagedEngine.
+        # drafter, draft_block, positions, int8_prefill_status,
+        # verify_attention_status, draft_context_status, attention_tile_status,
+        # projection_kernel_status: whatever the backend has, read through
+        # getattr(..., None) by ManagedEngine.
         return getattr(self._inner, name)
 
     def generate(
@@ -226,6 +232,7 @@ def _error_run(task: SuiteTask, index: int, arm: Arm, error: str) -> SuiteRun:
         int8_prefill=arm.int8_prefill,
         greedy=arm.greedy,
         attention_tile=arm.attention_tile,
+        projection_kernel=arm.projection_kernel,
         window=arm.window,
         state="error",
         outcome=None,
@@ -284,6 +291,7 @@ def run_one(
         int8_prefill=arm.int8_prefill,
         greedy=arm.greedy,
         attention_tile=arm.attention_tile,
+        projection_kernel=arm.projection_kernel,
         window=arm.window,
         state="failed" if failed else "done",
         outcome=None if failed else result.outcome,
@@ -325,6 +333,19 @@ def _check_int8(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> No
     )
 
 
+def _notice_unavailable(arm: Arm, what: str, status: dict | None, out: Callable[..., None]) -> None:
+    """The notice for a setting the arm inherits and the engine reports
+    unavailable; any other state, or no status, prints nothing."""
+    status = status or {}
+    if status.get("state") != "unavailable":
+        return
+    reason = status.get("reason") or "no reason given"
+    out(
+        f"  {arm.label}: {what} unavailable here ({reason}); "
+        "the engine runs stock, as the daemon would"
+    )
+
+
 def _check_tile(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> None:
     """Every arm inherits the attention tile from the user's config and none
     exists to measure it, so unlike int8 there is nothing to fail: where the
@@ -332,16 +353,19 @@ def _check_tile(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> No
     checkpoint with stock attention, and the arm runs the same way after a
     notice. `off`, or no status, is an engine with no tile (the mlx-lm
     backend), not a machine the tile cannot run on: no notice."""
-    if not arm.attention_tile:
-        return
-    status = engine.attention_tile_status or {}
-    if status.get("state") != "unavailable":
-        return
-    reason = status.get("reason") or "no reason given"
-    out(
-        f"  {arm.label}: attention tile unavailable here ({reason}); "
-        "the engine runs stock, as the daemon would"
-    )
+    if arm.attention_tile:
+        _notice_unavailable(arm, "attention tile", engine.attention_tile_status, out)
+
+
+def _check_proj(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> None:
+    """The projection kernel is inherited and unmeasured like the tile, so
+    the same holds: where the engine reports it unavailable, the daemon would
+    serve this checkpoint with stock projections, and the arm runs the same
+    way after a notice. Its block is unaffected — every drafter arm pins the
+    one its label names. `off`, or no status, is the setting switched off or
+    an engine without the kernel: no notice."""
+    if arm.projection_kernel:
+        _notice_unavailable(arm, "projection kernel", engine.projection_kernel_status, out)
 
 
 def _slug(label: str) -> str:
@@ -427,6 +451,7 @@ def _run_suite(
             _check_drafter(arm, engine)
             _check_int8(arm, engine, out)
             _check_tile(arm, engine, out)
+            _check_proj(arm, engine, out)
         except RuntimeError as e:
             check_error = str(e)
         if check_error is None:

@@ -286,7 +286,7 @@ def test_apply_keeps_the_configs_mode_on_the_file_and_its_backup(tmp_path):
 def _summary(label, model=M, grade=0.91, wall=812.0, peak=20 * 2**30):
     return ArmSummary(
         label=label,
-        key=(model, "d", 3, False, False, True),
+        key=(model, "d", 3, False, False, True, True),
         model_id=model,
         runs=16,
         completed=16,

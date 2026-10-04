@@ -6,7 +6,7 @@ from __future__ import annotations
 import datetime
 import tomllib
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
 
@@ -122,6 +122,10 @@ class Checkpoint:
     num_target_layers: int | None
     quant: QuantSummary
     vocab_size: int | None = None
+    # The config.json itself, for checks that read more of it than the
+    # fields above (the projection kernel's static check). Out of equality
+    # and the hash: a checkpoint is what it was summarised to.
+    config: dict = field(default_factory=dict, compare=False, repr=False)
 
 
 def _text(config: dict) -> dict:
@@ -157,6 +161,7 @@ def describe(
         num_target_layers=config.get("num_target_layers"),
         quant=summarize_quantization(config),
         vocab_size=text.get("vocab_size"),
+        config=config,
     )
 
 

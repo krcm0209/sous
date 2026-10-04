@@ -1,7 +1,16 @@
 import dataclasses
+import sys
+import types
 
-from sous.config import SousConfig
-from sous.tune.arms import BLOCK_SIZES, Arm, quick_arms, winner_stage_arms
+from sous.config import SPECULATIVE_BLOCK_KERNEL, SousConfig
+from sous.tune.arms import (
+    BLOCK_SIZES,
+    Arm,
+    drafter_kind,
+    quick_arms,
+    resolve_block,
+    winner_stage_arms,
+)
 from sous.tune.candidates import Candidate, describe
 from tests import tune_fixtures as fx
 
@@ -249,13 +258,14 @@ def test_a_text_only_model_gets_no_drafter_arms(tmp_path):
     assert any("text-only" in r.reason for r in refusals)
 
 
-def _winner(tmp_path, temperature=0.7, int8=False, tile=True):
+def _winner(tmp_path, temperature=0.7, int8=False, tile=True, proj=True):
     cfg = SousConfig(
         data_dir=tmp_path / "d",
         config_path=tmp_path / "c.toml",
         temperature=temperature,
         int8_prefill=int8,
         attention_tile=tile,
+        projection_kernel=proj,
     )
     return Arm(
         label="27B + DFlash2 @3",
@@ -270,13 +280,14 @@ def _winner(tmp_path, temperature=0.7, int8=False, tile=True):
         int8_prefill=int8,
         greedy=temperature == 0,
         attention_tile=tile,
+        projection_kernel=proj,
     )
 
 
 def test_the_suite_key_extends_the_bench_key_with_the_quality_dimensions(tmp_path):
     arm = _winner(tmp_path)
     assert arm.key == ("mlx-community/Qwen3.8-27B-4bit", "z-lab/Qwen3.8-27B-DFlash2", 3)
-    assert arm.suite_key == (*arm.key, False, False, True)
+    assert arm.suite_key == (*arm.key, False, False, True, True)
 
 
 def test_on_nax_a_routable_checkpoint_gets_an_int8_arm_and_a_sampled_winner_a_greedy_arm(tmp_path):
@@ -286,8 +297,8 @@ def test_on_nax_a_routable_checkpoint_gets_an_int8_arm_and_a_sampled_winner_a_gr
     int8, greedy = arms
     assert int8.int8_prefill and int8.config.int8_prefill and not int8.greedy
     assert greedy.greedy and greedy.config.temperature == 0 and not greedy.int8_prefill
-    assert int8.suite_key == (*int8.key, True, False, True)
-    assert greedy.suite_key == (*greedy.key, False, True, True)
+    assert int8.suite_key == (*int8.key, True, False, True, True)
+    assert greedy.suite_key == (*greedy.key, False, True, True, True)
     assert all(not a.current and a.fit_window == 131072 for a in arms)
     # Only the winner stage's own int8 arm is under test: the engine
     # refusing it must fail the arm, unlike an arm that merely inherited
@@ -344,7 +355,7 @@ def test_quick_arms_mirror_the_users_int8_and_greedy_settings(tmp_path):
         assert arm.greedy is True
         # Inherited, not proposed: quick_arms never puts an arm under test.
         assert arm.int8_under_test is False
-        assert arm.suite_key == (*arm.key, True, True, True)
+        assert arm.suite_key == (*arm.key, True, True, True, True)
         cp = _checkpoints()[arm.model_id]
         extra_arms = winner_stage_arms(arm, nax=True, checkpoint=cp)
         assert extra_arms == []
@@ -362,7 +373,7 @@ def test_quick_arms_mirror_the_users_attention_tile_and_key_their_suite_rows_by_
         assert refusals == []
         for arm in arms:
             assert arm.attention_tile is tile and arm.config.attention_tile is tile
-            assert arm.suite_key == (*arm.key, False, False, tile)
+            assert arm.suite_key == (*arm.key, False, False, tile, True)
         keys[tile] = {arm.suite_key for arm in arms}
     # A run resumed after the setting was flipped matches none of the old rows.
     assert keys[True].isdisjoint(keys[False])
@@ -373,4 +384,161 @@ def test_the_winner_stage_carries_the_attention_tile_and_adds_no_arm_for_it(tmp_
     arms = winner_stage_arms(_winner(tmp_path, tile=False), nax=True, checkpoint=cp)
     assert [a.label for a in arms] == ["27B + DFlash2 @3 + int8 prefill", "27B + DFlash2 @3 greedy"]
     assert all(a.attention_tile is False and a.config.attention_tile is False for a in arms)
+    assert [a.suite_key[5] for a in arms] == [False, False]
+
+
+def _static_check(monkeypatch, reason=None):
+    """Stand in for the projection kernel's static check, recording what the
+    tune asked it: the real one reads this machine's GPU."""
+    from sous.engine import projkernel
+
+    asked = []
+
+    def static_reason(config, model_config, drafter_kind):
+        asked.append((config, model_config, drafter_kind))
+        return reason
+
+    monkeypatch.setattr(projkernel, "static_reason", static_reason)
+    return asked
+
+
+def test_an_unset_block_resolves_to_the_kernels_where_the_static_check_passes(
+    tmp_path, monkeypatch
+):
+    asked = _static_check(monkeypatch)
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    assert user.speculative_block_explicit is False
+    resolved = resolve_block(user, _checkpoints())
+    assert resolved.speculative_block_size == SPECULATIVE_BLOCK_KERNEL == 5
+    # Still unset: a proposal must never write the resolved block back.
+    assert resolved.speculative_block_explicit is False
+    assert asked == [(user, fx.qwen_27b(), "dflash")]
+    arms, _ = quick_arms(
+        resolved, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
+    )
+    current = [a for a in arms if a.current]
+    assert [(a.drafter_id, a.block_size) for a in current] == [("z-lab/Qwen3.8-27B-DFlash2", 5)]
+    assert current[0].label == "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @5"
+
+
+def test_an_unset_block_stays_at_the_default_where_the_static_check_refuses(tmp_path, monkeypatch):
+    _static_check(monkeypatch, reason="attention tile off")
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    assert resolve_block(user, _checkpoints()) is user
+
+
+def test_only_an_unset_block_with_a_described_model_and_drafter_is_resolved(tmp_path, monkeypatch):
+    asked = _static_check(monkeypatch)
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    explicit = dataclasses.replace(user, speculative_block_explicit=True)
+    undrafted = dataclasses.replace(user, speculative_draft_id="")
+    assert resolve_block(explicit, _checkpoints()) is explicit
+    assert resolve_block(undrafted, _checkpoints()) is undrafted
+    for missing in ("mlx-community/Qwen3.8-27B-4bit", "z-lab/Qwen3.8-27B-DFlash2"):
+        cps = _checkpoints()
+        del cps[missing]
+        assert resolve_block(user, cps) is user
+    assert asked == []
+
+
+def test_an_unset_block_is_not_resolved_for_a_target_on_the_text_only_backend(
+    tmp_path, monkeypatch
+):
+    """Without vision_config the target loads on mlx-lm, where the factory drops
+    the drafter: the daemon runs no block, so none is resolved and no line says
+    the configured arm is block 5."""
+    asked = _static_check(monkeypatch)
+    text_only = {k: v for k, v in fx.qwen_27b().items() if k != "vision_config"}
+    cps = _checkpoints()
+    cps["mlx-community/Qwen3.8-27B-4bit"] = describe(
+        "mlx-community/Qwen3.8-27B-4bit",
+        config_fn=lambda m: text_only,
+        size_fn=lambda m: 16_100_000_000,
+    )
+    assert cps["mlx-community/Qwen3.8-27B-4bit"].backend == "lm"
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    assert resolve_block(user, cps) is user
+    assert asked == []
+
+
+def test_an_unset_block_is_not_resolved_for_a_drafter_the_target_refuses(tmp_path, monkeypatch):
+    """A drafter whose shapes do not match the target is dropped at load, so the
+    daemon runs the target undrafted and no block is resolved."""
+    asked = _static_check(monkeypatch)
+    user = SousConfig(
+        data_dir=tmp_path,
+        config_path=tmp_path / "c.toml",
+        speculative_draft_id="z-lab/Qwen3.5-9B-DFlash",
+    )
+    assert user.model_id == "mlx-community/Qwen3.8-27B-4bit"
+    assert resolve_block(user, _checkpoints()) is user
+    assert asked == []
+
+
+def test_every_drafter_arm_pins_the_block_its_label_names(tmp_path):
+    """An unset block resolves at load, and replace() would hand every arm the
+    user's unset flag: where the projection kernel runs, each drafter arm
+    would then load at block 5 whatever its label says."""
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    arms, _ = quick_arms(
+        user, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
+    )
+    drafted = [a for a in arms if a.drafter_id]
+    assert len(drafted) == 2 * len(BLOCK_SIZES)
+    for arm in drafted:
+        assert arm.config.speculative_block_explicit is True
+        assert arm.config.speculative_block_size == arm.block_size
+    assert all(not a.config.speculative_block_explicit for a in arms if not a.drafter_id)
+
+
+def test_the_drafter_kind_is_mlx_vlms_own_resolution():
+    assert drafter_kind(fx.dflash2_27b()) == "dflash"
+    assert drafter_kind({"model_type": "qwen3_5_mtp"}) == "mtp"
+    assert drafter_kind({"model_type": "qwen3", "num_nextn_predict_layers": 1}) == "mtp"
+    assert drafter_kind({"speculators_model_type": "eagle3"}) == "eagle3"
+
+
+def test_a_drafter_kind_mlx_vlm_cannot_resolve_reads_as_unresolved(monkeypatch):
+    name = "mlx_vlm.speculative.drafters"
+    monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    assert drafter_kind(fx.dflash2_27b()) == "unresolved"
+    monkeypatch.setitem(sys.modules, name, None)
+    assert drafter_kind(fx.dflash2_27b()) == "unresolved"
+
+
+def test_a_drafter_kind_resolver_that_raises_reads_as_unresolved(monkeypatch):
+    """The resolver is private to mlx-vlm and may change its signature; the
+    static check only advises, so a raise must not abort the tune."""
+    from mlx_vlm.speculative import drafters
+
+    def changed(*args, **kwargs):
+        raise TypeError("_expected_drafter_kind() takes 1 positional argument")
+
+    monkeypatch.setattr(drafters, "_expected_drafter_kind", changed)
+    assert drafter_kind(fx.dflash2_27b()) == "unresolved"
+
+
+def test_quick_arms_mirror_the_users_projection_kernel_and_key_their_suite_rows_by_it(tmp_path):
+    keys = {}
+    for proj in (True, False):
+        user = SousConfig(
+            data_dir=tmp_path / "d", config_path=tmp_path / "c.toml", projection_kernel=proj
+        )
+        arms, refusals = quick_arms(
+            user, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
+        )
+        assert refusals == []
+        for arm in arms:
+            assert arm.projection_kernel is proj and arm.config.projection_kernel is proj
+            assert arm.suite_key == (*arm.key, False, False, True, proj)
+        keys[proj] = {arm.suite_key for arm in arms}
+    # A run resumed after the setting was flipped matches none of the old rows.
+    assert keys[True].isdisjoint(keys[False])
+
+
+def test_the_winner_stage_carries_the_projection_kernel_and_adds_no_arm_for_it(tmp_path):
+    cp = _checkpoints()["mlx-community/Qwen3.8-27B-4bit"]
+    arms = winner_stage_arms(_winner(tmp_path, proj=False), nax=True, checkpoint=cp)
+    assert [a.label for a in arms] == ["27B + DFlash2 @3 + int8 prefill", "27B + DFlash2 @3 greedy"]
+    assert all(a.projection_kernel is False and a.config.projection_kernel is False for a in arms)
     assert [a.suite_key[-1] for a in arms] == [False, False]

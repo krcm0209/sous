@@ -53,6 +53,9 @@ class LMEngine:
         # never reach; reported off so the load line and the status document
         # read it from either backend.
         self.attention_tile_status = {"state": "off", "reason": None}
+        # The projection kernel serves only modules an mlx-vlm qwen3_5 load
+        # tagged, so mlx-lm's never reach it; reported off, as the tile is.
+        self.projection_kernel_status = {"state": "off", "reason": None}
         # Forks on disk, when the factory handed us a directory: built after
         # int8 has settled, since the key reads it. Tests and sous tune never
         # pass one, so nothing they build touches ~/.sous.
@@ -91,6 +94,7 @@ class LMEngine:
             positions="model",
             int8_status=self.int8_prefill_status,
             tile_status=self.attention_tile_status,
+            proj_status=self.projection_kernel_status,
         )
 
     def _loaded(self) -> tuple:

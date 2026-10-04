@@ -4,14 +4,20 @@ none, a block size, and the window it fits at."""
 from __future__ import annotations
 
 import dataclasses
+import importlib
 from dataclasses import dataclass
 
-from sous.config import MIN_CONTEXT_TOKENS, SPECULATIVE_BLOCK_MAX, SousConfig
+from sous.config import (
+    MIN_CONTEXT_TOKENS,
+    SPECULATIVE_BLOCK_KERNEL,
+    SPECULATIVE_BLOCK_MAX,
+    SousConfig,
+)
 from sous.tune.candidates import Candidate, Checkpoint, Fit, drafter_compatible, fit
 
-# The verify depths worth measuring per machine, up to the config's clamp: 4
-# measured best on the M5 Pro (#118), 2 and 3 are for machines where a verify
-# row costs more.
+# The verify depths worth measuring per machine, up to the config's clamp: 5
+# pays on the M5 Pro where the projection kernel runs and 4 where it does not;
+# 2 and 3 are for machines where a verify row costs more.
 BLOCK_SIZES = tuple(range(2, SPECULATIVE_BLOCK_MAX + 1))
 
 
@@ -40,6 +46,9 @@ class Arm:
     # user's setting. It still keys suite rows, because tile and stock
     # attention differ in their last bits.
     attention_tile: bool = True
+    # Inherited and keyed the same way, for the same reason: kernel and stock
+    # projections differ in their last bits.
+    projection_kernel: bool = True
     # True only for the winner stage's own int8 arm, built to *measure*
     # INT8 prefill: the engine refusing it must fail that arm. Every other
     # arm's int8_prefill is merely inherited from the user's config (every
@@ -57,11 +66,17 @@ class Arm:
         return (self.model_id, self.drafter_id, self.block_size)
 
     @property
-    def suite_key(self) -> tuple[str, str, int, bool, bool, bool]:
+    def suite_key(self) -> tuple[str, str, int, bool, bool, bool, bool]:
         """What identifies an arm across suite runs and a resume: the bench
         key, the two settings only the suite may change, and the attention
-        tile every arm inherits."""
-        return (*self.key, self.int8_prefill, self.greedy, self.attention_tile)
+        tile and projection kernel every arm inherits."""
+        return (
+            *self.key,
+            self.int8_prefill,
+            self.greedy,
+            self.attention_tile,
+            self.projection_kernel,
+        )
 
 
 @dataclass(frozen=True)
@@ -103,6 +118,57 @@ def _with_current(user: SousConfig, candidates: list[Candidate]) -> list[Candida
     return out
 
 
+def drafter_kind(config: dict) -> str:
+    """The round-loop kind mlx-vlm resolves at load for a drafter with this
+    config.json and no kind given, by its own resolver, so the static check
+    below needs no download. A resolver this cannot reach, or one that raises,
+    reads as "unresolved", which the check refuses like any kind but dflash:
+    the resolver is private to mlx-vlm and the check only advises, so its
+    drift must not abort the tune."""
+    try:
+        drafters = importlib.import_module("mlx_vlm.speculative.drafters")
+    except ImportError:
+        return "unresolved"
+    expected = getattr(drafters, "_expected_drafter_kind", None)
+    default = getattr(drafters, "DEFAULT_DRAFTER_KIND", None)
+    if expected is None or not isinstance(default, str):
+        return "unresolved"
+    model_type = config.get("model_type") or config.get("speculators_model_type")
+    try:
+        return str(expected(model_type, config) or default)
+    except Exception:  # noqa: BLE001 — any drift in a private resolver
+        return "unresolved"
+
+
+def resolve_block(user: SousConfig, checkpoints: dict[str, Checkpoint]) -> SousConfig:
+    """The user's configuration with the verify block the daemon would run.
+    An unset speculative_block_size resolves at load to
+    SPECULATIVE_BLOCK_KERNEL where the projection kernel goes active and stays
+    at the default elsewhere; the tune cannot load a model to find out, so it
+    puts the kernel's static check to the checkpoints it already described.
+    The current-arm mark, the user's own block among the measured ones and
+    every proposed change then compare against what the daemon runs. A
+    refusal the static check cannot see (a failed probe, a drifted source
+    pin) leaves the mark one block off; the arms themselves are unaffected,
+    since each pins the block its label names."""
+    if user.speculative_block_explicit or not user.speculative_draft_id:
+        return user
+    target = checkpoints.get(user.model_id)
+    drafter = checkpoints.get(user.speculative_draft_id)
+    if target is None or drafter is None:
+        return user
+    # The daemon runs this pair undrafted (the factory drops the drafter on
+    # the mlx-lm backend, the engine one that cannot read the target), so no
+    # block is resolved for it.
+    if target.backend != "vlm" or not drafter_compatible(target, drafter)[0]:
+        return user
+    from sous.engine import projkernel
+
+    if projkernel.static_reason(user, target.config, drafter_kind(drafter.config)) is not None:
+        return user
+    return dataclasses.replace(user, speculative_block_size=SPECULATIVE_BLOCK_KERNEL)
+
+
 def _arm(
     user: SousConfig,
     cand: Candidate,
@@ -118,6 +184,10 @@ def _arm(
         model_id=cand.id,
         speculative_draft_id=drafter_id,
         speculative_block_size=block if drafter_id else user.speculative_block_size,
+        # Explicit, or the copy of the user's unset flag would let the engine
+        # resolve the block at load: where the projection kernel runs, every
+        # drafter arm would measure block 5 whatever its label says.
+        speculative_block_explicit=True if drafter_id else user.speculative_block_explicit,
         max_context_tokens=min(user.max_context_tokens, f.window),
     )
     if current is None:
@@ -139,6 +209,7 @@ def _arm(
         int8_prefill=user.int8_prefill,
         greedy=user.temperature == 0,
         attention_tile=user.attention_tile,
+        projection_kernel=user.projection_kernel,
     )
 
 

@@ -217,12 +217,55 @@ def test_attention_tile_rejects_non_booleans_with_a_warning(tmp_path: Path, bad:
     assert cfg.attention_tile is False
 
 
+# ---- [model].projection_kernel ------------------------------------------------
+
+
+def test_projection_kernel_defaults_on(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nid = 'x/y'\n")
+    assert load_config(p).projection_kernel is True
+    assert SousConfig().projection_kernel is True
+
+
+def test_projection_kernel_reads_false_without_an_unknown_key_warning(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nprojection_kernel = false\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cfg = load_config(p)
+    assert cfg.projection_kernel is False
+
+
+@pytest.mark.parametrize("bad", ['"yes"', "1", "0.5"])
+def test_projection_kernel_rejects_non_booleans_with_a_warning(tmp_path: Path, bad: str):
+    p = tmp_path / "config.toml"
+    p.write_text(f"[model]\nprojection_kernel = {bad}\n")
+    with pytest.warns(
+        UserWarning, match=r"\[model\]\.projection_kernel .* must be true or false; using false"
+    ):
+        cfg = load_config(p)
+    assert cfg.projection_kernel is False
+
+
 def test_speculative_defaults(tmp_path: Path):
     cfg = load_config(tmp_path / "nope.toml")
     assert cfg.speculative_draft_id == "z-lab/Qwen3.8-27B-DFlash2"
-    # 4 measured best on the M5 Pro on real subagent turns (#118); 0 would hand
-    # the choice back to the drafter's own adaptive policy.
+    # Unset, the block is the engine's to resolve at load: 5 where the
+    # projection kernel serves the load, 4 elsewhere. 0 would hand the choice
+    # back to the drafter's own adaptive policy.
     assert cfg.speculative_block_size == 4
+    assert cfg.speculative_block_explicit is False
+    assert SousConfig().speculative_block_explicit is False
+
+
+def test_speculative_block_kernel_is_five_within_the_clamp():
+    from sous.config import (
+        SPECULATIVE_BLOCK_DEFAULT,
+        SPECULATIVE_BLOCK_KERNEL,
+        SPECULATIVE_BLOCK_MAX,
+    )
+
+    assert (SPECULATIVE_BLOCK_DEFAULT, SPECULATIVE_BLOCK_KERNEL, SPECULATIVE_BLOCK_MAX) == (4, 5, 5)
 
 
 def test_speculative_keys_from_toml_without_unknown_key_warnings(tmp_path: Path):
@@ -233,14 +276,17 @@ def test_speculative_keys_from_toml_without_unknown_key_warnings(tmp_path: Path)
         cfg = load_config(p)
     assert cfg.speculative_draft_id == ""
     assert cfg.speculative_block_size == 3
+    assert cfg.speculative_block_explicit is True
     assert not [w for w in caught if "unknown" in str(w.message).lower()]
 
 
 def test_speculative_block_size_one_or_negative_warns_and_uses_the_default(tmp_path: Path):
     """mlx-vlm treats the override as the total verify-block size and ends the
     round loop at <= 1 — a configured 1 would silently truncate every response
-    to one token. Invalid values degrade to the default (4) with a warning,
-    matching the [context] policy stance."""
+    to one token. Invalid values degrade to the default with a warning,
+    matching the [context] policy stance, and count as unset: the engine
+    resolves the block as if the key were absent, so the warning cannot name
+    a number."""
     for bad in ("1", "-3", "true", '"3"'):
         p = tmp_path / f"c{len(bad)}{bad[0]}.toml"
         p.write_text(f"[model]\nspeculative_block_size = {bad}\n")
@@ -248,14 +294,20 @@ def test_speculative_block_size_one_or_negative_warns_and_uses_the_default(tmp_p
             warnings.simplefilter("always")
             cfg = load_config(p)
         assert cfg.speculative_block_size == 4, bad
-        assert any("speculative_block_size" in str(w.message) for w in caught), bad
+        assert cfg.speculative_block_explicit is False, bad
+        assert any(
+            "speculative_block_size" in str(w.message)
+            and str(w.message).endswith("; using the default")
+            for w in caught
+        ), bad
 
 
 def test_speculative_block_size_above_five_warns_and_is_clamped_to_five(tmp_path: Path):
-    """No block above 5 has paid (block 6 ran 0.8x block 3 on the M5 Pro, and
-    without the attention tile 6+ rows leave mlx's fused attention kernel), so
-    a larger block is a net loss the user cannot see. Clamp, keeping the
-    intent (as deep as pays), and say so."""
+    """No block above 5 is validated in-tree (block 6 ran 0.8x block 3 on the M5
+    Pro without the projection kernel, and without the attention tile 6+ rows
+    leave mlx's fused attention kernel), so a larger block may be a loss the
+    user cannot see. Clamp, keeping the intent (as deep as validated), and say
+    so."""
     for big in ("6", "9", "16"):
         p = tmp_path / f"c{big}.toml"
         p.write_text(f"[model]\nspeculative_block_size = {big}\n")
@@ -263,8 +315,12 @@ def test_speculative_block_size_above_five_warns_and_is_clamped_to_five(tmp_path
             warnings.simplefilter("always")
             cfg = load_config(p)
         assert cfg.speculative_block_size == 5, big
+        assert cfg.speculative_block_explicit is True, big  # the intent stands
         assert any(
-            "speculative_block_size" in str(w.message) and "5" in str(w.message) for w in caught
+            str(w.message)
+            == f"sous config: [model].speculative_block_size {big} exceeds 5, the largest "
+            "verify block sous has validated in-tree; using 5"
+            for w in caught
         ), big
 
 
@@ -276,6 +332,7 @@ def test_speculative_block_size_zero_and_two_to_five_accepted(tmp_path: Path):
             warnings.simplefilter("always")
             cfg = load_config(p)
         assert cfg.speculative_block_size == ok
+        assert cfg.speculative_block_explicit is True
         assert not [w for w in caught if "speculative_block_size" in str(w.message)]
     p = tmp_path / "config.toml"
     p.write_text("[model]\nspeculative_block_size = 0\n")
@@ -283,6 +340,7 @@ def test_speculative_block_size_zero_and_two_to_five_accepted(tmp_path: Path):
         warnings.simplefilter("always")
         cfg = load_config(p)
     assert cfg.speculative_block_size == 0
+    assert cfg.speculative_block_explicit is True  # the drafter's policy, chosen
     assert not [w for w in caught if "speculative_block_size" in str(w.message)]
 
 

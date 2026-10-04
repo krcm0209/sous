@@ -5,6 +5,8 @@ itself is exercised by the `nax`-gated tests at the bottom, which skip where the
 neural accelerators are absent and run on the M5 Pro.
 """
 
+import hashlib
+import inspect
 import types
 
 import pytest
@@ -486,6 +488,35 @@ def test_install_wrappers_is_idempotent():
     first = Qwen3_5MLP.__call__
     i8.install_wrappers([(Qwen3_5MLP, "mlp")])
     assert Qwen3_5MLP.__call__ is first
+
+
+def _digest(fn):
+    return hashlib.sha256(inspect.getsource(fn).encode("utf-8")).hexdigest()
+
+
+def test_wrappers_leave_the_wrapped_source_readable(monkeypatch):
+    """A source pin hashes inspect.getsource of a method, which follows __wrapped__:
+    without it, an active int8 would read as mlx or mlx-vlm having changed the
+    pinned method. The class's own source is the witness no wrapper can change."""
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5GatedDeltaNet, Qwen3_5MLP
+
+    classes = (nn.QuantizedLinear, Qwen3_5MLP, Qwen3_5GatedDeltaNet)
+    # int8 installs once per process behind these two guards: reset both and the
+    # three methods, so this test wraps afresh and teardown restores what it found.
+    monkeypatch.setattr(i8, "_WRAPPED", set())
+    monkeypatch.setattr(i8, "_QUANTIZED_LINEAR_WRAPPED", False)
+    before = {cls: cls.__dict__["__call__"] for cls in classes}
+    for cls, method in before.items():
+        monkeypatch.setattr(cls, "__call__", method)
+    i8.install_wrappers([(Qwen3_5MLP, "mlp"), (Qwen3_5GatedDeltaNet, "gdn")])
+    for cls in classes:
+        wrapper = cls.__dict__["__call__"]
+        assert wrapper is not before[cls], cls
+        assert wrapper.__wrapped__ is before[cls], cls
+        source = inspect.getsource(wrapper)
+        assert source.lstrip().startswith("def __call__("), cls
+        assert source in inspect.getsource(cls), cls
+        assert _digest(wrapper) == _digest(before[cls]), cls
 
 
 # ---- enable() -----------------------------------------------------------------------
