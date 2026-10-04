@@ -121,8 +121,10 @@ def _with_current(user: SousConfig, candidates: list[Candidate]) -> list[Candida
 def drafter_kind(config: dict) -> str:
     """The round-loop kind mlx-vlm resolves at load for a drafter with this
     config.json and no kind given, by its own resolver, so the static check
-    below needs no download. A resolver this cannot reach reads as
-    "unresolved", which the check refuses like any kind but dflash."""
+    below needs no download. A resolver this cannot reach, or one that raises,
+    reads as "unresolved", which the check refuses like any kind but dflash:
+    the resolver is private to mlx-vlm and the check only advises, so its
+    drift must not abort the tune."""
     try:
         drafters = importlib.import_module("mlx_vlm.speculative.drafters")
     except ImportError:
@@ -132,7 +134,10 @@ def drafter_kind(config: dict) -> str:
     if expected is None or not isinstance(default, str):
         return "unresolved"
     model_type = config.get("model_type") or config.get("speculators_model_type")
-    return str(expected(model_type, config) or default)
+    try:
+        return str(expected(model_type, config) or default)
+    except Exception:  # noqa: BLE001 — any drift in a private resolver
+        return "unresolved"
 
 
 def resolve_block(user: SousConfig, checkpoints: dict[str, Checkpoint]) -> SousConfig:
@@ -151,6 +156,11 @@ def resolve_block(user: SousConfig, checkpoints: dict[str, Checkpoint]) -> SousC
     target = checkpoints.get(user.model_id)
     drafter = checkpoints.get(user.speculative_draft_id)
     if target is None or drafter is None:
+        return user
+    # The daemon runs this pair undrafted (the factory drops the drafter on
+    # the mlx-lm backend, the engine one that cannot read the target), so no
+    # block is resolved for it.
+    if target.backend != "vlm" or not drafter_compatible(target, drafter)[0]:
         return user
     from sous.engine import projkernel
 

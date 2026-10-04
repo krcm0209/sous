@@ -441,6 +441,40 @@ def test_only_an_unset_block_with_a_described_model_and_drafter_is_resolved(tmp_
     assert asked == []
 
 
+def test_an_unset_block_is_not_resolved_for_a_target_on_the_text_only_backend(
+    tmp_path, monkeypatch
+):
+    """Without vision_config the target loads on mlx-lm, where the factory drops
+    the drafter: the daemon runs no block, so none is resolved and no line says
+    the configured arm is block 5."""
+    asked = _static_check(monkeypatch)
+    text_only = {k: v for k, v in fx.qwen_27b().items() if k != "vision_config"}
+    cps = _checkpoints()
+    cps["mlx-community/Qwen3.8-27B-4bit"] = describe(
+        "mlx-community/Qwen3.8-27B-4bit",
+        config_fn=lambda m: text_only,
+        size_fn=lambda m: 16_100_000_000,
+    )
+    assert cps["mlx-community/Qwen3.8-27B-4bit"].backend == "lm"
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    assert resolve_block(user, cps) is user
+    assert asked == []
+
+
+def test_an_unset_block_is_not_resolved_for_a_drafter_the_target_refuses(tmp_path, monkeypatch):
+    """A drafter whose shapes do not match the target is dropped at load, so the
+    daemon runs the target undrafted and no block is resolved."""
+    asked = _static_check(monkeypatch)
+    user = SousConfig(
+        data_dir=tmp_path,
+        config_path=tmp_path / "c.toml",
+        speculative_draft_id="z-lab/Qwen3.5-9B-DFlash",
+    )
+    assert user.model_id == "mlx-community/Qwen3.8-27B-4bit"
+    assert resolve_block(user, _checkpoints()) is user
+    assert asked == []
+
+
 def test_every_drafter_arm_pins_the_block_its_label_names(tmp_path):
     """An unset block resolves at load, and replace() would hand every arm the
     user's unset flag: where the projection kernel runs, each drafter arm
@@ -469,6 +503,18 @@ def test_a_drafter_kind_mlx_vlm_cannot_resolve_reads_as_unresolved(monkeypatch):
     monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     assert drafter_kind(fx.dflash2_27b()) == "unresolved"
     monkeypatch.setitem(sys.modules, name, None)
+    assert drafter_kind(fx.dflash2_27b()) == "unresolved"
+
+
+def test_a_drafter_kind_resolver_that_raises_reads_as_unresolved(monkeypatch):
+    """The resolver is private to mlx-vlm and may change its signature; the
+    static check only advises, so a raise must not abort the tune."""
+    from mlx_vlm.speculative import drafters
+
+    def changed(*args, **kwargs):
+        raise TypeError("_expected_drafter_kind() takes 1 positional argument")
+
+    monkeypatch.setattr(drafters, "_expected_drafter_kind", changed)
     assert drafter_kind(fx.dflash2_27b()) == "unresolved"
 
 
