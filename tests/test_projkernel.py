@@ -156,6 +156,8 @@ def test_eligible_takes_only_what_the_kernel_decodes():
     assert not projkernel.eligible(_qlinear(256, 64, group_size=32, mode="mxfp4"))
     assert not projkernel.eligible(_qlinear(256, 64, bias=True))
     assert not projkernel.eligible(_qlinear(128, 64)), "K / 64 below the four-way K split"
+    assert projkernel.eligible(_qlinear(256, 2)), "eight scales, the fewest mlx binds as a buffer"
+    assert not projkernel.eligible(_qlinear(256, 1)), "four scales: mlx binds them constant"
     assert not projkernel.eligible(nn.Linear(256, 64)), "not quantized"
 
 
@@ -198,6 +200,14 @@ def test_linears_refuses_a_k_its_variant_cannot_split(no_launch, monkeypatch):
     monkeypatch.setattr(projkernel, "variant", lambda k, n_sum: "staged")
     with pytest.raises(ValueError, match="K=1088 does not fit the staged variant"):
         projkernel.linears(mx.zeros((2, 1088), dtype=mx.bfloat16), [pfx.rand_linear(64, 1088, 0)])
+
+
+def test_linears_refuses_scales_mlx_would_bind_constant(no_launch):
+    """mlx hands a kernel any input of fewer than eight elements in the constant
+    address space, which the bodies' device pointers cannot take: a one-column
+    linear at K = 256 has four scales and is refused here, not by the compiler."""
+    with pytest.raises(ValueError, match="4 scales are fewer than 8"):
+        projkernel.linears(mx.zeros((2, 256), dtype=mx.bfloat16), [pfx.rand_linear(1, 256, 0)])
 
 
 # ---- the stand-in ----------------------------------------------------------------
@@ -376,6 +386,18 @@ def test_the_three_variants_agree_bitwise(monkeypatch, t, layout):
     for kind in ("staged", "staged_ps"):
         for got, want in zip(outs[kind], outs["plain"], strict=True):
             assert mx.array_equal(got, want).item(), (kind, layout, t)
+
+
+@pfx.kernel
+@pytest.mark.parametrize(("n", "k"), [(2, 256), (1, 512)])
+def test_the_smallest_eligible_projections_compile_and_compute(n, k):
+    """Eight scales is the floor eligible() sets: were mlx to bind an array of
+    that size constant too, these would fail in the compiler."""
+    x = pfx.activations(3, k, 5)
+    weights = [pfx.rand_linear(n, k, 6)]
+    (got,) = projkernel.linears(x, weights)
+    (want,) = pfx.stand_in_mma(x, weights)
+    assert projkernel._stock_distance(got, want) <= projkernel.REL_RMS_BOUND
 
 
 @pfx.kernel

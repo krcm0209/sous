@@ -470,7 +470,9 @@ goal.
   kernel rides on the tile, inheriting its M5 Pro gate and, with a drafter,
   exact verify attention); the model (`qwen3_5`, every language-model
   `QuantizedLinear` affine 4-bit, group 64, bf16 scales and biases, no
-  `bias`); the drafter's kind (none or `dflash`); a target that does not
+  `bias`, and at least 8 scale values — mlx binds a kernel input of fewer
+  elements `constant`, which the bodies' device pointers cannot compile
+  against); the drafter's kind (none or `dflash`); a target that does not
   define `speculative_verify_dflash_hidden`, which would send greedy
   verify's tokens through `quantized_argmax`, past both hooks, and which a
   qwen3_5 target gains only through mlx-vlm drift; the source pins

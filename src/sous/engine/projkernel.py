@@ -44,6 +44,11 @@ MAX_ROWS = 8
 REL_RMS_BOUND = 1e-2
 _MAX_LINEARS = 4
 _GROUP = 64
+# mlx binds a kernel input of fewer elements than this in the constant address
+# space, and the bodies read every input through device pointers, so such an input
+# fails to compile. Of a projection's arrays only the scales and biases of a
+# one-column linear at K < 512 fall under it.
+_MIN_DEVICE_SIZE = 8
 # The Metal bodies' frozen F = 4, NSG = 1, KS = 4 and GB = 4, as the launch needs
 # them: 32 columns per threadgroup, 128 threads, K / 64 >= KS for the plain body,
 # K % (64 * KS * GB) == 0 for the staged one.
@@ -154,8 +159,9 @@ def variant(k: int, n_sum: int) -> str:
 
 def eligible(module: Any) -> bool:
     """An nn.QuantizedLinear the kernel decodes: affine, 4-bit, group 64, uint32
-    weights, bf16 scales and biases, no bias term, and K / 64 at least the kernel's
-    four-way K split. Any N: partial tiles are clamped on read and guarded on write."""
+    weights, bf16 scales and biases, no bias term, K / 64 at least the kernel's
+    four-way K split, and scales of at least _MIN_DEVICE_SIZE values. Any N past
+    that: partial tiles are clamped on read and guarded on write."""
     import mlx.core as mx
     import mlx.nn as nn
 
@@ -175,6 +181,8 @@ def eligible(module: Any) -> bool:
     if scales.dtype != mx.bfloat16 or biases.dtype != mx.bfloat16:
         return False
     if scales.shape != biases.shape or scales.shape[0] != weight.shape[0]:
+        return False
+    if scales.size < _MIN_DEVICE_SIZE:
         return False
     k = scales.shape[1] * _GROUP
     return weight.shape[1] * 8 == k and k // _GROUP >= _KS
@@ -249,6 +257,11 @@ def linears(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]:
     for w, scales, _ in weights:
         if w.shape[-1] * 8 != k or scales.shape[-1] * _GROUP != k:
             raise ValueError(f"projection kernel: a linear's K is not the activations' K={k}")
+        if scales.size < _MIN_DEVICE_SIZE:
+            raise ValueError(
+                f"projection kernel: a linear's {scales.size} scales are fewer than "
+                f"{_MIN_DEVICE_SIZE}"
+            )
     kind = variant(k, sum(int(w.shape[0]) for w, _, _ in weights))
     if k // _GROUP < _KS or (kind != "plain" and k % _STAGED_K):
         raise ValueError(f"projection kernel: K={k} does not fit the {kind} variant")
