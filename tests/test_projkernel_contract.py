@@ -67,9 +67,18 @@ def _kernel_on(monkeypatch, lm, *, stand_in: bool = True) -> None:
     pfx.guard_proj_state(monkeypatch)
     pfx.hooked(monkeypatch)
     if not stand_in:
-        monkeypatch.setattr(projkernel, "mma", projkernel.linears)
+        pfx.real_kernel(monkeypatch)
     monkeypatch.setattr(projkernel, "_active", 1)
     projkernel.tag(lm)
+
+
+def _decoded(t: int, *, stand_in: bool) -> dict[str, int]:
+    """The counters t one-row decode steps move: every projection through hook
+    two, and on the real kernel each one a one-row dispatch."""
+    moved = {"plain_kernel": PLAIN_CALLS * t}
+    if not stand_in:
+        moved["one_row"] = PLAIN_CALLS * t
+    return moved
 
 
 def _rows_of(x) -> int:
@@ -109,7 +118,7 @@ def test_the_kernel_keeps_verify_rows_equal_to_decode_through_the_real_forward(
     decode = _decode_rows(lm, ids, PREFIX, t)
     assert all(_same(verify, decode)), t
     assert _delta(start, verified) == {"verify_kernel": VERIFY_CALLS}
-    assert _delta(verified, projkernel.calls) == {"plain_kernel": PLAIN_CALLS * t}
+    assert _delta(verified, projkernel.calls) == _decoded(t, stand_in=stand_in)
 
     monkeypatch.setattr(projkernel, "_active", 0)
     start = dict(projkernel.calls)
@@ -167,7 +176,7 @@ def test_a_verify_of_more_than_eight_rows_is_split_and_equals_its_rows_alone(
     assert _delta(start, verified) == {"verify_kernel": VERIFY_CALLS, "verify_split": VERIFY_CALLS}
     assert len(launches) == 2 * VERIFY_CALLS
     assert max(launches) <= projkernel.MAX_ROWS and sum(launches) == t * VERIFY_CALLS
-    assert _delta(verified, projkernel.calls) == {"plain_kernel": PLAIN_CALLS * t}
+    assert _delta(verified, projkernel.calls) == _decoded(t, stand_in=stand_in)
 
 
 class _Wrapper:

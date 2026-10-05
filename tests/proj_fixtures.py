@@ -134,6 +134,13 @@ def stand_in_mma(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]
     return tuple(outs)
 
 
+def stand_in_one_row(x2: Any, w: Any, scales: Any, biases: Any) -> Any:
+    """A plain-mlx model of projkernel.one_row's contract: one [1, K] row through
+    one linear, the stand-in's own arithmetic, so it equals stand_in_mma's row
+    bit for bit as the real one-row kernel equals the MMA kernel's."""
+    return stand_in_mma(x2, [(w, scales, biases)])[0]
+
+
 def rand_module(n: int, k: int, seed: int) -> Any:
     """rand_linear's projection as the module a model holds: an nn.QuantizedLinear,
     affine 4-bit at group size 64, bf16 scales and biases, no bias term."""
@@ -185,8 +192,8 @@ def guard_proj_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """Registers restores for what install_hooks(), enable() and the probe leave
     behind for the rest of the process: nn.QuantizedLinear.__call__ and the
     verifier's _linear and _linears (the hooks), the flag, int8's install flag (a
-    test may install int8's wrapper in either order with ours) and the remembered
-    compile verdict. A test that installs or activates the kernel then cannot
+    test may install int8's wrapper in either order with ours), the remembered
+    compile verdict and the one-row seam. A test that installs or activates the kernel then cannot
     leak any of them into the next."""
     import mlx.nn as nn
 
@@ -199,15 +206,29 @@ def guard_proj_state(monkeypatch: pytest.MonkeyPatch) -> None:
         int8prefill, "_QUANTIZED_LINEAR_WRAPPED", int8prefill._QUANTIZED_LINEAR_WRAPPED
     )
     monkeypatch.setattr(projkernel, "_kernel_ok", projkernel._kernel_ok)
+    monkeypatch.setattr(projkernel, "one_row", projkernel.one_row)
+
+
+def stand_ins(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stand-ins as both kernels: `mma` and the one-row kernel `linears`,
+    warm_up() and the probe reach through `one_row`."""
+    monkeypatch.setattr(projkernel, "mma", stand_in_mma)
+    monkeypatch.setattr(projkernel, "one_row", stand_in_one_row)
+
+
+def real_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real kernels behind both seams, for a test that set the stand-ins."""
+    monkeypatch.setattr(projkernel, "mma", projkernel.linears)
+    monkeypatch.setattr(projkernel, "one_row", projkernel._launch_row)
 
 
 def hooked(monkeypatch: pytest.MonkeyPatch, *, active: int = 1) -> None:
     """Both hooks installed and the flag at `active` for this test only, with the
-    stand-in as the kernel; guard_proj_state's restores undo all of it."""
+    stand-ins as the kernels; guard_proj_state's restores undo all of it."""
     guard_proj_state(monkeypatch)
     projkernel.install_hooks()
     monkeypatch.setattr(projkernel, "_active", active)
-    monkeypatch.setattr(projkernel, "mma", stand_in_mma)
+    stand_ins(monkeypatch)
 
 
 # The attention tile's status as an active load reports it; enable() rides on it.
@@ -222,8 +243,8 @@ ACTIVE_TILE: dict[str, Any] = {
 def proj_ready(monkeypatch: pytest.MonkeyPatch, *, real_pins: bool = False) -> dict[str, Any]:
     """Every enable() and static_reason() guard that reads the machine passes
     on any GPU: the platform rule, and a core count of 20 under this GPU's own
-    name. The stand-in is the kernel, and the pins pass unless `real_pins` (for
-    the tests about the pins themselves). Registers guard_proj_state's restores
+    name. The stand-ins are the kernels, and the pins pass unless `real_pins`
+    (for the tests about the pins themselves). Registers guard_proj_state's restores
     and returns the attention tile's status to hand enable()."""
     import mlx.core as mx
 
@@ -233,7 +254,7 @@ def proj_ready(monkeypatch: pytest.MonkeyPatch, *, real_pins: bool = False) -> d
     device = str(mx.device_info()["device_name"])
     monkeypatch.setattr(nax, "platform_reason", lambda: None)
     monkeypatch.setattr(gpucores, "read", lambda: gpucores.GPUCores(20, device, None, "iokit"))
-    monkeypatch.setattr(projkernel, "mma", stand_in_mma)
+    stand_ins(monkeypatch)
     if not real_pins:
         monkeypatch.setattr(projkernel, "_pins_reason", lambda: None)
     return dict(ACTIVE_TILE)

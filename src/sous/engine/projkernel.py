@@ -9,8 +9,13 @@ linears share the dispatch, not on which of the three variants served it. The
 variants (plain; staged through threadgroup memory; staged with activation sums
 presummed by a small prepare kernel) differ only in how they load, so the choice
 between them is made by shape for speed and never changes an output. That
-independence is what lets verify rows and one-row decode go through the same
-kernel and agree bit for bit.
+independence is what lets verify rows and one-row decode agree bit for bit.
+
+A call of one row, which the MMA kernel serves at a fraction of its lanes, goes
+instead to a one-row kernel (``kernels/projection_row.metal``) that computes the
+same per-row arithmetic in the same order with one simdgroup per column, so its
+output equals the MMA kernel's at one row bitwise; ``kernel_available()`` and the
+load-time probe check that it does.
 
 The kernel needs no tensor units and no MPP, so it compiles on any Metal GPU with
 half x float simdgroup MMA; ``kernel_available()`` is what its tests skip on. Its
@@ -72,6 +77,14 @@ _SELECT = "__SELECT__"
 # mlx's default, stated rather than inherited: the variants agree bitwise only if
 # each rounds exactly as written, which relaxed and fast math do not promise.
 _SAFE_MATH = {"math_mode": "safe"}
+# The one-row body's frozen RC = 1 and NSG = 4: columns per threadgroup, threads.
+_ROW_COLS = 4
+_ROW_THREADS = 128
+# The widest K the one-row kernel takes: its group dots and sums, NSG * G * 2
+# fp32 values, must fit the 32 KB of threadgroup memory every Apple GPU has. A
+# one-row call past it goes to the MMA kernel, which computes the same bits.
+_ROW_MAX_K = 32 * 1024 // (4 * 2 * 4) * _GROUP
+_ROW_KERNEL = "sous_proj_row"
 
 
 @functools.cache
@@ -148,6 +161,22 @@ def _group_sums_kernel() -> Callable[..., list[Any]]:
         ["sums"],
         _bodies()[2],
         _header(False),
+        compile_options=_SAFE_MATH,
+    )
+
+
+def _row_source() -> str:
+    return _kernel_text("projection_row.metal")
+
+
+def _row_kernel() -> Callable[..., list[Any]]:
+    """The one-row kernel: one body, its K and N template arguments."""
+    return _kernel(
+        _ROW_KERNEL,
+        ["x", "w", "scales", "biases"],
+        ["y"],
+        _row_source(),
+        _kernel_text("common.h"),
         compile_options=_SAFE_MATH,
     )
 
@@ -252,11 +281,34 @@ def _launch(kind: str, x2: Any, weights: list[tuple[Any, Any, Any]]) -> list[Any
     return _projection_kernel(kind, len(weights))(inputs=inputs, **dispatch)
 
 
+@functools.cache
+def _row_dispatch(k: int, n: int) -> dict[str, Any]:
+    """The one-row launch arguments for K and N, built once per shape for the
+    reason _dispatch is."""
+    import mlx.core as mx
+
+    return {
+        "template": [("KD", k), ("ND", n)],
+        "grid": (_ROW_THREADS * -(-n // _ROW_COLS), 1, 1),
+        "threadgroup": (_ROW_THREADS, 1, 1),
+        "output_shapes": [(1, n)],
+        "output_dtypes": [mx.bfloat16],
+    }
+
+
+def _launch_row(x2: Any, w: Any, scales: Any, biases: Any) -> Any:
+    """One [1, K] bf16 row through one linear on the one-row kernel; [1, N] bf16."""
+    (y,) = _row_kernel()(inputs=[x2, w, scales, biases], **_row_dispatch(x2.shape[-1], w.shape[0]))
+    return y
+
+
 def linears(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]:
     """x [..., K] bf16 with 1..MAX_ROWS rows (the product of its leading dimensions)
     through 1..4 affine-Q4 gs64 linears that share it, given as (weight uint32
     [N, K/8], scales bf16 [N, K/64], biases bf16 [N, K/64]); one [..., N_i] bf16 per
-    linear. Raises ValueError for what the kernel cannot take; the hooks check their
+    linear. One row goes to the one-row kernel, one dispatch per linear (a row's
+    bits do not depend on the linears beside it), unless K is past _ROW_MAX_K.
+    Raises ValueError for what the kernel cannot take; the hooks check their
     calls before reaching here, so a raise is a caller's bug, never a fallback."""
     import mlx.core as mx
 
@@ -279,7 +331,13 @@ def linears(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]:
     kind = variant(k, sum(int(w.shape[0]) for w, _, _ in weights))
     if k // _GROUP < _KS or (kind != "plain" and k % _STAGED_K):
         raise ValueError(f"projection kernel: K={k} does not fit the {kind} variant")
-    outs = _launch(kind, x if x.ndim == 2 else x.reshape(rows, k), weights)
+    x2 = x if x.ndim == 2 else x.reshape(rows, k)
+    if rows == 1 and k <= _ROW_MAX_K:
+        calls["one_row"] += len(weights)
+        # `one_row` is read at call time, the seam tests swap a stand-in into.
+        outs = [one_row(x2, w, scales, biases) for w, scales, biases in weights]
+    else:
+        outs = _launch(kind, x2, weights)
     if x.ndim == 2:
         return tuple(outs)
     return tuple(out.reshape(*x.shape[:-1], out.shape[-1]) for out in outs)
@@ -290,9 +348,10 @@ def linear(x: Any, w: Any, scales: Any, biases: Any) -> Any:
     return linears(x, [(w, scales, biases)])[0]
 
 
-# The seam the hooks call through, looked up at call time so tests can swap in a
-# plain-mlx stand-in with the same contract.
+# The seams the hooks and linears() call through, looked up at call time so
+# tests can swap in plain-mlx stand-ins with the same contracts.
 mma = linears
+one_row = _launch_row
 
 
 # --------------------------------------------------------------------------------
@@ -308,6 +367,59 @@ _PROBE_ROW = 3
 
 _kernel_ok = False
 
+# The cancelling layouts the one-row checks add to random rows. Random rows leave
+# a reordered fp32 sum on the same bf16 almost everywhere; in these the large
+# terms cancel exactly, so the small result shows how it was summed. "quarter"
+# cancels the first K quarter against the last (the order the quarters are
+# added in), "group" a quarter of every quant group against another (the
+# order of a group's 64 products and of its activation sum: where another
+# GPU's MMA summed in another order, the MMA kernel's rows would move here).
+CANCELLING = ("quarter", "group")
+# How far the cancelling layouts' large values sit above the rest.
+_CANCEL = 256.0
+
+
+def _mirror(k: int, layout: str) -> tuple[Any, Any, int]:
+    """(source columns, mirror columns, the offset from one to the other) of a
+    cancelling layout, as [K] masks. Quarters are split by whole quant groups,
+    as both kernels split K, and the last is never narrower than the first."""
+    import mlx.core as mx
+
+    col = mx.arange(k)
+    if layout == "quarter":
+        groups = k // _GROUP
+        width = _GROUP * (groups // _KS)
+        last = _GROUP * ((_KS - 1) * groups // _KS)
+        return col < width, (col >= last) & (col < last + width), last
+    within = col % _GROUP
+    return within < 16, within >= 48, 48
+
+
+def _cancelling_rows(rows: int, k: int, layout: str, key: Any) -> Any:
+    """[rows, K] bf16: large values over a layout's source columns, exactly
+    their negation over its mirror, small values elsewhere."""
+    import mlx.core as mx
+
+    source, mirror, offset = _mirror(k, layout)
+    keys = mx.random.split(key, 2)
+    small = (mx.random.normal((rows, k), key=keys[0]) * 1e-2).astype(mx.bfloat16)
+    big = (mx.random.normal((rows, k), key=keys[1]) * _CANCEL).astype(mx.bfloat16)
+    return mx.where(source, big, mx.where(mirror, -mx.roll(big, offset, 1), small))
+
+
+def _cancelling_linear(n: int, k: int, layout: str, key: Any) -> tuple[Any, Any, Any]:
+    """An affine-Q4 gs64 linear whose mirror columns copy its source columns:
+    whole quant groups, or columns of one group, so the copies quantize to the
+    same codes, and against _cancelling_rows the two spans' products cancel
+    term by term."""
+    import mlx.core as mx
+
+    _, mirror, offset = _mirror(k, layout)
+    dense = (mx.random.normal((n, k), key=key) * 0.02).astype(mx.bfloat16)
+    dense = mx.where(mirror, mx.roll(dense, offset, 1), dense)
+    w, scales, biases = mx.quantize(dense, group_size=_GROUP, bits=4)
+    return w, scales, biases
+
 
 def _kernel_probe() -> str | None:
     """Compile and run every variant and linear count once on eight rows, plus each
@@ -316,9 +428,12 @@ def _kernel_probe() -> str | None:
     the linear counts share one arithmetic), the lone row must equal its row of the
     eight, and the plain call must sit within REL_RMS_BOUND of an fp32 dequantized
     reference: an Apple GPU whose MMA lane map differed from the probed one fails
-    here instead of serving wrong numbers. The inputs are built with GPU ops and
-    evaluated first: a compile failure with a CPU-stream op in flight deadlocks
-    inside mlx's exception path (0.32.2) instead of raising."""
+    here instead of serving wrong numbers. Last, every row through the one-row
+    kernel must equal the MMA kernel's one-row call bitwise, on random rows and in
+    each CANCELLING layout, where a kernel that sums in another order shows. The
+    inputs are built with GPU ops and evaluated first: a compile failure with a
+    CPU-stream op in flight deadlocks inside mlx's exception path (0.32.2)
+    instead of raising."""
     import mlx.core as mx
 
     try:
@@ -354,6 +469,25 @@ def _kernel_probe() -> str | None:
             (alone,) = _launch(kind, x[row : row + 1], weights[:1])
             if not mx.array_equal(alone, base[0][row : row + 1]).item():
                 return f"{kind}: a row alone differs from the same row among eight"
+        cases = [("random", x, weights)]
+        for j, layout in enumerate(CANCELLING):
+            keys = mx.random.split(mx.random.key(1 + j), 1 + len(_PROBE_NS))
+            rows = _cancelling_rows(MAX_ROWS, _PROBE_K, layout, keys[0])
+            linears_ = [
+                _cancelling_linear(n, _PROBE_K, layout, keys[1 + i])
+                for i, n in enumerate(_PROBE_NS)
+            ]
+            mx.eval(rows, linears_)
+            cases.append((f"{layout}-cancelling", rows, linears_))
+        for label, rows, linears_ in cases:
+            for i, linear_ in enumerate(linears_):
+                got = [_launch_row(rows[r : r + 1], *linear_) for r in range(MAX_ROWS)]
+                want = [_launch("plain", rows[r : r + 1], [linear_])[0] for r in range(MAX_ROWS)]
+                if not mx.array_equal(mx.concatenate(got), mx.concatenate(want)).item():
+                    return (
+                        f"one-row: linear {i} differs from the MMA kernel at one row "
+                        f"({label} activations)"
+                    )
     except Exception as e:  # noqa: BLE001 — any failure means the kernel cannot serve
         # The one-line reason cannot carry a compiler's full report; the log can.
         logger.warning("projection kernel: the kernel failed to build or run:\n%s", e)
@@ -403,6 +537,7 @@ calls: dict[str, int] = {
     "verify_split": 0,  # of those, calls over MAX_ROWS rows cut into runs
     "plain_kernel": 0,  # QuantizedLinear calls the kernel served
     "declined": 0,  # flag set and every linear tagged, refused for dtype or shape
+    "one_row": 0,  # one-row kernel dispatches linears() served, one per linear
 }
 _VERIFIER_MODULE = "mlx_vlm.models.qwen3_5.speculative_verifier"
 
@@ -696,11 +831,13 @@ def _dispatch_groups(root: Any) -> list[tuple[Any, ...]]:
 
 def warm_up(model: Any) -> None:
     """Compile and run every pipeline the model's projections can reach, each
-    dispatch key at T = 1..MAX_ROWS: no compile first happens mid-turn, and a
-    Metal toolchain that rejects the kernel fails here, inside enable()'s
-    refusal path, rather than inside a user's turn. The inputs are zeros built
-    on the GPU and evaluated before the first launch: a compile failure with a
-    CPU-stream op in flight deadlocks mlx's exception path instead of raising."""
+    dispatch key at T = 1..MAX_ROWS and every linear's (K, N) on the one-row
+    kernel: no compile first happens mid-turn, and a Metal toolchain that
+    rejects either kernel fails here, inside enable()'s refusal path, rather
+    than inside a user's turn. The inputs are zeros built on the GPU and
+    evaluated before the first launch: a compile failure with a CPU-stream op
+    in flight deadlocks mlx's exception path instead of raising. The counters
+    are left as found, since a load serves no call."""
     import mlx.core as mx
 
     groups = _dispatch_groups(_root(model))
@@ -709,10 +846,20 @@ def warm_up(model: Any) -> None:
         for k in sorted({_in_features(group[0]) for group in groups})
     }
     mx.eval(list(inputs.values()))
-    for group in groups:
-        weights = [_weights(m) for m in group]
-        x = inputs[_in_features(group[0])]
-        mx.eval([mma(x[:, :t], weights) for t in range(1, MAX_ROWS + 1)])
+    counted = dict(calls)
+    try:
+        singles: dict[tuple[int, int], Any] = {}
+        for group in groups:
+            weights = [_weights(m) for m in group]
+            x = inputs[_in_features(group[0])]
+            mx.eval([mma(x[:, :t], weights) for t in range(1, MAX_ROWS + 1)])
+            for m in group:
+                singles.setdefault((_in_features(m), m.weight.shape[0]), m)
+        for (k, _), m in singles.items():
+            if k <= _ROW_MAX_K:
+                mx.eval(one_row(inputs[k][0, :1], *_weights(m)))
+    finally:
+        calls.update(counted)
 
 
 def _stock_distance(got: Any, want: Any) -> float:
@@ -826,6 +973,45 @@ def _probe_steps(root: Any) -> str | None:
         reason = _check_group(group, [names.get(id(m), "?") for m in group], mx.random.key(seed))
         if reason is not None:
             return reason
+    return _check_rows(root, names)
+
+
+def _check_rows(root: Any, names: dict[int, str]) -> str | None:
+    """The one-row kernel against the MMA kernel on every dispatch key the model
+    reaches, on its real weights, and at every K on a synthetic linear per
+    CANCELLING layout: a random row and a row in each layout, each through
+    `one_row`, must equal its row of one `mma` call over all of them bitwise.
+    Several rows, because at one row `mma` is the one-row kernel itself; the MMA
+    kernel's rows do not depend on the row count, which _check_group and
+    kernel_available() both hold it to."""
+    import mlx.core as mx
+
+    groups = [g for g in _dispatch_groups(root) if _in_features(g[0]) <= _ROW_MAX_K]
+    cases = [([_weights(m) for m in g], [names.get(id(m), "?") for m in g]) for g in groups]
+    kinds = ("random", *(f"{layout}-cancelling" for layout in CANCELLING))
+    rows: dict[int, Any] = {}
+    for i, k in enumerate(sorted({_in_features(g[0]) for g in groups})):
+        keys = mx.random.split(mx.random.key(100 + i), 1 + 2 * len(CANCELLING))
+        built = [mx.random.normal((1, k), key=keys[0]).astype(mx.bfloat16)]
+        for j, layout in enumerate(CANCELLING):
+            built.append(_cancelling_rows(1, k, layout, keys[1 + j]))
+            linear_ = _cancelling_linear(_PROBE_NS[0], k, layout, keys[1 + len(CANCELLING) + j])
+            cases.append(([linear_], [f"a {layout}-cancelling K={k} linear"]))
+        rows[k] = mx.concatenate(built)
+    mx.eval(list(rows.values()), [weights for weights, _ in cases])
+    for weights, labels in cases:
+        x = rows[weights[0][0].shape[1] * 8]
+        refs = mma(x, weights)
+        checks = [
+            (label, kind, mx.array_equal(one_row(x[r : r + 1], *linear_), ref[r : r + 1]))
+            for linear_, ref, label in zip(weights, refs, labels, strict=True)
+            for r, kind in enumerate(kinds)
+        ]
+        same = mx.stack([check for *_, check in checks])
+        mx.eval(same)
+        for i, (label, kind, _) in enumerate(checks):
+            if not same[i].item():
+                return f"one-row: {label} differs from the MMA kernel ({kind} activations)"
     return None
 
 
