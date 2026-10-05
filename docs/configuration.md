@@ -185,13 +185,13 @@ update starts the store cold, whatever the setting). The daemon reads it at
 startup, so a change takes effect on its next start.
 
 `[model].projection_kernel` (default `true`) runs the target model's quantized
-projections through one small-row kernel for every speculative verify and for
+projections through a small-row kernel for every speculative verify and for
 every call of eight rows or fewer outside it: each decode step, and the short
 tail that ends a prefill (sous's simdgroup-matrix kernel, derived in part from
 Splash under Apache-2.0 — see `THIRD_PARTY_NOTICES.md` — with one-row calls on
 a one-row kernel of sous's own that produces the same bits; both are compiled
-at model load, no build step). Its cost stays nearly flat from one verify row to eight,
-which is what makes a deeper verify block pay: on an M5 Pro with the default
+at model load, no build step). Its cost stays nearly flat from one verify row
+to eight, which is what makes a deeper verify block pay: on an M5 Pro with the default
 model and drafter, a block-5 round with the kernel cost 5 ms more than a
 block-4 round without it (115 against 110 ms) and produced 3.46 tokens against
 3.00, so sampled decode at block 5 ran 1.10x block 4 without the kernel (95% CI

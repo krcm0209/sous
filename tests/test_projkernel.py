@@ -414,15 +414,14 @@ def test_the_probe_refuses_a_one_row_kernel_that_differs_from_the_mma_kernel(mon
 
 
 def _big_in(layout):
-    """True for a row in `layout`: columns 16..47 hold large values only in the
-    quarter layout (inside the first quarter, the small middle of a group), the
-    first 16 columns of the middle group only in the group layout (a middle
-    quarter)."""
+    """True for a row in `layout`: its large values all lie on the layout's
+    source and mirror columns. No layout's columns contain another's, so a row
+    in one layout is never taken for another, and a random row has none."""
 
     def big(x2):
-        start = 16 if layout == "quarter" else x2.shape[-1] // 2
-        span = x2[0, start : start + (32 if layout == "quarter" else 16)]
-        return mx.max(mx.abs(span.astype(mx.float32))).item() > 64
+        source, mirror, _ = projkernel._mirror(x2.shape[-1], layout)
+        large = mx.abs(x2[0].astype(mx.float32)) > 64
+        return mx.any(large).item() and not mx.any(large & ~(source | mirror)).item()
 
     return big
 
@@ -556,6 +555,20 @@ def test_the_one_row_kernel_equals_the_mma_kernel_at_one_row(k, ns, layout):
 
 
 @pfx.kernel
+def test_the_one_row_kernel_equals_the_mma_kernel_on_a_real_width_linear():
+    """The 27B's gate+up width on random rows, a backstop beside the cancelling
+    layouts: across tens of thousands of outputs a reordered epilogue or quarter
+    sum, which random rows at the narrow shapes round alike, lands a few of them
+    on another bf16."""
+    k, n, rows = 5120, 17_408, 4
+    x = pfx.activations(rows, k, 50)
+    weights = pfx.rand_linear(n, k, 51)
+    got = mx.concatenate([projkernel._launch_row(x[r : r + 1], *weights) for r in range(rows)])
+    (want,) = projkernel._launch("plain", x, [weights])
+    assert mx.array_equal(got, want).item()
+
+
+@pfx.kernel
 @pytest.mark.parametrize("layout", pfx.LAYOUTS)
 def test_a_fused_one_row_call_equals_the_mma_kernels_fused_call(forced, layout):
     """linears() at one row against the dispatch it made before it had a
@@ -572,15 +585,53 @@ def test_a_fused_one_row_call_equals_the_mma_kernels_fused_call(forced, layout):
 
 
 _DOT_ORDER = "for (uint h = 0; h < 2; ++h)\n#pragma unroll\n        for (uint s = 0; s < 4; ++s)"
-# name -> (the kernel's text, a reordered copy, the cancelling layout that shows it)
+_QUARTERS = "((acc + a1) + a2) + a3"
+_EPILOGUE = (
+    "acc = fma(dots[sg][g][r], float(sc[g]), acc);\n"
+    "        acc = fma(dots[sg][g][RC], float(bi[g]), acc);"
+)
+_LANE_SUM = (
+    "L[fm] = ((xf[o] + xf[o + 1]) + (xf[o + 2] + xf[o + 3])) +\n"
+    "              ((xf[o + 8] + xf[o + 9]) + (xf[o + 10] + xf[o + 11]));"
+)
+# name -> (the kernel's text, a reordered copy, the cancelling layout that shows
+# it). Every one of these changes bits on a real-width random linear, and random
+# rows at the probe's widths show none of them.
 _REORDERED = {
     # the first and last quarters, which cancel, added before the middle two
-    "quarters": ("((acc + a1) + a2) + a3", "((acc + a3) + a1) + a2", "quarter"),
+    "quarters": (_QUARTERS, "((acc + a3) + a1) + a2", "quarter"),
+    "paired quarters": (_QUARTERS, "(acc + a1) + (a2 + a3)", "middle"),
+    "reversed quarters": (_QUARTERS, "((a3 + a2) + a1) + acc", "middle"),
     # a group's products with s outer and h inner
     "products": (
         _DOT_ORDER,
         "for (uint s = 0; s < 4; ++s)\n#pragma unroll\n        for (uint h = 0; h < 2; ++h)",
         "group",
+    ),
+    "group sum": (
+        "((L[0] + L[1]) + (L[2] + L[3])) + ((L[4] + L[5]) + (L[6] + L[7]))",
+        "((L[0] + L[2]) + (L[1] + L[3])) + ((L[4] + L[6]) + (L[5] + L[7]))",
+        "group",
+    ),
+    "lane sum": (
+        _LANE_SUM,
+        "L[fm] = ((((((xf[o] + xf[o + 1]) + xf[o + 2]) + xf[o + 3]) + xf[o + 8]) + "
+        "xf[o + 9]) + xf[o + 10]) + xf[o + 11];",
+        "lane",
+    ),
+    "bias first": (
+        _EPILOGUE,
+        "acc = fma(dots[sg][g][RC], float(bi[g]), acc);\n"
+        "        acc = fma(dots[sg][g][r], float(sc[g]), acc);",
+        "pair",
+    ),
+    # stage by stage this reads as the same sum, but the products round apart
+    "unfused epilogue": (
+        _EPILOGUE,
+        "{ const float p = dots[sg][g][r] * float(sc[g]);\n"
+        "        const float b = dots[sg][g][RC] * float(bi[g]);\n"
+        "        acc = (acc + p) + b; }",
+        "pair",
     ),
 }
 
@@ -591,28 +642,25 @@ def test_a_one_row_kernel_that_sums_in_another_order_is_caught(monkeypatch, name
     """The negative control: the same kernel with one sum reordered. Its
     cancelling layout tells it apart from the MMA kernel, and
     kernel_available()'s probe refuses it. Built under another name, since mlx
-    keeps a compiled library per kernel name. Other reorders are invisible to
-    these layouts: adding the quarters as (a3 + a2) + (a1 + a0) rounds a1 and a2
-    onto the same grid as the shipped order does where a3 = -a0 exactly."""
+    keeps a compiled library per kernel name."""
     order, other, layout = _REORDERED[name]
     text = projkernel._row_source()
     assert text.count(order) == 1
     monkeypatch.setattr(int8prefill, "_kernels", {})
-    monkeypatch.setattr(projkernel, "_ROW_KERNEL", f"sous_proj_row_reordered_{name}")
+    slug = name.replace(" ", "_")
+    monkeypatch.setattr(projkernel, "_ROW_KERNEL", f"sous_proj_row_reordered_{slug}")
     reordered = text.replace(order, other)
     monkeypatch.setattr(projkernel, "_row_source", lambda: reordered)
-    fixture_layout = {"quarter": "quarters", "group": "group"}[layout]
-    x, ((w, scales, biases),) = pfx.projection_inputs(
-        fixture_layout, 8, 1024, (256,), x_seed=11, w_seed=12
-    )
+    x, ((w, scales, biases),) = pfx.projection_inputs(layout, 8, 1024, (256,), x_seed=11, w_seed=12)
     got = mx.concatenate(
         [projkernel._launch_row(x[r : r + 1], w, scales, biases) for r in range(8)]
     )
     (want,) = projkernel._launch("plain", x, [(w, scales, biases)])
     assert not mx.array_equal(got, want).item()
-    assert projkernel._kernel_probe() == (
-        "one-row: linear 0 differs from the MMA kernel at one row "
-        f"({layout}-cancelling activations)"
+    reason = projkernel._kernel_probe()
+    assert reason is not None and reason.startswith("one-row: linear "), reason
+    assert reason.endswith(
+        f"differs from the MMA kernel at one row ({layout}-cancelling activations)"
     )
 
 
@@ -691,25 +739,37 @@ def test_the_kernel_rounds_like_a_float64_reference(forced):
         assert np.mean(rounded == y64) >= 0.995, forced
 
 
-@pytest.mark.parametrize(("layout", "k"), [("quarters", 2048), ("quarters", 1088), ("group", 1024)])
+@pytest.mark.parametrize("k", [256, 1088, 2048])
+@pytest.mark.parametrize("layout", projkernel.CANCELLING)
 def test_the_cancelling_layouts_cancel_term_by_term(layout, k):
-    """What makes them sensitive to summation order: each mirror span's products
-    are exactly the negated products of its source span (same codes, same scales,
-    negated activations), and they dwarf the rest of the sum."""
+    """What makes them sensitive to summation order: each mirror column's products
+    are exactly the negated products of its source column (same codes, same
+    scales, negated activations), and they dwarf the rest of the sum."""
     x, ((w, scales, biases),) = pfx.projection_inputs(layout, 4, k, (40,), x_seed=9, w_seed=90)
     xs, dense = _f64(x), _dequantize_f64(w, scales, biases)
     terms = xs[:, None, :] * dense[None, :, :]
-    spans = pfx._mirrors(k, layout)
-    mirrored = np.zeros(k, dtype=bool)
-    for src, dst, width in spans:
-        assert np.array_equal(terms[..., dst : dst + width], -terms[..., src : src + width])
-        mirrored[src : src + width] = mirrored[dst : dst + width] = True
-    if layout == "quarters":
-        (a, b), _, _, (c, _) = pfx.k_quarters(k)
-        assert spans == [(a, c, b - a)]
-    big = np.abs(terms[..., mirrored]).sum(axis=-1)
-    rest = np.abs(terms[..., ~mirrored]).sum(axis=-1)
+    source, mirror, offset = (np.array(m) for m in projkernel._mirror(k, layout))
+    src = np.flatnonzero(source)
+    assert src.size and np.array_equal(np.flatnonzero(mirror), src + offset)
+    assert not np.any(source & mirror)
+    assert np.array_equal(terms[..., src + offset], -terms[..., src])
+    big = np.abs(terms[..., source | mirror]).sum(axis=-1)
+    rest = np.abs(terms[..., ~(source | mirror)]).sum(axis=-1)
     assert np.all(big > 100 * rest)
+
+
+@pytest.mark.parametrize(
+    ("layout", "first", "second"),
+    [("quarter", 0, 3), ("middle", 1, 2)],
+)
+@pytest.mark.parametrize("k", [256, 1088, 2048])
+def test_the_quarter_layouts_cancel_one_k_quarter_against_another(layout, first, second, k):
+    """Split as the kernels split K: whole quant groups, g0 = q * G // 4."""
+    groups = k // 64
+    starts = [64 * (q * groups // 4) for q in range(5)]
+    source, mirror, _ = (np.flatnonzero(np.array(m)) for m in projkernel._mirror(k, layout))
+    assert source[0] == starts[first] and source[-1] < starts[first + 1]
+    assert mirror[0] == starts[second] and mirror[-1] < starts[second + 1]
 
 
 # ---- routing: the tags, the flag and the two hooks ---------------------------------

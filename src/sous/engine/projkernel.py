@@ -368,13 +368,23 @@ _PROBE_ROW = 3
 _kernel_ok = False
 
 # The cancelling layouts the one-row checks add to random rows. Random rows leave
-# a reordered fp32 sum on the same bf16 almost everywhere; in these the large
-# terms cancel exactly, so the small result shows how it was summed. "quarter"
-# cancels the first K quarter against the last (the order the quarters are
-# added in), "group" a quarter of every quant group against another (the
-# order of a group's 64 products and of its activation sum: where another
-# GPU's MMA summed in another order, the MMA kernel's rows would move here).
-CANCELLING = ("quarter", "group")
+# a reordered fp32 sum on the same bf16 almost everywhere at the probe's widths;
+# in these the large terms cancel exactly, so the small result shows how it was
+# summed, and each layout shows the reorders of one step:
+# - "quarter" cancels the first K quarter against the last and "middle" the
+#   second against the third: between them, any other order or pairing of the
+#   four quarter partials (where a3 = -a0, (a3 + a2) + (a1 + a0) rounds a1 and
+#   a2 as the kernel does, so "quarter" alone misses it);
+# - "group" cancels a quarter of every quant group against another: the order
+#   of a group's 64 products and the tree over its eight lane sums (where
+#   another GPU's MMA summed in another order, the MMA kernel's rows would move
+#   here);
+# - "lane" cancels two values of each lane's eight against two of its others:
+#   the tree inside a lane sum;
+# - "pair" cancels whole quant groups against their neighbours, so a quarter's
+#   running sum swells and returns: the epilogue's order and its two fmas
+#   (separately rounded products move it).
+CANCELLING = ("quarter", "middle", "group", "lane", "pair")
 # How far the cancelling layouts' large values sit above the rest.
 _CANCEL = 256.0
 
@@ -382,17 +392,32 @@ _CANCEL = 256.0
 def _mirror(k: int, layout: str) -> tuple[Any, Any, int]:
     """(source columns, mirror columns, the offset from one to the other) of a
     cancelling layout, as [K] masks. Quarters are split by whole quant groups,
-    as both kernels split K, and the last is never narrower than the first."""
+    as both kernels split K, and the narrowest quarter sets the width. Mirror
+    columns lie in their source's quant group or a whole group of their own,
+    so copied weight columns quantize to the same codes."""
     import mlx.core as mx
 
     col = mx.arange(k)
-    if layout == "quarter":
-        groups = k // _GROUP
+    groups = k // _GROUP
+    if layout in ("quarter", "middle"):
+        first, second = (0, _KS - 1) if layout == "quarter" else (1, 2)
         width = _GROUP * (groups // _KS)
-        last = _GROUP * ((_KS - 1) * groups // _KS)
-        return col < width, (col >= last) & (col < last + width), last
-    within = col % _GROUP
-    return within < 16, within >= 48, 48
+        start = _GROUP * (first * groups // _KS)
+        offset = _GROUP * (second * groups // _KS) - start
+        source = (col >= start) & (col < start + width)
+        return source, mx.roll(source, offset), offset
+    if layout == "group":
+        within = col % _GROUP
+        return within < 16, within >= 48, 48
+    if layout == "lane":
+        # a lane's eight values are 16-column blocks' [o, o + 4) and [o + 8, o + 12)
+        within = col % 16
+        source = (within < 8) & (within % 4 < 2)
+        return source, mx.roll(source, 8), 8
+    if layout == "pair":
+        source = (col // _GROUP % 4 == 0) & (col + _GROUP < k)
+        return source, mx.roll(source, _GROUP), _GROUP
+    raise ValueError(f"no cancelling layout {layout!r}")
 
 
 def _cancelling_rows(rows: int, k: int, layout: str, key: Any) -> Any:
@@ -855,6 +880,9 @@ def warm_up(model: Any) -> None:
             mx.eval([mma(x[:, :t], weights) for t in range(1, MAX_ROWS + 1)])
             for m in group:
                 singles.setdefault((_in_features(m), m.weight.shape[0]), m)
+        # The real `mma` already sends each T = 1 call above to the one-row
+        # kernel; this states the one-row pipelines in their own right, so the
+        # warm-up still covers them when `mma` is a stand-in that does not.
         for (k, _), m in singles.items():
             if k <= _ROW_MAX_K:
                 mx.eval(one_row(inputs[k][0, :1], *_weights(m)))
@@ -983,7 +1011,11 @@ def _check_rows(root: Any, names: dict[int, str]) -> str | None:
     `one_row`, must equal its row of one `mma` call over all of them bitwise.
     Several rows, because at one row `mma` is the one-row kernel itself; the MMA
     kernel's rows do not depend on the row count, which _check_group and
-    kernel_available() both hold it to."""
+    kernel_available() both hold it to. For the same reason the steps before
+    this one, which compare rows of a several-row call with `mma` at one row,
+    already compare the two kernels: on the real kernel a one-row kernel off on
+    random rows fails there first, under their reasons, and this step adds the
+    cancelling layouts and the linear shapes they do not reach."""
     import mlx.core as mx
 
     groups = [g for g in _dispatch_groups(root) if _in_features(g[0]) <= _ROW_MAX_K]

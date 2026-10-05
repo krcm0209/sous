@@ -412,10 +412,11 @@ goal.
   in for `tileattn.tile`; the `nax` tests skip on
   `tileattn.availability()`, never int8's.
 - `engine/projkernel.py` serves the target model's small-row quantized
-  projections from one simdgroup-matrix MMA kernel
+  projections from a simdgroup-matrix MMA kernel
   (`kernels/projection_mma.metal` and `.h`: plain, staged and group-sums
   bodies split at `// STAGED` and `// GROUP_SUMS`; no MPP and no `nax.h`,
-  so it compiles on any Metal GPU and CI runs its arithmetic tests): every
+  so it compiles on any Metal GPU and CI runs its arithmetic tests), and
+  one-row calls from a one-row kernel with the same bits (below): every
   exact-verifier projection and the verify head, and every target call of
   1–8 rows outside the verifier — one-row decode, a prefill's last chunk of
   ≤ 8 rows and the one-row forward that ends every prefill segment, and the
@@ -445,18 +446,24 @@ goal.
   k = 2c + e: the hardware's sequential C + p0 + … + p7, probed on the M2
   and the M5 Pro), the group sum's tree, the two-fma epilogue,
   `((a0 + a1) + a2) + a3` — so its output equals the MMA kernel's at T = 1
-  bit for bit. Every step is an
-  explicit `fma` or add: safe math still contracts a plain `acc + d * s`
-  into an fma. RC = 1 and NSG = 4 (one column per simdgroup) are frozen for
-  speed only — the tile changes no bit — and its threadgroup memory
-  (NSG·G·(RC + 1) fp32) caps K at `_ROW_MAX_K` = 65536, past which a
-  one-row call stays on the MMA kernel. Its bits are checked against the
-  MMA kernel on random rows and in `CANCELLING`'s two layouts, where the
-  large terms cancel exactly: random rows hid every reorder tried, the
-  quarter layout shows a reordered quarter sum and the group layout a
-  reordered group (the one that would move were another GPU's MMA to sum
-  in another order); even so `(a3 + a2) + (a1 + a0)` passes the quarter
-  layout, since where a3 = −a0 it rounds a1 and a2 onto the same grid. Two hooks, each a `functools.wraps` wrapper carrying
+  bit for bit. Every step is an explicit `fma` or add: safe math still
+  contracts a plain `acc + d * s` into an fma. RC = 1 and NSG = 4 (one
+  column per simdgroup) are frozen for speed only — the tile changes no
+  bit — and its threadgroup memory (NSG·G·(RC + 1) fp32) caps K at
+  `_ROW_MAX_K` = 65536, past which a one-row call stays on the MMA kernel.
+  Its bits are checked against the MMA kernel on random rows and in
+  `CANCELLING`'s five layouts, where large terms cancel exactly. Random
+  rows at the probe's widths show none of the reorders tried: a reordered
+  quarter sum or epilogue moves only a few outputs in tens of thousands of
+  a real-width linear, and a lane sum's tree none. So each step has a
+  layout that shows it — `quarter` and `middle` the quarters' order and
+  pairing (`(a3 + a2) + (a1 + a0)` passes `quarter` alone), `group` a
+  group's products and its sum's tree (the one that would move were
+  another GPU's MMA to sum in another order), `lane` the tree inside a
+  lane's sum, `pair` the epilogue's order and its fmas — and the negative
+  control in `tests/test_projkernel.py` holds each to a reordered copy of
+  the kernel. A kernel edit that changes a sum's shape needs a layout that
+  shows it. Two hooks, each a `functools.wraps` wrapper carrying
   `_HOOK_MARK`, installed once per process on the first activation and
   never removed (int8's three wrappers carry `wraps` too, so every source
   pin follows `__wrapped__` to mlx's and mlx-vlm's own code whatever is
