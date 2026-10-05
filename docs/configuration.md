@@ -191,32 +191,32 @@ tail that ends a prefill (sous's simdgroup-matrix kernel, derived in part from
 Splash under Apache-2.0 — see `THIRD_PARTY_NOTICES.md` — with one-row calls on
 a one-row kernel of sous's own that produces the same bits; both are compiled
 at model load, no build step). Its cost stays nearly flat from one verify row
-to eight, which is what makes a deeper verify block pay: on an M5 Pro with the default
-model and drafter, a block-5 round with the kernel cost 5 ms more than a
-block-4 round without it (115 against 110 ms) and produced 3.46 tokens against
-3.00, so sampled decode at block 5 ran 1.10x block 4 without the kernel (95% CI
-1.07–1.14) on 64 real subagent turns at 44–77K of context (#148). That is why
-an unset `speculative_block_size` is 5 wherever the kernel is active. Each
-row's output is bitwise independent of how many rows a call carries and of
-which projections share it, so greedy output with the drafter stays identical
-to output without it — and that is also why plain decode goes through the
-kernel. Decode's projections are one-row calls, which the simdgroup-matrix
-kernel serves on a fraction of its lanes, so they run on the one-row kernel
-instead, whose output is the same bit for bit. Before it, decode with no
-drafter ran about 0.78x what it does with `false` (10.7 against 13.6 tok/s on
-those turns); that has not been re-measured since. The kernel is closer to an
-exact reference than mlx's own one-row kernel, but not bit-identical to it, so
-a near-tie can resolve the other way than with `false`, which runs the stock
-paths. It is active only where the attention tile is active, which so far
-means a 20-core M5 Pro, with a dense Qwen3.5-family model whose projections
-are affine 4-bit at group size 64, no drafter or a DFlash one, and the mlx and
-mlx-vlm sources it was validated with. Anywhere else the model-load line reads
-`projection_kernel=unavailable` (`off` on the mlx-lm backend), the status
-document's `projection_kernel` block carries the reason, the projections run
-stock and an unset block is 4 where the tile is active, else 3. As with the
-tile, that is one INFO line, and a `WARNING` saying
-`sous: projection kernel unavailable (…)` means the kernel should have run here
-and did not. The on-disk forks are keyed by it: where it
+to eight, which is what makes a deeper verify block pay: on an M5 Pro with the
+default model and drafter, a block-5 round with the kernel cost 5 ms more than
+a block-4 round without it (115 against 110 ms) and produced 3.46 tokens
+against 3.00, so sampled decode at block 5 ran 1.10x block 4 without the
+kernel (95% CI 1.07–1.14) on 64 real subagent turns at 44–77K of context
+(#148). That is why an unset `speculative_block_size` is 5 wherever the kernel
+is active. Each row's output is bitwise independent of how many rows a call
+carries and of which projections share it, so greedy output with the drafter
+stays identical to output without it — and that is also why plain decode goes
+through the kernel. Decode's projections are one-row calls, which the
+simdgroup-matrix kernel serves on a fraction of its lanes, so they run on the
+one-row kernel instead, whose output is the same bit for bit. Before it,
+decode with no drafter ran about 0.78x what it does with `false` (10.7 against
+13.6 tok/s on those turns); that has not been re-measured since. The kernel is
+closer to an exact reference than mlx's own one-row kernel, but not
+bit-identical to it, so a near-tie can resolve the other way than with
+`false`, which runs the stock paths. It is active only where the attention
+tile is active, which so far means a 20-core M5 Pro, with a dense
+Qwen3.5-family model whose projections are affine 4-bit at group size 64, no
+drafter or a DFlash one, and the mlx and mlx-vlm sources it was validated
+with. Anywhere else the model-load line reads `projection_kernel=unavailable`
+(`off` on the mlx-lm backend), the status document's `projection_kernel` block
+carries the reason, the projections run stock and an unset block is 4 where
+the tile is active, else 3. As with the tile, that is one INFO line, and a
+`WARNING` saying `sous: projection kernel unavailable (…)` means the kernel
+should have run here and did not. The on-disk forks are keyed by it: where it
 is active, changing the setting starts the fork store cold once. The daemon
 reads it at startup, so a change takes effect on its next start.
 

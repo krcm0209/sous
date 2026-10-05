@@ -525,7 +525,9 @@ goal.
   linear per K, a random row and a row in each `CANCELLING` layout through
   `one_row` `array_equal` to its row of one multi-row `mma` call (at one row
   `mma` is the one-row kernel itself), a mismatch making the whole kernel
-  `unavailable` with a warning, since parity rests on it. It
+  `unavailable` with a warning, since parity rests on it (a one-row kernel
+  off on random rows already fails the earlier parity and T-invariance
+  steps, which compare several-row calls with `mma` at one row). It
   restores `calls`, leaves the flag 0 and calls `mx.clear_cache()` in
   `finally`. A refusal at the tile, model or drafter-kind step only says
   the kernel does not apply to this load: one INFO line, `projection kernel
