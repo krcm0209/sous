@@ -185,34 +185,39 @@ update starts the store cold, whatever the setting). The daemon reads it at
 startup, so a change takes effect on its next start.
 
 `[model].projection_kernel` (default `true`) runs the target model's quantized
-projections through one small-row kernel for every speculative verify and for
+projections through a small-row kernel for every speculative verify and for
 every call of eight rows or fewer outside it: each decode step, and the short
 tail that ends a prefill (sous's simdgroup-matrix kernel, derived in part from
-Splash under Apache-2.0 — see `THIRD_PARTY_NOTICES.md` — and compiled at model
-load, no build step). Its cost stays nearly flat from one verify row to eight,
-which is what makes a deeper verify block pay: on an M5 Pro with the default
-model and drafter, a block-5 round with the kernel cost 5 ms more than a
-block-4 round without it (115 against 110 ms) and produced 3.46 tokens against
-3.00, so sampled decode at block 5 ran 1.10x block 4 without the kernel (95% CI
-1.07–1.14) on 64 real subagent turns at 44–77K of context (#148). That is why
-an unset `speculative_block_size` is 5 wherever the kernel is active. Each
-row's output is bitwise independent of how many rows a call carries and of
-which projections share it, so greedy output with the drafter stays identical
-to output without it — and that is also why plain decode goes through the
-kernel, at a cost: with no drafter, decode runs about 0.78x what it does with
-`false` (10.7 against 13.6 tok/s on those turns). The kernel is closer to an
-exact reference than mlx's own one-row kernel, but not bit-identical to it, so
-a near-tie can resolve the other way than with `false`, which runs the stock
-paths. It is active only where the attention tile is active, which so far
-means a 20-core M5 Pro, with a dense Qwen3.5-family model whose projections
-are affine 4-bit at group size 64, no drafter or a DFlash one, and the mlx and
-mlx-vlm sources it was validated with. Anywhere else the model-load line reads
-`projection_kernel=unavailable` (`off` on the mlx-lm backend), the status
-document's `projection_kernel` block carries the reason, the projections run
-stock and an unset block is 4 where the tile is active, else 3. As with the
-tile, that is one INFO line, and a `WARNING` saying
-`sous: projection kernel unavailable (…)` means the kernel should have run here
-and did not. The on-disk forks are keyed by it: where it
+Splash under Apache-2.0 — see `THIRD_PARTY_NOTICES.md` — with one-row calls on
+a one-row kernel of sous's own that produces the same bits; both are compiled
+at model load, no build step). Its cost stays nearly flat from one verify row
+to eight, which is what makes a deeper verify block pay: on an M5 Pro with the
+default model and drafter, a block-5 round with the kernel cost 5 ms more than
+a block-4 round without it (115 against 110 ms) and produced 3.46 tokens
+against 3.00, so sampled decode at block 5 ran 1.10x block 4 without the
+kernel (95% CI 1.07–1.14) on 64 real subagent turns at 44–77K of context
+(#148). That is why an unset `speculative_block_size` is 5 wherever the kernel
+is active. Each row's output is bitwise independent of how many rows a call
+carries and of which projections share it, so greedy output with the drafter
+stays identical to output without it — and that is also why plain decode goes
+through the kernel. Decode's projections are one-row calls, which the
+simdgroup-matrix kernel serves on a fraction of its lanes, so they run on the
+one-row kernel instead, whose output is the same bit for bit. That took
+decode with no drafter from 10.2 to 13.4 tok/s on the first 16 of those turns
+(1.32x), about the 13.5 tok/s it decodes with `false` there (measured in
+separate runs); before it, decode with no drafter ran about 0.78x. The kernel is
+closer to an exact reference than mlx's own one-row kernel, but not
+bit-identical to it, so a near-tie can resolve the other way than with
+`false`, which runs the stock paths. It is active only where the attention
+tile is active, which so far means a 20-core M5 Pro, with a dense
+Qwen3.5-family model whose projections are affine 4-bit at group size 64, no
+drafter or a DFlash one, and the mlx and mlx-vlm sources it was validated
+with. Anywhere else the model-load line reads `projection_kernel=unavailable`
+(`off` on the mlx-lm backend), the status document's `projection_kernel` block
+carries the reason, the projections run stock and an unset block is 4 where
+the tile is active, else 3. As with the tile, that is one INFO line, and a
+`WARNING` saying `sous: projection kernel unavailable (…)` means the kernel
+should have run here and did not. The on-disk forks are keyed by it: where it
 is active, changing the setting starts the fork store cold once. The daemon
 reads it at startup, so a change takes effect on its next start.
 
@@ -248,8 +253,9 @@ drafter-off decode with `projection_kernel = false`, 13.6 tok/s on 64 real
 subagent turns at 44–77K tokens — against 2.0x at block 4 without the kernel
 (27.1 against 13.6 tok/s; 1.83x at block 3). Either way, output with the
 drafter was identical to plain decode under the same setting on every turn
-(#118, #148). Measured against the kernel's own drafter-off decode, which is
-slower (see `projection_kernel` above), the same runs are about 2.9x.
+(#118, #148). Measured against the kernel's own drafter-off decode as it ran
+before one-row calls had a kernel of their own (see `projection_kernel`
+above), the same runs are about 2.9x.
 The "~2.4x greedy" figure earlier versions quoted ran an argmax sampler
 through the sampled speculative walk, before the engine reached mlx-vlm's
 greedy branch, and that branch also drafts differently (#87). Without the

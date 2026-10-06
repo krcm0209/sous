@@ -143,7 +143,9 @@ class SousConfig:
     # decode included. With it a 5-row verify round's projections cost about
     # what 4 rows' do, which makes block 5 pay: 1.10x sampled decode over
     # block 4 without the kernel on real subagent turns at 44-77K (M5 Pro).
-    # Decode without a drafter runs at about 0.78x. Not bit-identical to
+    # One-row calls run on a one-row kernel with the same bits, so decode
+    # without a drafter runs about as fast as with false (13.4 against 13.5
+    # tok/s, M5 Pro, separate runs). Not bit-identical to
     # stock's kernels, hence the switch; false runs the stock paths, and an
     # unset speculative_block_size then resolves to 4 where the tile is
     # active, else 3. Active only where the attention tile is, `unavailable`

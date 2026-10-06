@@ -144,6 +144,7 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_the_kernel()
             assert texts[key] == text, (f"block {block}", *key)
     assert again == reference
     assert plain_counts["plain_kernel"] > 0, plain_counts
+    assert plain_counts["one_row"] > 0, plain_counts
     assert plain_counts["verify_kernel"] == 0, plain_counts
     for block, counts in drafted_counts.items():
         assert counts["verify_kernel"] > 0, (block, counts)

@@ -412,10 +412,11 @@ goal.
   in for `tileattn.tile`; the `nax` tests skip on
   `tileattn.availability()`, never int8's.
 - `engine/projkernel.py` serves the target model's small-row quantized
-  projections from one simdgroup-matrix MMA kernel
+  projections from a simdgroup-matrix MMA kernel
   (`kernels/projection_mma.metal` and `.h`: plain, staged and group-sums
   bodies split at `// STAGED` and `// GROUP_SUMS`; no MPP and no `nax.h`,
-  so it compiles on any Metal GPU and CI runs its arithmetic tests): every
+  so it compiles on any Metal GPU and CI runs its arithmetic tests), and
+  one-row calls from a one-row kernel with the same bits (below): every
   exact-verifier projection and the verify head, and every target call of
   1–8 rows outside the verifier — one-row decode, a prefill's last chunk of
   ≤ 8 rows and the one-row forward that ends every prefill segment, and the
@@ -435,7 +436,34 @@ goal.
   equals the same projections decoded one at a time. F = 4, NSG = 1,
   KS = 4, GB = 4 (staged), CH = 1, SPLITS = 1, PF = 1 and SBV = 1 are
   frozen: another KS, or CH or SPLITS above 1, changes the summation order
-  and the bits. Two hooks, each a `functools.wraps` wrapper carrying
+  and the bits. A call of one row (decode, the one-row forward that ends a
+  prefill segment, a one-row tail) never reaches the MMA kernel: `linears()`
+  sends it, one dispatch per linear, through the `one_row` seam to the
+  one-row kernel (`kernels/projection_row.metal`, sous's own, compiled
+  under `math_mode: safe` like the rest), which writes the same order out
+  by hand — quarters as the group ranges `[q·G/4, (q+1)·G/4)`, each group's
+  64 products as one fma chain from +0 in the MMA's order (h, s, then MMA
+  k = 2c + e: the hardware's sequential C + p0 + … + p7, probed on the M2
+  and the M5 Pro), the group sum's tree, the two-fma epilogue,
+  `((a0 + a1) + a2) + a3` — so its output equals the MMA kernel's at T = 1
+  bit for bit. Every step is an explicit `fma` or add: safe math still
+  contracts a plain `acc + d * s` into an fma. RC = 1 and NSG = 4 (one
+  column per simdgroup) are frozen for speed only — the tile changes no
+  bit — and its threadgroup memory (NSG·G·(RC + 1) fp32) caps K at
+  `_ROW_MAX_K` = 65536, past which a one-row call stays on the MMA kernel.
+  Its bits are checked against the MMA kernel on random rows and in
+  `CANCELLING`'s five layouts, where large terms cancel exactly. Random
+  rows at the probe's widths show none of the reorders tried: a reordered
+  quarter sum or epilogue moves only a few outputs in tens of thousands of
+  a real-width linear, and a lane sum's tree none. So each step has a
+  layout that shows it — `quarter` and `middle` the quarters' order and
+  pairing (`(a3 + a2) + (a1 + a0)` passes `quarter` alone), `group` a
+  group's products and its sum's tree (the one that would move were
+  another GPU's MMA to sum in another order), `lane` the tree inside a
+  lane's sum, `pair` the epilogue's order and its fmas — and the negative
+  control in `tests/test_projkernel.py` holds each to a reordered copy of
+  the kernel. A kernel edit that changes a sum's shape needs a layout that
+  shows it. Two hooks, each a `functools.wraps` wrapper carrying
   `_HOOK_MARK`, installed once per process on the first activation and
   never removed (int8's three wrappers carry `wraps` too, so every source
   pin follows `__wrapped__` to mlx's and mlx-vlm's own code whatever is
@@ -482,7 +510,8 @@ goal.
   `generate_step`, `nn.QuantizedLinear.__call__`, `_dflash_verify`,
   `_dflash_verify_greedy` and `_dflash_rounds`) and
   `verifyattn.VALIDATED_MLX`; a warm-up that
-  compiles every pipeline the model's dispatch keys need at T = 1..8; then
+  compiles every pipeline the model's dispatch keys need at T = 1..8 and
+  every linear's (K, N) on the one-row kernel; then
   the tags, the hooks and the probe, on the `sous-model-load` thread. The
   probe drives layer 3's verifier `_feed_forward` at T = 5 and the same
   layer's plain modules at T = 1 through both hooks (`calls` must show
@@ -491,7 +520,14 @@ goal.
   `lm_head`), every row at T = 1..8 equal to its one-row single, every
   fused group equal to its singles, relative RMS within 1e-2 of stock
   `quantized_matmul` (parity cannot catch a kernel that is wrong the same
-  way on both paths) and a NaN in one row leaving the others alone. It
+  way on both paths) and a NaN in one row leaving the others alone; last,
+  on every dispatch key the model reaches and on a synthetic cancelling
+  linear per K, a random row and a row in each `CANCELLING` layout through
+  `one_row` `array_equal` to its row of one multi-row `mma` call (at one row
+  `mma` is the one-row kernel itself), a mismatch making the whole kernel
+  `unavailable` with a warning, since parity rests on it (a one-row kernel
+  off on random rows already fails the earlier parity and T-invariance
+  steps, which compare several-row calls with `mma` at one row). It
   restores `calls`, leaves the flag 0 and calls `mx.clear_cache()` in
   `finally`. A refusal at the tile, model or drafter-kind step only says
   the kernel does not apply to this load: one INFO line, `projection kernel
@@ -527,7 +563,9 @@ goal.
   (`VLMEngine(projection_kernel=False, draft_block_explicit=True)`); only
   `default_engine_factory` hands them the config. Nothing is logged per
   turn; `projkernel.calls` (`verify_kernel`, `verify_split`,
-  `plain_kernel`, `declined`) counts every path for the tests and for
+  `plain_kernel`, `declined`, and `one_row`, one per one-row dispatch
+  `linears()` serves; warm-up and probe leave them all as found) counts
+  every path for the tests and for
   harnesses, and the load line carries `projection_kernel=` and, with a
   drafter, `draft_block=`. The fork key records `proj` (`active`, else
   `off`) and `projkernel.py` is in `_EPOCH_FILES`: the one-row forward that
@@ -542,9 +580,12 @@ goal.
   floor, the per-forward sum within ±2%: the bits are the parity contract
   and the speed is the only reason the kernel exists. Tests install the
   hooks through `pfx.guard_proj_state` and `pfx.hooked`, swap the plain-mlx
-  stand-in in for `projkernel.mma`, and skip the kernel's own tests on
-  `projkernel.kernel_available()`, which compiles and runs every variant
-  once and remembers success only: the lane map was probed on Apple GPUs,
+  stand-ins in for `projkernel.mma` and `projkernel.one_row`
+  (`pfx.stand_ins`; `pfx.real_kernel` puts both real kernels back), and
+  skip the kernel's own tests on `projkernel.kernel_available()`, which
+  compiles and runs every variant and the one-row kernel once (the one-row
+  kernel bitwise against the MMA kernel at T = 1, random and cancelling)
+  and remembers success only: the lane map was probed on Apple GPUs,
   so a GPU where it differs skips rather than fails.
 - `engine/draftctx.py` hands the DFlash drafter the prompt's hidden states on
   the hybrid prompt-cache path (#142). mlx-vlm's round loop
