@@ -258,28 +258,43 @@ def run_one(
     scratch: Path,
     *,
     python: Path,
+    work: Path | None = None,
     grade_timeout: float = 120.0,
 ) -> SuiteRun:
     """One task, once, through the suite loop, then the grade over what it
-    left in the scratch copy of the project."""
-    project = scratch / "project"
+    left in the scratch copy of the project.
+
+    The copy runs at `work` when given and is moved to `scratch / "project"`
+    afterwards, beside the transcript: the system prompt names the project
+    root, so a root built from the arm's label or the run index would hand
+    each arm, and each run, a prompt of its own (#149). The run samples from
+    seed `index`, so run i of every arm draws from the same stream."""
+    archive = scratch / "project"
+    project = work or archive
     shutil.copytree(task.project, project)
     transcript = Transcript(scratch / "transcript.jsonl")
     tools = ScratchTools(project, task.verify_commands)
     before = counting.output_tokens
-    with interpreter_first(python):
-        result = run_loop(
-            instructions=task.instructions,
-            context_files=task.context_files,
-            root=project,
-            engine=engine,
-            window=arm.window,
-            budget=Budget(turns=task.max_turns, minutes=task.max_minutes),
-            tools=tools,
-            transcript=transcript,
-        )
+    try:
+        with interpreter_first(python):
+            result = run_loop(
+                instructions=task.instructions,
+                context_files=task.context_files,
+                root=project,
+                engine=engine,
+                window=arm.window,
+                budget=Budget(turns=task.max_turns, minutes=task.max_minutes),
+                tools=tools,
+                transcript=transcript,
+                seed=index,
+            )
+        grade = grade_task(task, project, python=python, timeout=grade_timeout)
+    finally:
+        # A copy that failed partway leaves nothing to move, and a raise here
+        # would hide the run's own error.
+        if project != archive and project.exists():
+            shutil.move(project, archive)
     malformed, repetitions = metrics_from_transcript(transcript.path)
-    grade = grade_task(task, project, python=python, timeout=grade_timeout)
     failed = result.error is not None
     return SuiteRun(
         task=task.name,
@@ -409,6 +424,7 @@ def _run_suite(
     factory: Callable[[str], Engine] | None,
     python: Path,
     active_memory: Callable[[], int],
+    work: Path | None,
 ) -> SuiteOutcome:
     baseline = active_memory()
     base = factory or default_engine_factory(arm.config, forks=False)
@@ -463,9 +479,12 @@ def _run_suite(
                     run_scratch = scratch / _slug(arm.label) / f"{task.name}-{index + 1}"
                     # A resumed run may have died mid-task here; nothing in a
                     # half-run scratch is worth keeping.
-                    if run_scratch.exists():
-                        shutil.rmtree(run_scratch)
+                    for stale in (run_scratch, work):
+                        if stale is not None and stale.exists():
+                            shutil.rmtree(stale)
                     run_scratch.mkdir(parents=True)
+                    if work is not None:
+                        work.parent.mkdir(parents=True, exist_ok=True)
                     try:
                         result = run_one(
                             task,
@@ -475,6 +494,7 @@ def _run_suite(
                             counters[-1],
                             run_scratch,
                             python=python,
+                            work=work,
                         )
                     except Exception as e:  # noqa: BLE001 — one run's failure, recorded; goes on
                         result = _error_run(task, index, arm, f"{type(e).__name__}: {e}")
@@ -511,10 +531,14 @@ def run_suite(
     factory: Callable[[str], Engine] | None = None,
     python: Path | None = None,
     active_memory: Callable[[], int] | None = None,
+    work: Path | None = None,
 ) -> SuiteOutcome:
     """Every (task, run index) of the arm not in `done`, on a thread of its
     own that loads the engine once, hands each run to `record` as it
-    finishes, and releases its mlx state on the way out."""
+    finishes, and releases its mlx state on the way out. `work` is where
+    every run's project runs before it is archived under `scratch`; a
+    caller comparing arms passes the same one to each arm, outside every
+    arm's archive."""
     outcome: list[SuiteOutcome | BaseException] = []
 
     def run() -> None:
@@ -531,6 +555,7 @@ def run_suite(
                     factory,
                     python or Path(sys.executable),
                     active_memory or _active_memory,
+                    work,
                 )
             )
         except BaseException as e:  # noqa: BLE001 — becomes the outcome's error

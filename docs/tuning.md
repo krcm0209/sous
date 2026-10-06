@@ -36,8 +36,11 @@ from a JSON schema, a CLI flag, a config-format migration — through an agent
 loop of its own over a scratch copy of each task's project, running only that
 task's verify commands and the suite's test runners, and denying nothing
 because there is nothing to approve. Each run is scored by a
-hidden grader (`--runs` sets the runs per task, default 2). The rule, printed
-in full with every number:
+hidden grader (`--runs` sets the runs per task, default 2). Every arm and run
+works on its copy at one path, `<run-id>/project`, which the prompt names, so
+arms are compared on the same prompt; run *i* of every arm samples from seed
+*i*, so a task's runs differ on purpose rather than replaying one stream.
+The rule, printed in full with every number:
 
 - the **reference** is your current configuration when it fits this machine,
   else the fastest arm of the largest tier that does;

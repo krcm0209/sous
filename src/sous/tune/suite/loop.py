@@ -130,8 +130,9 @@ def run_loop(
     tools: ScratchTools,
     transcript: Transcript,
     command_timeout: float = COMMAND_TIMEOUT,
+    seed: int | None = None,
 ) -> LoopResult:
-    session = engine.session()
+    session = engine.session(seed=seed)
     try:
         messages: list[dict] = [
             {"role": "system", "content": build_system_prompt(root)},

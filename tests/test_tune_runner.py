@@ -182,6 +182,52 @@ def test_run_suite_loads_once_runs_what_is_not_done_records_in_order_and_release
     assert (tmp_path / "scratch" / "m" / "implement_rpn-3" / "project" / "rpn.py").is_file()
 
 
+def test_every_arm_and_run_sees_one_project_root_and_run_i_samples_seed_i(tmp_path, monkeypatch):
+    """An arm comparison must compare arms, not prompts: the system prompt
+    names one project path for every arm and run index, and run i of every
+    arm samples from seed i, so runs differ on purpose and pair across arms.
+    Each run's project still ends up archived beside its transcript."""
+    task = _task()
+    seeds: list[int | None] = []
+    real = ManagedEngine.session
+
+    def session(self, seed=None):
+        seeds.append(seed)
+        return real(self, seed=seed)
+
+    monkeypatch.setattr(ManagedEngine, "session", session)
+    work = tmp_path / "run" / "project"
+    # What an interrupted run left behind must not leak into the next one.
+    work.mkdir(parents=True)
+    (work / "stale.txt").write_text("from a run that died")
+    prompts: list[str] = []
+    for label in ("a", "b"):
+        inner = FakeEngine([FINISH, FINISH])
+        outcome = run_suite(
+            dataclasses.replace(_arm(tmp_path), label=label),
+            [task],
+            runs=2,
+            done=set(),
+            record=lambda r: None,
+            scratch=tmp_path / "run" / "suite",
+            out=lambda *a: None,
+            factory=lambda mid, inner=inner: inner,
+            python=PYTHON,
+            active_memory=lambda: 0,
+            work=work,
+        )
+        assert [r.state for r in outcome.runs] == ["done", "done"]
+        prompts += [call[0]["content"] for call in inner.calls]
+    assert len(prompts) == 4 and len(set(prompts)) == 1
+    assert f"Project root: {work}" in prompts[0]
+    assert seeds == [0, 1, 0, 1]
+    assert not work.exists()
+    for label in ("a", "b"):
+        for n in (1, 2):
+            archived = tmp_path / "run" / "suite" / label / f"implement_rpn-{n}" / "project"
+            assert (archived / "rpn.py").is_file() and not (archived / "stale.txt").exists()
+
+
 def test_the_next_run_waits_for_an_abandoned_generation(tmp_path, monkeypatch):
     """run_loop can give up on a stalled generation (budget-exhausted) at
     its own wall-clock deadline while the engine's session thread keeps
