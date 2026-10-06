@@ -202,9 +202,10 @@ carries and of which projections share it, so greedy output with the drafter
 stays identical to output without it — and that is also why plain decode goes
 through the kernel. Decode's projections are one-row calls, which the
 simdgroup-matrix kernel serves on a fraction of its lanes, so they run on the
-one-row kernel instead, whose output is the same bit for bit. Before it,
-decode with no drafter ran about 0.78x what it does with `false` (10.7 against
-13.6 tok/s on those turns); that has not been re-measured since. The kernel is
+one-row kernel instead, whose output is the same bit for bit. That took
+decode with no drafter from 10.2 to 13.4 tok/s on the first 16 of those turns
+(1.32x), about the 13.5 tok/s it decodes with `false` there (measured in
+separate runs); before it, decode with no drafter ran about 0.78x. The kernel is
 closer to an exact reference than mlx's own one-row kernel, but not
 bit-identical to it, so a near-tie can resolve the other way than with
 `false`, which runs the stock paths. It is active only where the attention
