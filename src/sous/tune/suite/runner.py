@@ -290,9 +290,7 @@ def run_one(
             )
         grade = grade_task(task, project, python=python, timeout=grade_timeout)
     finally:
-        # A copy that failed partway leaves nothing to move, and a raise here
-        # would hide the run's own error.
-        if project != archive and project.exists():
+        if project != archive:
             shutil.move(project, archive)
     malformed, repetitions = metrics_from_transcript(transcript.path)
     failed = result.error is not None
@@ -424,7 +422,7 @@ def _run_suite(
     factory: Callable[[str], Engine] | None,
     python: Path,
     active_memory: Callable[[], int],
-    work: Path | None,
+    work: Path,
 ) -> SuiteOutcome:
     baseline = active_memory()
     base = factory or default_engine_factory(arm.config, forks=False)
@@ -480,11 +478,10 @@ def _run_suite(
                     # A resumed run may have died mid-task here; nothing in a
                     # half-run scratch is worth keeping.
                     for stale in (run_scratch, work):
-                        if stale is not None and stale.exists():
+                        if stale.exists():
                             shutil.rmtree(stale)
                     run_scratch.mkdir(parents=True)
-                    if work is not None:
-                        work.parent.mkdir(parents=True, exist_ok=True)
+                    work.parent.mkdir(parents=True, exist_ok=True)
                     try:
                         result = run_one(
                             task,
@@ -535,10 +532,10 @@ def run_suite(
 ) -> SuiteOutcome:
     """Every (task, run index) of the arm not in `done`, on a thread of its
     own that loads the engine once, hands each run to `record` as it
-    finishes, and releases its mlx state on the way out. `work` is where
-    every run's project runs before it is archived under `scratch`; a
-    caller comparing arms passes the same one to each arm, outside every
-    arm's archive."""
+    finishes, and releases its mlx state on the way out. Every run's project
+    runs at `work`, by default `project` beside `scratch` (outside every
+    arm's archive), before it is archived under `scratch`: arms compared on
+    one `work` see one prompt."""
     outcome: list[SuiteOutcome | BaseException] = []
 
     def run() -> None:
@@ -555,7 +552,7 @@ def run_suite(
                     factory,
                     python or Path(sys.executable),
                     active_memory or _active_memory,
-                    work,
+                    work or scratch.parent / "project",
                 )
             )
         except BaseException as e:  # noqa: BLE001 — becomes the outcome's error

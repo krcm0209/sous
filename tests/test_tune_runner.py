@@ -202,7 +202,7 @@ def test_every_arm_and_run_sees_one_project_root_and_run_i_samples_seed_i(tmp_pa
     (work / "stale.txt").write_text("from a run that died")
     prompts: list[str] = []
     for label in ("a", "b"):
-        inner = FakeEngine([FINISH, FINISH])
+        inner = FakeEngine([_solution_write(task), FINISH] * 2)
         outcome = run_suite(
             dataclasses.replace(_arm(tmp_path), label=label),
             [task],
@@ -214,11 +214,11 @@ def test_every_arm_and_run_sees_one_project_root_and_run_i_samples_seed_i(tmp_pa
             factory=lambda mid, inner=inner: inner,
             python=PYTHON,
             active_memory=lambda: 0,
-            work=work,
         )
-        assert [r.state for r in outcome.runs] == ["done", "done"]
+        # Graded where the run left its project, not after it moved away.
+        assert [(r.state, r.grade) for r in outcome.runs] == [("done", 1.0), ("done", 1.0)]
         prompts += [call[0]["content"] for call in inner.calls]
-    assert len(prompts) == 4 and len(set(prompts)) == 1
+    assert len(prompts) == 8 and len(set(prompts)) == 1
     assert f"Project root: {work}" in prompts[0]
     assert seeds == [0, 1, 0, 1]
     assert not work.exists()
@@ -226,6 +226,32 @@ def test_every_arm_and_run_sees_one_project_root_and_run_i_samples_seed_i(tmp_pa
         for n in (1, 2):
             archived = tmp_path / "run" / "suite" / label / f"implement_rpn-{n}" / "project"
             assert (archived / "rpn.py").is_file() and not (archived / "stale.txt").exists()
+
+
+def test_a_run_that_raises_midway_still_archives_its_project(tmp_path, monkeypatch):
+    from sous.tune.suite import runner
+
+    def broken(**kwargs):
+        (kwargs["root"] / "half.txt").write_text("written before the failure")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runner, "run_loop", broken)
+    outcome = run_suite(
+        _arm(tmp_path),
+        [_task()],
+        runs=1,
+        done=set(),
+        record=lambda r: None,
+        scratch=tmp_path / "scratch",
+        out=lambda *a: None,
+        factory=lambda mid: FakeEngine([]),
+        python=PYTHON,
+        active_memory=lambda: 0,
+    )
+    assert [(r.state, r.error) for r in outcome.runs] == [("error", "OSError: disk full")]
+    archived = tmp_path / "scratch" / "m" / "implement_rpn-1" / "project"
+    assert (archived / "half.txt").is_file() and (archived / "rpn.py").is_file()
+    assert not (tmp_path / "project").exists()
 
 
 def test_the_next_run_waits_for_an_abandoned_generation(tmp_path, monkeypatch):

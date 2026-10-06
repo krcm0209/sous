@@ -124,7 +124,6 @@ def _suite_stage(
             done=done,
             record=record,
             scratch=run.path / "suite",
-            work=run.path / "project",
             out=out,
         )
         if outcome.error:

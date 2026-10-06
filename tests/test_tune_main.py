@@ -546,23 +546,6 @@ def test_a_quick_run_never_touches_the_suite(tmp_path, capsys):
     assert "## Suite" not in capsys.readouterr().out
 
 
-def test_every_suite_arm_runs_its_projects_at_one_path_beside_the_archive(tmp_path):
-    deps, _ = _deps(tmp_path, scores={CUR: 30.0, NINE: 45.0}, cached=(M, D, N))
-    paths = []
-    inner = deps["suite"]
-
-    def suite(arm, tasks, **kw):
-        paths.append((kw["scratch"], kw["work"]))
-        return inner(arm, tasks, **kw)
-
-    deps["suite"] = suite
-    main(_args(quick=False), config=_cfg(tmp_path), **deps)
-    assert len(paths) >= 2
-    scratch, work = paths[0]
-    assert all(p == (scratch, work) for p in paths)
-    assert scratch.name == "suite" and work == scratch.parent / "project"
-
-
 def test_a_stopped_suite_still_reports_the_runs_it_recorded(tmp_path, capsys):
     deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N))
 
