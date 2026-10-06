@@ -12,11 +12,13 @@ and the reduce kernel, divided at its ``// REDUCE`` line. ``projection_mma.metal
 holds three, the plain kernel, the staged kernel and the group-sums kernel,
 divided at its ``// STAGED`` and ``// GROUP_SUMS`` lines; ``projection_mma.h``
 holds the 8x8x8 simdgroup multiply-accumulate helper and the presum switch.
-None of the three uses tensor ops, so they compile on any Metal GPU and CI runs
-their tests.
+``projection_row.metal`` is the one-row kernel, which serves a single row in the
+same summation order with no MMA. None of these uses tensor ops, so they compile
+on any Metal GPU and CI runs their tests.
 
 The int8 kernels are derived from oMLX (jundot/omlx#3548) and the projection
 kernel in part from Splash (incoai/splash and its Apple7/8 port), both under the
-Apache License 2.0; see THIRD_PARTY_NOTICES.md. ``attention_tile.metal`` is
-sous's own.
+Apache License 2.0; see THIRD_PARTY_NOTICES.md. ``attention_tile.metal`` is sous's
+own, and so is ``projection_row.metal`` apart from the nibble decode and epilogue it
+shares with the projection kernel.
 """

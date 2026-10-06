@@ -66,6 +66,21 @@ def test_the_header_holds_mma8_and_the_presum_switch():
     assert "MetalPerformancePrimitives" not in header
 
 
+def test_the_one_row_kernel_is_one_body_with_its_tile_frozen():
+    """One simdgroup per column, four per threadgroup: the tile only sets the
+    speed, but the launch sizes the grid from it, and its threadgroup memory
+    (NSG * G * (RC + 1) fp32 values) caps the K the kernel takes at Apple's
+    32 KB. Mode h only, the quarters added in the MMA kernel's order."""
+    body = _text("projection_row.metal")
+    assert "#include" not in body and "mpp::" not in body
+    assert "constexpr uint RC = 1;" in body and "constexpr uint NSG = 4;" in body
+    assert "as_type<half2>(" in body and "- half2(1024.0h)" in body
+    assert body.count("((acc + a1) + a2) + a3") == 1
+    assert (projkernel._ROW_COLS, projkernel._ROW_THREADS) == (1 * 4, 32 * 4)
+    assert 4 * (projkernel._ROW_MAX_K // 64) * (1 + 1) * 4 == 32 * 1024
+    assert projkernel._ROW_MAX_K >= 17_408, "the 27B's down projection"
+
+
 def test_the_linear_select_is_generated_per_count():
     assert projkernel._select(1) == (
         "#define W_ w0\n#define S_ s0\n#define B_ b0\n#define Y_ y0\n  const uint NL_ = N0;"
@@ -92,9 +107,10 @@ def test_every_kernel_is_built_with_safe_math_under_its_own_name(monkeypatch):
         for nl in range(1, 5):
             projkernel._projection_kernel(kind, nl)
     projkernel._group_sums_kernel()
+    projkernel._row_kernel()
     assert set(made) == {
         f"sous_proj_{kind}_n{nl}" for kind in projkernel.VARIANTS for nl in range(1, 5)
-    } | {"sous_proj_group_sums"}
+    } | {"sous_proj_group_sums", "sous_proj_row"}
     for name, kwargs in made.items():
         assert kwargs["compile_options"] == {"math_mode": "safe"}, name
         assert kwargs.get("ensure_row_contiguous", True) is True, name
@@ -107,6 +123,9 @@ def test_every_kernel_is_built_with_safe_math_under_its_own_name(monkeypatch):
     assert "#define PRESUM 1" not in made["sous_proj_staged_n2"]["header"]
     assert made["sous_proj_plain_n1"]["input_names"] == ["x", "w0", "s0", "b0"]
     assert made["sous_proj_group_sums"]["output_names"] == ["sums"]
+    row = made["sous_proj_row"]
+    assert (row["input_names"], row["output_names"]) == (["x", "w", "scales", "biases"], ["y"])
+    assert row["source"] == _text("projection_row.metal")
 
 
 # ---- the variant choice ----------------------------------------------------------
@@ -170,6 +189,7 @@ def no_launch(monkeypatch):
         raise AssertionError("a refused call reached the kernel")
 
     monkeypatch.setattr(projkernel, "_launch", launched)
+    monkeypatch.setattr(projkernel, "one_row", launched)
 
 
 @pytest.mark.parametrize(
@@ -177,6 +197,9 @@ def no_launch(monkeypatch):
     [
         ((3, 256), mx.float16, 1, "bf16"),
         ((3, 256), mx.float32, 1, "bf16"),
+        ((1, 256), mx.float16, 1, "bf16"),
+        ((1, 256), mx.bfloat16, 5, "linears"),
+        ((1, 512), mx.bfloat16, 1, "K"),
         ((9, 256), mx.bfloat16, 1, "rows"),
         ((3, 3, 256), mx.bfloat16, 1, "rows"),  # nine rows over two leading dims
         ((0, 256), mx.bfloat16, 1, "rows"),
@@ -195,8 +218,11 @@ def test_linears_refuses_a_k_its_variant_cannot_split(no_launch, monkeypatch):
     """The plain body needs K / 64 >= 4 for its four K simdgroups, the staged ones
     K % 1024 == 0 for whole staging stages: a K that fits neither is refused rather
     than read past the end of the weights."""
-    with pytest.raises(ValueError, match="K=128 does not fit the plain variant"):
-        projkernel.linears(mx.zeros((2, 128), dtype=mx.bfloat16), [pfx.rand_linear(64, 128, 0)])
+    for rows in (1, 2):
+        with pytest.raises(ValueError, match="K=128 does not fit the plain variant"):
+            projkernel.linears(
+                mx.zeros((rows, 128), dtype=mx.bfloat16), [pfx.rand_linear(64, 128, 0)]
+            )
     monkeypatch.setattr(projkernel, "variant", lambda k, n_sum: "staged")
     with pytest.raises(ValueError, match="K=1088 does not fit the staged variant"):
         projkernel.linears(mx.zeros((2, 1088), dtype=mx.bfloat16), [pfx.rand_linear(64, 1088, 0)])
@@ -208,6 +234,63 @@ def test_linears_refuses_scales_mlx_would_bind_constant(no_launch):
     linear at K = 256 has four scales and is refused here, not by the compiler."""
     with pytest.raises(ValueError, match="4 scales are fewer than 8"):
         projkernel.linears(mx.zeros((2, 256), dtype=mx.bfloat16), [pfx.rand_linear(1, 256, 0)])
+
+
+# ---- which kernel linears() launches ---------------------------------------------
+
+
+@pytest.fixture
+def launches(monkeypatch):
+    """Both kernels replaced by recording stand-ins: ("mma", rows, linears) per
+    MMA launch, ("row", x shape, N) per one-row launch."""
+    seen: list = []
+
+    def mma_launch(kind, x2, weights):
+        seen.append(("mma", x2.shape[0], len(weights)))
+        return list(pfx.stand_in_mma(x2, weights))
+
+    def row(x2, w, scales, biases):
+        seen.append(("row", x2.shape, w.shape[0]))
+        return pfx.stand_in_one_row(x2, w, scales, biases)
+
+    monkeypatch.setattr(projkernel, "_launch", mma_launch)
+    monkeypatch.setattr(projkernel, "one_row", row)
+    return seen
+
+
+@pytest.mark.parametrize("shape", [(1, 256), (1, 1, 256)])
+def test_linears_sends_one_row_to_the_one_row_kernel_once_per_linear(launches, shape):
+    """A fused call at one row is one one-row dispatch per linear: a row's bits
+    do not depend on the linears beside it, so nothing is lost by splitting."""
+    ns = (72, 48, 40)
+    weights = [pfx.rand_linear(n, 256, 80 + i) for i, n in enumerate(ns)]
+    before = dict(projkernel.calls)
+    outs = projkernel.linears(_acts(*shape), weights)
+    assert launches == [("row", (1, 256), n) for n in ns]
+    assert _proj_counts_since(before) == {"one_row": 3}
+    assert [o.shape for o in outs] == [(*shape[:-1], n) for n in ns]
+
+
+def test_linears_keeps_two_rows_and_more_on_the_mma_kernel(launches):
+    weights = [pfx.rand_linear(n, 256, 90 + i) for i, n in enumerate((72, 48))]
+    before = dict(projkernel.calls)
+    for t in range(2, projkernel.MAX_ROWS + 1):
+        projkernel.linears(_acts(1, t, 256), weights)
+    assert launches == [("mma", t, 2) for t in range(2, projkernel.MAX_ROWS + 1)]
+    assert _proj_counts_since(before) == {}
+
+
+def test_linears_keeps_a_row_too_wide_for_the_one_row_kernel_on_the_mma_kernel(launches):
+    """Past _ROW_MAX_K the one-row kernel's group dots would not fit Apple's
+    32 KB of threadgroup memory; the MMA kernel computes the same bits."""
+    k = projkernel._ROW_MAX_K + 64
+    linear = (
+        mx.zeros((8, k // 8), dtype=mx.uint32),
+        mx.zeros((8, k // 64), dtype=mx.bfloat16),
+        mx.zeros((8, k // 64), dtype=mx.bfloat16),
+    )
+    projkernel.linears(mx.zeros((1, k), dtype=mx.bfloat16), [linear])
+    assert launches == [("mma", 1, 1)]
 
 
 # ---- the stand-in ----------------------------------------------------------------
@@ -303,6 +386,56 @@ def test_the_probe_refuses_a_row_that_depends_on_the_row_count(monkeypatch):
     assert projkernel._kernel_probe() == "plain: a row alone differs from the same row among eight"
 
 
+def _stand_in_launch(kind, x2, weights):
+    return list(pfx.stand_in_mma(x2, weights))
+
+
+def _nudged_row(*, when=None):
+    """A one-row stand-in about one bf16 ulp off the MMA kernel's row, on every
+    row or only where `when(x2)` holds."""
+
+    def row(x2, w, scales, biases):
+        out = pfx.stand_in_one_row(x2, w, scales, biases)
+        if when is not None and not when(x2):
+            return out
+        return (out.astype(mx.float32) * 1.0078125).astype(mx.bfloat16)
+
+    return row
+
+
+def test_the_probe_refuses_a_one_row_kernel_that_differs_from_the_mma_kernel(monkeypatch):
+    """Bitwise, at one row: decode's row must be the row the MMA kernel serves
+    a verify, or greedy parity is gone."""
+    monkeypatch.setattr(projkernel, "_launch", _stand_in_launch)
+    monkeypatch.setattr(projkernel, "_launch_row", _nudged_row())
+    assert projkernel._kernel_probe() == (
+        "one-row: linear 0 differs from the MMA kernel at one row (random activations)"
+    )
+
+
+def _big_in(layout):
+    """True for a row in `layout`: its large values all lie on the layout's
+    source and mirror columns. No layout's columns contain another's, so a row
+    in one layout is never taken for another, and a random row has none."""
+
+    def big(x2):
+        source, mirror, _ = projkernel._mirror(x2.shape[-1], layout)
+        large = mx.abs(x2[0].astype(mx.float32)) > 64
+        return mx.any(large).item() and not mx.any(large & ~(source | mirror)).item()
+
+    return big
+
+
+@pytest.mark.parametrize("layout", projkernel.CANCELLING)
+def test_the_probe_refuses_a_one_row_kernel_off_only_where_a_layout_cancels(monkeypatch, layout):
+    monkeypatch.setattr(projkernel, "_launch", _stand_in_launch)
+    monkeypatch.setattr(projkernel, "_launch_row", _nudged_row(when=_big_in(layout)))
+    assert projkernel._kernel_probe() == (
+        "one-row: linear 0 differs from the MMA kernel at one row "
+        f"({layout}-cancelling activations)"
+    )
+
+
 def test_the_kernel_is_available_wherever_metal_is():
     """The arithmetic tests below skip when kernel_available() is False, and its
     probe answers False for wrong numbers as well as for no Metal: a kernel that
@@ -388,6 +521,149 @@ def test_the_three_variants_agree_bitwise(monkeypatch, t, layout):
             assert mx.array_equal(got, want).item(), (kind, layout, t)
 
 
+# (K, the linears' N) for the one-row kernel against the MMA kernel: K from the
+# fewest groups the K split takes to the 27B's down projection, an uneven split
+# (1088) among them; every K % 1024 == 0 is checked against all three MMA
+# variants. N covers partial column tiles (of the one-row kernel's 4 and the MMA
+# kernel's 32), in_proj_b/a's 32 and 48, and the fewest scales mlx binds as a
+# buffer.
+_ONE_ROW_SHAPES = [
+    (256, (2, 32, 48)),
+    (512, (1, 37)),
+    (1088, (48, 40)),
+    (1024, (8, 33, 72)),
+    (5120, (48, 130)),
+    (6144, (32, 36)),
+    (17_408, (32, 45)),
+]
+
+
+@pfx.kernel
+@pytest.mark.parametrize("layout", pfx.LAYOUTS)
+@pytest.mark.parametrize(("k", "ns"), _ONE_ROW_SHAPES)
+def test_the_one_row_kernel_equals_the_mma_kernel_at_one_row(k, ns, layout):
+    x, weights = pfx.projection_inputs(layout, 3, k, ns, x_seed=k, w_seed=k + 1)
+    kinds = projkernel.VARIANTS if k % 1024 == 0 else ("plain",)
+    for r in range(3):
+        row = x[r : r + 1]
+        for (w, scales, biases), n in zip(weights, ns, strict=True):
+            got = projkernel._launch_row(row, w, scales, biases)
+            assert got.shape == (1, n) and got.dtype == mx.bfloat16
+            for kind in kinds:
+                (want,) = projkernel._launch(kind, row, [(w, scales, biases)])
+                assert mx.array_equal(got, want).item(), (k, n, layout, r, kind)
+
+
+@pfx.kernel
+def test_the_one_row_kernel_equals_the_mma_kernel_on_a_real_width_linear():
+    """The 27B's gate+up width on random rows, a backstop beside the cancelling
+    layouts: across tens of thousands of outputs a reordered epilogue or quarter
+    sum, which random rows at the narrow shapes round alike, lands a few of them
+    on another bf16."""
+    k, n, rows = 5120, 17_408, 4
+    x = pfx.activations(rows, k, 50)
+    weights = pfx.rand_linear(n, k, 51)
+    got = mx.concatenate([projkernel._launch_row(x[r : r + 1], *weights) for r in range(rows)])
+    (want,) = projkernel._launch("plain", x, [weights])
+    assert mx.array_equal(got, want).item()
+
+
+@pfx.kernel
+@pytest.mark.parametrize("layout", pfx.LAYOUTS)
+def test_a_fused_one_row_call_equals_the_mma_kernels_fused_call(forced, layout):
+    """linears() at one row against the dispatch it made before it had a
+    one-row kernel: the MMA kernel's fused call at T = 1, in each variant."""
+    ns = (136, 48, 40, 8)
+    x, weights = pfx.projection_inputs(layout, 1, 2048, ns, x_seed=13, w_seed=14)
+    before = dict(projkernel.calls)
+    got = projkernel.linears(x[None], weights)
+    assert _proj_counts_since(before) == {"one_row": len(ns)}
+    want = projkernel._launch(forced, x, weights)
+    for g, w, n in zip(got, want, ns, strict=True):
+        assert g.shape == (1, 1, n)
+        assert mx.array_equal(g[0], w).item(), (forced, layout, n)
+
+
+_DOT_ORDER = "for (uint h = 0; h < 2; ++h)\n#pragma unroll\n        for (uint s = 0; s < 4; ++s)"
+_QUARTERS = "((acc + a1) + a2) + a3"
+_EPILOGUE = (
+    "acc = fma(dots[sg][g][r], float(sc[g]), acc);\n"
+    "        acc = fma(dots[sg][g][RC], float(bi[g]), acc);"
+)
+_LANE_SUM = (
+    "L[fm] = ((xf[o] + xf[o + 1]) + (xf[o + 2] + xf[o + 3])) +\n"
+    "              ((xf[o + 8] + xf[o + 9]) + (xf[o + 10] + xf[o + 11]));"
+)
+# name -> (the kernel's text, a reordered copy, the cancelling layout that shows
+# it). Every one of these changes bits on a real-width random linear, and random
+# rows at the probe's widths show none of them.
+_REORDERED = {
+    # the first and last quarters, which cancel, added before the middle two
+    "quarters": (_QUARTERS, "((acc + a3) + a1) + a2", "quarter"),
+    "paired quarters": (_QUARTERS, "(acc + a1) + (a2 + a3)", "middle"),
+    "reversed quarters": (_QUARTERS, "((a3 + a2) + a1) + acc", "middle"),
+    # a group's products with s outer and h inner
+    "products": (
+        _DOT_ORDER,
+        "for (uint s = 0; s < 4; ++s)\n#pragma unroll\n        for (uint h = 0; h < 2; ++h)",
+        "group",
+    ),
+    "group sum": (
+        "((L[0] + L[1]) + (L[2] + L[3])) + ((L[4] + L[5]) + (L[6] + L[7]))",
+        "((L[0] + L[2]) + (L[1] + L[3])) + ((L[4] + L[6]) + (L[5] + L[7]))",
+        "group",
+    ),
+    "lane sum": (
+        _LANE_SUM,
+        "L[fm] = ((((((xf[o] + xf[o + 1]) + xf[o + 2]) + xf[o + 3]) + xf[o + 8]) + "
+        "xf[o + 9]) + xf[o + 10]) + xf[o + 11];",
+        "lane",
+    ),
+    "bias first": (
+        _EPILOGUE,
+        "acc = fma(dots[sg][g][RC], float(bi[g]), acc);\n"
+        "        acc = fma(dots[sg][g][r], float(sc[g]), acc);",
+        "pair",
+    ),
+    # stage by stage this reads as the same sum, but the products round apart
+    "unfused epilogue": (
+        _EPILOGUE,
+        "{ const float p = dots[sg][g][r] * float(sc[g]);\n"
+        "        const float b = dots[sg][g][RC] * float(bi[g]);\n"
+        "        acc = (acc + p) + b; }",
+        "pair",
+    ),
+}
+
+
+@pfx.kernel
+@pytest.mark.parametrize("name", list(_REORDERED))
+def test_a_one_row_kernel_that_sums_in_another_order_is_caught(monkeypatch, name):
+    """The negative control: the same kernel with one sum reordered. Its
+    cancelling layout tells it apart from the MMA kernel, and
+    kernel_available()'s probe refuses it. Built under another name, since mlx
+    keeps a compiled library per kernel name."""
+    order, other, layout = _REORDERED[name]
+    text = projkernel._row_source()
+    assert text.count(order) == 1
+    monkeypatch.setattr(int8prefill, "_kernels", {})
+    slug = name.replace(" ", "_")
+    monkeypatch.setattr(projkernel, "_ROW_KERNEL", f"sous_proj_row_reordered_{slug}")
+    reordered = text.replace(order, other)
+    monkeypatch.setattr(projkernel, "_row_source", lambda: reordered)
+    x, ((w, scales, biases),) = pfx.projection_inputs(layout, 8, 1024, (256,), x_seed=11, w_seed=12)
+    got = mx.concatenate(
+        [projkernel._launch_row(x[r : r + 1], w, scales, biases) for r in range(8)]
+    )
+    (want,) = projkernel._launch("plain", x, [(w, scales, biases)])
+    assert not mx.array_equal(got, want).item()
+    reason = projkernel._kernel_probe()
+    assert reason is not None and reason.startswith("one-row: linear "), reason
+    assert reason.endswith(
+        f"differs from the MMA kernel at one row ({layout}-cancelling activations)"
+    )
+
+
 @pfx.kernel
 @pytest.mark.parametrize(("n", "k"), [(2, 256), (1, 512)])
 def test_the_smallest_eligible_projections_compile_and_compute(n, k):
@@ -463,25 +739,37 @@ def test_the_kernel_rounds_like_a_float64_reference(forced):
         assert np.mean(rounded == y64) >= 0.995, forced
 
 
-@pytest.mark.parametrize(("layout", "k"), [("quarters", 2048), ("quarters", 1088), ("group", 1024)])
+@pytest.mark.parametrize("k", [256, 1088, 2048])
+@pytest.mark.parametrize("layout", projkernel.CANCELLING)
 def test_the_cancelling_layouts_cancel_term_by_term(layout, k):
-    """What makes them sensitive to summation order: each mirror span's products
-    are exactly the negated products of its source span (same codes, same scales,
-    negated activations), and they dwarf the rest of the sum."""
+    """What makes them sensitive to summation order: each mirror column's products
+    are exactly the negated products of its source column (same codes, same
+    scales, negated activations), and they dwarf the rest of the sum."""
     x, ((w, scales, biases),) = pfx.projection_inputs(layout, 4, k, (40,), x_seed=9, w_seed=90)
     xs, dense = _f64(x), _dequantize_f64(w, scales, biases)
     terms = xs[:, None, :] * dense[None, :, :]
-    spans = pfx._mirrors(k, layout)
-    mirrored = np.zeros(k, dtype=bool)
-    for src, dst, width in spans:
-        assert np.array_equal(terms[..., dst : dst + width], -terms[..., src : src + width])
-        mirrored[src : src + width] = mirrored[dst : dst + width] = True
-    if layout == "quarters":
-        (a, b), _, _, (c, _) = pfx.k_quarters(k)
-        assert spans == [(a, c, b - a)]
-    big = np.abs(terms[..., mirrored]).sum(axis=-1)
-    rest = np.abs(terms[..., ~mirrored]).sum(axis=-1)
+    source, mirror, offset = (np.array(m) for m in projkernel._mirror(k, layout))
+    src = np.flatnonzero(source)
+    assert src.size and np.array_equal(np.flatnonzero(mirror), src + offset)
+    assert not np.any(source & mirror)
+    assert np.array_equal(terms[..., src + offset], -terms[..., src])
+    big = np.abs(terms[..., source | mirror]).sum(axis=-1)
+    rest = np.abs(terms[..., ~(source | mirror)]).sum(axis=-1)
     assert np.all(big > 100 * rest)
+
+
+@pytest.mark.parametrize(
+    ("layout", "first", "second"),
+    [("quarter", 0, 3), ("middle", 1, 2)],
+)
+@pytest.mark.parametrize("k", [256, 1088, 2048])
+def test_the_quarter_layouts_cancel_one_k_quarter_against_another(layout, first, second, k):
+    """Split as the kernels split K: whole quant groups, g0 = q * G // 4."""
+    groups = k // 64
+    starts = [64 * (q * groups // 4) for q in range(5)]
+    source, mirror, _ = (np.flatnonzero(np.array(m)) for m in projkernel._mirror(k, layout))
+    assert source[0] == starts[first] and source[-1] < starts[first + 1]
+    assert mirror[0] == starts[second] and mirror[-1] < starts[second + 1]
 
 
 # ---- routing: the tags, the flag and the two hooks ---------------------------------
@@ -528,8 +816,30 @@ def fresh_target(tiny_target):
     projkernel.untag(tiny_target)
 
 
-def test_the_counters_name_the_four_paths():
-    assert set(projkernel.calls) == {"verify_kernel", "verify_split", "plain_kernel", "declined"}
+def test_the_counters_name_the_five_paths():
+    assert set(projkernel.calls) == {
+        "verify_kernel",
+        "verify_split",
+        "plain_kernel",
+        "declined",
+        "one_row",
+    }
+
+
+@pfx.kernel
+def test_a_one_row_call_through_hook_two_is_a_one_row_dispatch(monkeypatch):
+    pfx.hooked(monkeypatch)
+    pfx.real_kernel(monkeypatch)
+    linear = _tagged_linear(256, 256, 0)
+    x = _acts(1, 1, 256)
+    before = dict(projkernel.calls)
+    got = linear(x)
+    assert _proj_counts_since(before) == {"plain_kernel": 1, "one_row": 1}
+    (want,) = projkernel._launch("plain", x[0], _triples(linear))
+    assert _bitwise(got[0], want)
+    before = dict(projkernel.calls)
+    linear(_acts(1, 3, 256))
+    assert _proj_counts_since(before) == {"plain_kernel": 1}
 
 
 def test_clear_drops_the_flag(monkeypatch):
@@ -1271,6 +1581,35 @@ def test_warm_up_runs_every_dispatch_key_at_every_row_count(monkeypatch):
     assert {dtype for *_, dtype in seen} == {mx.bfloat16}
 
 
+# Every linear shape (K, N) of the tiny model, each a one-row kernel pipeline.
+_TINY_LINEARS = {(256, 2048), (256, 512), (256, 256), (256, 4), (512, 256), (1024, 256)}
+
+
+def test_warm_up_runs_the_one_row_kernel_once_per_linear_shape(monkeypatch):
+    pfx.guard_proj_state(monkeypatch)
+    pfx.stand_ins(monkeypatch)
+    seen: list = []
+
+    def spy(x2, w, scales, biases):
+        seen.append((x2.shape, x2.dtype, w.shape[0]))
+        return pfx.stand_in_one_row(x2, w, scales, biases)
+
+    monkeypatch.setattr(projkernel, "one_row", spy)
+    projkernel.warm_up(pfx.tiny_quantized_model())
+    assert sorted((shape[1], n) for shape, _, n in seen) == sorted(_TINY_LINEARS)
+    assert {(shape[0], dtype) for shape, dtype, _ in seen} == {(1, mx.bfloat16)}
+
+
+@pfx.kernel
+def test_warm_up_leaves_the_counters_as_it_found_them(monkeypatch):
+    """Its one-row launches go through linears() on the real kernel, which
+    counts what it serves; a load is not a served call."""
+    pfx.guard_proj_state(monkeypatch)
+    before = dict(projkernel.calls)
+    projkernel.warm_up(pfx.tiny_quantized_model())
+    assert projkernel.calls == before
+
+
 def _probe_model(monkeypatch, mma=None):
     """A tiny model as enable() hands it to the probe: tagged, both hooks in
     place, the flag clear, and `mma` (the stand-in by default) as the kernel."""
@@ -1311,7 +1650,37 @@ def test_probe_passes_the_stand_in(monkeypatch):
 
 @pfx.kernel
 def test_probe_passes_the_real_kernel(monkeypatch):
-    assert _run_probe(_probe_model(monkeypatch, projkernel.linears)) is None
+    lm = _probe_model(monkeypatch)
+    pfx.real_kernel(monkeypatch)
+    assert _run_probe(lm) is None
+
+
+def test_probe_fails_one_row_for_a_one_row_kernel_that_differs(monkeypatch):
+    lm = _probe_model(monkeypatch)
+    monkeypatch.setattr(projkernel, "one_row", _nudged_row())
+    assert _run_probe(lm) == (
+        "one-row: model.layers.0.linear_attn.in_proj_qkv differs from the MMA kernel "
+        "(random activations)"
+    )
+
+
+@pytest.mark.parametrize("layout", projkernel.CANCELLING)
+def test_probe_fails_one_row_where_a_layout_cancels_alone(monkeypatch, layout):
+    lm = _probe_model(monkeypatch)
+    monkeypatch.setattr(projkernel, "one_row", _nudged_row(when=_big_in(layout)))
+    assert _run_probe(lm) == (
+        "one-row: model.layers.0.linear_attn.in_proj_qkv differs from the MMA kernel "
+        f"({layout}-cancelling activations)"
+    )
+
+
+def test_enable_refuses_a_one_row_kernel_that_differs_and_warns(monkeypatch):
+    """Parity rests on the one-row kernel's bits: a mismatch switches the whole
+    kernel off, MMA paths included, with a warning."""
+    pfx.proj_ready(monkeypatch)
+    monkeypatch.setattr(projkernel, "one_row", _nudged_row())
+    status = _refusal(pfx.tiny_quantized_model(), warned=True)
+    assert status["reason"].startswith("one-row: "), status
 
 
 def test_probe_refuses_projections_that_never_reach_the_kernel(monkeypatch):

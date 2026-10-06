@@ -39,61 +39,29 @@ def activations(rows: int, k: int, seed: int) -> Any:
     return x
 
 
-# The bitwise tests' inputs. Random activations leave a reordered fp32 sum one bf16
-# rounding away from the same bits almost everywhere; the two cancelling layouts
-# make the order show. "quarters" cancels the first K simdgroup's partial against
-# the last's (the order the K partials are added in), "group" cancels inside every
-# quant group (the order of the group's activation sum, in-line or presummed).
-LAYOUTS = ("random", "quarters", "group")
-_CANCEL = 256.0
-_SMALL = 1e-2
-
-
-def k_quarters(k: int) -> list[tuple[int, int]]:
-    """The column range each of the kernel's four K simdgroups sums, split by whole
-    quant groups as the kernel splits them (g0 = sk * G // 4)."""
-    g = k // 64
-    return [(64 * (sk * g // 4), 64 * ((sk + 1) * g // 4)) for sk in range(4)]
-
-
-def _mirrors(k: int, layout: str) -> list[tuple[int, int, int]]:
-    """(source, mirror, width) column spans a cancelling layout pairs up."""
-    if layout == "quarters":
-        (a, b), _, _, (c, _) = k_quarters(k)
-        return [(a, c, b - a)]  # the last quarter is never narrower than the first
-    if layout == "group":
-        return [(g, g + 48, 16) for g in range(0, k, 64)]
-    raise ValueError(layout)
+# The bitwise tests' inputs: random rows, and the probe's own cancelling layouts
+# (projkernel.CANCELLING says what each one shows).
+LAYOUTS = ("random", *projkernel.CANCELLING)
 
 
 def cancelling_activations(rows: int, k: int, layout: str, seed: int) -> Any:
-    """[rows, K] bf16 activations, +c·v over each source span and exactly -c·v over
-    its mirror, small values elsewhere: the large terms cancel, so the result is
-    small and a reordered fp32 sum lands on another bf16. Built on the GPU and
-    evaluated."""
+    """[rows, K] bf16 activations in a cancelling layout, as the probe builds
+    them: large over the source columns, exactly their negation over the
+    mirror, small elsewhere. Built on the GPU and evaluated."""
     import mlx.core as mx
 
-    keys = mx.random.split(mx.random.key(seed), 2)
-    x = (mx.random.normal((rows, k), key=keys[0]) * _SMALL).astype(mx.bfloat16)
-    big = (mx.random.normal((rows, k), key=keys[1]) * _CANCEL).astype(mx.bfloat16)
-    for src, dst, width in _mirrors(k, layout):
-        x[:, src : src + width] = big[:, src : src + width]
-        x[:, dst : dst + width] = -big[:, src : src + width]
+    x = projkernel._cancelling_rows(rows, k, layout, mx.random.key(seed))
     mx.eval(x)
     return x
 
 
 def cancelling_linear(n: int, k: int, layout: str, seed: int) -> tuple[Any, Any, Any]:
-    """rand_linear's projection with each mirror span's weight columns copied from
-    its source span, so the two spans' products cancel term by term. The spans are
-    whole quant groups or the same columns of one group, so both quantize to the
-    same codes."""
+    """An affine-Q4 gs64 projection whose mirror columns copy its source
+    columns, as the probe builds it, so against cancelling_activations() the
+    two spans' products cancel term by term. Evaluated."""
     import mlx.core as mx
 
-    dense = (mx.random.normal((n, k), key=mx.random.key(seed)) * 0.02).astype(mx.bfloat16)
-    for src, dst, width in _mirrors(k, layout):
-        dense[:, dst : dst + width] = dense[:, src : src + width]
-    w, scales, biases = mx.quantize(dense, group_size=64, bits=4)
+    w, scales, biases = projkernel._cancelling_linear(n, k, layout, mx.random.key(seed))
     mx.eval(w, scales, biases)
     return w, scales, biases
 
@@ -132,6 +100,13 @@ def stand_in_mma(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]
         y = mx.concatenate([rows[r : r + 1] @ dense.T for r in range(n_rows)], axis=0)
         outs.append(y.astype(mx.bfloat16).reshape(*x.shape[:-1], dense.shape[0]))
     return tuple(outs)
+
+
+def stand_in_one_row(x2: Any, w: Any, scales: Any, biases: Any) -> Any:
+    """A plain-mlx model of projkernel.one_row's contract: one [1, K] row through
+    one linear, the stand-in's own arithmetic, so it equals stand_in_mma's row
+    bit for bit as the real one-row kernel equals the MMA kernel's."""
+    return stand_in_mma(x2, [(w, scales, biases)])[0]
 
 
 def rand_module(n: int, k: int, seed: int) -> Any:
@@ -185,8 +160,8 @@ def guard_proj_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """Registers restores for what install_hooks(), enable() and the probe leave
     behind for the rest of the process: nn.QuantizedLinear.__call__ and the
     verifier's _linear and _linears (the hooks), the flag, int8's install flag (a
-    test may install int8's wrapper in either order with ours) and the remembered
-    compile verdict. A test that installs or activates the kernel then cannot
+    test may install int8's wrapper in either order with ours), the remembered
+    compile verdict and the one-row seam. A test that installs or activates the kernel then cannot
     leak any of them into the next."""
     import mlx.nn as nn
 
@@ -199,15 +174,29 @@ def guard_proj_state(monkeypatch: pytest.MonkeyPatch) -> None:
         int8prefill, "_QUANTIZED_LINEAR_WRAPPED", int8prefill._QUANTIZED_LINEAR_WRAPPED
     )
     monkeypatch.setattr(projkernel, "_kernel_ok", projkernel._kernel_ok)
+    monkeypatch.setattr(projkernel, "one_row", projkernel.one_row)
+
+
+def stand_ins(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stand-ins as both kernels: `mma` and the one-row kernel `linears`,
+    warm_up() and the probe reach through `one_row`."""
+    monkeypatch.setattr(projkernel, "mma", stand_in_mma)
+    monkeypatch.setattr(projkernel, "one_row", stand_in_one_row)
+
+
+def real_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real kernels behind both seams, for a test that set the stand-ins."""
+    monkeypatch.setattr(projkernel, "mma", projkernel.linears)
+    monkeypatch.setattr(projkernel, "one_row", projkernel._launch_row)
 
 
 def hooked(monkeypatch: pytest.MonkeyPatch, *, active: int = 1) -> None:
     """Both hooks installed and the flag at `active` for this test only, with the
-    stand-in as the kernel; guard_proj_state's restores undo all of it."""
+    stand-ins as the kernels; guard_proj_state's restores undo all of it."""
     guard_proj_state(monkeypatch)
     projkernel.install_hooks()
     monkeypatch.setattr(projkernel, "_active", active)
-    monkeypatch.setattr(projkernel, "mma", stand_in_mma)
+    stand_ins(monkeypatch)
 
 
 # The attention tile's status as an active load reports it; enable() rides on it.
@@ -222,8 +211,8 @@ ACTIVE_TILE: dict[str, Any] = {
 def proj_ready(monkeypatch: pytest.MonkeyPatch, *, real_pins: bool = False) -> dict[str, Any]:
     """Every enable() and static_reason() guard that reads the machine passes
     on any GPU: the platform rule, and a core count of 20 under this GPU's own
-    name. The stand-in is the kernel, and the pins pass unless `real_pins` (for
-    the tests about the pins themselves). Registers guard_proj_state's restores
+    name. The stand-ins are the kernels, and the pins pass unless `real_pins`
+    (for the tests about the pins themselves). Registers guard_proj_state's restores
     and returns the attention tile's status to hand enable()."""
     import mlx.core as mx
 
@@ -233,7 +222,7 @@ def proj_ready(monkeypatch: pytest.MonkeyPatch, *, real_pins: bool = False) -> d
     device = str(mx.device_info()["device_name"])
     monkeypatch.setattr(nax, "platform_reason", lambda: None)
     monkeypatch.setattr(gpucores, "read", lambda: gpucores.GPUCores(20, device, None, "iokit"))
-    monkeypatch.setattr(projkernel, "mma", stand_in_mma)
+    stand_ins(monkeypatch)
     if not real_pins:
         monkeypatch.setattr(projkernel, "_pins_reason", lambda: None)
     return dict(ACTIVE_TILE)
