@@ -77,13 +77,17 @@ _SELECT = "__SELECT__"
 # mlx's default, stated rather than inherited: the variants agree bitwise only if
 # each rounds exactly as written, which relaxed and fast math do not promise.
 _SAFE_MATH = {"math_mode": "safe"}
-# The one-row body's frozen RC = 1 and NSG = 4: columns per threadgroup, threads.
-_ROW_COLS = 4
-_ROW_THREADS = 128
-# The widest K the one-row kernel takes: its group dots and sums, NSG * G * 2
+# The one-row body's frozen tile: RC columns per simdgroup, NSG simdgroups per
+# threadgroup. The grid and the K cap below both follow from them.
+_ROW_RC = 1
+_ROW_NSG = 4
+_ROW_COLS = _ROW_RC * _ROW_NSG
+_ROW_THREADS = 32 * _ROW_NSG
+# The widest K the one-row kernel takes: its group dots and sums, NSG * G * (RC + 1)
 # fp32 values, must fit the 32 KB of threadgroup memory every Apple GPU has. A
 # one-row call past it goes to the MMA kernel, which computes the same bits.
-_ROW_MAX_K = 32 * 1024 // (4 * 2 * 4) * _GROUP
+_THREADGROUP_BYTES = 32 * 1024
+_ROW_MAX_K = _THREADGROUP_BYTES // (_ROW_NSG * (_ROW_RC + 1) * 4) * _GROUP
 _ROW_KERNEL = "sous_proj_row"
 
 
@@ -446,6 +450,20 @@ def _cancelling_linear(n: int, k: int, layout: str, key: Any) -> tuple[Any, Any,
     return w, scales, biases
 
 
+def _cancelling_case(
+    rows: int, k: int, ns: tuple[int, ...], layout: str, key: Any
+) -> tuple[Any, list[tuple[Any, Any, Any]]]:
+    """([rows, K] activations, one linear per N in `ns`) in one cancelling layout,
+    evaluated, the way both probes build a case."""
+    import mlx.core as mx
+
+    keys = mx.random.split(key, 1 + len(ns))
+    x = _cancelling_rows(rows, k, layout, keys[0])
+    linears_ = [_cancelling_linear(n, k, layout, keys[1 + i]) for i, n in enumerate(ns)]
+    mx.eval(x, linears_)
+    return x, linears_
+
+
 def _kernel_probe() -> str | None:
     """Compile and run every variant and linear count once on eight rows, plus each
     variant on one row alone; None when every output is right, else why not. Every
@@ -496,13 +514,9 @@ def _kernel_probe() -> str | None:
                 return f"{kind}: a row alone differs from the same row among eight"
         cases = [("random", x, weights)]
         for j, layout in enumerate(CANCELLING):
-            keys = mx.random.split(mx.random.key(1 + j), 1 + len(_PROBE_NS))
-            rows = _cancelling_rows(MAX_ROWS, _PROBE_K, layout, keys[0])
-            linears_ = [
-                _cancelling_linear(n, _PROBE_K, layout, keys[1 + i])
-                for i, n in enumerate(_PROBE_NS)
-            ]
-            mx.eval(rows, linears_)
+            rows, linears_ = _cancelling_case(
+                MAX_ROWS, _PROBE_K, _PROBE_NS, layout, mx.random.key(1 + j)
+            )
             cases.append((f"{layout}-cancelling", rows, linears_))
         for label, rows, linears_ in cases:
             for i, linear_ in enumerate(linears_):
@@ -1023,12 +1037,12 @@ def _check_rows(root: Any, names: dict[int, str]) -> str | None:
     kinds = ("random", *(f"{layout}-cancelling" for layout in CANCELLING))
     rows: dict[int, Any] = {}
     for i, k in enumerate(sorted({_in_features(g[0]) for g in groups})):
-        keys = mx.random.split(mx.random.key(100 + i), 1 + 2 * len(CANCELLING))
+        keys = mx.random.split(mx.random.key(100 + i), 1 + len(CANCELLING))
         built = [mx.random.normal((1, k), key=keys[0]).astype(mx.bfloat16)]
         for j, layout in enumerate(CANCELLING):
-            built.append(_cancelling_rows(1, k, layout, keys[1 + j]))
-            linear_ = _cancelling_linear(_PROBE_NS[0], k, layout, keys[1 + len(CANCELLING) + j])
-            cases.append(([linear_], [f"a {layout}-cancelling K={k} linear"]))
+            row, linears_ = _cancelling_case(1, k, (_PROBE_NS[0],), layout, keys[1 + j])
+            built.append(row)
+            cases.append((linears_, [f"a {layout}-cancelling K={k} linear"]))
         rows[k] = mx.concatenate(built)
     mx.eval(list(rows.values()), [weights for weights, _ in cases])
     for weights, labels in cases:

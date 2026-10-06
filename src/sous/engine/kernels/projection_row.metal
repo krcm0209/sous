@@ -22,7 +22,9 @@
 // columns per simdgroup, NSG simdgroups) changes no output, only the speed; its
 // threadgroup memory, NSG * G * (RC + 1) fp32 values, bounds K, which
 // projkernel.py routes past _ROW_MAX_K to the MMA kernel instead.
-// sous's own; prepended by projkernel.py with common.h.
+// sous's own, except the nibble decode and the two-fma epilogue it shares with
+// projection_mma.metal, which follow Splash and its Apple7/8 port (Apache-2.0;
+// see THIRD_PARTY_NOTICES.md). Prepended by projkernel.py with common.h.
 //
 // Template: KD (K), ND (N). Grid (32 * NSG * ceil(N / (RC * NSG)), 1, 1),
 // threadgroup (32 * NSG, 1, 1).

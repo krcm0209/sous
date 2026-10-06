@@ -18,6 +18,7 @@ on any Metal GPU and CI runs their tests.
 
 The int8 kernels are derived from oMLX (jundot/omlx#3548) and the projection
 kernel in part from Splash (incoai/splash and its Apple7/8 port), both under the
-Apache License 2.0; see THIRD_PARTY_NOTICES.md. ``attention_tile.metal`` and
-``projection_row.metal`` are sous's own.
+Apache License 2.0; see THIRD_PARTY_NOTICES.md. ``attention_tile.metal`` is sous's
+own, and so is ``projection_row.metal`` apart from the nibble decode and epilogue it
+shares with the projection kernel.
 """
