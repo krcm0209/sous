@@ -50,7 +50,7 @@ dependencies = [
     # mx.clear_streams() before exiting (ml-explore/mlx#4327) — sous complies
     # via engine.base.release_mlx_thread_state. A new mlx-touching thread that
     # skips it segfaults the daemon; see the helper's docstring.
-    "mlx==0.32.2",
+    "mlx==0.32.3",
     "mlx-lm>=0.31",
     # Never below 0.7.0, where generate_step re-applies a caller's
     # position_ids/rope_deltas over the embedding helper's; below it

@@ -161,8 +161,8 @@ def _gemm_probe() -> str | None:
     kernels compile against the OS's own Metal toolchain at runtime, so a new macOS
     can reject a source that compiled before (#123: macOS 27's MSL 4.1). This runs
     only GPU work, which fails cleanly; the same failure with a CPU-stream op in
-    flight deadlocks inside mlx's exception path (0.32.2) instead of raising. Only
-    success is remembered: a failure is probed again on the next call, so one bad
+    flight deadlocks inside mlx's exception path (0.32.2 and 0.32.3) instead of
+    raising. Only success is remembered: a failure is probed again on the next call, so one bad
     moment cannot switch int8 off for a long-lived daemon."""
     global _probe_ok
     if _probe_ok:

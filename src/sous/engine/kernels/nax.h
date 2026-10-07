@@ -4,7 +4,7 @@
 // test them) on any Metal GPU.
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
-// Mirror of mlx::steel::BaseNAXFrag::get_coord() (mlx 0.32.2, steel/gemm/nax.h): the
+// Mirror of mlx::steel::BaseNAXFrag::get_coord() (mlx 0.32.2 and 0.32.3, steel/gemm/nax.h): the
 // lane's (column x, row y) inside a 16x16 fragment. A lane's slots r*4 + j are
 // (row y + 8r, col x + j) of its fragment; a 16x32 destination is two such
 // fragments along n.
