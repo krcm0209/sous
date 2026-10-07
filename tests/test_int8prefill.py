@@ -66,9 +66,9 @@ def test_kernel_sources_ship_as_package_files():
 
 
 def test_kernel_hands_mlx_only_the_arguments_it_was_given(monkeypatch):
-    """int8's kernels take mlx's defaults, so they pass neither of the keywords
-    the attention tile needs: an older mlx within the dependency floor may not
-    accept them, and a TypeError there would turn int8 prefill unavailable."""
+    """int8's kernels take mlx's defaults and pass neither of the keywords the
+    attention tile needs: passing them would tie int8 prefill to mlx
+    accepting them, and a TypeError there would turn it unavailable."""
     made = {}
 
     def metal_kernel(**kwargs):

@@ -134,8 +134,8 @@ goal.
   same tokens landed at `0..n-1`; measured 2026-09-14 on the default model:
   keys off by 127–170 % either way, prefill and decode, drafter or not). Only
   from 0.7.0 does `generate_step` re-apply a caller's positions over the
-  helper's — hence the `mlx-vlm>=0.7.0` floor; below it the kwargs are silently
-  overwritten. A suffix-only array is sliced the same way, so the array is
+  helper's — hence mlx-vlm is never pinned below 0.7.0; below it the kwargs are
+  silently overwritten. A suffix-only array is sliced the same way, so the array is
   always absolute from 0; `rope_deltas` goes with it so the engine owns the
   delta the model adopts into the state a drafter run nulls and positions the
   generated tokens from. mlx-vlm's own `_prime_cached_prefix_rope_state` does
@@ -324,8 +324,15 @@ goal.
   0.32.2's dispatch (`VALIDATED_MLX`) — re-read
   `scaled_dot_product_attention.cpp` and extend it on every mlx bump; every
   mlx-vlm function the hook reads is pinned by source hash
-  (`VALIDATED_MLX_VLM_SOURCES`), checked at load because the daemon's tool
-  environment can resolve a newer mlx-vlm than the lock. While the tile is
+  (`VALIDATED_MLX_VLM_SOURCES`), checked at load because a tool environment
+  can still be handed another mlx-vlm than the lock. `pyproject.toml` pins
+  mlx and mlx-vlm with `==` to the releases these sets, tileattn's and
+  projkernel's were validated on (#168). Another mlx-vlm loads the exact
+  paths only while every hooked source still hashes the same, so move a pin
+  only once the hash tests pass on the new release (extending the sets where
+  a source changed) and its M5 Pro checks have run;
+  `tests/test_dependency_pins.py` holds the pins to `VALIDATED_MLX`, its own
+  `VALIDATED_MLX_VLM` and the installed versions. While the tile is
   inactive T = 2 is left alone: stock already makes one call there, and
   grouping it would change output at plan straddles. While it is active the
   wrapper's scope widens to every T from 1 and the rows go to `tileattn`

@@ -54,8 +54,9 @@ VALIDATED_MLX = frozenset({"0.32.2"})
 # The MoE variant reuses the same verifier class with other attention shapes.
 SUPPORTED_MODEL_TYPES = frozenset({"qwen3_5"})
 # Every mlx-vlm function the hook calls or re-implements around, by the module
-# that defines it. The daemon's tool environment can resolve a newer mlx-vlm
-# than the lock, so these are checked at load, not only in CI.
+# that defines it. pyproject pins mlx-vlm, but a tool environment can still be
+# handed another one (an override, a later install over the pin), so these are
+# checked at load, not only in CI.
 _SOURCES = {
     "Qwen3_5BatchInvariantForward._attention": "mlx_vlm.models.qwen3_5.speculative_verifier",
     "Qwen3_5Attention._prepare_projected_qkv": "mlx_vlm.models.qwen3_5.language",
