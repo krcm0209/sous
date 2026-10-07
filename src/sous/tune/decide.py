@@ -72,8 +72,6 @@ def _changes(user: SousConfig, arm: Arm, *, full: bool = False) -> dict[str, dic
         model["max_context_tokens"] = window
     if full and arm.int8_prefill != user.int8_prefill:
         model["int8_prefill"] = arm.int8_prefill
-    if full and arm.greedy and user.temperature != 0:
-        model["temperature"] = 0.0
     changes: dict[str, dict[str, object]] = {}
     if model:
         changes["model"] = model

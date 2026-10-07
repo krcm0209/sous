@@ -236,7 +236,8 @@ generation itself cannot be interrupted and runs on to completion).
 documented non-thinking-mode defaults). Greedy decoding (temperature 0)
 sounds safer but isn't: it gives the model no way to escape a bad
 completion once it happens, since a near-identical prompt plus a nudge
-still argmaxes to the same wrong output every time.
+still argmaxes to the same wrong output every time. `sous tune` never
+proposes it; it runs only when you set it.
 
 Speculative decoding (`speculative_draft_id`, `speculative_block_size`) is
 ~1.8x decode on the default model at short context with the shipped

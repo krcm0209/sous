@@ -39,13 +39,15 @@ class Arm:
     # what a proposal writes: the drafterless arm must not carry the
     # reservation made for a drafter its configuration never loads.
     fit_window: int | None = None
-    # The quality-affecting dimensions the winner stage measures, mirrored
-    # from `config` so a row can be keyed without reading the config back.
+    # The quality-affecting setting the winner stage measures, mirrored from
+    # `config` so a row can be keyed without reading the config back.
     int8_prefill: bool = False
-    greedy: bool = False
     # Mirrored the same way but never measured: every arm inherits the
-    # user's setting. It still keys suite rows, because tile and stock
-    # attention differ in their last bits.
+    # user's temperature, and greedy is only ever the user's own choice. It
+    # still keys suite rows, because greedy and sampled runs differ.
+    greedy: bool = False
+    # Inherited and keyed the same way: tile and stock attention differ in
+    # their last bits.
     attention_tile: bool = True
     # Inherited and keyed the same way, for the same reason: kernel and stock
     # projections differ in their last bits.
@@ -69,8 +71,9 @@ class Arm:
     @property
     def suite_key(self) -> tuple[str, str, int, bool, bool, bool, bool]:
         """What identifies an arm across suite runs and a resume: the bench
-        key, the two settings only the suite may change, and the attention
-        tile and projection kernel every arm inherits."""
+        key, the one setting only the suite may change, and whether the
+        sampler is greedy, the attention tile and the projection kernel,
+        which every arm inherits."""
         return (
             *self.key,
             self.int8_prefill,
@@ -302,11 +305,13 @@ def quick_arms(
 
 
 def winner_stage_arms(winner: Arm, *, nax: bool, checkpoint: Checkpoint) -> list[Arm]:
-    """One extra arm per quality-affecting setting the winner does not have
-    yet: INT8 prefill where the tensor units and the checkpoint's quantization
-    allow it (the engine refuses anything else with a status, and the arm
-    would measure the stock path under the int8 label), and greedy sampling
-    for a winner that samples. Each is judged on its own against the winner."""
+    """An INT8 prefill arm for a winner that has it off, where the tensor
+    units and the checkpoint's quantization allow it (the engine refuses
+    anything else with a status, and the arm would measure the stock path
+    under the int8 label), judged on its own against the winner. Greedy
+    sampling is never an arm: it removes the variety a stuck agent needs to
+    get out of a repetition loop, and a suite whose greedy runs of a task
+    repeat one trajectory cannot measure that."""
     from sous.engine.int8prefill import SUPPORTED_MODEL_TYPES
 
     arms: list[Arm] = []
@@ -322,16 +327,6 @@ def winner_stage_arms(winner: Arm, *, nax: bool, checkpoint: Checkpoint) -> list
                 current=False,
                 int8_prefill=True,
                 int8_under_test=True,
-            )
-        )
-    if not winner.greedy:
-        arms.append(
-            dataclasses.replace(
-                winner,
-                label=f"{winner.label} greedy",
-                config=dataclasses.replace(winner.config, temperature=0.0),
-                current=False,
-                greedy=True,
             )
         )
     return arms
