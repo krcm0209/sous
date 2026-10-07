@@ -438,7 +438,20 @@ def test_without_runs_of_the_current_arm_the_first_measured_arm_is_the_reference
     assert full_decision(user, [cur], [], [], runs_per_task=1) is None
 
 
-def test_the_winner_stage_judges_each_extra_arm_against_the_winner(tmp_path):
+def test_a_greedy_users_proposal_leaves_the_temperature_alone(tmp_path):
+    # Every arm inherits the user's temperature, so a greedy user's winner ran
+    # greedy too, and a change of model writes nothing about the sampler.
+    user = _user(tmp_path, temperature=0.0)
+    cur = dataclasses.replace(_arm(user, "27 @3", current=True), greedy=True)
+    nine = dataclasses.replace(_arm(user, "9", drafter="", block=0, model=M9), greedy=True)
+    runs = _runs(cur, [1.0], seconds=100.0) + _runs(nine, [1.0], seconds=50.0)
+    choice = full_decision(user, [cur, nine], runs, [], runs_per_task=1)
+    assert choice is not None and choice.label == "9"
+    assert choice.changes["model"]["id"] == M9
+    assert "temperature" not in choice.changes["model"]
+
+
+def test_the_winner_stage_judges_the_int8_arm_against_the_winner(tmp_path):
     user = _user(tmp_path)
     winner = _arm(user, "27 @3", current=True)
     int8 = dataclasses.replace(
@@ -448,27 +461,10 @@ def test_the_winner_stage_judges_each_extra_arm_against_the_winner(tmp_path):
         current=False,
         int8_prefill=True,
     )
-    greedy = dataclasses.replace(
-        winner,
-        label="27 @3 greedy",
-        config=dataclasses.replace(user, temperature=0.0),
-        current=False,
-        greedy=True,
-    )
-    runs = (
-        _runs(winner, [1.0, 1.0], seconds=100.0)
-        + _runs(int8, [1.0, 0.96], seconds=80.0)
-        + _runs(greedy, [1.0, 1.0], seconds=70.0)
-    )
-    choice = full_decision(
-        user, [winner, int8, greedy], runs, [], runs_per_task=2, reference=winner
-    )
-    assert choice is not None and choice.label == "27 @3 greedy"
-    assert choice.changes == {"model": {"temperature": 0.0}}
-    assert "reference: 27 @3 (the model stage's winner)" in choice.reasons[0]
     runs = _runs(winner, [1.0, 1.0], seconds=100.0) + _runs(int8, [1.0, 0.96], seconds=80.0)
     choice = full_decision(user, [winner, int8], runs, [], runs_per_task=2, reference=winner)
     assert choice is not None and choice.changes == {"model": {"int8_prefill": True}}
+    assert "reference: 27 @3 (the model stage's winner)" in choice.reasons[0]
     runs = _runs(winner, [1.0, 1.0], seconds=100.0) + _runs(int8, [1.0, 0.88], seconds=80.0)
     choice = full_decision(user, [winner, int8], runs, [], runs_per_task=2, reference=winner)
     assert choice is not None and choice.changes == {}

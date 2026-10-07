@@ -448,7 +448,7 @@ def test_a_full_run_grades_each_models_fastest_arm_and_can_change_the_model(tmp_
     # The model stage: each model's fastest arm, the current one among them.
     assert [label for label, _ in seen[:2]] == [CUR, NINE]
     # The winner stage on the 9B: nax is on and the fixture is affine 4-bit gs64.
-    assert [label for label, _ in seen[2:]] == [f"{NINE} + int8 prefill", f"{NINE} greedy"]
+    assert [label for label, _ in seen[2:]] == [f"{NINE} + int8 prefill"]
     assert "## Suite" in out and "suite: 2 tasks x 2 runs on 2 arm(s)" in out
     assert "roughly" in out and "min from the measured speeds" in out
     assert f'+id = "{N}"' in out
@@ -462,20 +462,31 @@ def test_the_winner_stage_offers_only_what_the_hardware_allows(tmp_path, capsys)
     no_nax = dataclasses.replace(_hardware(tmp_path), nax=False, nax_reason="pre-M5")
     deps["detect"] = lambda: no_nax
     assert main(_args(quick=False, yes=True), config=_cfg(tmp_path), **deps) == 0
-    assert [label for label, _ in seen if "int8" in label] == []
-    assert [label for label, _ in seen if label.endswith(" greedy")]
+    assert [label for label, _ in seen[2:]] == []
+    assert "winner stage on" not in capsys.readouterr().out
 
 
-def test_a_greedy_arm_that_wins_writes_temperature_zero(tmp_path, capsys):
-    deps, _ = _deps(
-        tmp_path,
-        scores={CUR: 30.0, NINE: 20.0},
-        cached=(M, D, N),
-        seconds={f"{CUR} greedy": 5.0},
-    )
-    assert main(_args(quick=False, yes=True), config=_cfg(tmp_path), **deps) == 0
+@pytest.mark.parametrize("temperature", [0.7, 0.0])
+def test_a_full_run_never_measures_or_proposes_a_temperature(tmp_path, capsys, temperature):
+    # Greedy is only ever the user's own setting: no arm changes the
+    # sampler, and a greedy user's arms all run greedy.
+    graded = []
+    deps, _ = _deps(tmp_path, scores={CUR: 30.0, NINE: 20.0}, cached=(M, D, N))
+    real_suite = deps["suite"]
+
+    def suite(arm, tasks, **kw):
+        graded.append(arm)
+        return real_suite(arm, tasks, **kw)
+
+    deps["suite"] = suite
+    cfg = _cfg(tmp_path, temperature=temperature)
+    assert main(_args(quick=False, yes=True), config=cfg, **deps) == 0
     out = capsys.readouterr().out
-    assert "+temperature = 0.0" in out and "+id" not in out
+    assert graded and not any("greedy" in arm.label for arm in graded)
+    assert {(arm.config.temperature, arm.greedy) for arm in graded} == {
+        (temperature, temperature == 0)
+    }
+    assert "temperature" not in out
 
 
 def test_resume_skips_suite_runs_already_recorded(tmp_path, capsys):
@@ -533,8 +544,8 @@ def test_the_daemon_is_asked_again_before_every_suite_arm(tmp_path, capsys):
     deps["ready"] = lambda port: (calls.append(port), real(port))[1]
     assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 0
     # once up front, once before the first bench load, once per suite arm
-    # (two models, then two winner-stage arms)
-    assert len(calls) == 2 + 4
+    # (two models, then the winner stage's int8 arm)
+    assert len(calls) == 2 + 3
 
 
 def test_a_quick_run_never_touches_the_suite(tmp_path, capsys):
@@ -591,11 +602,11 @@ def test_a_stopped_suite_still_reports_the_runs_it_recorded(tmp_path, capsys):
 
 
 def test_a_stop_in_the_winner_stage_keeps_the_model_stages_choice(tmp_path, capsys):
-    """The winner stage measures extra settings (int8, greedy) on top of an
-    already-decided model-stage winner. A stop there must not discard that
-    decision — the report should still recommend what the model stage
-    chose, with a note that the winner-stage settings were left unmeasured
-    — and main must still exit 1 before applying anything."""
+    """The winner stage measures int8 prefill on top of an already-decided
+    model-stage winner. A stop there must not discard that decision — the
+    report should still recommend what the model stage chose, with a note
+    that the winner stage was left unmeasured — and main must still exit 1
+    before applying anything."""
     calls = []
     deps, _ = _deps(
         tmp_path,

@@ -295,27 +295,32 @@ def test_the_suite_key_extends_the_bench_key_with_the_quality_dimensions(tmp_pat
     assert arm.suite_key == (*arm.key, False, False, True, True)
 
 
-def test_on_nax_a_routable_checkpoint_gets_an_int8_arm_and_a_sampled_winner_a_greedy_arm(tmp_path):
+def test_on_nax_a_routable_checkpoint_gets_an_int8_arm_and_no_greedy_arm(tmp_path):
     cp = _checkpoints()["mlx-community/Qwen3.8-27B-4bit"]
     arms = winner_stage_arms(_winner(tmp_path), nax=True, checkpoint=cp)
-    assert [a.label for a in arms] == ["27B + DFlash2 @3 + int8 prefill", "27B + DFlash2 @3 greedy"]
-    int8, greedy = arms
-    assert int8.int8_prefill and int8.config.int8_prefill and not int8.greedy
-    assert greedy.greedy and greedy.config.temperature == 0 and not greedy.int8_prefill
+    assert [a.label for a in arms] == ["27B + DFlash2 @3 + int8 prefill"]
+    (int8,) = arms
+    assert int8.int8_prefill and int8.config.int8_prefill
+    assert not int8.greedy and int8.config.temperature == 0.7
     assert int8.suite_key == (*int8.key, True, False, True, True)
-    assert greedy.suite_key == (*greedy.key, False, True, True, True)
-    assert all(not a.current and a.fit_window == 131072 for a in arms)
+    assert not int8.current and int8.fit_window == 131072
     # Only the winner stage's own int8 arm is under test: the engine
     # refusing it must fail the arm, unlike an arm that merely inherited
     # int8_prefill from the user's config.
-    assert int8.int8_under_test and not greedy.int8_under_test
+    assert int8.int8_under_test
 
 
-def test_without_nax_only_the_greedy_arm_is_offered(tmp_path):
+def test_a_winner_the_user_set_greedy_keeps_greedy_on_its_int8_arm(tmp_path):
     cp = _checkpoints()["mlx-community/Qwen3.8-27B-4bit"]
-    assert [a.label for a in winner_stage_arms(_winner(tmp_path), nax=False, checkpoint=cp)] == [
-        "27B + DFlash2 @3 greedy"
+    arms = winner_stage_arms(_winner(tmp_path, temperature=0), nax=True, checkpoint=cp)
+    assert [(a.label, a.greedy, a.config.temperature) for a in arms] == [
+        ("27B + DFlash2 @3 + int8 prefill", True, 0)
     ]
+
+
+def test_without_nax_no_extra_arm_is_offered(tmp_path):
+    cp = _checkpoints()["mlx-community/Qwen3.8-27B-4bit"]
+    assert winner_stage_arms(_winner(tmp_path), nax=False, checkpoint=cp) == []
 
 
 def test_a_checkpoint_int8_cannot_route_gets_no_int8_arm(tmp_path):
@@ -324,14 +329,12 @@ def test_a_checkpoint_int8_cannot_route_gets_no_int8_arm(tmp_path):
         config_fn=lambda m: fx.qwen_27b({"group_size": 32, "bits": 4, "mode": "mxfp4"}),
         size_fn=lambda m: 15_000_000_000,
     )
-    arms = winner_stage_arms(_winner(tmp_path), nax=True, checkpoint=cp)
-    assert [a.greedy for a in arms] == [True]
+    assert winner_stage_arms(_winner(tmp_path), nax=True, checkpoint=cp) == []
 
 
-def test_a_winner_already_greedy_and_int8_gets_no_extra_arms(tmp_path):
+def test_a_winner_with_int8_on_gets_no_extra_arms(tmp_path):
     cp = _checkpoints()["mlx-community/Qwen3.8-27B-4bit"]
-    arms = winner_stage_arms(_winner(tmp_path, temperature=0, int8=True), nax=True, checkpoint=cp)
-    assert arms == []
+    assert winner_stage_arms(_winner(tmp_path, int8=True), nax=True, checkpoint=cp) == []
 
 
 def test_a_moe_checkpoint_gets_no_int8_arm(tmp_path):
@@ -340,8 +343,7 @@ def test_a_moe_checkpoint_gets_no_int8_arm(tmp_path):
         config_fn=lambda m: fx.qwen_27b(model_type="qwen3_5_moe"),
         size_fn=lambda m: 20_000_000_000,
     )
-    arms = winner_stage_arms(_winner(tmp_path), nax=True, checkpoint=cp)
-    assert [a.greedy for a in arms] == [True]
+    assert winner_stage_arms(_winner(tmp_path), nax=True, checkpoint=cp) == []
 
 
 def test_quick_arms_mirror_the_users_int8_and_greedy_settings(tmp_path):
@@ -390,9 +392,9 @@ def test_quick_arms_mirror_the_users_attention_tile_and_key_their_suite_rows_by_
 def test_the_winner_stage_carries_the_attention_tile_and_adds_no_arm_for_it(tmp_path):
     cp = _checkpoints()["mlx-community/Qwen3.8-27B-4bit"]
     arms = winner_stage_arms(_winner(tmp_path, tile=False), nax=True, checkpoint=cp)
-    assert [a.label for a in arms] == ["27B + DFlash2 @3 + int8 prefill", "27B + DFlash2 @3 greedy"]
+    assert [a.label for a in arms] == ["27B + DFlash2 @3 + int8 prefill"]
     assert all(a.attention_tile is False and a.config.attention_tile is False for a in arms)
-    assert [a.suite_key[5] for a in arms] == [False, False]
+    assert [a.suite_key[5] for a in arms] == [False]
 
 
 def _static_check(monkeypatch, reason=None, tile_reason="same", asked_tile=None):
@@ -582,6 +584,6 @@ def test_quick_arms_mirror_the_users_projection_kernel_and_key_their_suite_rows_
 def test_the_winner_stage_carries_the_projection_kernel_and_adds_no_arm_for_it(tmp_path):
     cp = _checkpoints()["mlx-community/Qwen3.8-27B-4bit"]
     arms = winner_stage_arms(_winner(tmp_path, proj=False), nax=True, checkpoint=cp)
-    assert [a.label for a in arms] == ["27B + DFlash2 @3 + int8 prefill", "27B + DFlash2 @3 greedy"]
+    assert [a.label for a in arms] == ["27B + DFlash2 @3 + int8 prefill"]
     assert all(a.projection_kernel is False and a.config.projection_kernel is False for a in arms)
-    assert [a.suite_key[-1] for a in arms] == [False, False]
+    assert [a.suite_key[-1] for a in arms] == [False]

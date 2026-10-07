@@ -198,9 +198,9 @@ def _full_stages(
             if stop is not None:
                 # The model stage already settled on `choice`; losing it here
                 # would report "nothing recommended" when a recommendation
-                # exists and only the winner stage's own extra settings (int8,
-                # greedy) were left unmeasured. FullChoice is frozen, so the
-                # note is appended onto a fresh copy rather than mutated in.
+                # exists and only the winner stage's int8 arm was left
+                # unmeasured. FullChoice is frozen, so the note is appended
+                # onto a fresh copy rather than mutated in.
                 note = f"winner stage incomplete: {stop}"
                 incomplete = dataclasses.replace(choice, reasons=[*choice.reasons, note])
                 return incomplete, _summaries([*stage, *extra], suite_runs, rows), stop

@@ -27,7 +27,7 @@ quick run never changes the model.
 
 **`sous tune`** (about three hours on an M5 Pro for three fitting models; the
 estimate is printed after the quick stage from the measured speeds and covers
-the model stage; the winner stage adds up to two arms of the same size) does
+the model stage; the winner stage adds at most one arm of the same size) does
 all of the above, then grades the candidates: for each model's fastest
 quality-neutral arm, and for your current configuration, it runs a suite of
 eight mechanical coding tasks — implement a module from its spec, write
@@ -40,8 +40,8 @@ hidden grader (`--runs` sets the runs per task, default 2). Every arm and run
 works on its copy at one path, `<run-id>/project`, which the prompt names, so
 arms are compared on the same prompt; run *i* of every sampled arm samples from
 seed *i*, so a task's runs differ on purpose rather than replaying one stream.
-A greedy arm (`temperature = 0`) draws nothing, so its runs of a task repeat one
-trajectory and count as that one result more than once.
+With `temperature = 0` set, every arm is greedy and draws nothing, so its runs
+of a task repeat one trajectory and count as that one result more than once.
 The rule, printed in full with every number:
 
 - the **reference** is your current configuration when it fits this machine,
@@ -52,14 +52,15 @@ The rule, printed in full with every number:
 - the **winner** is the eligible arm with the lowest total suite wall time
   (a tie goes to the smaller memory footprint).
 
-On the winner, the same rule then judges one extra arm per quality-affecting
-setting: INT8 prefill (only for a winner that has it off, since it ships on,
-and only where the tensor units and the checkpoint allow it) and greedy
-sampling (`temperature = 0`, which also lets the drafter's
-exact-match verify run). A setting lands in the diff only when its own
-measured arm is eligible and faster — that is why there is no `--greedy`
-flag to understand. The full run may therefore change `[model].id`, the
-drafter and block size, the window, `int8_prefill` and `temperature`.
+On the winner, the same rule then judges one extra arm: INT8 prefill, only
+for a winner that has it off (it ships on) and only where the tensor units and
+the checkpoint allow it. It lands in the diff only when its own measured arm is
+eligible and faster. The tune never changes `temperature`: every arm inherits
+yours, and greedy decoding (`temperature = 0`) is never proposed. Greedy leaves
+a model that starts repeating itself no way out, and its runs of a task repeat
+one trajectory, so the suite cannot measure that risk; it runs only when you set
+it. The full run may therefore change `[model].id`, the drafter and block
+size, the window and `int8_prefill`.
 Every arm inherits `[model].attention_tile` and `[model].projection_kernel`
 and no arm changes them; suite rows are keyed by both, so a `--resume` after
 either was flipped runs those arms again instead of mixing kernel and stock
