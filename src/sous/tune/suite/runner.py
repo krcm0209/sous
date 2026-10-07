@@ -327,9 +327,9 @@ def _check_int8(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> No
     *measure* int8 prefill, so the engine refusing it must fail that arm —
     a run under the int8 label over the stock path would put that setting
     in the config on stock numbers. Every other arm only inherited
-    int8_prefill from the user's config; the daemon would run it stock with
-    one warning rather than refuse it, so this prints a notice instead and
-    lets the arm run."""
+    int8_prefill from the user's config; the daemon would run it stock, with
+    the reason in its status, rather than refuse it, so this prints a notice
+    instead and lets the arm run."""
     if not arm.int8_prefill:
         return
     status = engine.int8_prefill_status or {}

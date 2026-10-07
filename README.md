@@ -56,7 +56,9 @@ What it will not do for you:
   and about 25 tok/s at 57K on an M5 Pro, sampling as shipped. It prefills
   at about 480 tok/s on a 4K prompt and about 350 tok/s on a 61K one: a
   subagent's first turn takes about three minutes when nothing is cached,
-  and 16 s from a fork. Its short-context decode speed, scaled to the same
+  and 16 s from a fork (prefill figures measured before int8 prefill
+  shipped on; [docs/configuration.md](docs/configuration.md) gives its
+  gains). Its short-context decode speed, scaled to the same
   memory bandwidth, is roughly what MTPLX, mlx-serve and mlx-dspark publish;
   LM Studio's Splash engine is faster on an M5 Pro (see
   [How it compares](#how-it-compares)).

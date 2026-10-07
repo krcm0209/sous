@@ -24,7 +24,7 @@ prompt_cache = true
 # prompt_cache_disk_gb = "auto"
 speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
 # speculative_block_size = 5  # unset: 5 with the projection kernel, 4 with only the attention tile, else 3
-int8_prefill = false
+int8_prefill = true
 attention_tile = true
 projection_kernel = true
 ```
@@ -137,20 +137,26 @@ resident bytes, hits, fork hits, retained and moved turn-slot takes,
 evictions and the subset the pressure valve took — counts only — and
 `inflight`, the turn being served right now with its phase, tokens and rate.
 
-`[model].int8_prefill` (default `false`) runs the prefill matmuls as INT8 activations
+`[model].int8_prefill` (default `true`) runs the prefill matmuls as INT8 activations
 against the checkpoint's packed 4-bit weights on the M5 GPU's neural accelerators
 (Apache-2.0 kernel derived from oMLX, compiled at model load — no build step). Measured
 on an M5 Pro with the default model on macOS 27: 374 → 602 tok/s at 4K tokens, 336 →
 503 tok/s at 32K, and 8–25% off warm prefills at 64–192K of context (MLP and
 linear-attention projections; attention projections are not routed, see #76). Decode
 and speculative verify are untouched. It changes prefill numerics (KL 0.033 vs the
-stock path on a code prompt; 4-bit weights alone are 0.052 vs 8-bit), which is why it
-ships off. Needs an M5-family or newer GPU, macOS 26.2+ and a Metal compiler that
-accepts the kernel (sous compiles and runs it once before routing); anywhere else the
-status document reports `int8_prefill: unavailable` with the reason and prefill
-runs stock. Only dense Qwen3.5-family models (`model_type` `qwen3_5`, as the default
-model is) with affine 4-bit, group-size-64 weights route, and the MoE variant is refused;
-a checkpoint with no eligible projection warns once; in a mixed checkpoint, ineligible
+stock path on a code prompt; 4-bit weights alone are 0.052 vs 8-bit), but on `sous
+tune`'s tool-loop suite, with both arms given one prompt and one seed per run, its
+mean grade stayed within 0.05 of stock's (+0.013, 95% CI −0.020 to +0.054 over 64
+paired runs, #123), so it ships on; the suite's prompts are short, and long subagent
+turns were not graded. Needs an M5-family or newer GPU, macOS 26.2+ and a Metal
+compiler that accepts the kernel (sous compiles and runs it once before routing).
+Where it does not apply — another GPU, an older macOS, a model or checkpoint it
+cannot route — the load logs one INFO line, the status document reports
+`int8_prefill: unavailable` with the reason, and prefill runs stock; where it should
+have run and did not (the kernel failed to compile or to warm up), the load warns. Only dense
+Qwen3.5-family models (`model_type` `qwen3_5`, as the default model is) with affine
+4-bit, group-size-64 weights route, and the MoE variant is refused; a checkpoint with
+no eligible projection says so in that INFO line; in a mixed checkpoint, ineligible
 projections fall through per projection.
 
 `[model].attention_tile` (default `true`) runs decode's one-row attention and

@@ -54,9 +54,9 @@ class Arm:
     # INT8 prefill: the engine refusing it must fail that arm. Every other
     # arm's int8_prefill is merely inherited from the user's config (every
     # quick_arms arm mirrors it) — the daemon would run that arm's
-    # checkpoint on the stock path with one warning rather than refuse it,
-    # so the suite runner must do the same instead of treating an inherited
-    # setting as a hard requirement.
+    # checkpoint on the stock path, with the reason in its status, rather
+    # than refuse it, so the suite runner must do the same instead of
+    # treating an inherited setting as a hard requirement.
     int8_under_test: bool = False
 
     @property

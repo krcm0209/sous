@@ -257,10 +257,14 @@ def _runs(arm, grades, **kw):
 
 # Every user here sets block 3, the block the fixtures' current arm and rows
 # are written for, so these tests move neither with the shipped default nor
-# with how an unset block resolves.
+# with how an unset block resolves. Every user also turns int8 prefill off, as
+# the fixtures' arms have it: a user with it on would see the decision propose
+# switching it off for every arm, and the winner stage measures int8 only for
+# a winner that has it off.
 def _user(tmp_path, **over):
     over.setdefault("speculative_block_size", 3)
     over.setdefault("speculative_block_explicit", True)
+    over.setdefault("int8_prefill", False)
     return SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", **over)
 
 
@@ -565,7 +569,12 @@ def test_a_drafter_arm_of_another_pair_writes_its_block_when_the_users_is_unset(
     """The resolved block is the daemon's for the user's own model and drafter
     only: an unset block could resolve differently for another pair, so its
     block is written even when the numbers match."""
-    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=5)
+    user = SousConfig(
+        data_dir=tmp_path,
+        config_path=tmp_path / "c.toml",
+        speculative_block_size=5,
+        int8_prefill=False,
+    )
     cur = _arm(user, "27 @5", block=5, current=True, fit_window=131072)
     nine = _arm(user, "9 + d @5", drafter="z/9d", block=5, model=M9, fit_window=131072)
     runs = _runs(cur, [1.0], seconds=100.0) + _runs(nine, [1.0], seconds=50.0)

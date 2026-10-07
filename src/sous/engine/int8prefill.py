@@ -475,15 +475,22 @@ def _warm_up(model: Any) -> None:
         mx.eval(linear_int8(module, mx.zeros((MIN_ROWS, k), dtype=module.scales.dtype)))
 
 
-def _refuse(reason: str) -> dict[str, Any]:
-    """The requested accelerator cannot serve this load: say so once and report why.
-    A silently inert opt-in is worse than one warning line."""
+def _refuse(reason: str, *, expected: bool = False) -> dict[str, Any]:
+    """This load cannot use int8 prefill: report why. An `expected` refusal says
+    only that it does not apply here (a Mac without the tensor units, a model
+    type or checkpoint it cannot route), which is how most loads of a default-on
+    setting go: one INFO line, and the reason in the status. Any other refusal
+    means it should have run and did not (the GEMM probe or the warm-up failed):
+    one warning, since a switch that is silently inert there hides a fault."""
     # A compiler error runs to dozens of lines; the status needs the one naming it.
     reason = _error_line(reason)
-    warnings.warn(
-        f"sous: int8 prefill requested but unavailable ({reason}); prefilling with stock kernels",
-        stacklevel=3,
-    )
+    if expected:
+        logger.info("int8 prefill unavailable: %s", reason)
+    else:
+        warnings.warn(
+            f"sous: int8 prefill unavailable ({reason}); prefilling with stock kernels",
+            stacklevel=3,
+        )
     return {"state": "unavailable", "reason": reason, "routed": 0}
 
 
@@ -492,17 +499,27 @@ def enable(model: Any, *, enabled: bool) -> dict[str, Any]:
     — a model load must not fail because a prefill accelerator is missing."""
     if not enabled:
         return {"state": "off", "reason": None, "routed": 0}
-    avail = availability()
-    if not avail.available:
-        return _refuse(avail.reason or "unavailable")
+    # Everything that says int8 does not apply to this load comes before the
+    # probe: a model it could never route must neither pay for the kernel's
+    # compile nor warn when a new macOS rejects it.
+    platform = nax.platform_reason()
+    if platform is not None:
+        return _refuse(platform, expected=True)
     model_type = _model_type(model)
     if model_type not in SUPPORTED_MODEL_TYPES:
-        return _refuse(f"unsupported model type {model_type or 'unknown'!r} (dense qwen3_5 only)")
+        return _refuse(
+            f"unsupported model type {model_type or 'unknown'!r} (dense qwen3_5 only)",
+            expected=True,
+        )
     try:
         routed = _tag(model)
         if routed == 0:
             _untag(model)
-            return _refuse("no eligible projections (affine Q4 gs64 required)")
+            return _refuse("no eligible projections (affine Q4 gs64 required)", expected=True)
+        avail = availability()
+        if not avail.available:
+            _untag(model)
+            return _refuse(avail.reason or "unavailable")
         install_wrappers()
         _warm_up(model)
     except Exception as e:  # noqa: BLE001 — degrade, never block the model

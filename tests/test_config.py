@@ -162,11 +162,17 @@ def test_prompt_cache_disk_gb_beside_a_disabled_cache_warns(tmp_path: Path):
 # ---- [model].int8_prefill -----------------------------------------------------
 
 
-def test_int8_prefill_defaults_off(tmp_path: Path):
+def test_int8_prefill_defaults_on(tmp_path: Path):
     p = tmp_path / "config.toml"
     p.write_text("[model]\nid = 'x/y'\n")
+    assert load_config(p).int8_prefill is True
+    assert SousConfig().int8_prefill is True
+
+
+def test_int8_prefill_reads_false(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nint8_prefill = false\n")
     assert load_config(p).int8_prefill is False
-    assert SousConfig().int8_prefill is False
 
 
 def test_int8_prefill_reads_true_without_an_unknown_key_warning(tmp_path: Path):
