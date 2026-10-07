@@ -38,11 +38,14 @@ dependencies = [
     # it directly.
     "httpx>=0.28",
     "huggingface-hub",
-    # mlx and mlx-vlm are pinned exactly: verify attention, the attention tile
-    # and the projection kernel load only on the mlx in verifyattn.VALIDATED_MLX
-    # and on the mlx-vlm sources they pin by hash, so any other release loads
-    # them unavailable and decode runs stock. Raise a pin only in the commit
-    # that extends those sets; tests/test_dependency_pins.py holds them together.
+    # mlx and mlx-vlm are pinned to the releases the exact paths were validated
+    # on: verify attention, the attention tile and the projection kernel load
+    # only on an mlx in verifyattn.VALIDATED_MLX and while every mlx-vlm
+    # function they hook still hashes as pinned, and anywhere else decode runs
+    # stock. Move a pin only once those checks pass on the new release
+    # (extending the sets where a source changed) and its M5 Pro checks have
+    # run; tests/test_dependency_pins.py holds the pins to the installed
+    # versions.
     # mlx >= 0.32.1 also requires every thread that touched mlx to call
     # mx.clear_streams() before exiting (ml-explore/mlx#4327) — sous complies
     # via engine.base.release_mlx_thread_state. A new mlx-touching thread that
