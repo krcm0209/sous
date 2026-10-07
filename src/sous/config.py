@@ -429,8 +429,9 @@ def _prompt_cache_disk_gb(model: dict) -> float | None:
 
 def _int8_prefill(model: dict) -> bool:
     """[model].int8_prefill: true or false; anything else warns and means false,
-    the same stance as the other [model] knobs (a typo must not turn on a path
-    that changes numerics)."""
+    the stock path, the same stance as the other [model] knobs: a value that is
+    not a boolean is not a request to run a path that changes numerics, whatever
+    the default."""
     value = model.get("int8_prefill", True)
     if isinstance(value, bool):
         return value

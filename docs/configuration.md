@@ -153,7 +153,7 @@ compiler that accepts the kernel (sous compiles and runs it once before routing)
 Where it does not apply — another GPU, an older macOS, a model or checkpoint it
 cannot route — the load logs one INFO line, the status document reports
 `int8_prefill: unavailable` with the reason, and prefill runs stock; where it should
-have run and did not (the kernel failed to compile), the load warns. Only dense
+have run and did not (the kernel failed to compile or to warm up), the load warns. Only dense
 Qwen3.5-family models (`model_type` `qwen3_5`, as the default model is) with affine
 4-bit, group-size-64 weights route, and the MoE variant is refused; a checkpoint with
 no eligible projection says so in that INFO line; in a mixed checkpoint, ineligible

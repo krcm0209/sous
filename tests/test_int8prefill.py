@@ -605,6 +605,9 @@ def test_a_gemm_probe_failure_on_the_m5_still_warns(monkeypatch, m5):
     monkeypatch.setattr(
         i8, "availability", lambda: i8.Availability(False, "the int8 GEMM probe failed: no")
     )
+    monkeypatch.setattr(
+        i8, "_warm_up", lambda model: pytest.fail("the warm-up ran after the probe refused")
+    )
     model = _Model([_Layer()])
     with pytest.warns(UserWarning, match="probe failed"):
         status = i8.enable(model, enabled=True)
