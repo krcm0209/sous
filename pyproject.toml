@@ -44,8 +44,8 @@ dependencies = [
     # function they hook still hashes as pinned, and anywhere else decode runs
     # stock. Move a pin only once those checks pass on the new release
     # (extending the sets where a source changed) and its M5 Pro checks have
-    # run; tests/test_dependency_pins.py holds the pins to the installed
-    # versions.
+    # run; tests/test_dependency_pins.py holds the pins to the validated and
+    # installed versions.
     # mlx >= 0.32.1 also requires every thread that touched mlx to call
     # mx.clear_streams() before exiting (ml-explore/mlx#4327) — sous complies
     # via engine.base.release_mlx_thread_state. A new mlx-touching thread that

@@ -331,8 +331,8 @@ goal.
   paths only while every hooked source still hashes the same, so move a pin
   only once the hash tests pass on the new release (extending the sets where
   a source changed) and its M5 Pro checks have run;
-  `tests/test_dependency_pins.py` holds the pins to `VALIDATED_MLX` and the
-  installed versions. While the tile is
+  `tests/test_dependency_pins.py` holds the pins to `VALIDATED_MLX`, its own
+  `VALIDATED_MLX_VLM` and the installed versions. While the tile is
   inactive T = 2 is left alone: stock already makes one call there, and
   grouping it would change output at plan straddles. While it is active the
   wrapper's scope widens to every T from 1 and the rows go to `tileattn`
