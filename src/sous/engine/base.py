@@ -82,6 +82,13 @@ class Engine(Protocol):
     def unload(self) -> None: ...
 
 
+def _seed_thread(seed: int) -> None:
+    """Seed mlx's PRNG for the calling thread only (GenerationSession)."""
+    import mlx.core as mx
+
+    mx.random.seed(seed)
+
+
 def release_mlx_thread_state() -> None:
     """Destroy this thread's mlx streams before the thread exits.
 
@@ -479,10 +486,11 @@ class ManagedEngine:
     def generation_in_flight(self) -> bool:
         return self._gen_lock.locked()
 
-    def session(self) -> GenerationSession:
+    def session(self, seed: int | None = None) -> GenerationSession:
         """A generation thread of the caller's own; the endpoint keeps one alive
-        across turns so their caches survive."""
-        return GenerationSession(self)
+        across turns so their caches survive. `seed`, when given, seeds mlx's
+        PRNG on that thread before its first generation (see GenerationSession)."""
+        return GenerationSession(self, seed=seed)
 
     def unload(self) -> None:
         self._inner.unload()
@@ -522,10 +530,20 @@ class GenerationSession:
     loop — mid-generation, under _gen_lock. A stalled-and-abandoned generation
     keeps firing it until it ends, so a consumer must tolerate deltas that
     arrive after generate() has already raised GenerationStalled.
+
+    mlx keeps its PRNG state per thread and starts every new thread on one
+    default key, whatever any other thread seeded: without a `seed`, every
+    session's sampled generations replay the same stream from its first
+    turn. A `seed` is applied on this thread, under _gen_lock, right before
+    the first generation; the stream then advances from turn to turn as it
+    always has. The tune suite seeds each run so that its runs differ on
+    purpose and run i of every arm draws from the same stream; the endpoint
+    passes none.
     """
 
-    def __init__(self, managed: ManagedEngine):
+    def __init__(self, managed: ManagedEngine, seed: int | None = None):
         self._managed = managed
+        self._seed = seed
         # maxsize=1 plus put_nowait everywhere: at most one request is ever
         # outstanding, so Full in generate() means a protocol bug — failing
         # loudly beats deadlocking the session's owner (the endpoint's turn
@@ -563,6 +581,9 @@ class GenerationSession:
                     if self._abandoned.is_set():
                         return
                     try:
+                        if self._seed is not None:
+                            _seed_thread(self._seed)
+                            self._seed = None
                         reply = ("ok", self._managed._inner.generate(*req))
                     except BaseException as e:  # noqa: BLE001 — relayed to the caller
                         reply = ("err", e)
