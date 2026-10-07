@@ -370,7 +370,10 @@ def test_quick_arms_mirror_the_users_attention_tile_and_key_their_suite_rows_by_
     keys = {}
     for tile in (True, False):
         user = SousConfig(
-            data_dir=tmp_path / "d", config_path=tmp_path / "c.toml", attention_tile=tile
+            data_dir=tmp_path / "d",
+            config_path=tmp_path / "c.toml",
+            attention_tile=tile,
+            int8_prefill=False,
         )
         arms, refusals = quick_arms(
             user, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
@@ -559,7 +562,10 @@ def test_quick_arms_mirror_the_users_projection_kernel_and_key_their_suite_rows_
     keys = {}
     for proj in (True, False):
         user = SousConfig(
-            data_dir=tmp_path / "d", config_path=tmp_path / "c.toml", projection_kernel=proj
+            data_dir=tmp_path / "d",
+            config_path=tmp_path / "c.toml",
+            projection_kernel=proj,
+            int8_prefill=False,
         )
         arms, refusals = quick_arms(
             user, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET

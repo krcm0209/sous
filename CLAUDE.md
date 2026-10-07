@@ -293,7 +293,12 @@ goal.
   Stage A must keep compiling on any Metal GPU so CI (macos-15, no tensor
   units) can test it.
 - `int8prefill.enable()` never raises and a model load never fails because of
-  it: every failure is one `warnings.warn` plus `state: unavailable`. Tests
+  it, and being on by default its refusals come in two kinds, like the
+  attention tile's (`_refuse(expected=...)`): one that only says int8 does not
+  apply to this load — the platform rule, a model type other than dense
+  `qwen3_5`, no routable affine Q4 gs64 projection — is one INFO line plus
+  `unavailable`; one that says it should have run and did not — the GEMM probe
+  or the warm-up failing — is one `warnings.warn` plus `unavailable`. Tests
   that need the GEMM without tensor units monkeypatch `int8prefill.qmm`.
 - mlx (>= 0.32.1) compiles runtime kernels as the newest MSL the OS has — 4.1 on
   macOS 27, where `decltype` of a local cooperative tensor carries `thread` and
@@ -381,8 +386,8 @@ goal.
   prove every read stops at n, compares with stock one-row SDPA within
   1e-2 relative RMS (parity cannot catch a kernel that is wrong the same
   way on both paths) and runs one of the model's own attention modules
-  through a restored-style `KVCache`. Like int8 it never raises, but being
-  on by default its refusals come in two kinds (`_refuse(expected=...)`). One
+  through a restored-style `KVCache`. Like int8 it never raises and, being
+  on by default, its refusals come in two kinds (`_refuse(expected=...)`). One
   that only says the tile does not apply to this load — the platform rule,
   the split target (unreadable, another GPU, unmeasured), the model's type,
   shape, scale or dtype, a drafter kind other than `dflash` — is one INFO
