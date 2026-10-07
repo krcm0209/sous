@@ -961,6 +961,37 @@ def test_session_relays_exceptions_and_survives_them():
     assert not session._thread.is_alive()
 
 
+class _Drawing(FakeEngine):
+    """Each generation answers with three draws from mlx's PRNG on the thread
+    that runs it."""
+
+    def generate(self, messages, tools, max_tokens, on_delta=None):
+        import mlx.core as mx
+
+        return repr(mx.random.uniform(shape=(3,), stream=mx.cpu).tolist())
+
+
+def _draws(seed: int | None) -> list[str]:
+    session = ManagedEngine(_Drawing([])).session(seed=seed)
+    try:
+        return [session.generate(_msgs(), [], 8, timeout=30) for _ in range(2)]
+    finally:
+        session.close()
+        session.join(5)
+
+
+def test_a_seeded_session_draws_its_seeds_stream_on_its_own_thread():
+    # mlx keeps its PRNG state per thread and starts every new thread on one
+    # default key: unseeded sessions all replay the same stream.
+    assert _draws(None) == _draws(None)
+    assert _draws(1) == _draws(1)
+    assert _draws(1) != _draws(2)
+    assert _draws(1) != _draws(None)
+    first, second = _draws(1)
+    # The stream advances from one generation to the next within a session.
+    assert first != second
+
+
 def test_session_close_without_any_generation():
     session = ManagedEngine(FakeEngine([])).session()
     session.close()

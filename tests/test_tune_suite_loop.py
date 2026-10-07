@@ -3,7 +3,7 @@ from pathlib import Path
 
 import sous.tune.suite.loop as loop_module
 from sous.config import SousConfig
-from sous.engine.base import EngineManager, GenerationStalled
+from sous.engine.base import EngineManager, GenerationStalled, ManagedEngine
 from sous.tune.suite.loop import Budget, Transcript, run_loop
 from sous.tune.suite.tools import COMMAND_TIMEOUT, ScratchTools
 from tests.fake_engine import FakeEngine
@@ -24,6 +24,7 @@ def _run(
     budget: Budget = Budget(turns=8, minutes=5),  # noqa: B008 — frozen; sharing it is harmless
     engine: FakeEngine | None = None,
     tools: ScratchTools | None = None,
+    seed: int | None = None,
 ):
     """`engine` replaces the default scripted one: a test that scripts token
     counts needs to hold on to the instance the loop ran against; `tools`
@@ -44,6 +45,7 @@ def _run(
             budget=budget,
             tools=tools if tools is not None else ScratchTools(root),
             transcript=transcript,
+            seed=seed,
         )
     finally:
         mgr.unload_now()
@@ -61,6 +63,19 @@ def test_a_finished_task_is_completed_with_its_summary(tmp_path: Path):
     assert [e["event"] for e in events] == ["generation", "tool", "generation", "finished"]
     assert events[1]["name"] == "write_file"
     assert events[-1]["outcome"] == "completed"
+
+
+def test_the_loops_session_samples_from_the_runs_seed(tmp_path: Path, monkeypatch):
+    seeds: list[int | None] = []
+    real = ManagedEngine.session
+
+    def session(self, seed=None):
+        seeds.append(seed)
+        return real(self, seed=seed)
+
+    monkeypatch.setattr(ManagedEngine, "session", session)
+    _run(tmp_path, [FINISH], seed=7)
+    assert seeds == [7]
 
 
 def test_running_out_of_turns_is_budget_exhausted_not_failed(tmp_path: Path):
