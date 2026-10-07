@@ -197,6 +197,9 @@ def _cfg(tmp_path, **over):
     # built on it moves with how the daemon would resolve an unset one.
     over.setdefault("speculative_block_size", 3)
     over.setdefault("speculative_block_explicit", True)
+    # Off, so the winner stage still builds the int8 arm these runs exercise:
+    # it measures int8 only for a winner that has it off.
+    over.setdefault("int8_prefill", False)
     return SousConfig(data_dir=tmp_path, config_path=p, **over)
 
 

@@ -53,8 +53,9 @@ The rule, printed in full with every number:
   (a tie goes to the smaller memory footprint).
 
 On the winner, the same rule then judges one extra arm per quality-affecting
-setting: INT8 prefill (where the tensor units and the checkpoint allow it)
-and greedy sampling (`temperature = 0`, which also lets the drafter's
+setting: INT8 prefill (when the winner has it off — it ships on, so only a
+configuration that turned it off — and where the tensor units and the
+checkpoint allow it) and greedy sampling (`temperature = 0`, which also lets the drafter's
 exact-match verify run). A setting lands in the diff only when its own
 measured arm is eligible and faster — that is why there is no `--greedy`
 flag to understand. The full run may therefore change `[model].id`, the

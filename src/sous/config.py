@@ -122,12 +122,14 @@ class SousConfig:
     # included: only a block the user left unset is the engine's to resolve.
     speculative_block_explicit: bool = False
     # Prefill matmuls of affine-Q4/gs64 projections on the M5 tensor units with
-    # int8 activations: ~1.4x prefill measured on the M5 Pro (2026-09-11), but
-    # int8 activations change numerics (KL 0.033 vs stock on the standard prompt,
-    # inside the 4-bit weight envelope of 0.052), so it ships off until the
-    # tool-loop A/B says otherwise. Ignored, with a status reason, on GPUs
-    # without neural accelerators (pre-M5) or macOS < 26.2.
-    int8_prefill: bool = False
+    # int8 activations: ~1.4x prefill measured on the M5 Pro (2026-09-11). They
+    # change numerics (KL 0.033 vs stock on the standard prompt, inside the 4-bit
+    # weight envelope of 0.052), but on the tool-loop suite with one prompt per
+    # comparison int8's grade stayed within 0.05 of stock's (+0.013, 95% CI
+    # -0.020..+0.054 over 64 paired runs, #123), so it ships on. Ignored, with
+    # one INFO line and a status reason, on GPUs without neural accelerators
+    # (pre-M5), macOS < 26.2 and checkpoints it cannot route.
+    int8_prefill: bool = True
     # Decode's one-row attention and the exact verifier's on the M5's tensor
     # units, through one GQA-packed tile whose key partition steps with the
     # context. On by default because it is as accurate as stock and greedy
@@ -429,7 +431,7 @@ def _int8_prefill(model: dict) -> bool:
     """[model].int8_prefill: true or false; anything else warns and means false,
     the same stance as the other [model] knobs (a typo must not turn on a path
     that changes numerics)."""
-    value = model.get("int8_prefill", False)
+    value = model.get("int8_prefill", True)
     if isinstance(value, bool):
         return value
     warnings.warn(

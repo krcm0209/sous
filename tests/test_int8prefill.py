@@ -8,6 +8,7 @@ neural accelerators are absent and run on the M5 Pro.
 import hashlib
 import inspect
 import types
+import warnings
 
 import pytest
 
@@ -571,16 +572,46 @@ def test_enable_off_touches_nothing():
     assert _tags(model) == []
 
 
-def test_enable_unavailable_tags_nothing(monkeypatch):
-    monkeypatch.setattr(i8, "availability", lambda: i8.Availability(False, "no tensor units"))
+@pytest.fixture
+def m5(monkeypatch):
+    """A machine the platform rule passes, whatever this one is."""
+    monkeypatch.setattr(i8.nax, "platform_reason", lambda: None)
+
+
+def _quiet_enable(model, caplog):
+    """enable() asserted to warn nothing; returns its status and the INFO text."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with caplog.at_level("INFO", logger="sous.engine.int8prefill"):
+            status = i8.enable(model, enabled=True)
+    return status, caplog.text
+
+
+def test_a_mac_without_the_tensor_units_is_one_info_line_not_a_warning(monkeypatch, caplog):
+    """On by default, int8 prefill does not apply to most Macs: saying so is
+    INFO, as the attention tile's expected refusals are. A warning would fire on
+    every load for a condition nobody can act on."""
+    monkeypatch.setattr(i8.nax, "platform_reason", lambda: "no tensor units")
     model = _Model([_Layer()])
-    with pytest.warns(UserWarning, match="no tensor units"):
-        status = i8.enable(model, enabled=True)
+    status, logged = _quiet_enable(model, caplog)
     assert status == {"state": "unavailable", "reason": "no tensor units", "routed": 0}
+    assert "int8 prefill unavailable: no tensor units" in logged
     assert _tags(model) == []
 
 
-def test_enable_tags_mlp_and_gdn_but_not_attention_or_lm_head(monkeypatch):
+def test_a_gemm_probe_failure_on_the_m5_still_warns(monkeypatch, m5):
+    """The kernel should have run here and did not (a macOS update can reject
+    it, #123): a silently inert default would hide that."""
+    monkeypatch.setattr(
+        i8, "availability", lambda: i8.Availability(False, "the int8 GEMM probe failed: no")
+    )
+    model = _Model([_Layer()])
+    with pytest.warns(UserWarning, match="probe failed"):
+        status = i8.enable(model, enabled=True)
+    assert status["state"] == "unavailable" and _tags(model) == []
+
+
+def test_enable_tags_mlp_and_gdn_but_not_attention_or_lm_head(monkeypatch, m5):
     monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
     monkeypatch.setattr(i8, "_warm_up", lambda model: None)
     model = _Model([_Layer(), _Layer()])
@@ -592,7 +623,7 @@ def test_enable_tags_mlp_and_gdn_but_not_attention_or_lm_head(monkeypatch):
     assert not any("self_attn" in p or "lm_head" in p or "in_proj_a" in p for p in tagged)
 
 
-def test_enable_tags_an_mlp_all_or_nothing(monkeypatch):
+def test_enable_tags_an_mlp_all_or_nothing(monkeypatch, m5):
     monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
     monkeypatch.setattr(i8, "_warm_up", lambda model: None)
     model = _Model([_Layer(down_bits=8)])
@@ -601,15 +632,15 @@ def test_enable_tags_an_mlp_all_or_nothing(monkeypatch):
     assert not any(".mlp." in p for p in _tags(model))
 
 
-def test_enable_refuses_the_moe_variant_that_reuses_the_dense_classes(monkeypatch):
+def test_enable_refuses_the_moe_variant_that_reuses_the_dense_classes(monkeypatch, caplog, m5):
     """qwen3_5_moe imports Qwen3_5GatedDeltaNet and Qwen3_5MLP (its shared expert)
     from the dense module, so a class-based walk would route parts of an untested
     architecture; the gate is the model type."""
     monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
     monkeypatch.setattr(i8, "_warm_up", lambda model: None)
     model = _Model([_Layer()], model_type="qwen3_5_moe")
-    with pytest.warns(UserWarning, match="qwen3_5_moe"):
-        status = i8.enable(model, enabled=True)
+    status, logged = _quiet_enable(model, caplog)
+    assert "qwen3_5_moe" in logged
     assert status["state"] == "unavailable"
     assert status["reason"] is not None and "qwen3_5_moe" in status["reason"]
     assert _tags(model) == []
@@ -624,16 +655,18 @@ def test_model_type_is_read_from_config_then_model_then_args():
     assert i8._model_type(types.SimpleNamespace()) == ""
 
 
-def test_enable_with_no_eligible_projection_is_unavailable(monkeypatch):
+def test_enable_with_no_eligible_projection_is_unavailable(monkeypatch, caplog, m5):
+    """A checkpoint int8 cannot route (8-bit, mxfp4) is a choice of weights,
+    not a fault: INFO."""
     monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
     model = _Model([])
-    with pytest.warns(UserWarning, match="no eligible projections"):
-        status = i8.enable(model, enabled=True)
+    status, logged = _quiet_enable(model, caplog)
+    assert "no eligible projections" in logged
     assert status["state"] == "unavailable"
     assert status["reason"] is not None and "no eligible projections" in status["reason"]
 
 
-def test_enable_degrades_when_warm_up_fails(monkeypatch):
+def test_enable_degrades_when_warm_up_fails(monkeypatch, m5):
     monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
 
     def boom(model):
@@ -647,7 +680,7 @@ def test_enable_degrades_when_warm_up_fails(monkeypatch):
     assert _tags(model) == []
 
 
-def test_enable_reports_one_line_of_a_compiler_error(monkeypatch):
+def test_enable_reports_one_line_of_a_compiler_error(monkeypatch, m5):
     """The whole compiler output would otherwise go into the load warning and the
     status document's int8_prefill.reason."""
     monkeypatch.setattr(i8, "availability", lambda: i8.Availability(True))
