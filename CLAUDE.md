@@ -386,8 +386,8 @@ goal.
   prove every read stops at n, compares with stock one-row SDPA within
   1e-2 relative RMS (parity cannot catch a kernel that is wrong the same
   way on both paths) and runs one of the model's own attention modules
-  through a restored-style `KVCache`. Like int8 it never raises, but being
-  on by default its refusals come in two kinds (`_refuse(expected=...)`). One
+  through a restored-style `KVCache`. Like int8 it never raises and, being
+  on by default, its refusals come in two kinds (`_refuse(expected=...)`). One
   that only says the tile does not apply to this load — the platform rule,
   the split target (unreadable, another GPU, unmeasured), the model's type,
   shape, scale or dtype, a drafter kind other than `dflash` — is one INFO

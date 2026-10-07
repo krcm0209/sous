@@ -499,12 +499,12 @@ def enable(model: Any, *, enabled: bool) -> dict[str, Any]:
     — a model load must not fail because a prefill accelerator is missing."""
     if not enabled:
         return {"state": "off", "reason": None, "routed": 0}
+    # Everything that says int8 does not apply to this load comes before the
+    # probe: a model it could never route must neither pay for the kernel's
+    # compile nor warn when a new macOS rejects it.
     platform = nax.platform_reason()
     if platform is not None:
         return _refuse(platform, expected=True)
-    avail = availability()
-    if not avail.available:
-        return _refuse(avail.reason or "unavailable")
     model_type = _model_type(model)
     if model_type not in SUPPORTED_MODEL_TYPES:
         return _refuse(
@@ -516,6 +516,10 @@ def enable(model: Any, *, enabled: bool) -> dict[str, Any]:
         if routed == 0:
             _untag(model)
             return _refuse("no eligible projections (affine Q4 gs64 required)", expected=True)
+        avail = availability()
+        if not avail.available:
+            _untag(model)
+            return _refuse(avail.reason or "unavailable")
         install_wrappers()
         _warm_up(model)
     except Exception as e:  # noqa: BLE001 — degrade, never block the model

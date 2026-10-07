@@ -632,6 +632,21 @@ def test_enable_tags_an_mlp_all_or_nothing(monkeypatch, m5):
     assert not any(".mlp." in p for p in _tags(model))
 
 
+def test_a_model_int8_cannot_route_is_refused_before_the_probe(monkeypatch, caplog, m5):
+    """On an M5 whose macOS rejects the kernel, a model int8 could never route
+    must not pay for the probe or warn about it: its refusal is the model's."""
+    probed = []
+
+    def failing_probe():
+        probed.append(1)
+        return i8.Availability(False, "the int8 GEMM probe failed: no")
+
+    monkeypatch.setattr(i8, "availability", failing_probe)
+    status, logged = _quiet_enable(_Model([_Layer()], model_type="gemma3"), caplog)
+    assert status["state"] == "unavailable" and "gemma3" in status["reason"]
+    assert "gemma3" in logged and probed == []
+
+
 def test_enable_refuses_the_moe_variant_that_reuses_the_dense_classes(monkeypatch, caplog, m5):
     """qwen3_5_moe imports Qwen3_5GatedDeltaNet and Qwen3_5MLP (its shared expert)
     from the dense module, so a class-based walk would route parts of an untested
