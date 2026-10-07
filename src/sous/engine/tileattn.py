@@ -290,8 +290,8 @@ def _compile_probe() -> str | None:
     at runtime against the OS's own Metal toolchain, so a new macOS can reject a
     source that compiled before. The inputs are built with GPU ops and evaluated
     first: a compile failure with a CPU-stream op in flight deadlocks inside mlx's
-    exception path (0.32.2) instead of raising. Only success is remembered, so one
-    bad moment cannot switch the tile off for a long-lived daemon."""
+    exception path (0.32.2 and 0.32.3) instead of raising. Only success is
+    remembered, so one bad moment cannot switch the tile off for a long-lived daemon."""
     global _compile_ok
     if _compile_ok:
         return None

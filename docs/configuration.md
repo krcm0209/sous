@@ -175,7 +175,7 @@ with `false`, which runs the stock paths. It is active only where it has
 been measured: a 20-core M5 Pro GPU on macOS 26.2+, running a dense
 Qwen3.5-family model (`model_type` `qwen3_5`, 24 query and 4 KV heads, head
 dim 256, bf16 attention, as the default model is) with no drafter or a
-DFlash one, on the mlx it was validated with (0.32.2) and with the mlx-vlm
+DFlash one, on the mlx releases it was validated with (0.32.2 and 0.32.3) and with the mlx-vlm
 functions it hooks unchanged (sous pins their sources, so a newer mlx or
 mlx-vlm leaves it unavailable until sous is updated for it). Anywhere else the
 model-load line reads `attention_tile=unavailable` (`off` on the mlx-lm

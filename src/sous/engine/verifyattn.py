@@ -9,7 +9,7 @@ simdgroup ``i % 32`` (one pass) or block ``i % blocks`` (two passes) whatever
 the key count, and the causal mask skips excluded keys. So every row stays
 bit-identical to the loop and to the M=1 decode.
 
-``plan()`` mirrors mlx 0.32.2's dispatch (backend/metal/
+``plan()`` mirrors the dispatch of mlx 0.32.2 and 0.32.3 (backend/metal/
 scaled_dot_product_attention.cpp), which sous cannot inspect at runtime. So four
 guards stand between it and a served turn:
 - the mlx version;
@@ -46,11 +46,11 @@ logger = logging.getLogger("sous.engine.verifyattn")
 HEAD_DIM = 256
 MIN_ROWS = 3
 MAX_ROWS = 8
-# Past mlx 0.32.2's last SDPA dispatch threshold (65536 keys).
+# Past the last SDPA dispatch threshold (65536 keys) of mlx 0.32.2 and 0.32.3.
 _SCAN_TO = 70_000
 # mlx releases whose SDPA dispatch plan() has been read against; re-read
 # backend/metal/scaled_dot_product_attention.cpp and extend this on a bump.
-VALIDATED_MLX = frozenset({"0.32.2"})
+VALIDATED_MLX = frozenset({"0.32.2", "0.32.3"})
 # The MoE variant reuses the same verifier class with other attention shapes.
 SUPPORTED_MODEL_TYPES = frozenset({"qwen3_5"})
 # Every mlx-vlm function the hook calls or re-implements around, by the module
@@ -117,7 +117,7 @@ calls = {"grouped": 0, "loop": 0, "original": 0}
 
 
 def plan(arch: str, n_keys: int, gqa: int, q_len: int) -> tuple[str, int]:
-    """The kernel mlx 0.32.2 picks for one head-dim-256 SDPA call:
+    """The kernel mlx 0.32.2 and 0.32.3 pick for one head-dim-256 SDPA call:
     ("fallback", 0), ("1pass", 0) or ("2pass", blocks). Mirrors
     has_fused_kernel/use_fallback and sdpa_vector_2pass's block table."""
     if q_len > 8 or q_len > n_keys or q_len * gqa > 32:

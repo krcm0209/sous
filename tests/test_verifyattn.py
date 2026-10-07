@@ -57,7 +57,7 @@ ROOT = Path(__file__).resolve().parents[1]
         (G, 100000, 1, 1, ("1pass", 0)),
     ],
 )
-def test_plan_mirrors_mlx_0_32_2_dispatch(arch, n_keys, gqa, q_len, expected):
+def test_plan_mirrors_mlxs_dispatch(arch, n_keys, gqa, q_len, expected):
     assert verifyattn.plan(arch, n_keys, gqa, q_len) == expected
 
 
