@@ -462,7 +462,8 @@ def test_the_winner_stage_offers_only_what_the_hardware_allows(tmp_path, capsys)
     no_nax = dataclasses.replace(_hardware(tmp_path), nax=False, nax_reason="pre-M5")
     deps["detect"] = lambda: no_nax
     assert main(_args(quick=False, yes=True), config=_cfg(tmp_path), **deps) == 0
-    assert [label for label, _ in seen[2:]] == []
+    # The model stage still grades both models; no winner-stage arm follows.
+    assert [label for label, _ in seen] == [CUR, NINE]
     assert "winner stage on" not in capsys.readouterr().out
 
 

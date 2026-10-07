@@ -56,11 +56,11 @@ On the winner, the same rule then judges one extra arm: INT8 prefill, only
 for a winner that has it off (it ships on) and only where the tensor units and
 the checkpoint allow it. It lands in the diff only when its own measured arm is
 eligible and faster. The tune never changes `temperature`: every arm inherits
-yours, and greedy decoding (`temperature = 0`) is never proposed. Greedy leaves
-a model that starts repeating itself no way out, and its runs of a task repeat
-one trajectory, so the suite cannot measure that risk; it runs only when you set
-it. The full run may therefore change `[model].id`, the drafter and block
-size, the window and `int8_prefill`.
+yours, and greedy decoding (`temperature = 0`) is never proposed, because it
+leaves a model that starts repeating itself no way out and, as above, the suite
+cannot measure that risk; it runs only when you set it. The full run may
+therefore change `[model].id`, the drafter and block size, the window and
+`int8_prefill`.
 Every arm inherits `[model].attention_tile` and `[model].projection_kernel`
 and no arm changes them; suite rows are keyed by both, so a `--resume` after
 either was flipped runs those arms again instead of mixing kernel and stock
