@@ -38,17 +38,21 @@ dependencies = [
     # it directly.
     "httpx>=0.28",
     "huggingface-hub",
-    # mlx >= 0.32.1 requires every thread that touched mlx to call
+    # mlx and mlx-vlm are pinned exactly: verify attention, the attention tile
+    # and the projection kernel load only on the mlx in verifyattn.VALIDATED_MLX
+    # and on the mlx-vlm sources they pin by hash, so any other release loads
+    # them unavailable and decode runs stock. Raise a pin only in the commit
+    # that extends those sets; tests/test_dependency_pins.py holds them together.
+    # mlx >= 0.32.1 also requires every thread that touched mlx to call
     # mx.clear_streams() before exiting (ml-explore/mlx#4327) — sous complies
-    # via engine.base.release_mlx_thread_state, which is what allows mlx to
-    # float here. A new mlx-touching thread that skips it segfaults the
-    # daemon; see the helper's docstring.
-    "mlx>=0.31",
+    # via engine.base.release_mlx_thread_state. A new mlx-touching thread that
+    # skips it segfaults the daemon; see the helper's docstring.
+    "mlx==0.32.2",
     "mlx-lm>=0.31",
-    # 0.7.0 is where generate_step re-applies a caller's position_ids/rope_deltas
-    # over the embedding helper's; below it VLMEngine._positions is silently
-    # overwritten and inert.
-    "mlx-vlm>=0.7.0",
+    # Never below 0.7.0, where generate_step re-applies a caller's
+    # position_ids/rope_deltas over the embedding helper's; below it
+    # VLMEngine._positions is silently overwritten and inert.
+    "mlx-vlm==0.7.2",
     "psutil>=7",
     # `sous top` (src/sous/tui.py) imports rich.text.Text directly. Textual
     # pulls rich in, but a direct import must be a direct dependency.

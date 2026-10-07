@@ -324,8 +324,11 @@ goal.
   0.32.2's dispatch (`VALIDATED_MLX`) — re-read
   `scaled_dot_product_attention.cpp` and extend it on every mlx bump; every
   mlx-vlm function the hook reads is pinned by source hash
-  (`VALIDATED_MLX_VLM_SOURCES`), checked at load because the daemon's tool
-  environment can resolve a newer mlx-vlm than the lock. While the tile is
+  (`VALIDATED_MLX_VLM_SOURCES`), checked at load because a tool environment
+  can still be handed another mlx-vlm than the lock. `pyproject.toml` pins
+  mlx and mlx-vlm with `==` to exactly what these sets, tileattn's and
+  projkernel's validate (#168): raise a pin only in the commit that extends
+  them; `tests/test_dependency_pins.py` holds the two together. While the tile is
   inactive T = 2 is left alone: stock already makes one call there, and
   grouping it would change output at plan straddles. While it is active the
   wrapper's scope widens to every T from 1 and the rows go to `tileattn`
