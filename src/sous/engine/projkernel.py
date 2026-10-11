@@ -475,8 +475,8 @@ def _kernel_probe() -> str | None:
     kernel must equal the MMA kernel's one-row call bitwise, on random rows and in
     each CANCELLING layout, where a kernel that sums in another order shows. The
     inputs are built with GPU ops and evaluated first: a compile failure with a
-    CPU-stream op in flight deadlocks inside mlx's exception path (0.32.2)
-    instead of raising."""
+    CPU-stream op in flight deadlocks inside mlx's exception path instead of
+    raising."""
     import mlx.core as mx
 
     try:
@@ -772,9 +772,9 @@ SUPPORTED_DRAFTER_KINDS = frozenset({"dflash"})
 # of the two hooks, and that greedy verify takes its tokens from the hooked head:
 # sha256 of inspect.getsource, keyed "module:qualname". getsource follows
 # __wrapped__ through both hooks and int8's wrappers, so these are mlx's and
-# mlx-vlm's own sources whatever is installed over them. Validated on mlx 0.32.2
-# and mlx-vlm 0.7.2; add a digest only after re-reading that function against
-# both hooks.
+# mlx-vlm's own sources whatever is installed over them. Validated on the mlx
+# releases in verifyattn.VALIDATED_MLX and on mlx-vlm 0.7.2; add a digest only
+# after re-reading that function against both hooks.
 VALIDATED_PROJ_SOURCES: dict[str, str] = {
     "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._linear": (
         "668b9a7064f30c63348028fb72f22119b73e2897e2d246024c80fbe54e0404dd"
