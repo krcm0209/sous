@@ -1161,13 +1161,15 @@ def test_an_unreachable_upstream_logs_at_error_but_a_forwarded_status_at_info(
 
 def test_mounting_pins_the_noisy_library_loggers(tmp_path: Path, monkeypatch):
     """The handler swap (sous.logs) replaces the root handler, never a library
-    logger's level — the no-bodies rule rests on these three pins."""
-    for name in ("sse_starlette", "httpx", "httpcore"):
+    logger's level — the no-bodies rule rests on these pins. httpx2/httpcore2
+    are huggingface-hub 2.x's HTTP stack: every model load fetches config.json
+    through the hub, and httpx2 logs the full request URL at INFO as httpx does."""
+    for name in ("sse_starlette", "httpx", "httpcore", "httpx2", "httpcore2"):
         monkeypatch.setattr(logging.getLogger(name), "level", logging.DEBUG)
-    _app(tmp_path, FakeEngine([]))  # create_server → mount_endpoint, which pins these three
+    _app(tmp_path, FakeEngine([]))  # create_server → mount_endpoint, which pins these
     assert logging.getLogger("sse_starlette").level == logging.INFO
-    assert logging.getLogger("httpx").level == logging.WARNING
-    assert logging.getLogger("httpcore").level == logging.WARNING
+    for name in ("httpx", "httpcore", "httpx2", "httpcore2"):
+        assert logging.getLogger(name).level == logging.WARNING, name
 
 
 def test_mounting_pins_the_sse_logger_above_debug(tmp_path: Path, monkeypatch):

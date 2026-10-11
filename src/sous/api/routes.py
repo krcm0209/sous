@@ -949,6 +949,9 @@ def mount_endpoint(
     # logs response header values verbatim at DEBUG. Neither is hypothetical
     # at INFO: configure_daemon_logging() sets the root level to INFO, so both
     # reach the daemon log unless pinned above where they say those things.
-    for noisy in ("httpx", "httpcore"):
+    # httpx2/httpcore2 are the same libraries under the names huggingface-hub
+    # 2.x imports them by: every model load fetches config.json through the
+    # hub, so an unpinned httpx2 put the request URL in the daemon log.
+    for noisy in ("httpx", "httpcore", "httpx2", "httpcore2"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     return Endpoint(engines, config, upstream, inflight)

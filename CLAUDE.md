@@ -278,7 +278,9 @@ goal.
   request path gets its logger pinned in `mount_endpoint`: sse-starlette logs
   each SSE frame, httpx the full upstream URL with its query string, httpcore
   response header values — and `configure_daemon_logging` sets the root level
-  to INFO, so none of that is hypothetical.
+  to INFO, so none of that is hypothetical. huggingface-hub 2.x imports the
+  same two libraries as `httpx2`/`httpcore2`, and every model load fetches
+  `config.json` through the hub, so those names carry the same pin.
 - `engine/int8prefill.py` compiles the Metal kernel pair in `engine/kernels/` at
   model load (Apache-2.0, derived from oMLX — see THIRD_PARTY_NOTICES.md). The Python `reorder_k` and
   the GEMM's nibble decode are two halves of one K-order contract (slot
