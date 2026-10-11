@@ -48,8 +48,11 @@ MIN_ROWS = 3
 MAX_ROWS = 8
 # Past the last SDPA dispatch threshold (65536 keys) of the validated mlx releases.
 _SCAN_TO = 70_000
-# mlx releases whose SDPA dispatch plan() has been read against; re-read
-# backend/metal/scaled_dot_product_attention.cpp and extend this on a bump.
+# mlx releases every mirror of mlx's own code has been read against: plan()
+# against backend/metal/scaled_dot_product_attention.cpp, nax.platform_reason()
+# against is_nax_available() in backend/metal/device.cpp, and kernels/nax.h's
+# nax_coord() against BaseNAXFrag::get_coord() in kernels/steel/gemm/nax.h.
+# Re-read all three before extending this on a bump.
 VALIDATED_MLX = frozenset({"0.32.2", "0.32.3"})
 # The MoE variant reuses the same verifier class with other attention shapes.
 SUPPORTED_MODEL_TYPES = frozenset({"qwen3_5"})
