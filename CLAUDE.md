@@ -321,7 +321,7 @@ goal.
   kernel plan. Grouping is bit-exact only because inside one plan mlx
   assigns key i to simdgroup `i % 32` or block `i % blocks` whatever the key
   count and the causal mask skips excluded keys, and `plan()` mirrors the
-  dispatch of mlx 0.32.2 and 0.32.3 (`VALIDATED_MLX`) — re-read
+  dispatch of the mlx releases in `VALIDATED_MLX` — re-read
   `scaled_dot_product_attention.cpp` and extend it on every mlx bump; every
   mlx-vlm function the hook reads is pinned by source hash
   (`VALIDATED_MLX_VLM_SOURCES`), checked at load because a tool environment

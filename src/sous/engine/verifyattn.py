@@ -9,9 +9,9 @@ simdgroup ``i % 32`` (one pass) or block ``i % blocks`` (two passes) whatever
 the key count, and the causal mask skips excluded keys. So every row stays
 bit-identical to the loop and to the M=1 decode.
 
-``plan()`` mirrors the dispatch of mlx 0.32.2 and 0.32.3 (backend/metal/
-scaled_dot_product_attention.cpp), which sous cannot inspect at runtime. So four
-guards stand between it and a served turn:
+``plan()`` mirrors the dispatch of the mlx releases in ``VALIDATED_MLX``
+(backend/metal/scaled_dot_product_attention.cpp), which sous cannot inspect at
+runtime. So four guards stand between it and a served turn:
 - the mlx version;
 - the source of every mlx-vlm function the hook reads;
 - a load-time probe on this GPU;
@@ -46,7 +46,7 @@ logger = logging.getLogger("sous.engine.verifyattn")
 HEAD_DIM = 256
 MIN_ROWS = 3
 MAX_ROWS = 8
-# Past the last SDPA dispatch threshold (65536 keys) of mlx 0.32.2 and 0.32.3.
+# Past the last SDPA dispatch threshold (65536 keys) of the validated mlx releases.
 _SCAN_TO = 70_000
 # mlx releases whose SDPA dispatch plan() has been read against; re-read
 # backend/metal/scaled_dot_product_attention.cpp and extend this on a bump.
@@ -117,8 +117,8 @@ calls = {"grouped": 0, "loop": 0, "original": 0}
 
 
 def plan(arch: str, n_keys: int, gqa: int, q_len: int) -> tuple[str, int]:
-    """The kernel mlx 0.32.2 and 0.32.3 pick for one head-dim-256 SDPA call:
-    ("fallback", 0), ("1pass", 0) or ("2pass", blocks). Mirrors
+    """The kernel the mlx releases in VALIDATED_MLX pick for one head-dim-256
+    SDPA call: ("fallback", 0), ("1pass", 0) or ("2pass", blocks). Mirrors
     has_fused_kernel/use_fallback and sdpa_vector_2pass's block table."""
     if q_len > 8 or q_len > n_keys or q_len * gqa > 32:
         return ("fallback", 0)

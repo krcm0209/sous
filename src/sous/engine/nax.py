@@ -24,10 +24,11 @@ class Availability:
 
 
 def platform_reason() -> str | None:
-    """None when mlx's own is_nax_available() (device.cpp, 0.32.2 and 0.32.3) would pass:
-    macOS >= 26.2 and an Apple GPU of generation >= 17 (>= 18 for 'p'-suffix
-    parts), the M5 family and later. Otherwise why not. Read at call time, so a
-    test that fakes the platform or the device reaches every kernel's caller."""
+    """None when mlx's own is_nax_available() (device.cpp, unchanged across the
+    releases in verifyattn.VALIDATED_MLX) would pass: macOS >= 26.2 and an Apple
+    GPU of generation >= 17 (>= 18 for 'p'-suffix parts), the M5 family and later.
+    Otherwise why not. Read at call time, so a test that fakes the platform or the
+    device reaches every kernel's caller."""
     if platform.system() != "Darwin":
         return "not macOS"
     try:
