@@ -55,7 +55,7 @@ dependencies = [
     # Never below 0.7.0, where generate_step re-applies a caller's
     # position_ids/rope_deltas over the embedding helper's; below it
     # VLMEngine._positions is silently overwritten and inert.
-    "mlx-vlm==0.7.2",
+    "mlx-vlm==0.7.6",
     "psutil>=7",
     # `sous top` (src/sous/tui.py) imports rich.text.Text directly. Textual
     # pulls rich in, but a direct import must be a direct dependency.
