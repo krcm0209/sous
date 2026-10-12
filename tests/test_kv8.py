@@ -7,13 +7,25 @@ availability() passes.
 """
 
 import contextlib
+import importlib
+import logging
+import time
+import types
+import warnings
 from importlib.resources import files
 
 import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-from sous.engine import int8prefill, kv8, nax, tileattn  # noqa: E402 — after the guard
+from sous.engine import (  # noqa: E402 — after the guard
+    int8prefill,
+    kv8,
+    nax,
+    projkernel,
+    tileattn,
+    verifyattn,
+)
 from tests import kv8_fixtures as kfx  # noqa: E402
 from tests import tile_fixtures as tfx  # noqa: E402
 
@@ -1647,3 +1659,613 @@ def test_dispatch_the_verifier_hands_its_layer_cache_to_serve_verify(dispatch_li
         )
         assert all(_dispatch_mirror(c) is not None for c in full)
     assert all(_dispatch_mirror(c) is None for c in full)
+
+
+# ---- enable(): the gates, the pins, availability, the ceiling and the probe ---------
+
+_GATE_BUILD_ERROR = "Unable to build metal library\nprogram_source:3:1: error: boom"
+# The attention tile's and exact verify's statuses as active loads report them.
+_ACTIVE_TILE = {"state": "active", "reason": None, "splits": 20, "probe_seconds": 0.5}
+_ACTIVE_VERIFY = {"state": "active", "reason": None, "probe_seconds": 0.2}
+# The default window; at S = 20 its ceiling is 84,481 keys.
+_WINDOW = 131_072
+_PINNED = {
+    ("mlx_vlm.models.cache", "KVCache.update_and_fetch"),
+    ("mlx_vlm.models.cache", "KVCache.trim"),
+    ("mlx_vlm.models.cache", "KVCache.prefix_cache_reserve"),
+    ("mlx_vlm.speculative.cache_state", "start_speculative_cache"),
+    ("mlx_vlm.speculative.cache_state", "SpeculativeCacheTransaction.commit"),
+    ("mlx_vlm.speculative.cache_state", "SpeculativeCacheTransaction.abort"),
+    ("mlx_vlm.speculative.cache_state", "_trim_append_caches"),
+    ("mlx_vlm.speculative.cache_state", "_cache_position_reader"),
+    ("mlx_vlm.speculative.cache_state", "commit_speculative_round"),
+    ("mlx_vlm.speculative.cache_state", "abort_speculative_round"),
+    ("mlx_vlm.speculative.cache_state", "rollback_speculative_cache"),
+    ("mlx_vlm.speculative.dflash", "_dflash_rounds"),
+    ("mlx_vlm.speculative.dflash", "_dflash_verify"),
+    ("mlx_vlm.speculative.dflash", "_dflash_verify_greedy"),
+    ("mlx_vlm.speculative.dflash", "_reserve_dflash_target_cache"),
+    ("mlx_vlm.models.qwen3_5.language", "LanguageModel.rollback_speculative_cache"),
+    ("mlx_vlm.models.qwen3_5.speculative_verifier", "Qwen3_5BatchInvariantForward.verify"),
+}
+
+
+def _untouchable(*args, **kwargs):
+    raise AssertionError("a guard or step ran that this test says must not")
+
+
+def _language():
+    return importlib.import_module("mlx_vlm.models.qwen3_5.language")
+
+
+def _gate_state(monkeypatch) -> None:
+    """Registers restores for what enable() and the probe leave behind for the
+    rest of the process: kv8's flag, window, ceiling, floor and remembered
+    compile verdict, and the tile's decode global, flag and verdict."""
+    tfx.guard_tile_state(monkeypatch)
+    for name in ("_active", "_window", "_ceiling", "_compile_ok", "N8"):
+        monkeypatch.setattr(kv8, name, getattr(kv8, name))
+
+
+def _kv8_ready(monkeypatch, *, fake_availability: bool = True, fake_probe: bool = True) -> dict:
+    """Every guard that reads the machine passes on any GPU (tile_ready: the
+    platform rule, 20 cores under this GPU's name, the tile's stand-in and a
+    far mark of 3,201 keys), the stand-in is kv8's kernel and the floor is N0.
+    Unless asked for, availability() and the probe are faked to pass, so a
+    test reaches the guard it is about without compiling or probing. Returns
+    the tile's active status to hand enable()."""
+    _gate_state(monkeypatch)
+    tfx.tile_ready(monkeypatch)
+    monkeypatch.setattr(kv8, "tile8", kfx.stand_in_tile8)
+    monkeypatch.setattr(kv8, "N8", tileattn.N0)
+    if fake_availability:
+        monkeypatch.setattr(kv8, "availability", lambda: nax.Availability(True))
+    if fake_probe:
+        monkeypatch.setattr(kv8, "probe", lambda modules, splits, arch, verify_active: None)
+    return dict(_ACTIVE_TILE)
+
+
+class _GateRecords(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@contextlib.contextmanager
+def _gate_log():
+    """Every record kv8's logger emits inside the block, INFO included.
+    Records still propagate, so a test's own caplog sees them too."""
+    logger = logging.getLogger("sous.engine.kv8")
+    handler, level = _GateRecords(), logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield handler.records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+
+
+def _refusal(lm, *, warned: bool, **kwargs) -> dict:
+    """enable() on `lm`, expected to refuse, leaving the flag, the window and
+    the ceiling clear. A load kv8 does not apply to (the tile, the window) is
+    one INFO line and no warning, since most Macs load that way; one where it
+    should have run and did not is exactly one warning, on one line, in kv8's
+    words."""
+    kwargs = {"tile_status": dict(_ACTIVE_TILE), "verify_status": None, "window": _WINDOW, **kwargs}
+    with warnings.catch_warnings(record=True) as caught, _gate_log() as records:
+        warnings.simplefilter("always")
+        status = kv8.enable(lm, enabled=True, **kwargs)
+    messages = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    infos = [r.getMessage() for r in records if r.levelno == logging.INFO]
+    assert status["state"] == "unavailable"
+    assert status["floor"] is None and status["ceiling"] is None
+    if warned:
+        assert len(messages) == 1, messages
+        assert messages[0].startswith("sous: int8 K/V mirror unavailable (")
+        assert "\n" not in messages[0]
+        assert not any(m.startswith("int8 K/V mirror unavailable") for m in infos), infos
+    else:
+        assert messages == []
+        assert infos == [f"int8 K/V mirror unavailable: {status['reason']}"]
+    assert kv8._active == 0 and kv8._window is None and kv8._ceiling == 0
+    return status
+
+
+def _enabling_failures(caplog) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == "sous.engine.kv8" and r.getMessage() == "int8 K/V mirror: enabling failed"
+    ]
+
+
+def test_enable_off_returns_before_any_guard(monkeypatch):
+    _gate_state(monkeypatch)
+    monkeypatch.setattr(kv8, "_active", 1)
+    monkeypatch.setattr(kv8, "_window", kv8.Window(serial=99))
+    monkeypatch.setattr(kv8, "_ceiling", 84_481)
+    for name in ("_tile_reason", "_pins_reason", "availability", "ceiling", "probe"):
+        monkeypatch.setattr(kv8, name, _untouchable)
+    with warnings.catch_warnings(record=True) as caught, _gate_log() as records:
+        warnings.simplefilter("always")
+        status = kv8.enable(
+            types.SimpleNamespace(), enabled=False, tile_status={}, verify_status=None, window=0
+        )
+    assert status == {
+        "state": "off",
+        "reason": None,
+        "probe_seconds": None,
+        "floor": None,
+        "ceiling": None,
+    }
+    assert [w for w in caught if issubclass(w.category, UserWarning)] == []
+    assert records == []
+    assert kv8._active == 0 and kv8._window is None and kv8._ceiling == 0
+
+
+@pytest.mark.parametrize(
+    ("tile_status", "reason"),
+    [
+        ({"state": "off", "reason": None, "splits": None}, "attention tile off"),
+        (
+            {"state": "unavailable", "reason": "split target 16 not measured (measured: 20)"},
+            "split target 16 not measured (measured: 20)",
+        ),
+        ({"state": "unavailable", "reason": None}, "attention tile unavailable"),
+        (None, "attention tile unknown"),
+    ],
+)
+def test_enable_rides_on_the_attention_tile(monkeypatch, tile_status, reason):
+    _kv8_ready(monkeypatch)
+    monkeypatch.setattr(kv8, "_pins_reason", _untouchable)
+    status = _refusal(tfx.tiny_language_model(), warned=False, tile_status=tile_status)
+    assert status["reason"] == reason and status["probe_seconds"] is None
+
+
+_GUARD_REASONS = [
+    "macOS 15.5 < 26.2",
+    "mlx-vlm KVCache.trim changed",
+    "the int8 K/V kernels failed: program_source:3:1: error: boom",
+    "floor 1600 keys is not a tile step boundary at 20 splits",
+    "window below the kv8 floor (window 3000, ceiling 1536, floor 1536)",
+    "parity: verify rows at prefix 1535, T=6 differ from decode",
+]
+# Which of them warn: a pinned source that drifted, kernels this OS rejects, a
+# floor that is no cut point and a failed probe. The tile and the window only
+# say kv8 does not apply to this load.
+_GUARD_WARNS = [False, True, True, True, False, True]
+
+
+@pytest.mark.parametrize("first", range(len(_GUARD_REASONS)))
+def test_enable_names_the_first_failing_guard(monkeypatch, first):
+    """Guard `first` and every guard after it fail; the reason is guard `first`'s."""
+    tile = _kv8_ready(monkeypatch)
+    kwargs: dict = {"tile_status": tile, "verify_status": None, "window": _WINDOW}
+    breakers = [
+        lambda: kwargs.update(
+            tile_status={"state": "unavailable", "reason": _GUARD_REASONS[0], "splits": None}
+        ),
+        lambda: monkeypatch.setitem(
+            kv8.VALIDATED_KV8_SOURCES, ("mlx_vlm.models.cache", "KVCache.trim"), "0" * 64
+        ),
+        lambda: monkeypatch.setattr(
+            kv8, "availability", lambda: nax.Availability(False, _GUARD_REASONS[2])
+        ),
+        lambda: monkeypatch.setattr(kv8, "N8", 1600),
+        lambda: kwargs.update(window=3000),
+        lambda: monkeypatch.setattr(
+            kv8, "probe", lambda modules, splits, arch, verify_active: _GUARD_REASONS[5]
+        ),
+    ]
+    for brk in breakers[first:]:
+        brk()
+    status = _refusal(tfx.tiny_language_model(), warned=_GUARD_WARNS[first], **kwargs)
+    assert status["reason"] == _GUARD_REASONS[first]
+    # The cost is reported once the kernels' compile has started.
+    assert (status["probe_seconds"] is None) == (first < 2)
+
+
+@pytest.mark.parametrize(("window", "limit"), [(0, 0), (3000, 1536)])
+def test_enable_refuses_a_window_below_the_floor(monkeypatch, window, limit):
+    """A window of 0, every test-built engine's, fits no ceiling at all; 3,000
+    tokens fit one at the floor itself, below which kv8 serves nothing."""
+    _kv8_ready(monkeypatch)
+    monkeypatch.setattr(kv8, "probe", _untouchable)
+    status = _refusal(tfx.tiny_language_model(), warned=False, window=window)
+    assert status["reason"] == (
+        f"window below the kv8 floor (window {window}, ceiling {limit}, floor 1536)"
+    )
+    assert isinstance(status["probe_seconds"], float)
+
+
+def test_enable_refuses_a_floor_that_is_not_a_step_boundary(monkeypatch):
+    _kv8_ready(monkeypatch)
+    monkeypatch.setattr(kv8, "N8", 1600)
+    monkeypatch.setattr(kv8, "probe", _untouchable)
+    status = _refusal(tfx.tiny_language_model(), warned=True)
+    assert status["reason"] == "floor 1600 keys is not a tile step boundary at 20 splits"
+    assert isinstance(status["probe_seconds"], float)
+
+
+def test_the_floor_is_a_step_boundary_at_every_measured_split():
+    """Another core count joining the tile's measured splits fails here until
+    the floor is re-cut: kv8 and the tile may meet only at step boundaries."""
+    for splits in tileattn.MEASURED_SPLITS:
+        assert kv8.N8 in tileattn.boundaries(kv8.N8, splits), splits
+
+
+@pytest.mark.parametrize(
+    ("window", "limit"),
+    [
+        (0, 0),
+        (1535, 0),
+        (3000, 1536),
+        (4096, 1921),
+        (65_536, 42_241),
+        (131_072, 84_481),
+        (262_144, 170_241),
+    ],
+)
+def test_the_ceiling_is_the_last_step_boundary_whose_mirror_fits(window, limit):
+    assert kv8.ceiling(window, 20) == limit
+
+
+@pytest.mark.parametrize("splits", [10, 16, 20])
+@pytest.mark.parametrize("window", [4096, 32_768, 131_072, 262_144])
+def test_the_ceiling_fits_its_mirror_and_the_next_boundary_does_not(window, splits):
+    def fits(b: int) -> bool:
+        c = -(-b // 256) * 256
+        return 1.504 * c + 0.504 * c / 16 + 272 <= window
+
+    limit = kv8.ceiling(window, splits)
+    bounds = tileattn.boundaries(window + 32 * splits, splits)
+    assert limit in bounds and fits(limit)
+    assert not fits(bounds[bounds.index(limit) + 1])
+
+
+def test_the_kv8_pins_hold_on_the_locked_mlx_vlm():
+    """A dependency bump that changes any function the mirror's validity rests
+    on fails here until someone re-reads it against the trim wrap and adds its
+    new hash."""
+    assert set(kv8.VALIDATED_KV8_SOURCES) == _PINNED
+    for (module, qualname), digest in kv8.VALIDATED_KV8_SOURCES.items():
+        assert verifyattn._source_digest(module, qualname) == digest, qualname
+    assert kv8._pins_reason() is None
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        ("mlx_vlm.models.cache", "KVCache.trim"),
+        ("mlx_vlm.speculative.cache_state", "_trim_append_caches"),
+        ("mlx_vlm.models.qwen3_5.speculative_verifier", "Qwen3_5BatchInvariantForward.verify"),
+    ],
+)
+def test_enable_refuses_a_changed_source(monkeypatch, key):
+    _kv8_ready(monkeypatch)
+    monkeypatch.setitem(kv8.VALIDATED_KV8_SOURCES, key, "0" * 64)
+    status = _refusal(tfx.tiny_language_model(), warned=True)
+    assert status["reason"] == f"mlx-vlm {key[1]} changed"
+    assert status["probe_seconds"] is None
+
+
+def test_a_pinned_function_mlx_vlm_removed_counts_as_changed(monkeypatch):
+    from mlx_vlm.models.cache import KVCache
+
+    _kv8_ready(monkeypatch)
+    monkeypatch.delattr(KVCache, "prefix_cache_reserve")
+    status = _refusal(tfx.tiny_language_model(), warned=True)
+    assert status["reason"] == "mlx-vlm KVCache.prefix_cache_reserve changed"
+
+
+def test_compile_probe_runs_the_quantiser_and_every_row_count_once(monkeypatch):
+    _gate_state(monkeypatch)
+    monkeypatch.setattr(nax, "platform_reason", lambda: None)
+    monkeypatch.setattr(kv8, "_compile_ok", False)
+    seen: list = []
+    quantize = kv8.quantize
+
+    def spy_quantize(k, v, out_rows):
+        seen.append(("quantize", k.shape[2], out_rows, k.dtype))
+        return quantize(k, v, out_rows)
+
+    def spy_tile8(queries, codes, sc, n, chunk):
+        seen.append(("tile8", queries.shape[2], n, chunk, queries.dtype))
+        return kfx.stand_in_tile8(queries, codes, sc, n, chunk)
+
+    monkeypatch.setattr(kv8, "quantize", spy_quantize)
+    monkeypatch.setattr(kv8, "tile8", spy_tile8)
+    assert kv8.availability() == nax.Availability(True)
+    n0, chunk = tileattn.N0, tileattn.chunk_for(tileattn.N0, 20)
+    assert seen == [("quantize", n0, n0 + 256, mx.bfloat16)] + [
+        ("tile8", t, n0, chunk, mx.bfloat16) for t in range(1, tileattn.MAX_RUN + 1)
+    ]
+    assert kv8._compile_ok
+    seen.clear()
+    assert kv8.availability() == nax.Availability(True)
+    assert seen == []
+
+
+def test_availability_reports_the_error_line_and_remembers_only_success(monkeypatch, caplog):
+    _gate_state(monkeypatch)
+    monkeypatch.setattr(nax, "platform_reason", lambda: None)
+    monkeypatch.setattr(kv8, "_compile_ok", False)
+
+    def rejected(*args):
+        raise RuntimeError(_GATE_BUILD_ERROR)
+
+    monkeypatch.setattr(kv8, "tile8", rejected)
+    with caplog.at_level(logging.WARNING, logger="sous.engine.kv8"):
+        refused = kv8.availability()
+    assert refused == nax.Availability(
+        False, "the int8 K/V kernels failed: program_source:3:1: error: boom"
+    )
+    assert not kv8._compile_ok
+    # The reason keeps one line; the log keeps the compiler's whole report.
+    (record,) = [r for r in caplog.records if r.name == "sous.engine.kv8"]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        f"int8 K/V mirror: the kernels failed to build or run:\n{_GATE_BUILD_ERROR}"
+    )
+    monkeypatch.setattr(kv8, "tile8", kfx.stand_in_tile8)
+    assert kv8.availability() == nax.Availability(True) and kv8._compile_ok
+    monkeypatch.setattr(kv8, "tile8", rejected)
+    assert kv8.availability() == nax.Availability(True)
+
+
+def test_enable_refuses_kernels_that_fail_to_build_with_the_error_line(monkeypatch):
+    _kv8_ready(monkeypatch, fake_availability=False)
+    monkeypatch.setattr(kv8, "_compile_ok", False)
+
+    def rejected(*args):
+        raise RuntimeError(_GATE_BUILD_ERROR)
+
+    monkeypatch.setattr(kv8, "tile8", rejected)
+    monkeypatch.setattr(kv8, "probe", _untouchable)
+    status = _refusal(tfx.tiny_language_model(), warned=True)
+    assert status["reason"] == "the int8 K/V kernels failed: program_source:3:1: error: boom"
+    assert isinstance(status["probe_seconds"], float)
+
+
+def test_enable_refuses_a_failed_probe_with_its_cost(monkeypatch):
+    _kv8_ready(monkeypatch)
+    reason = "exactness: T=5 at n=1540 is 0.101 from the fp32 reference (bound 0.01)"
+    monkeypatch.setattr(kv8, "probe", lambda modules, splits, arch, verify_active: reason)
+    status = _refusal(tfx.tiny_language_model(), warned=True)
+    assert status["reason"] == reason
+    assert isinstance(status["probe_seconds"], float)
+
+
+def test_enable_refuses_an_exception_in_a_guard_with_its_error_line(monkeypatch, caplog):
+    _kv8_ready(monkeypatch)
+    monkeypatch.setattr(kv8, "_active", 1)
+    monkeypatch.setattr(kv8, "_ceiling", 84_481)
+    error = RuntimeError(_GATE_BUILD_ERROR)
+
+    def broken():
+        raise error
+
+    monkeypatch.setattr(kv8, "_pins_reason", broken)
+    status = _refusal(tfx.tiny_language_model(), warned=True)
+    assert status["reason"] == "program_source:3:1: error: boom"
+    assert status["probe_seconds"] is None
+    # The warning keeps one line; the log keeps where it was raised.
+    (record,) = _enabling_failures(caplog)
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is not None and record.exc_info[1] is error
+
+
+def test_enable_refuses_a_probe_that_raises_and_reports_what_it_cost(monkeypatch, caplog):
+    _kv8_ready(monkeypatch)
+
+    def raising(modules, splits, arch, verify_active):
+        raise RuntimeError("device lost")
+
+    monkeypatch.setattr(kv8, "probe", raising)
+    status = _refusal(tfx.tiny_language_model(), warned=True)
+    assert status["reason"] == "device lost"
+    assert isinstance(status["probe_seconds"], float)
+    (record,) = _enabling_failures(caplog)
+    assert record.exc_info is not None and "device lost" in str(record.exc_info[1])
+
+
+@pytest.mark.parametrize(
+    ("verify_status", "verify_active"),
+    [
+        (None, False),
+        ({"state": "off", "reason": None, "probe_seconds": None}, False),
+        ({"state": "unavailable", "reason": "mlx 0.99.0 not validated"}, False),
+        (_ACTIVE_VERIFY, True),
+    ],
+)
+def test_enable_activates_and_probes_the_verifier_only_beside_exact_verify(
+    monkeypatch, caplog, verify_status, verify_active
+):
+    tile = _kv8_ready(monkeypatch)
+    lm = tfx.tiny_language_model()
+    seen: list = []
+
+    def passing(modules, splits, arch, verify):
+        seen.append(([id(m) for m in modules], splits, arch, verify, kv8._active, kv8._ceiling))
+
+    monkeypatch.setattr(kv8, "probe", passing)
+    with caplog.at_level(logging.INFO, logger="sous.engine.kv8"):
+        status = kv8.enable(
+            lm, enabled=True, tile_status=tile, verify_status=verify_status, window=_WINDOW
+        )
+    assert status == {
+        "state": "active",
+        "reason": None,
+        "probe_seconds": status["probe_seconds"],
+        "floor": 1536,
+        "ceiling": 84_481,
+    }
+    assert isinstance(status["probe_seconds"], float)
+    # The flag and the ceiling are raised only once the probe has passed.
+    modules = [id(m) for m in verifyattn._attention_modules(lm)]
+    assert seen == [(modules, 20, tileattn._arch(), verify_active, 0, 0)]
+    assert kv8._active == 1 and kv8._ceiling == 84_481 and kv8._window is None
+    assert [r.getMessage() for r in caplog.records if r.name == "sous.engine.kv8"] == [
+        f"int8 K/V mirror: 2 layers, 1536 <= keys < 84481, probe {status['probe_seconds']:.2f}s"
+    ]
+
+
+def test_a_refused_load_after_an_active_one_leaves_nothing_serving(monkeypatch):
+    tile = _kv8_ready(monkeypatch)
+    lm = tfx.tiny_language_model()
+    status = kv8.enable(lm, enabled=True, tile_status=tile, verify_status=None, window=_WINDOW)
+    assert status["state"] == "active" and kv8._ceiling == 84_481
+    _refusal(lm, warned=False, tile_status={"state": "off", "reason": None, "splits": None})
+    assert not kv8.serving_now() and not kv8.serves(2_000)
+
+
+@pytest.mark.slow
+def test_enable_goes_active_through_the_real_availability_and_probe(monkeypatch):
+    tile = _kv8_ready(monkeypatch, fake_availability=False, fake_probe=False)
+    monkeypatch.setattr(kv8, "_compile_ok", False)
+    lm = tfx.tiny_language_model()
+    tfx.verify_ready(monkeypatch, lm)
+    status = kv8.enable(
+        lm, enabled=True, tile_status=tile, verify_status=dict(_ACTIVE_VERIFY), window=_WINDOW
+    )
+    assert status["state"] == "active", status
+    assert (status["floor"], status["ceiling"]) == (1536, 84_481)
+    assert kv8._active == 1 and kv8._compile_ok
+
+
+def _probe_setup(monkeypatch, tile8=None) -> tuple:
+    """`tile8` (the stand-in by default) as kv8's kernel and the tile's
+    stand-in as the tile, a far mark of 3,201 keys instead of 57,601 (the
+    stand-ins are plain mlx, far slower than the kernels), the floor at N0,
+    and the tiny model with its full-attention modules."""
+    _gate_state(monkeypatch)
+    tfx.tile_ready(monkeypatch)
+    monkeypatch.setattr(kv8, "tile8", kfx.stand_in_tile8 if tile8 is None else tile8)
+    monkeypatch.setattr(kv8, "N8", tileattn.N0)
+    lm = tfx.tiny_language_model()
+    return lm, verifyattn._attention_modules(lm)
+
+
+def _counters() -> tuple:
+    return dict(kv8.calls), dict(tileattn.calls), dict(projkernel.calls)
+
+
+def _run_probe(modules, *, verify_active: bool) -> str | None:
+    """probe() at S = 20, asserting it left the flag clear, the window closed,
+    every counter, the tile's flag and mlx-vlm's decode global as it found
+    them, whatever it decided."""
+    installed, splits = _language().scaled_dot_product_attention, tileattn._active_splits
+    before = _counters()
+    reason = kv8.probe(modules, 20, tileattn._arch(), verify_active)
+    assert kv8._active == 0 and kv8._window is None
+    assert _counters() == before
+    assert _language().scaled_dot_product_attention is installed
+    assert tileattn._active_splits == splits
+    return reason
+
+
+@pytest.mark.slow
+def test_probe_passes_the_stand_in_with_the_verifier_half(monkeypatch):
+    lm, modules = _probe_setup(monkeypatch)
+    tfx.verify_ready(monkeypatch, lm)
+    assert _run_probe(modules, verify_active=True) is None
+
+
+@pytest.mark.slow
+def test_probe_without_exact_verify_never_builds_the_verifier(monkeypatch):
+    _, modules = _probe_setup(monkeypatch)
+    monkeypatch.setattr(projkernel, "_verifier_class", _untouchable)
+    assert _run_probe(modules, verify_active=False) is None
+
+
+def test_probe_fails_parity_for_a_kernel_that_ignores_the_stepped_chunk(monkeypatch):
+    def own_chunk(queries, codes, sc, n, chunk):
+        return kfx.stand_in_tile8(queries, codes, sc, n, -(-n // 20))
+
+    _, modules = _probe_setup(monkeypatch, own_chunk)
+    reason = _run_probe(modules, verify_active=False)
+    assert reason is not None and reason.startswith("parity:"), reason
+
+
+def test_probe_fails_exactness_for_a_kernel_wrong_the_same_way_on_both_paths(monkeypatch):
+    def scaled(queries, codes, sc, n, chunk):
+        out = kfx.stand_in_tile8(queries, codes, sc, n, chunk)
+        return (out.astype(mx.float32) * 1.1).astype(mx.bfloat16)
+
+    _, modules = _probe_setup(monkeypatch, scaled)
+    reason = _run_probe(modules, verify_active=False)
+    assert reason is not None and reason.startswith("exactness: T=1 at n=1536 is "), reason
+
+
+def test_probe_refuses_a_module_whose_calls_never_reach_kv8(monkeypatch):
+    _, modules = _probe_setup(monkeypatch)
+    # Parity cannot see this fault, so its sweep would only cost time.
+    monkeypatch.setattr(kv8, "_probe_parity", lambda *args: None)
+    monkeypatch.setattr(tileattn, "_plain_kv_cache", lambda cache: False)
+    reason = _run_probe(modules, verify_active=False)
+    assert reason == "the model's attention module did not reach kv8"
+
+
+def test_probe_refuses_a_verifier_that_never_reaches_kv8(monkeypatch):
+    lm, modules = _probe_setup(monkeypatch)
+    monkeypatch.setattr(kv8, "_probe_parity", lambda *args: None)
+    for module in tfx.verify_ready(monkeypatch, lm):
+        object.__setattr__(module, verifyattn._TAG, 0)
+    reason = _run_probe(modules, verify_active=True)
+    assert reason == "the exact verifier's attention did not reach kv8"
+
+
+@pytest.mark.parametrize("step", ["prepare", "tile8"])
+def test_probe_restores_what_it_touched_when_a_step_raises(monkeypatch, step):
+    """A raise from the mirror step (prepare) or from the module step (the
+    kernel under a forced window, a mirror already built on its cache) still
+    leaves the flag clear, the window closed, every counter and the tile's
+    flag and decode global as they were."""
+    original = {"prepare": kv8.prepare, "tile8": kfx.stand_in_tile8}[step]
+
+    def fails_inside_a_window(*args):
+        if kv8._window is not None:
+            raise RuntimeError("device lost")
+        return original(*args)
+
+    _, modules = _probe_setup(monkeypatch)
+    monkeypatch.setattr(kv8, step, fails_inside_a_window)
+    monkeypatch.setattr(kv8, "_probe_parity", lambda *args: None)
+    installed, splits = _language().scaled_dot_product_attention, tileattn._active_splits
+    before = _counters()
+    with pytest.raises(RuntimeError, match="device lost"):
+        kv8.probe(modules, 20, tileattn._arch(), False)
+    assert kv8._active == 0 and kv8._window is None
+    assert _counters() == before
+    assert _language().scaled_dot_product_attention is installed
+    assert tileattn._active_splits == splits
+
+
+@kfx.nax
+def test_probe_passes_the_real_kernels_on_the_tiny_model(monkeypatch):
+    _gate_state(monkeypatch)
+    lm = tfx.tiny_language_model()
+    tfx.verify_ready(monkeypatch, lm)
+    start = time.perf_counter()
+    reason = _run_probe(verifyattn._attention_modules(lm), verify_active=True)
+    assert reason is None, f"{reason} (after {time.perf_counter() - start:.2f}s)"
+
+
+@kfx.nax
+def test_enable_activates_the_real_kernels_on_the_tiny_model(monkeypatch):
+    _gate_state(monkeypatch)
+    lm = tfx.tiny_language_model()
+    tfx.verify_ready(monkeypatch, lm)
+    status = kv8.enable(
+        lm,
+        enabled=True,
+        tile_status=dict(_ACTIVE_TILE),
+        verify_status=dict(_ACTIVE_VERIFY),
+        window=_WINDOW,
+    )
+    assert status["state"] == "active", status
+    assert (status["floor"], status["ceiling"]) == (kv8.N8, kv8.ceiling(_WINDOW, 20))
