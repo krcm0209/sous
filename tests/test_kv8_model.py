@@ -1,7 +1,7 @@
 """kv8 on the real default model, greedy: drafter on against drafter off.
 
-Acceptance bars (manual, on the M5 Pro; about 35 minutes, most of it four model loads and five
-cold prefills of the ~57.5K-token prompt with the prompt cache off):
+Acceptance bars (manual, on the M5 Pro; about 19 minutes, 1117 s measured, most of it four model
+loads and five cold prefills of the ~57.5K-token prompt with the prompt cache off):
 - With the tile active and the default 131072 window, an engine reports kv8 active, with its probe
   time printed, its floor at N8 and its ceiling the largest step boundary whose mirror fits
   beside the bf16 KV; the test skips, naming the reason, where kv8 cannot be active.
@@ -12,6 +12,8 @@ cold prefills of the ~57.5K-token prompt with the prompt cache off):
   first two prompts and `capped` on the third, the same with the drafter on and off; the
   counters show decode and verify served from the mirror, trims followed, one window per
   decode, one cap per capped decode, and nothing declined or out of scope on the tile.
+- With the drafter off, the far prompt's decode peaks no higher than the bf16 KV of its final
+  keys, the mirror at its capacity, one layer's mirror buffer and 1 GiB beyond the loaded weights.
 - An engine with kv8 off, built after the kv8 engines unloaded, reproduces the output of one built
   before any kv8 engine ran in the process, reports `off` on every decode and makes no kv8 call.
 """
@@ -38,6 +40,8 @@ HEAD = "Continue this Python source exactly where it stops, in the same style:\n
 WINDOW = 131072
 BLOCKS = (5, 8)
 SLACK = 16
+# The default model's full-attention layers, for the memory bound.
+FULL_LAYERS, KV_HEADS, HEAD_DIM = 16, 4, 256
 # The window state each prompt's decode must end in, drafter on or off.
 EXPECTED = {"floor": "served", "far": "served", "cap": "capped"}
 
@@ -114,20 +118,40 @@ def _prompt(engine, ids, target):
     return messages
 
 
-def _generate(engine, prompts):
+def _generate(engine, prompts, peaks=None):
     """({(prompt, max_tokens): text}, {(prompt, max_tokens): (kv8 state, kv8 rows)},
-    kv8 counter deltas, tile counter deltas) at the engine's current block."""
+    kv8 counter deltas, tile counter deltas) at the engine's current block. With `peaks`
+    a dict, each call's peak Metal memory above what was resident before it (the loaded
+    weights) lands there under its (prompt, max_tokens)."""
     kv8_before, tile_before = dict(kv8.calls), dict(tileattn.calls)
     texts, gauges = {}, {}
     for name, (messages, caps, line) in prompts.items():
         for cap in caps:
+            resident = mx.get_active_memory()
+            mx.reset_peak_memory()
             with _ceiling(line):
                 texts[(name, cap)] = engine.generate(messages, [], cap)
+            if peaks is not None:
+                peaks[(name, cap)] = (mx.get_peak_memory() - resident, resident)
             spec = engine.speculation()
             gauges[(name, cap)] = (spec.kv8, spec.kv8_rows)
     kv8_counts = {k: v - kv8_before[k] for k, v in kv8.calls.items()}
     tile_counts = {k: v - tile_before[k] for k, v in tileattn.calls.items()}
     return texts, gauges, kv8_counts, tile_counts
+
+
+def _rows_range(key, targets):
+    """(least, most or None) rows a decode's window has quantised per full-attention layer.
+    Where it serves throughout, the mirror is built at the first served call and then
+    extended to the last key a forward appended (the cap-th token is never fed back), so a
+    decode that stopped early falls short of the least. Where the ceiling cuts it, the
+    mirror stops at the line: at most that many with the drafter off (a drafter's rollbacks
+    re-quantise rows below the line, so the most holds only without one)."""
+    name, cap = key
+    target, _, line = targets[name]
+    if line is None:
+        return target - SLACK + cap - 1, None
+    return line - SLACK, line
 
 
 def _check_status(status, splits):
@@ -180,7 +204,8 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_kv8():
         _check_status(status, splits)
         far_end = targets["far"][0] + max(targets["far"][1])
         assert far_end + SLACK < status["ceiling"], (far_end, status)
-        undrafted, plain_gauges, plain_counts, plain_tile = _generate(plain, prompts)
+        peaks: dict = {}
+        undrafted, plain_gauges, plain_counts, plain_tile = _generate(plain, prompts, peaks)
 
     drafted, drafted_gauges, drafted_counts, drafted_tile = {}, {}, {}, {}
     with _engine(kv_int8=True, drafter=True) as engine:
@@ -195,9 +220,11 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_kv8():
                 drafted_tile[block],
             ) = _generate(engine, prompts)
 
+    # unload() cleared the flag: the off engine below starts from none.
+    assert kv8._active == 0
+
     with _engine(kv_int8=False, drafter=True) as off:
         assert off.kv_int8_status["state"] == "off", off.kv_int8_status
-        assert kv8._active == 0
         again, again_gauges, off_counts, _ = _generate(off, prompts)
 
     # Parity: greedy output is the same with the drafter on and off, at every block.
@@ -207,14 +234,16 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_kv8():
     assert again == reference
 
     # The gauges: each decode's window state and the rows it quantised. A served or capped
-    # window first built its mirror over the whole prefix, which is at least N8 rows.
+    # window first built its mirror over the whole prefix, then followed the generation.
     for key, (state, rows) in plain_gauges.items():
         assert state == EXPECTED[key[0]], (key, state, rows)
-        assert rows >= kv8.N8, (key, state, rows)
+        least, most = _rows_range(key, targets)
+        assert rows >= least and (most is None or rows <= most), (key, state, rows, least, most)
     for block in BLOCKS:
         for key, (state, rows) in drafted_gauges[block].items():
             assert state == plain_gauges[key][0], (f"block {block}", key, state)
-            assert rows >= kv8.N8, (f"block {block}", key, state, rows)
+            least = _rows_range(key, targets)[0]
+            assert rows >= least, (f"block {block}", key, state, rows, least)
     for gauges in (reference_gauges, again_gauges):
         assert set(gauges.values()) == {("off", 0)}, gauges
 
@@ -241,3 +270,22 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_kv8():
     for counts in (plain_tile, *drafted_tile.values()):
         assert counts["decode_out"] == counts["verify_out"] == counts["verify_declined"] == 0
     assert not any(off_counts.values()), off_counts
+
+    # Memory, drafter off: the decode holds the bf16 KV, the mirror at its capacity and, while
+    # a growth swaps buffers, one layer's old one. A slice update that copied the buffer
+    # instead of writing in place would show up here as a multiple of the mirror's size.
+    far = max(k for k in peaks if k[0] == "far")
+    peak, resident = peaks[far]
+    keys = targets["far"][0] + far[1] + SLACK
+    kv_bytes = FULL_LAYERS * KV_HEADS * HEAD_DIM * 2 * 2 * (math.ceil(keys / 256) * 256)
+    mirror_cap = math.ceil((keys + kv8.GROWTH) / 256) * 256
+    layer_mirror = kv8.BYTES_PER_ROW_PER_HEAD * KV_HEADS * mirror_cap
+    bound = kv_bytes + FULL_LAYERS * layer_mirror + layer_mirror + (1 << 30)
+    print(
+        f"kv8 peak above the {resident / 2**30:.2f} GiB resident weights, drafter off:"
+        + "".join(f" {k[0]}/{k[1]} {v[0] / 2**30:.2f} GiB;" for k, v in peaks.items())
+        + f" far bound {bound / 2**30:.2f} GiB = KV {kv_bytes / 2**30:.2f}"
+        f" + mirror {FULL_LAYERS * layer_mirror / 2**30:.2f}"
+        f" + layer {layer_mirror / 2**30:.2f} + 1.00"
+    )
+    assert peak <= bound, (peak, bound, kv_bytes, layer_mirror, keys)
