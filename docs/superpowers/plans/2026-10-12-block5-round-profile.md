@@ -59,9 +59,13 @@ measured in situ.
   the whole conversation from the tools fork. Every turn k in this plan is therefore
   warmed by posting its predecessor turn k−1 (same subagent, rebuilt by the same builder),
   then posted once untimed, and every timed post of k takes the k−1 slot and prefills only
-  the k−1 → k delta. A timed post must log `took=turn@n_{k−1}` or `turn-moved@n_{k−1}`
-  (same take length, same class); a `fork`, `disk` or `miss` take invalidates the post.
-  A subagent's first turn is warmed by itself and its timed posts take `fork@<header>`.
+  the k−1 → k delta. A timed post must log `took=turn@L` or `turn-moved@L` with
+  L = n_{k−1} minus the generation prompt (the slot holds the render without it: 7 tokens on
+  this model, `n_suffix` in the replay list); a `fork`, `disk` or `miss` take invalidates the
+  post. A `turn-moved` take is valid but consumes the k−1 slot, so the driver re-warms (k−1,
+  then k, untimed) before the next timed post whenever the previous timed post moved the
+  slot or failed the check. A subagent's first turn is warmed by itself and its timed posts
+  take the header fork the untimed post published (`fork@<header>`).
 - **Freeze.** No number or rule in sections 2–4 changes after the first job of `run.sh`
   (D0) starts. Task 3 step 0 (the attach and performance-state probes) and the M2 smoke
   are exempt probes whose outcomes select pre-registered branches, not amendments. A
