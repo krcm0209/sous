@@ -61,16 +61,21 @@ leaves a model that starts repeating itself no way out and, as above, the suite
 cannot measure that risk; it runs only when you set it. The full run may
 therefore change `[model].id`, the drafter and block size, the window and
 `int8_prefill`.
-Every arm inherits `[model].attention_tile` and `[model].projection_kernel`
-and no arm changes them; suite rows are keyed by both, so a `--resume` after
-either was flipped runs those arms again instead of mixing kernel and stock
-rows, and where the engine reports one `unavailable`, the arm prints a notice
-with the reason and runs stock, as the daemon would (an `off` engine, such as
-the mlx-lm backend's, gets no notice). Bench rows are keyed only by model,
-drafter, block and window, so a `--resume` across a sous upgrade or a flip of
-`attention_tile` or `projection_kernel` reuses decode and prefill timings
-measured before it, which can rank the blocks the other way: start a fresh
-tune after either.
+Every arm inherits `[model].attention_tile`, `[model].projection_kernel` and
+`[model].kv_int8` and no arm changes them; suite rows are keyed by all three,
+so a `--resume` after any of them was flipped runs those arms again instead of
+mixing rows measured with and without it (a row written before a setting
+existed reads as `false` for it), and where the engine reports one
+`unavailable`, the arm prints a notice with the reason and runs without it, as
+the daemon would: stock attention or projections, or attention over the bf16
+cache for `kv_int8` (an `off` engine, such as the mlx-lm backend's, gets no
+notice). `kv_int8` matters most here of the three: attention past its floor
+reads keys and values quantised to int8, which moves more than the last bits,
+and the suite's grades are where that would show. Bench rows are keyed only by
+model, drafter, block and window, so a `--resume` across a sous upgrade or a
+flip of `attention_tile`, `projection_kernel` or `kv_int8` reuses decode and
+prefill timings measured before it, which can rank the blocks the other way:
+start a fresh tune after any of them.
 
 Every drafter arm runs exactly the block its label names. Your configured arm
 is the block the daemon would run: with `speculative_block_size` unset, that

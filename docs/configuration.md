@@ -27,6 +27,7 @@ speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
 int8_prefill = true
 attention_tile = true
 projection_kernel = true
+kv_int8 = true
 ```
 
 Every value is optional. Swap `[model].id` for any MLX text or vision model
@@ -225,6 +226,50 @@ the tile is active, else 3. As with the tile, that is one INFO line, and a
 `WARNING` saying `sous: projection kernel unavailable (…)` means the kernel
 should have run here and did not. The on-disk forks are keyed by it: where it
 is active, changing the setting starts the fork store cold once. The daemon
+reads it at startup, so a change takes effect on its next start.
+
+`[model].kv_int8` (default `true`) runs decode's and speculative verify's
+attention over an int8 copy of the context's keys and values instead of the
+bf16 cache, on the attention tile's key partition (sous's own kernels,
+compiled at model load — no build step). Attention over a long context is
+dominated by reading the keys and values, and int8 halves those bytes. Every
+key and value row is quantised per token and KV head with one fp16 scale, and
+each query row inside the kernel with one fp32 scale; on the default model's
+keys and values from a real 35K-token prompt that costs about 1 % relative
+error on the keys and values themselves and 0.7 % median (1.8 % in the worst
+layer) on the attention output. So, unlike the tile and the projection
+kernel, it moves more than the last bits: a reply can differ from one with
+`false`, which reads the bf16 cache. Greedy output with the drafter still
+equals output without it, since a verify row reads the same int8 rows as the
+decode step at the same key count.
+
+Only a generation reads the copy. It is built from the bf16 cache on the
+first decode step at or past the floor and dropped when the generation ends,
+so prefill, the prompt cache, the on-disk forks and everything stored stay
+bf16, and the fork store does not depend on the setting. It serves attention
+from the floor, 1,536 keys (the model-load line's `kv_int8_floor=`), up to a
+ceiling set by `max_context_tokens` (`kv_int8_ceiling=`). The copy is half
+the size of the bf16 cache it mirrors and lives inside the memory the daemon
+already reserves for a turn's KV, so it serves only below the context length
+at which the turn's bf16 cache and the copy still fit there together: about
+84K keys at 131072, about 170K at 262144. Neither the reserve nor the
+prompt-cache budget grows for it. A generation whose context reaches the
+ceiling drops its copy and runs on over the bf16 cache, so one request takes
+the same path whatever else the daemon holds; below the floor attention is
+the tile's or the stock path, unchanged. The turn line's `kv8=` says what a
+generation did — `served`, `capped` at the ceiling, `idle` (its context
+stayed below the floor) or `off` — and `kv8_rows=` how many rows it quantised
+in each layer (see [Observability](observability.md#the-turn-line)).
+
+It runs only where the attention tile is active (so far a 20-core M5 Pro;
+see `attention_tile` above), with the mlx-vlm functions it relies on unchanged
+(sous pins their sources, as it does the tile's). Where the tile is off or
+`unavailable`, the model-load line reads `kv_int8=unavailable` (`off` with
+`false` and on the mlx-lm backend), the status document's `kv_int8` block
+carries the reason, and attention reads the bf16 cache; that is one INFO line,
+and a load warning about it means it should have run here and did not (its
+kernels or load-time check failed, or a pinned mlx-vlm source changed under
+it). A value other than `true` or `false` warns and means `false`. The daemon
 reads it at startup, so a change takes effect on its next start.
 
 `[server].generation_timeout_minutes` bounds a turn at both ends: how long it
