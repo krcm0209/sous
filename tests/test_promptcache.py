@@ -671,6 +671,38 @@ def test_the_drafters_gauges_follow_every_decode_path(trimmable):
     assert (st["draft_rounds"], st["drafted_tokens"], st["draft_context"]) == (1, 2, 3)
 
 
+def test_the_kv8_gauges_are_assigned_per_turn_from_the_last_decode():
+    """The mirror's state and rows ride on the same Speculation as the
+    drafter's counts: assigned after each decode, back to off and 0 with the
+    next turn, and dropped from the daemon-wide view, where a max over the
+    owners' states would mean nothing. Read per owner, as the turn runner
+    reads them."""
+    from sous.engine.promptcache import TURN_GAUGES, without_turn_gauges
+
+    assert {"kv8", "kv8_rows"} <= TURN_GAUGES
+    me = threading.current_thread()
+    h = FakeHooks(trimmable=False)
+    pc = PrefixCache(h)
+    h.speculation_value = Speculation(kv8="capped", kv8_rows=84481)
+    pc.generate(STABLE_1, FULL_1, 16)
+    st = pc.stats(owner=me)
+    assert (st["kv8"], st["kv8_rows"]) == ("capped", 84481)
+    assert not {"kv8", "kv8_rows"} & set(without_turn_gauges(pc.stats()))
+    h.speculation_value = Speculation()
+    pc.generate(STABLE_2, FULL_2, 16)
+    st = pc.stats(owner=me)
+    assert (st["kv8"], st["kv8_rows"]) == ("off", 0)
+
+
+def test_the_kv8_gauges_follow_the_decode_with_the_cache_off():
+    h = FakeHooks(trimmable=True)
+    pc = PrefixCache(h, enabled=False)
+    h.speculation_value = Speculation(kv8="served", kv8_rows=40)
+    pc.generate(STABLE_1, FULL_1, 16)
+    st = pc.stats(owner=threading.current_thread())
+    assert (st["kv8"], st["kv8_rows"]) == ("served", 40)
+
+
 def test_non_trimmable_restores_the_cache_to_the_stable_boundary():
     h = FakeHooks(trimmable=False)
     pc = PrefixCache(h)
@@ -1190,6 +1222,8 @@ def test_stats_as_dict_reports_every_counter():
         "drafted_tokens": 0,
         "accepted_tokens": 0,
         "draft_context": 0,
+        "kv8": "off",
+        "kv8_rows": 0,
     }
 
 

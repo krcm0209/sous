@@ -617,6 +617,34 @@ def test_gauge_fields_are_read_directly_not_as_deltas(tmp_path: Path):
     assert 2.9 <= result.tokenize_seconds < 3.5
 
 
+def test_the_kv8_gauges_are_read_directly_and_default_off(tmp_path: Path):
+    """The mirror's word on the decode is a gauge like draft_context, read
+    from `after` as it stands: a lower row count than the previous turn's
+    is this turn's, not a clamped delta. An engine whose stats never name
+    the gauges (a fake, or an engine from before them) reads off and 0."""
+    inner = FakeEngine(["a", "b"])
+    runner, _ = _runner(tmp_path, inner)
+    plain = runner.run(MSGS, [], 100, RecordingSink())
+    assert (plain.kv8, plain.kv8_rows) == ("off", 0)
+    inner.stats = {
+        "hits": 0,
+        "fork_hits": 0,
+        "reused_tokens": 0,
+        "kv8": "served",
+        "kv8_rows": 90000,
+    }
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        inner.stats = {**inner.stats, "kv8": "capped", "kv8_rows": 4096}
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    result = runner.run(MSGS, [], 100, RecordingSink())
+    assert (result.kv8, result.kv8_rows) == ("capped", 4096)
+
+
 def test_queue_seconds_is_the_wait_for_the_endpoint_lock(tmp_path: Path):
     inner = _Gated(["slow|turn", "fast"], delay=0.1)
     runner, _ = _runner(tmp_path, inner)

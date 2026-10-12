@@ -106,6 +106,11 @@ class TurnResult:
     drafted_tokens: int = 0
     accepted_tokens: int = 0
     draft_context: int = 0
+    # Whether that decode read int8 K/V ("off", "idle", "served" or
+    # "capped") and the rows it quantised for it; "off" and 0 from an engine
+    # that never reports them.
+    kv8: str = "off"
+    kv8_rows: int = 0
 
 
 @dataclass(frozen=True)
@@ -344,6 +349,8 @@ class TurnRunner:
                     drafted_tokens=after.get("drafted_tokens", 0),
                     accepted_tokens=after.get("accepted_tokens", 0),
                     draft_context=after.get("draft_context", 0),
+                    kv8=after.get("kv8", "off"),
+                    kv8_rows=after.get("kv8_rows", 0),
                 )
         finally:
             self._engines.touch()
