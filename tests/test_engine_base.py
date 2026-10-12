@@ -1399,8 +1399,6 @@ def test_default_factory_passes_no_window_when_the_reserve_cannot_be_measured(mo
     is no window for the mirror to fit beside: kv8 gets a window of 0 and
     serves nothing, rather than a ceiling sized against a reserve that does
     not exist."""
-    import pytest
-
     from sous.engine import base, vlm
 
     seen: dict[str, dict] = {}

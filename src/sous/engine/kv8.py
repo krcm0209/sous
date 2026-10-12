@@ -532,7 +532,10 @@ def _build(cache: Any, window: Window, top: int) -> Mirror:
         object.__setattr__(cache, "trim", _wrap_trim(cache, original))
     else:
         original = stale.original_trim
-    # A stale mirror's buffers are freed before the new ones are allocated.
+    # This `del` frees nothing itself: prepare's `mirror` local still holds the
+    # stale Mirror until prepare returns. The stale buffers go before the new
+    # ones exist because `quantize` is lazy and allocates at eval time, after
+    # prepare has returned.
     del stale
     cap = _capacity(cache.offset, window)
     codes, sc = quantize(cache.keys[:, :, :top, :], cache.values[:, :, :top, :], cap)

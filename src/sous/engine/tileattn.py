@@ -255,8 +255,9 @@ def _verify_runs(
     """The run loop behind verify() and serve_verify(), as [1, 24, T, 256]. Each
     run (j, k, chunk), in row order, is answered by one of three: grouped stock
     calls when chunk is 0; `served(j, k, chunk)` when that returns a part (kv8,
-    reading its int8 mirror); one tile call otherwise. Every part is a
-    contiguous [1, k - j, 24, 256], and the parts are concatenated on the row
+    reading its int8 mirror); one tile call otherwise. The tile and
+    kv8 parts are contiguous [1, k - j, 24, 256] (the stock part is a
+    transposed view of that shape), and the parts are concatenated on the row
     axis. With one loop, a run kv8 leaves to the tile is sliced and launched
     exactly as it is with kv8 off. A single run's part is used as it is, with
     no concatenation."""

@@ -372,6 +372,8 @@ def _assert_fenced(n, t):
 
 @pytest.mark.parametrize(("n", "t"), [(N0, 1), (2000, 3), (1600, 8), (1548, 12)])
 def test_codes_and_scales_past_n_change_nothing(kernel8, n, t):
+    # The stand-in slices codes[:, :, :n] before any read, so its cases pass by
+    # construction; only the `real` kernel8 parameter tests the fence.
     _assert_fenced(n, t)
 
 
@@ -379,7 +381,9 @@ def test_codes_and_scales_past_n_change_nothing(kernel8, n, t):
 def test_reads_stay_below_n(kernel8, n, t):
     """Buffers that end exactly at n (n a multiple of 4, so the scale plane's head
     stride stays 16-byte aligned) give the output of the capacity-sized ones: no read
-    reaches past the last live row."""
+    reaches past the last live row. The stand-in slices codes[:, :, :n] before any
+    read, so its cases pass by construction; only the `real` kernel8 parameter tests
+    the fence."""
     assert n % 4 == 0
     q, codes, sc, _, _ = kfx.serving_codes(n, t)
     want = kv8.verify_codes(q, codes, sc, n, 20)
@@ -2214,8 +2218,6 @@ def test_enable_activates_the_real_kernels_on_the_tiny_model(monkeypatch):
 def _dw_isolate(monkeypatch, *, active: int) -> None:
     """kv8's module state as a fresh load leaves it, restored after the test:
     the window, its serial and the counters a real open_window moves."""
-    from sous.engine import kv8
-
     monkeypatch.setattr(kv8, "_active", active)
     monkeypatch.setattr(kv8, "_window", None)
     monkeypatch.setattr(kv8, "_serial", kv8._serial)
@@ -2227,11 +2229,7 @@ def _dw_engine():
     tests/test_engine_positions.py builds one: no weights, no drafter, and
     positions left to the model so the stub needs no rotary kwargs."""
     import threading
-    import types
 
-    import pytest
-
-    pytest.importorskip("mlx.core")
     from sous.engine import draftctx
     from sous.engine.promptcache import PromptMemo, Speculation
     from sous.engine.vlm import VLMEngine
@@ -2259,16 +2257,11 @@ def _dw_engine():
 
 def _dw_result(text: str):
     """One stream_generate result: accepted text, never a draft row."""
-    import types
-
     return types.SimpleNamespace(is_draft=False, text=text, generation_tokens=1, finish_reason=None)
 
 
 def test_decode_window_spans_the_generation_and_reports_its_state(monkeypatch):
     import sys
-    import types
-
-    from sous.engine import kv8
 
     _dw_isolate(monkeypatch, active=1)
     seen: dict[str, object] = {}
@@ -2300,9 +2293,6 @@ def test_decode_window_spans_the_generation_and_reports_its_state(monkeypatch):
 
 def test_decode_window_stays_shut_while_kv8_is_inactive(monkeypatch):
     import sys
-    import types
-
-    from sous.engine import kv8
 
     _dw_isolate(monkeypatch, active=0)
     seen: dict[str, object] = {}
@@ -2326,11 +2316,7 @@ def test_decode_window_closes_on_an_exception_and_keeps_the_last_speculation(
     monkeypatch,
 ):
     import sys
-    import types
 
-    import pytest
-
-    from sous.engine import kv8
     from sous.engine.promptcache import Speculation
 
     _dw_isolate(monkeypatch, active=1)
@@ -2361,11 +2347,7 @@ def test_decode_window_closes_on_an_exception_and_keeps_the_last_speculation(
 
 
 def test_decode_window_opens_inside_the_drafters_seed_and_closes_before_it_ends(monkeypatch):
-    import contextlib
     import sys
-    import types
-
-    from sous.engine import kv8
 
     _dw_isolate(monkeypatch, active=1)
     order: list[object] = []

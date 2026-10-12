@@ -381,9 +381,8 @@ goal.
   rows arrive through verifyattn's wrapper, whose scope widens to every T
   from 1 while the flag is set. Inside a decode's serving window the rows
   from `N8` up to the ceiling `L` go to kv8 instead of the tile
-  (`engine/kv8.py` bullet). The
-  flag `_active_splits` is a plain int, the active S or 0, never a model
-  reference: the first statement of every
+  (`engine/kv8.py` bullet). The flag `_active_splits` is a plain int, the
+  active S or 0, never a model reference: the first statement of every
   `enable()` clears it, only an `active` result sets it, and
   `VLMEngine.unload()` clears it through `tileattn.clear()`. `enable()`
   checks, in order: the config; the shared platform rule
@@ -661,9 +660,9 @@ goal.
   `n = min(n, offset)` after the original runs. The wrap is the
   mechanism; the clamp every served call runs first (`n = min(n, offset −
   T)`) and the rebuild from row 0 of a mirror from another window are
-  defences. A served call quantises `[n, min(offset, L))` once (no row at
-  or past `L` is ever written)
-  (`kv8.prepare(cache, t)`, before a verify's run loop): the first build
+  defences. A served call quantises `[n, min(offset, L))` once, so no row
+  at or past `L` is ever written (`kv8.prepare(cache, t)`, before a
+  verify's run loop): the first build
   writes the cap-sized buffers in one dispatch per layer, later calls
   slice-assign a row-sized output in place, and a growth (`GROWTH` = 4096
   rows, never past `round_up(L, 256)`) goes layer by layer, each new

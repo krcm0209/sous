@@ -481,7 +481,8 @@ class Speculation:
 
     `kv8` and `kv8_rows` are the int8 K/V mirror's word on the same call,
     drafter or not: the state its serving window closed in (`idle`, `served`
-    or `capped`; `off` when no window opened) and the rows it quantised."""
+    or `capped`; `off` when no window opened) and the rows it quantised, per
+    full-attention layer (every layer quantises the same rows)."""
 
     rounds: int = 0
     drafted: int = 0

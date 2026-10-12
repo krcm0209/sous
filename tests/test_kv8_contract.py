@@ -274,7 +274,8 @@ def test_both_hooks_reach_kv8_through_the_real_forward_with_a_window_open(tiny, 
         assert window.state == "served"
     finally:
         state, rows = kv8.close_window(cache)
-    assert state == "served" and rows >= prefix
+    # Per full-attention layer: the build's prefix + t rows, then the step's one.
+    assert state == "served" and rows == prefix + t + 1
     assert kv8._window is None and _dropped(cache)
     assert _delta(tile_start, tile_verified) == {"verify_calls": LAYERS, "verify_t5": LAYERS}
     assert _counted(kv8_start, kv8_verified) == {
@@ -682,10 +683,10 @@ def test_a_prefill_builds_no_mirror_and_the_cold_paths_decode_builds_one(tiny, m
     moved = _delta(kv8_start, kv8.calls)
     # The prefill segment's last step at 1,600 keys, then 1,601 and 1,602.
     assert _counted(kv8_start, kv8.calls) == {"windows": 1, "decode_kv8": 3 * LAYERS}
-    assert moved.get("mirror_builds", 0) > 0
+    assert moved.get("mirror_builds", 0) == LAYERS
     assert _delta(tile_start, tileattn.calls) == {}
     spec = engine.speculation()
-    assert spec.kv8 == "served" and spec.kv8_rows >= PROMPT
+    assert spec.kv8 == "served" and spec.kv8_rows == PROMPT + 2
     assert kv8._window is None and _dropped(cache)
 
 
@@ -701,7 +702,7 @@ def test_an_exception_out_of_the_generation_closes_the_window(tiny, monkeypatch)
     builds = kv8.calls["mirror_builds"]
     with pytest.raises(_Boom):
         engine.decode(cache, ids[:PROMPT], 3)
-    assert kv8.calls["mirror_builds"] > builds
+    assert kv8.calls["mirror_builds"] == builds + LAYERS
     assert kv8._window is None and _dropped(cache)
     assert engine.speculation() == Speculation()
 

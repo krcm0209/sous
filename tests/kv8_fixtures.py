@@ -174,8 +174,10 @@ def window(caches: Sequence[Any] = (), *, force: bool = True) -> Iterator[kv8.Wi
     drops the mirrors and trim wraps on `caches`, unless the block closed it
     itself, and the flag is put back."""
     active = kv8._active
-    kv8._active = 1
     opened = kv8.open_window(force=force)
+    # After open_window: a window leaked by an earlier test makes it assert, and
+    # the flag must not stay set for the rest of the session then.
+    kv8._active = 1
     try:
         yield opened
     finally:

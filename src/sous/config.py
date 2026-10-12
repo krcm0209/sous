@@ -164,10 +164,10 @@ class SousConfig:
     # bf16. It costs about half the bf16 KV of the rows it covers and must
     # fit beside them in the window-sized reserve, so it serves only below
     # a ceiling (about 84.5K keys at the 131072 window, 170K at 262144) and
-    # the rest of the generation runs on the
-    # tile. Which path a row takes depends only on its own key count, so
-    # greedy output with the drafter equals greedy output without it. Not
-    # bit-identical to the tile, hence the switch; false runs the tile.
+    # the rest of the generation runs on the tile. Which path a row takes
+    # depends only on its own key count, so greedy output with the drafter
+    # equals greedy output without it. Not bit-identical to the tile, hence
+    # the switch; false runs the tile.
     # Active only where the attention tile is, `unavailable` with the
     # reason anywhere else. Read once, at daemon start.
     kv_int8: bool = True
