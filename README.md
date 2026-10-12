@@ -185,7 +185,13 @@ MCP server sous shipped as before 0.7.0; the bare name `sous` on PyPI is held
 by an abandoned placeholder and a PEP 541 request to claim it is open
 (pypi/support#11881). When it is granted the package will be `sous`.
 
-From a checkout, `uv tool install .` works instead of the PyPI package.
+From a checkout, `uv tool install .` works instead of the PyPI package. A
+plain `uv tool install` resolves dependencies afresh, so the install can carry
+newer transitive packages (transformers, tokenizers, huggingface-hub) than the
+lock the test suite and the gates ran on. To install exactly the locked set:
+
+    uv export --format requirements-txt --no-hashes --no-dev --no-emit-project -o /tmp/sous-constraints.txt
+    uv tool install --reinstall -c /tmp/sous-constraints.txt .
 
 ## Quick start
 

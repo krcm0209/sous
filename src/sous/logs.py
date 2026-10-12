@@ -78,8 +78,9 @@ def configure_daemon_logging() -> None:
     handler and any stray `RichHandler` (matched by class name: rich is a
     transitive dependency and this module must not import it). Sets the
     root level to INFO when it is unset or higher. Library logger *levels*
-    are untouched: the endpoint pins sse-starlette/httpx/httpcore above where
-    they log bodies and URLs, and a handler swap must never loosen that."""
+    are untouched: the endpoint pins sse-starlette and httpx/httpcore (and
+    their httpx2/httpcore2 names) above where they log bodies and URLs, and a
+    handler swap must never loosen that."""
     root = logging.getLogger()
     for handler in list(root.handlers):
         if handler.get_name() == SOUS_HANDLER_NAME or type(handler).__name__ == "RichHandler":
