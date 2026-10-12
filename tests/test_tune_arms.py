@@ -263,7 +263,7 @@ def test_a_text_only_model_gets_no_drafter_arms(tmp_path):
     assert any("text-only" in r.reason for r in refusals)
 
 
-def _winner(tmp_path, temperature=0.7, int8=False, tile=True, proj=True):
+def _winner(tmp_path, temperature=0.7, int8=False, tile=True, proj=True, kv8=True):
     cfg = SousConfig(
         data_dir=tmp_path / "d",
         config_path=tmp_path / "c.toml",
@@ -271,6 +271,7 @@ def _winner(tmp_path, temperature=0.7, int8=False, tile=True, proj=True):
         int8_prefill=int8,
         attention_tile=tile,
         projection_kernel=proj,
+        kv_int8=kv8,
     )
     return Arm(
         label="27B + DFlash2 @3",
@@ -286,13 +287,14 @@ def _winner(tmp_path, temperature=0.7, int8=False, tile=True, proj=True):
         greedy=temperature == 0,
         attention_tile=tile,
         projection_kernel=proj,
+        kv_int8=kv8,
     )
 
 
 def test_the_suite_key_extends_the_bench_key_with_the_quality_dimensions(tmp_path):
     arm = _winner(tmp_path)
     assert arm.key == ("mlx-community/Qwen3.8-27B-4bit", "z-lab/Qwen3.8-27B-DFlash2", 3)
-    assert arm.suite_key == (*arm.key, False, False, True, True)
+    assert arm.suite_key == (*arm.key, False, False, True, True, True)
 
 
 def test_on_nax_a_routable_checkpoint_gets_an_int8_arm_and_no_greedy_arm(tmp_path):
@@ -302,7 +304,7 @@ def test_on_nax_a_routable_checkpoint_gets_an_int8_arm_and_no_greedy_arm(tmp_pat
     (int8,) = arms
     assert int8.int8_prefill and int8.config.int8_prefill
     assert not int8.greedy and int8.config.temperature == 0.7
-    assert int8.suite_key == (*int8.key, True, False, True, True)
+    assert int8.suite_key == (*int8.key, True, False, True, True, True)
     assert not int8.current and int8.fit_window == 131072
     # Only the winner stage's own int8 arm is under test: the engine
     # refusing it must fail the arm, unlike an arm that merely inherited
@@ -362,7 +364,7 @@ def test_quick_arms_mirror_the_users_int8_and_greedy_settings(tmp_path):
         assert arm.greedy is True
         # Inherited, not proposed: quick_arms never puts an arm under test.
         assert arm.int8_under_test is False
-        assert arm.suite_key == (*arm.key, True, True, True, True)
+        assert arm.suite_key == (*arm.key, True, True, True, True, True)
         cp = _checkpoints()[arm.model_id]
         extra_arms = winner_stage_arms(arm, nax=True, checkpoint=cp)
         assert extra_arms == []
@@ -383,7 +385,7 @@ def test_quick_arms_mirror_the_users_attention_tile_and_key_their_suite_rows_by_
         assert refusals == []
         for arm in arms:
             assert arm.attention_tile is tile and arm.config.attention_tile is tile
-            assert arm.suite_key == (*arm.key, False, False, tile, True)
+            assert arm.suite_key == (*arm.key, False, False, tile, True, True)
         keys[tile] = {arm.suite_key for arm in arms}
     # A run resumed after the setting was flipped matches none of the old rows.
     assert keys[True].isdisjoint(keys[False])
@@ -575,7 +577,7 @@ def test_quick_arms_mirror_the_users_projection_kernel_and_key_their_suite_rows_
         assert refusals == []
         for arm in arms:
             assert arm.projection_kernel is proj and arm.config.projection_kernel is proj
-            assert arm.suite_key == (*arm.key, False, False, True, proj)
+            assert arm.suite_key == (*arm.key, False, False, True, proj, True)
         keys[proj] = {arm.suite_key for arm in arms}
     # A run resumed after the setting was flipped matches none of the old rows.
     assert keys[True].isdisjoint(keys[False])
@@ -586,4 +588,33 @@ def test_the_winner_stage_carries_the_projection_kernel_and_adds_no_arm_for_it(t
     arms = winner_stage_arms(_winner(tmp_path, proj=False), nax=True, checkpoint=cp)
     assert [a.label for a in arms] == ["27B + DFlash2 @3 + int8 prefill"]
     assert all(a.projection_kernel is False and a.config.projection_kernel is False for a in arms)
+    assert [a.suite_key[6] for a in arms] == [False]
+
+
+def test_quick_arms_mirror_the_users_kv_int8_and_key_their_suite_rows_by_it(tmp_path):
+    keys = {}
+    for kv8 in (True, False):
+        user = SousConfig(
+            data_dir=tmp_path / "d",
+            config_path=tmp_path / "c.toml",
+            kv_int8=kv8,
+            int8_prefill=False,
+        )
+        arms, refusals = quick_arms(
+            user, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
+        )
+        assert refusals == []
+        for arm in arms:
+            assert arm.kv_int8 is kv8 and arm.config.kv_int8 is kv8
+            assert arm.suite_key == (*arm.key, False, False, True, True, kv8)
+        keys[kv8] = {arm.suite_key for arm in arms}
+    # A run resumed after the setting was flipped matches none of the old rows.
+    assert keys[True].isdisjoint(keys[False])
+
+
+def test_the_winner_stage_carries_kv_int8_and_adds_no_arm_for_it(tmp_path):
+    cp = _checkpoints()["mlx-community/Qwen3.8-27B-4bit"]
+    arms = winner_stage_arms(_winner(tmp_path, kv8=False), nax=True, checkpoint=cp)
+    assert [a.label for a in arms] == ["27B + DFlash2 @3 + int8 prefill"]
+    assert all(a.kv_int8 is False and a.config.kv_int8 is False for a in arms)
     assert [a.suite_key[-1] for a in arms] == [False]

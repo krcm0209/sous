@@ -133,6 +133,7 @@ def _suite(grades, seconds, seen):
                     greedy=arm.greedy,
                     attention_tile=arm.attention_tile,
                     projection_kernel=arm.projection_kernel,
+                    kv_int8=arm.kv_int8,
                     window=arm.window,
                     state="done",
                     outcome="completed",
@@ -504,6 +505,25 @@ def test_resume_skips_suite_runs_already_recorded(tmp_path, capsys):
     assert {r["kind"] for r in rows} == {"bench", "suite"}
 
 
+def test_resume_grades_every_suite_arm_again_after_kv_int8_was_flipped(tmp_path, capsys):
+    """kv_int8 changes attention numerics past the floor, so suite rows are
+    keyed by it: a resume after the flip pools none of the earlier rows with
+    the new ones and grades every arm from scratch."""
+    seen = []
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N), seen=seen)
+    assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 0
+    first = list(seen)
+    assert first and all(done == [] for _, done in first)
+    run_id = sorted(p.name for p in (tmp_path / "tune").iterdir())[-1]
+    seen.clear()
+    flipped = _cfg(tmp_path, kv_int8=False)
+    assert main(_args(quick=False, resume=run_id), config=flipped, **deps) == 0
+    assert seen == first
+    results = (tmp_path / "tune" / run_id / "results.jsonl").read_text().splitlines()
+    suite_rows = [r for r in map(json.loads, results) if r["kind"] == "suite"]
+    assert {r["kv_int8"] for r in suite_rows} == {True, False}
+
+
 def test_resume_retries_a_run_the_runner_recorded_as_an_error(tmp_path, capsys):
     """_error_run and the denier-failure relabel both leave a state="error"
     row in results.jsonl — a row is appended, never rewritten — so a stale
@@ -576,6 +596,7 @@ def test_a_stopped_suite_still_reports_the_runs_it_recorded(tmp_path, capsys):
             greedy=arm.greedy,
             attention_tile=arm.attention_tile,
             projection_kernel=arm.projection_kernel,
+            kv_int8=arm.kv_int8,
             window=arm.window,
             state="done",
             outcome="completed",
