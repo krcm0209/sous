@@ -1,7 +1,7 @@
 """kv8 on the real default model, greedy: drafter on against drafter off.
 
-Acceptance bars (manual, on the M5 Pro; about 19 minutes, 1117 s measured, most of it four model
-loads and five cold prefills of the ~57.5K-token prompt with the prompt cache off):
+Acceptance bars (manual, on the M5 Pro; about 25 minutes, 1512 s measured, most of it four model
+loads and seven cold prefills of the ~57.5K-token prompt with the prompt cache off):
 - With the tile active and the default 131072 window, an engine reports kv8 active, with its probe
   time printed, its floor at N8 and its ceiling the largest step boundary whose mirror fits
   beside the bf16 KV; the test skips, naming the reason, where kv8 cannot be active.
@@ -301,7 +301,8 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_kv8():
 
     # Memory, drafter off: the far prompt's decode steps with kv8 on against with it off, each
     # peak read from the first token on. Both hold the weights and the bf16 KV identically, so
-    # the difference is the mirror: its buffers at the capacity the first build allocates. The
+    # the difference is the mirror: its buffers at (within one 256-row step of) the capacity the
+    # first build allocates, which rounds up from the prompt length plus GROWTH. The
     # lower bound proves the instrument sees the mirror at all (a peak set before the mirror
     # existed, as in the prefill, would read 0). The upper one catches a slice update that
     # copied the buffer instead of writing in place, which would add at least one more

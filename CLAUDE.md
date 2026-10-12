@@ -662,8 +662,8 @@ goal.
   T)`) and the rebuild from row 0 of a mirror from another window are
   defences. A served call quantises `[n, min(offset, L))` once, so no row
   at or past `L` is ever written (`kv8.prepare(cache, t)`, before a
-  verify's run loop): the first build
-  writes the cap-sized buffers in one dispatch per layer, later calls
+  verify's run loop): the first build writes the cap-sized buffers in one
+  dispatch per layer, later calls
   slice-assign a row-sized output in place, and a growth (`GROWTH` = 4096
   rows, never past `round_up(L, 256)`) goes layer by layer, each new
   buffer evaluated before the old one is dropped. A row is served iff
