@@ -464,12 +464,16 @@ def test_compile_probe_keeps_the_error_line_and_logs_the_report(monkeypatch, cap
     with caplog.at_level("WARNING", logger="sous.engine.kv8"):
         reason = kv8._compile_probe()
     assert reason == "program_source:12:3: error: use of undeclared identifier 'x'"
-    assert "x = sg / 2;" in caplog.text
+    (record,) = [r for r in caplog.records if r.name == "sous.engine.kv8"]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        f"int8 K/V mirror: the kernels failed to build or run:\n{_COMPILER_ERROR}"
+    )
 
 
 def test_compile_probe_runs_the_quantiser_and_every_row_variant(monkeypatch):
     """Only success is remembered: a failure is probed again on the next call."""
-    rows, quantised, dtypes = [], [], set()
+    rows, quantised, dtypes, args = [], [], set(), set()
     quantize = kv8.quantize
 
     def counted(k, v, out_rows):
@@ -479,6 +483,7 @@ def test_compile_probe_runs_the_quantiser_and_every_row_variant(monkeypatch):
     def flaky(queries, codes, sc, n, chunk):
         rows.append(queries.shape[2])
         dtypes.add(queries.dtype)
+        args.add((n, chunk))
         if len(rows) == 1:
             raise RuntimeError("transient")
         return mx.zeros((1, queries.shape[2], HQ, D), dtype=mx.bfloat16)
@@ -492,6 +497,7 @@ def test_compile_probe_runs_the_quantiser_and_every_row_variant(monkeypatch):
     assert rows == [1, *range(1, tileattn.MAX_RUN + 1)]
     assert quantised == [(N0, N0 + 256, mx.bfloat16)] * 2
     assert dtypes == {mx.bfloat16}
+    assert args == {(N0, tileattn.chunk_for(N0, min(tileattn.MEASURED_SPLITS)))}
 
 
 # ---- the real kernel (needs the tensor units; skipped where they are absent) -----
