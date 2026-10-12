@@ -168,6 +168,49 @@ def test_the_projection_kernel_module_is_an_epoch_file():
     assert "projkernel.py" in forkstore._EPOCH_FILES
 
 
+def test_the_kv8_kernels_stay_out_of_the_engine_epoch(monkeypatch, tmp_path: Path):
+    """The int8 K/V mirror's kernels serve only inside a generation, whose
+    KV no fork keeps, so adding or editing them must leave every store
+    warm; the tile's kernel and the headers they share still count."""
+    src = tmp_path / "engine"
+    (src / "kernels").mkdir(parents=True)
+    for name in forkstore._EPOCH_FILES:
+        (src / name).write_text(f"# {name}\n")
+    (src / "kernels" / "attention_tile.metal").write_text("tile\n")
+    (src / "kernels" / "common.h").write_text("header\n")
+    monkeypatch.setattr(forkstore, "_ENGINE_SOURCES", src)
+    forkstore.engine_epoch.cache_clear()
+    without = engine_epoch()
+    for name in ("attention_tile_kv8.metal", "kv8_quant.metal"):
+        (src / "kernels" / name).write_text(f"// {name}\n")
+    forkstore.engine_epoch.cache_clear()
+    assert engine_epoch() == without
+    for name in ("attention_tile_kv8.metal", "kv8_quant.metal"):
+        (src / "kernels" / name).write_text(f"// {name} changed\n")
+    forkstore.engine_epoch.cache_clear()
+    assert engine_epoch() == without
+    (src / "kernels" / "common.h").write_text("header changed\n")
+    forkstore.engine_epoch.cache_clear()
+    changed = engine_epoch()
+    assert changed != without  # the shared header is compiled into the stored-KV kernels too
+    (src / "kernels" / "attention_tile.metal").write_text("tile changed\n")
+    forkstore.engine_epoch.cache_clear()
+    assert engine_epoch() != changed  # the tile's own kernel still writes stored KV
+    forkstore.engine_epoch.cache_clear()
+
+
+def test_the_kv8_exclusions_name_kernels_in_the_tree_and_kv8_is_no_epoch_file():
+    """An excluded name that no longer matches a file excludes nothing, and
+    the renamed kernel would cold-start every store on each later edit, so
+    each name must still be a kernel in the tree. kv8.py stays out of the
+    epoch files: nothing it serves is stored."""
+    kernels = forkstore._ENGINE_SOURCES.joinpath("kernels")
+    assert forkstore._EPOCH_EXCLUDED_KERNELS == ("attention_tile_kv8.metal", "kv8_quant.metal")
+    for name in forkstore._EPOCH_EXCLUDED_KERNELS:
+        assert kernels.joinpath(name).is_file(), name
+    assert "kv8.py" not in forkstore._EPOCH_FILES
+
+
 def test_weights_identity_is_the_snapshot_sha_for_a_hub_layout(tmp_path: Path):
     snap = tmp_path / "models--x" / "snapshots" / "73e3e38d981303bc594367cd910ea6eb48349da8"
     snap.mkdir(parents=True)
