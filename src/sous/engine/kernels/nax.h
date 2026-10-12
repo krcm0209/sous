@@ -1,7 +1,7 @@
 // Prepended after common.h for the tensor-op kernels only, the int8 GEMM and the
-// attention tile's split kernel: the Metal-4 tensor-op header needs macOS 26.2+, and
-// keeping it out of Stage A and the tile's reduce kernel lets those compile (and CI
-// test them) on any Metal GPU.
+// attention tile's and kv8's split kernels: the Metal-4 tensor-op header needs macOS
+// 26.2+, and keeping it out of Stage A, the tile's reduce kernel and kv8's quantiser
+// lets those compile (and CI test them) on any Metal GPU.
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
 // Mirror of mlx::steel::BaseNAXFrag::get_coord() (steel/gemm/nax.h, unchanged
