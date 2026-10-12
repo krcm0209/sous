@@ -262,6 +262,7 @@ def _default_factory(
     int8_prefill: bool = False,
     attention_tile: bool = False,
     projection_kernel: bool = False,
+    kv_int8: bool = False,
     fork_dir: Path | None = None,
     fork_budget: int | None = None,
 ) -> Engine:
@@ -325,13 +326,18 @@ def _default_factory(
             int8_prefill=int8_prefill,
             attention_tile=attention_tile,
             projection_kernel=projection_kernel,
+            kv_int8=kv_int8,
+            # In tokens, the window the reserve above is sized from: kv8's
+            # mirror must fit beside the turn's bf16 KV inside it. With no
+            # reserve measured there is no window to fit, and kv8 serves nothing.
+            kv_int8_window=reserve_tokens if bytes_per_token is not None else 0,
             fork_dir=fork_dir,
             fork_budget=fork_budget,
             weights_identity=weights,
         )
-    # The drafter settings, the attention tile and the projection kernel stop
-    # here: speculative decoding and both kernels' hooks are mlx-vlm paths,
-    # and the mlx-lm backend has no parameter for any of them.
+    # The drafter settings, the attention tile, the projection kernel and kv8
+    # stop here: speculative decoding and the kernels' hooks are mlx-vlm
+    # paths, and the mlx-lm backend has no parameter for any of them.
     from sous.engine import lm
 
     return lm.LMEngine(
@@ -377,6 +383,7 @@ def default_engine_factory(config: SousConfig, *, forks: bool = True) -> Callabl
         int8_prefill=config.int8_prefill,
         attention_tile=config.attention_tile,
         projection_kernel=config.projection_kernel,
+        kv_int8=config.kv_int8,
         fork_dir=fork_dir,
         fork_budget=fork_budget,
     )
@@ -430,6 +437,13 @@ class ManagedEngine:
         # reports whether the kernel serves this load, the LM backend reports
         # it off, and fakes have neither.
         return getattr(self._inner, "projection_kernel_status", None)
+
+    @property
+    def kv_int8_status(self) -> dict | None:
+        # Optional on purpose, like attention_tile_status: the VLM backend
+        # reports whether kv8 serves this load, the LM backend reports it
+        # off, and fakes have neither.
+        return getattr(self._inner, "kv_int8_status", None)
 
     @property
     def draft_block(self) -> int | None:

@@ -1324,6 +1324,116 @@ def test_default_factory_takes_a_direct_callers_block_as_an_explicit_block(monke
     assert seen["vlm"]["projection_kernel"] is False
 
 
+# ---- kv_int8 plumbing ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_engine_manager_threads_kv_int8_into_default_factory(monkeypatch, tmp_path, value):
+    import sous.engine.base as base
+
+    seen: dict[str, dict] = {}
+
+    def fake_default_factory(model_id, *args, **kwargs):
+        seen["kwargs"] = kwargs
+        return FakeEngine([])
+
+    monkeypatch.setattr(base, "_default_factory", fake_default_factory)
+    EngineManager(_cfg(tmp_path, kv_int8=value)).get()
+    assert seen["kwargs"]["kv_int8"] is value
+
+
+def test_default_factory_passes_kv_int8_and_its_window_to_the_vlm_engine_only(monkeypatch):
+    """The window kv8 sizes its ceiling from is the reserve's, in tokens: the
+    mirror must fit beside the turn's bf16 KV inside that reserve."""
+    from sous.engine import base, lm, vlm
+
+    seen: dict[str, dict] = {}
+
+    class RecordingVLM:
+        def __init__(self, model_id, **kwargs):
+            seen["vlm"] = kwargs
+
+    class RecordingLM:
+        def __init__(self, model_id, **kwargs):
+            seen["lm"] = kwargs
+
+    monkeypatch.setattr(vlm, "VLMEngine", RecordingVLM)
+    monkeypatch.setattr(lm, "LMEngine", RecordingLM)
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"vision_config": {}})
+    monkeypatch.setattr("sous.engine.window.kv_bytes_per_token", lambda cfg: 1024)
+    base._default_factory(
+        "m", 0.7, 0.8, 20, True, cache_budget=0, reserve_tokens=131072, kv_int8=True
+    )
+    assert seen["vlm"]["kv_int8"] is True
+    assert seen["vlm"]["kv_int8_window"] == 131072
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"model_type": "qwen3_5"})
+    base._default_factory(
+        "m", 0.7, 0.8, 20, True, cache_budget=0, reserve_tokens=131072, kv_int8=True
+    )
+    assert "kv_int8" not in seen["lm"]
+    assert "kv_int8_window" not in seen["lm"]
+
+
+def test_default_factory_leaves_kv_int8_off_for_a_direct_caller(monkeypatch):
+    """Scripts and tests that call the factory themselves keep the bf16
+    attention paths unless they ask, and without a window kv8 has no rows it
+    could serve."""
+    from sous.engine import base, vlm
+
+    seen: dict[str, dict] = {}
+
+    class RecordingVLM:
+        def __init__(self, model_id, **kwargs):
+            seen["vlm"] = kwargs
+
+    monkeypatch.setattr(vlm, "VLMEngine", RecordingVLM)
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"vision_config": {}})
+    monkeypatch.setattr("sous.engine.window.kv_bytes_per_token", lambda cfg: 1024)
+    base._default_factory("m", 0.7, 0.8, 20, True, cache_budget=0)
+    assert seen["vlm"]["kv_int8"] is False
+    assert seen["vlm"]["kv_int8_window"] == 0
+
+
+def test_default_factory_passes_no_window_when_the_reserve_cannot_be_measured(monkeypatch):
+    """With no bytes-per-token figure the factory reserves nothing, so there
+    is no window for the mirror to fit beside: kv8 gets a window of 0 and
+    serves nothing, rather than a ceiling sized against a reserve that does
+    not exist."""
+    import pytest
+
+    from sous.engine import base, vlm
+
+    seen: dict[str, dict] = {}
+
+    class RecordingVLM:
+        def __init__(self, model_id, **kwargs):
+            seen["vlm"] = kwargs
+
+    monkeypatch.setattr(vlm, "VLMEngine", RecordingVLM)
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"vision_config": {}})
+    monkeypatch.setattr("sous.engine.window.kv_bytes_per_token", lambda cfg: None)
+    with pytest.warns(UserWarning, match="KV cost per token unknown"):
+        base._default_factory(
+            "m", 0.7, 0.8, 20, True, cache_budget=0, reserve_tokens=131072, kv_int8=True
+        )
+    assert seen["vlm"]["kv_int8"] is True
+    assert seen["vlm"]["kv_int8_window"] == 0
+
+
+def test_managed_engine_passes_the_kv_int8_status_through():
+    inner = FakeEngine([])
+    assert ManagedEngine(inner).kv_int8_status is None, "fakes without the attribute stay silent"
+    status = {
+        "state": "active",
+        "reason": None,
+        "probe_seconds": 0.12,
+        "floor": 1536,
+        "ceiling": 81920,
+    }
+    inner.kv_int8_status = status  # ty: ignore[unresolved-attribute]
+    assert ManagedEngine(inner).kv_int8_status is status
+
+
 def test_status_carries_the_int8_prefill_view_when_the_engine_reports_one(tmp_path):
     inner = FakeEngine([])
     manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
@@ -1552,6 +1662,21 @@ def test_lm_engine_reports_the_projection_kernel_off(monkeypatch):
     assert engine.projection_kernel_status == {"state": "off", "reason": None}
 
 
+def test_lm_engine_reports_kv_int8_off(monkeypatch):
+    from sous.engine.lm import LMEngine
+
+    _stub(monkeypatch, "mlx_lm", load=lambda model_id: (object(), _RecordingTokenizer()))
+    _stub(monkeypatch, "mlx_lm.sample_utils", make_sampler=lambda **kw: None)
+    engine = LMEngine("test/model", cache_budget=0)
+    assert engine.kv_int8_status == {
+        "state": "off",
+        "reason": None,
+        "probe_seconds": None,
+        "floor": None,
+        "ceiling": None,
+    }
+
+
 def _drafted_vlm(monkeypatch, proj_state: str, tile_state: str = "off", **kwargs):
     """A VLMEngine over stubs whose drafter loads, whose attention tile reports
     `tile_state` and whose projection kernel reports `proj_state`; returned
@@ -1649,6 +1774,125 @@ def test_vlm_engine_reports_no_draft_block_without_a_drafter(monkeypatch):
     assert engine.draft_block is None and engine._draft_block_size == 2
     # The constructor's default keeps the stock projections.
     assert engine.projection_kernel_status["state"] == "off"
+
+
+@pytest.mark.parametrize("drafter_loads", [True, False])
+def test_vlm_engine_enables_kv8_after_the_projection_kernel_and_before_the_store_and_budget(
+    monkeypatch, tmp_path, drafter_loads
+):
+    from sous.engine import base, draftctx, kv8, projkernel, tileattn, verifyattn, vlm
+
+    model = _positionless_model()
+    processor = types.SimpleNamespace(tokenizer=_RecordingTokenizer())
+    _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+
+    def load_drafter(m, draft_id):
+        if not drafter_loads:
+            raise RuntimeError("no such repo")
+        return types.SimpleNamespace(prefer_requested_block_size=False), "dflash"
+
+    monkeypatch.setattr(vlm, "_load_quantized_drafter", load_drafter)
+    order: list[str] = []
+    seen: dict[str, object] = {}
+    tile_status = {"state": "active", "reason": None, "splits": 20, "probe_seconds": 0.43}
+    kv8_status = {
+        "state": "active",
+        "reason": None,
+        "probe_seconds": 0.12,
+        "floor": 1536,
+        "ceiling": 81920,
+    }
+
+    def verify_enable(m, *, enabled):
+        return {"state": "active" if enabled else "off", "reason": None, "probe_seconds": None}
+
+    def proj_enable(m, *, enabled, drafter_kind, tile_status):
+        order.append("projection_kernel")
+        return {"state": "off", "reason": None, "probe_seconds": None}
+
+    def kv8_enable(m, *, enabled, tile_status, verify_status, window):
+        order.append("kv_int8")
+        seen.update(
+            model=m,
+            enabled=enabled,
+            tile_status=tile_status,
+            verify_status=verify_status,
+            window=window,
+        )
+        return kv8_status
+
+    def context_enable(m, d, kind):
+        order.append("draft_context")
+        return draftctx.OFF
+
+    class Store:
+        def __init__(self, *args):
+            order.append("fork_store")
+
+    def budget(reserve_bytes):
+        order.append("budget")
+        return 0
+
+    monkeypatch.setattr(verifyattn, "enable", verify_enable)
+    monkeypatch.setattr(
+        tileattn, "enable", lambda m, *, enabled, drafter_kind, verify_status: tile_status
+    )
+    monkeypatch.setattr(projkernel, "enable", proj_enable)
+    monkeypatch.setattr(kv8, "enable", kv8_enable)
+    monkeypatch.setattr(draftctx, "enable", context_enable)
+    monkeypatch.setattr(vlm, "ForkStore", Store)
+    monkeypatch.setattr(vlm.VLMEngine, "_fork_key_fields", lambda self, weights: {})
+    monkeypatch.setattr(base, "measure_cache_budget", budget)
+
+    def build() -> vlm.VLMEngine:
+        return vlm.VLMEngine(
+            "test/model",
+            draft_id="z-lab/drafter",
+            prompt_cache=True,
+            attention_tile=True,
+            kv_int8=True,
+            kv_int8_window=131072,
+            fork_dir=tmp_path / "forks",
+        )
+
+    if drafter_loads:
+        engine = build()
+    else:
+        with pytest.warns(UserWarning, match="speculative drafter"):
+            engine = build()
+    assert order == ["projection_kernel", "kv_int8", "draft_context", "fork_store", "budget"]
+    assert seen["model"] is model and seen["enabled"] is True
+    assert seen["tile_status"] is engine.attention_tile_status is tile_status
+    assert seen["verify_status"] is engine.verify_attention_status
+    assert engine.verify_attention_status["state"] == ("active" if drafter_loads else "off")
+    assert seen["window"] == 131072
+    assert engine.kv_int8_status is kv8_status
+
+
+def test_vlm_engine_built_directly_leaves_kv8_off(monkeypatch):
+    """Tests and scripts that build an engine themselves keep the bf16
+    attention paths: the constructor's default refuses before any gate."""
+    from sous.engine import kv8
+    from sous.engine.vlm import VLMEngine
+
+    _stub(
+        monkeypatch,
+        "mlx_vlm",
+        load=lambda model_id: (_positionless_model(), _RecordingTokenizer()),
+    )
+    _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
+    # Left raised by an imagined earlier load: enable() must clear it.
+    monkeypatch.setattr(kv8, "_active", 1)
+    engine = VLMEngine("test/model", cache_budget=0)
+    assert engine.kv_int8_status == {
+        "state": "off",
+        "reason": None,
+        "probe_seconds": None,
+        "floor": None,
+        "ceiling": None,
+    }
+    assert kv8._active == 0
 
 
 # ---- streaming deltas (endpoint) ---------------------------------------------
@@ -2325,6 +2569,7 @@ def test_default_engine_factory_maps_every_model_value_onto_the_backend(monkeypa
         int8_prefill=True,
         attention_tile=False,
         projection_kernel=False,
+        kv_int8=False,
         speculative_block_explicit=True,
     )
     base.default_engine_factory(cfg)("org/m")
@@ -2339,6 +2584,7 @@ def test_default_engine_factory_maps_every_model_value_onto_the_backend(monkeypa
         "int8_prefill": True,
         "attention_tile": False,
         "projection_kernel": False,
+        "kv_int8": False,
         "fork_dir": None,
         "fork_budget": None,
     }

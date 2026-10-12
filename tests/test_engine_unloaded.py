@@ -82,6 +82,16 @@ def test_lm_reset_prompt_cache_works_after_unload():
     assert engine.prompt_cache_stats()["hits"] == 0
 
 
+def test_lm_speculation_reports_kv8_off():
+    """No drafter and no int8 mirror on this backend: the turn line reads
+    kv8=off from it, as from a VLM decode that opened no window."""
+    from sous.engine.promptcache import Speculation
+
+    spec = _unloaded_lm().speculation()
+    assert spec == Speculation()
+    assert (spec.kv8, spec.kv8_rows) == ("off", 0)
+
+
 def test_vlm_reset_prompt_cache_works_after_unload():
     engine = _unloaded_vlm()
     engine.reset_prompt_cache()  # must not raise
@@ -104,22 +114,33 @@ def test_vlm_unload_turns_the_projection_kernel_off(monkeypatch):
     assert projkernel._active == 0
 
 
+def test_vlm_unload_turns_kv8_off(monkeypatch):
+    from sous.engine import kv8
+
+    monkeypatch.setattr(kv8, "_active", 1)
+    monkeypatch.setattr(kv8, "_window", kv8.Window(serial=7))
+    _unloaded_vlm().unload()
+    assert kv8._active == 0
+    assert kv8._window is None
+
+
 class _ContextThatFailsToClose:
     def close(self) -> None:
         raise RuntimeError("close failed")
 
 
 @pytest.mark.parametrize("failing", ["prompt cache", "draft context"])
-def test_vlm_unload_clears_the_tile_and_projection_kernel_before_anything_can_raise(
+def test_vlm_unload_clears_the_tile_projection_kernel_and_kv8_before_anything_can_raise(
     monkeypatch, failing
 ):
-    from sous.engine import projkernel, tileattn
+    from sous.engine import kv8, projkernel, tileattn
 
     def fails(*args, **kwargs):
         raise RuntimeError("reset failed")
 
     monkeypatch.setattr(tileattn, "_active_splits", 20)
     monkeypatch.setattr(projkernel, "_active", 1)
+    monkeypatch.setattr(kv8, "_active", 1)
     engine = _unloaded_vlm()
     if failing == "prompt cache":
         monkeypatch.setattr(engine, "reset_prompt_cache", fails)
@@ -129,6 +150,7 @@ def test_vlm_unload_clears_the_tile_and_projection_kernel_before_anything_can_ra
         engine.unload()
     assert tileattn._active_splits == 0
     assert projkernel._active == 0
+    assert kv8._active == 0
 
 
 def test_lm_headroom_never_raises_without_mlx(monkeypatch):

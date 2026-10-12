@@ -467,12 +467,18 @@ class Speculation:
     neither), and the positions of context its first draft saw. The counts
     are zero without a drafter, or when the call never drafted; the context
     is measured only while the engine seeds it, and reads zero otherwise
-    whatever the drafter saw."""
+    whatever the drafter saw.
+
+    `kv8` and `kv8_rows` are the int8 K/V mirror's word on the same call,
+    drafter or not: the state its serving window closed in (`idle`, `served`
+    or `capped`; `off` when no window opened) and the rows it quantised."""
 
     rounds: int = 0
     drafted: int = 0
     accepted: int = 0
     context: int = 0
+    kv8: str = "off"
+    kv8_rows: int = 0
 
 
 class CacheHooks(Protocol):

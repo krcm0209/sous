@@ -2206,3 +2206,196 @@ def test_enable_activates_the_real_kernels_on_the_tiny_model(monkeypatch):
     )
     assert status["state"] == "active", status
     assert (status["floor"], status["ceiling"]) == (kv8.N8, kv8.ceiling(_WINDOW, 20))
+
+
+# ---- the serving window inside VLMEngine.decode() ------------------------------
+
+
+def _dw_isolate(monkeypatch, *, active: int) -> None:
+    """kv8's module state as a fresh load leaves it, restored after the test:
+    the window, its serial and the counters a real open_window moves."""
+    from sous.engine import kv8
+
+    monkeypatch.setattr(kv8, "_active", active)
+    monkeypatch.setattr(kv8, "_window", None)
+    monkeypatch.setattr(kv8, "_serial", kv8._serial)
+    monkeypatch.setattr(kv8, "calls", dict.fromkeys(kv8.calls, 0))
+
+
+def _dw_engine():
+    """A VLMEngine holding only what decode() reads, built the way
+    tests/test_engine_positions.py builds one: no weights, no drafter, and
+    positions left to the model so the stub needs no rotary kwargs."""
+    import threading
+    import types
+
+    import pytest
+
+    pytest.importorskip("mlx.core")
+    from sous.engine import draftctx
+    from sous.engine.promptcache import PromptMemo, Speculation
+    from sous.engine.vlm import VLMEngine
+
+    engine = object.__new__(VLMEngine)
+    engine.model_id = "test/model"
+    engine._model = types.SimpleNamespace(  # ty: ignore[invalid-assignment]
+        config=types.SimpleNamespace(eos_token_id=0)
+    )
+    stopping = types.SimpleNamespace(reset=lambda eos: None)
+    engine._processor = types.SimpleNamespace(  # ty: ignore[invalid-assignment]
+        tokenizer=types.SimpleNamespace(stopping_criteria=stopping)
+    )
+    engine._sampler = object()
+    engine._positional = False
+    engine._memo = PromptMemo()
+    engine._tokenize_lock = threading.Lock()
+    engine._draft = None
+    engine._draft_kind = ""
+    engine._draft_block_size = 0
+    engine._draft_context = draftctx.OFF
+    engine._speculation = Speculation()
+    return engine
+
+
+def _dw_result(text: str):
+    """One stream_generate result: accepted text, never a draft row."""
+    import types
+
+    return types.SimpleNamespace(is_draft=False, text=text, generation_tokens=1, finish_reason=None)
+
+
+def test_decode_window_spans_the_generation_and_reports_its_state(monkeypatch):
+    import sys
+    import types
+
+    from sous.engine import kv8
+
+    _dw_isolate(monkeypatch, active=1)
+    seen: dict[str, object] = {}
+
+    def stream_generate(model, processor, prompt, **kwargs):
+        window = kv8._window
+        assert window is not None, "the window is open while the generation runs"
+        seen["force"] = window.force
+        seen["serving"] = kv8.serving_now()
+        # What the seams would record had they served two calls.
+        window.state = "served"
+        window.rows = 37
+        window.served = 2
+        yield _dw_result("ok")
+
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm", types.SimpleNamespace(stream_generate=stream_generate)
+    )
+    engine = _dw_engine()
+    cache = [types.SimpleNamespace(), types.SimpleNamespace()]
+    assert engine.decode(cache, [4, 5], 8) == "ok"
+    assert seen["serving"] is True
+    assert seen["force"] is False
+    assert kv8._window is None, "the window closes with the decode"
+    assert kv8.calls["windows"] == 1
+    spec = engine.speculation()
+    assert (spec.kv8, spec.kv8_rows) == ("served", 37)
+
+
+def test_decode_window_stays_shut_while_kv8_is_inactive(monkeypatch):
+    import sys
+    import types
+
+    from sous.engine import kv8
+
+    _dw_isolate(monkeypatch, active=0)
+    seen: dict[str, object] = {}
+
+    def stream_generate(model, processor, prompt, **kwargs):
+        seen["window"] = kv8._window
+        yield _dw_result("ok")
+
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm", types.SimpleNamespace(stream_generate=stream_generate)
+    )
+    engine = _dw_engine()
+    assert engine.decode([types.SimpleNamespace()], [4, 5], 8) == "ok"
+    assert seen["window"] is None
+    assert kv8.calls["windows"] == 0
+    spec = engine.speculation()
+    assert (spec.kv8, spec.kv8_rows) == ("off", 0)
+
+
+def test_decode_window_closes_on_an_exception_and_keeps_the_last_speculation(
+    monkeypatch,
+):
+    import sys
+    import types
+
+    import pytest
+
+    from sous.engine import kv8
+    from sous.engine.promptcache import Speculation
+
+    _dw_isolate(monkeypatch, active=1)
+
+    def failing(model, processor, prompt, **kwargs):
+        assert kv8._window is not None, "the window is open while the generation runs"
+        yield _dw_result("partial")
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(sys.modules, "mlx_vlm", types.SimpleNamespace(stream_generate=failing))
+    engine = _dw_engine()
+    previous = Speculation(rounds=3, drafted=6, accepted=4, context=9, kv8="served", kv8_rows=11)
+    engine._speculation = previous
+    cache = [types.SimpleNamespace()]
+    with pytest.raises(RuntimeError, match="boom"):
+        engine.decode(cache, [4, 5], 8)
+    assert kv8._window is None
+    assert engine.speculation() is previous, "the retry's decode supplies the next values"
+
+    # Nothing was left open for the next decode's open_window to trip on.
+    def fine(model, processor, prompt, **kwargs):
+        yield _dw_result("ok")
+
+    monkeypatch.setitem(sys.modules, "mlx_vlm", types.SimpleNamespace(stream_generate=fine))
+    assert engine.decode(cache, [4, 5], 8) == "ok"
+    assert kv8.calls["windows"] == 2
+    assert engine.speculation().kv8 == "idle"
+
+
+def test_decode_window_opens_inside_the_drafters_seed_and_closes_before_it_ends(monkeypatch):
+    import contextlib
+    import sys
+    import types
+
+    from sous.engine import kv8
+
+    _dw_isolate(monkeypatch, active=1)
+    order: list[object] = []
+    cache = [types.SimpleNamespace(), types.SimpleNamespace()]
+
+    @contextlib.contextmanager
+    def seed(tail):
+        order.append("seed")
+        yield
+        order.append("unseed")
+
+    def open_window(*, force=False):
+        order.append(("open", force))
+
+    def close_window(c):
+        order.append(("close", c is cache))
+        return ("capped", 5)
+
+    def stream_generate(model, processor, prompt, **kwargs):
+        order.append("generate")
+        yield _dw_result("ok")
+
+    monkeypatch.setattr(kv8, "open_window", open_window)
+    monkeypatch.setattr(kv8, "close_window", close_window)
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm", types.SimpleNamespace(stream_generate=stream_generate)
+    )
+    engine = _dw_engine()
+    engine._draft_context = types.SimpleNamespace(seed=seed, fed=lambda: 0)
+    assert engine.decode(cache, [4, 5], 8) == "ok"
+    assert order == ["seed", ("open", False), "generate", ("close", True), "unseed"]
+    spec = engine.speculation()
+    assert (spec.kv8, spec.kv8_rows) == ("capped", 5)
