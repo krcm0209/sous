@@ -88,7 +88,7 @@ example (wrapped here):
   cache=hit took=turn@82647 reused_tokens=82647 prefilled_tokens=1681 forks=0 evicted=1 pressure=0
   load_s=0.0 queue_s=2.5 engine_wait_s=0.0 tokenize_s=1.1 ttft_s=9.8 prefill_s=7.9 decode_s=196.6
   prefill_tps=212.8 decode_tps=14.7 draft_rounds=1104 drafted=2208 accepted=1782 draft_context=1688
-  seconds=207.4 tools=1b21cd75 system=9f8e7d6c
+  kv8=capped kv8_rows=84671 seconds=207.4 tools=1b21cd75 system=9f8e7d6c
 ```
 
 `id` is the response's message id (the same one in `message_start`, so the
@@ -147,7 +147,22 @@ measured only while the load line says `draft_context=active` and reads 0
 otherwise, whatever the drafter saw; the three counts are 0 when no
 drafter ran, and when it ran no round — one token asked for, or a stop on
 the first (with the prompt cache off the drafter sees the whole prompt,
-and they are logged the same way). `seconds` is the total, running
+and they are logged the same way). `kv8` says whether that decode's
+attention read the int8 copy of the context's K/V: `off` when no copy
+could be made (the load line does not say `kv_int8=active`), `idle` when
+the context stayed below the floor (`kv_int8_floor=`) for the whole
+decode, `served` when at least one decode or verify call read it, and
+`capped` when a call started at or past the ceiling (`kv_int8_ceiling=`)
+— from there every call of that decode ran on the bf16 attention tile,
+whether or not earlier calls were served, as the turn above did once its
+84,335-token prompt grew past a ceiling of 84,481. `kv8_rows` is how many
+rows the decode quantised into the copy: the whole context on its first
+served call, then each call's new rows, counting again the rows a
+rejected draft rolled back and a later call re-quantised; 0 when nothing
+was served. The first served call is the decode's own last prompt token,
+so the one-time build of the copy is timed into `ttft_s` and `decode_s`.
+Neither field touches prefill, the forks or the slots, which hold bf16
+K/V only. `seconds` is the total, running
 from the moment the turn takes the endpoint lock, so client-visible latency is
 `seconds` plus `queue_s`. On a miss the line adds `lcp=` (how many leading
 tokens the render shared with the closest resident slot), `lcp_region=`
@@ -213,7 +228,21 @@ a load the kernel cannot serve, every load whose attention tile is not
 `speculative_block_size`, or for an unset one 5 where the projection kernel
 is active, 4 where only the attention tile is and 3 elsewhere, 0 being the
 drafter's own policy; the status
-document's engine block carries it as `draft_block`). One
+document's engine block carries it as `draft_block`), then
+`kv_int8=active|unavailable|off` (whether decode's and speculative
+verify's attention read an int8 copy of the context's K/V, built inside
+each generation and dropped at its end, from `kv_int8_floor=` keys up to
+`kv_int8_ceiling=`, with those two and `kv_int8_probe_s=` when it does;
+the ceiling is the largest attention-tile step at which that copy still
+fits beside the turn's bf16 K/V in the `[model].max_context_tokens`
+reserve — about 84.5K keys at 131072 and 170K at 262144 — so the copy
+never takes memory from the prompt-cache slots; `off` means
+`[model].kv_int8 = false` or the mlx-lm backend, and `unavailable` a load
+it cannot serve, every load whose attention tile is not `active` included,
+since it rides on the tile, and a window too small to put the ceiling
+above the floor — the status document's engine block carries `kv_int8`
+with its state and reason, and the log splits INFO and `WARNING` the way
+it does for the tile). One
 more line names the Anthropic tool *types* a turn dropped, when any.
 Each forwarded request logs one line too: `upstream`, method, path, the
 model id when the body named one, the upstream's status, and seconds to
