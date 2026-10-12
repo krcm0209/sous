@@ -12,8 +12,9 @@ loads and five cold prefills of the ~57.5K-token prompt with the prompt cache of
   first two prompts and `capped` on the third, the same with the drafter on and off; the
   counters show decode and verify served from the mirror, trims followed, one window per
   decode, one cap per capped decode, and nothing declined or out of scope on the tile.
-- With the drafter off, the far prompt's decode peaks no higher than the bf16 KV of its final
-  keys, the mirror at its capacity, one layer's mirror buffer and 1 GiB beyond the loaded weights.
+- With the drafter off, the far prompt's decode peaks no more than the mirror at its capacity,
+  one layer's mirror buffer and 0.5 GiB above the same decode with kv8 off (the mirror is
+  written in place, not copied).
 - An engine with kv8 off, built after the kv8 engines unloaded, reproduces the output of one built
   before any kv8 engine ran in the process, reports `off` on every decode and makes no kv8 call.
 """
@@ -206,6 +207,18 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_kv8():
         assert far_end + SLACK < status["ceiling"], (far_end, status)
         peaks: dict = {}
         undrafted, plain_gauges, plain_counts, plain_tile = _generate(plain, prompts, peaks)
+        # After _generate, which has taken its counter deltas: the far prompt again with the
+        # flag clear, so decode() opens no window and the tile serves every row. Its output
+        # and gauges are discarded; only the peak is the witness's.
+        far_messages, far_caps, _ = prompts["far"]
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        kv8._active = 0
+        try:
+            plain.generate(far_messages, [], max(far_caps))
+        finally:
+            kv8._active = 1
+        peak_off = mx.get_peak_memory() - resident
 
     drafted, drafted_gauges, drafted_counts, drafted_tile = {}, {}, {}, {}
     with _engine(kv_int8=True, drafter=True) as engine:
@@ -271,21 +284,24 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_kv8():
         assert counts["decode_out"] == counts["verify_out"] == counts["verify_declined"] == 0
     assert not any(off_counts.values()), off_counts
 
-    # Memory, drafter off: the decode holds the bf16 KV, the mirror at its capacity and, while
-    # a growth swaps buffers, one layer's old one. A slice update that copied the buffer
-    # instead of writing in place would show up here as a multiple of the mirror's size.
+    # Memory, drafter off: the same far decode with kv8 on against with it off. Both hold the
+    # same prefill scratch and KVCache growth, so the difference is the mirror: its buffers at
+    # the capacity the first build allocates, and one layer's old one while a growth swaps
+    # buffers. An update that copied the buffer instead of writing in place would add at least
+    # one more mirror-sized buffer (about 1.9 GiB here), well past the half GiB of slack for
+    # scratch the two paths do not share.
     far = max(k for k in peaks if k[0] == "far")
-    peak, resident = peaks[far]
+    peak_on, resident = peaks[far]
     keys = targets["far"][0] + far[1] + SLACK
-    kv_bytes = FULL_LAYERS * KV_HEADS * HEAD_DIM * 2 * 2 * (math.ceil(keys / 256) * 256)
     mirror_cap = math.ceil((keys + kv8.GROWTH) / 256) * 256
-    layer_mirror = kv8.BYTES_PER_ROW_PER_HEAD * KV_HEADS * mirror_cap
-    bound = kv_bytes + FULL_LAYERS * layer_mirror + layer_mirror + (1 << 30)
+    mirror_bytes = kv8.BYTES_PER_ROW_PER_HEAD * KV_HEADS * FULL_LAYERS * mirror_cap
+    layer_mirror = mirror_bytes // FULL_LAYERS
+    bound = mirror_bytes + layer_mirror + (1 << 29)
     print(
         f"kv8 peak above the {resident / 2**30:.2f} GiB resident weights, drafter off:"
         + "".join(f" {k[0]}/{k[1]} {v[0] / 2**30:.2f} GiB;" for k, v in peaks.items())
-        + f" far bound {bound / 2**30:.2f} GiB = KV {kv_bytes / 2**30:.2f}"
-        f" + mirror {FULL_LAYERS * layer_mirror / 2**30:.2f}"
-        f" + layer {layer_mirror / 2**30:.2f} + 1.00"
+        + f" far with kv8 off {peak_off / 2**30:.2f} GiB;"
+        f" on - off {(peak_on - peak_off) / 2**30:.2f} GiB, bound {bound / 2**30:.2f} GiB"
+        f" = mirror {mirror_bytes / 2**30:.2f} + layer {layer_mirror / 2**30:.2f} + 0.50"
     )
-    assert peak <= bound, (peak, bound, kv_bytes, layer_mirror, keys)
+    assert peak_on - peak_off <= bound, (peak_on, peak_off, bound, mirror_bytes, keys)
