@@ -224,9 +224,11 @@ plain round `own` unless noted.
   in picks145 order kept). Targets: 18 values `t_i = 44,000 + (i + 0.5) × 2,000`. For each
   target in order, the nearest unused pool turn within ±2,000 tokens whose subagent and
   content key are not yet used; a target with none is skipped and stated; remaining slots
-  are filled from the nearest targets allowing a second turn per subagent. Descriptive
-  buckets are the sorted thirds. Task 1 also lists three reserve turns per third, in
-  order, for floor replacements. The list, each turn's `n`, predecessor and recorded
+  are filled from the nearest targets allowing a second turn per subagent, still within
+  ±2,000 of the target. Descriptive buckets are the sorted thirds. Task 1 also lists three
+  reserve turns per third, in order, for floor replacements: the unused pool turns nearest
+  to that third's six grid targets (A: 45–55K, B: 57–67K, C: 69–79K), ties by picks145
+  order. The list, each turn's `n`, predecessor and recorded
   length are written to `README.md` before any timing.
 - **Long pair (report-only):** from the full `replay-157.json` set (647 turns, 44K–229K; the
   #130 sweep log holds only usage, and its request bodies were built from a since-changed
