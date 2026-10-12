@@ -3047,3 +3047,115 @@ def test_status_carries_the_projection_kernel_and_the_draft_block(tmp_path):
     inner.drafter = "z-lab/drafter"  # ty: ignore[unresolved-attribute]
     inner.draft_block = 5  # ty: ignore[unresolved-attribute]
     assert manager.status()["draft_block"] == 5
+
+
+_KV8_ACTIVE = {
+    "state": "active",
+    "reason": None,
+    "probe_seconds": 1.84,
+    "floor": 1536,
+    "ceiling": 84481,
+}
+
+
+@pytest.mark.parametrize(
+    ("status", "tail"),
+    [
+        (
+            _KV8_ACTIVE,
+            " positions=engine kv_int8=active kv_int8_probe_s=1.84"
+            " kv_int8_floor=1536 kv_int8_ceiling=84481",
+        ),
+        (
+            {
+                "state": "unavailable",
+                "reason": "attention tile off",
+                "probe_seconds": None,
+                "floor": None,
+                "ceiling": None,
+            },
+            " positions=engine kv_int8=unavailable",
+        ),
+        (
+            {**_KV8_ACTIVE, "state": "unavailable", "reason": "probe: parity at n=1536"},
+            " positions=engine kv_int8=unavailable",
+        ),
+        (
+            {"state": "off", "reason": None, "probe_seconds": None, "floor": None, "ceiling": None},
+            " positions=engine kv_int8=off",
+        ),
+        (None, " model=fake/model positions=engine"),
+    ],
+)
+def test_get_logs_the_kv_int8_state(caplog, tmp_path, status, tail):
+    """The probe's time, the floor and the ceiling print only when kv8 is
+    active: an unavailable load serves no row, whatever its status still
+    holds from a probe that ran."""
+    import logging
+
+    def factory(model_id):
+        engine = _positional_factory(model_id)
+        if status is not None:
+            engine.kv_int8_status = status  # ty: ignore[unresolved-attribute]
+        return engine
+
+    mgr = EngineManager(_cfg(tmp_path), engine_factory=factory)
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert len(lines) == 1 and lines[0].endswith(tail), lines
+
+
+def test_get_logs_the_kv_int8_tokens_after_the_draft_block(caplog, tmp_path):
+    """kv8 enables after the block is pinned and rides on the tile, so its
+    tokens close the line: the tile's, the kernel's, the block, then kv8's."""
+    import logging
+
+    def factory(model_id):
+        engine = _positional_factory(model_id)
+        engine.attention_tile_status = {  # ty: ignore[unresolved-attribute]
+            "state": "active",
+            "reason": None,
+            "splits": 20,
+            "probe_seconds": 0.43,
+        }
+        engine.projection_kernel_status = {  # ty: ignore[unresolved-attribute]
+            "state": "active",
+            "reason": None,
+            "probe_seconds": 0.37,
+        }
+        engine.draft_block = 5  # ty: ignore[unresolved-attribute]
+        engine.kv_int8_status = _KV8_ACTIVE  # ty: ignore[unresolved-attribute]
+        return engine
+
+    mgr = EngineManager(_cfg(tmp_path), engine_factory=factory)
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    expected = (
+        " projection_kernel=active projection_kernel_probe_s=0.37 draft_block=5"
+        " kv_int8=active kv_int8_probe_s=1.84 kv_int8_floor=1536 kv_int8_ceiling=84481"
+    )
+    assert len(lines) == 1 and lines[0].endswith(expected), lines
+
+
+def test_status_carries_the_kv_int8_view_when_the_engine_reports_one(tmp_path):
+    """State and reason only, as for the tile and the kernel: the floor, the
+    ceiling and the probe's time are the load line's, said once per load."""
+    inner = FakeEngine([])
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    assert "kv_int8" not in manager.status(), "fakes without the attribute stay silent"
+    inner.kv_int8_status = _KV8_ACTIVE  # ty: ignore[unresolved-attribute]
+    assert manager.status()["kv_int8"] == {"state": "active", "reason": None}
+    inner.kv_int8_status = {  # ty: ignore[unresolved-attribute]
+        "state": "unavailable",
+        "reason": "window below the kv8 floor",
+        "probe_seconds": None,
+        "floor": None,
+        "ceiling": None,
+    }
+    assert manager.status()["kv_int8"] == {
+        "state": "unavailable",
+        "reason": "window below the kv8 floor",
+    }

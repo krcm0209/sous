@@ -765,6 +765,18 @@ class EngineManager:
         # attention tile is and 3 elsewhere.
         if engine.draft_block is not None:
             line += f" draft_block={engine.draft_block}"
+        kv8 = engine.kv_int8_status
+        if kv8 is not None:
+            line += f" kv_int8={kv8['state']}"
+            # The rows kv8 serves run from the floor up to the ceiling, and
+            # the ceiling follows [model].max_context_tokens, so the config
+            # alone cannot say where int8 attention stops.
+            if kv8["state"] == "active":
+                line += (
+                    f" kv_int8_probe_s={kv8['probe_seconds']}"
+                    f" kv_int8_floor={kv8['floor']}"
+                    f" kv_int8_ceiling={kv8['ceiling']}"
+                )
         _logger.info(line)
         return engine
 
@@ -1092,6 +1104,9 @@ class EngineManager:
                 # without one.
                 if self._engine.drafter is not None:
                     out["draft_block"] = self._engine.draft_block
+                kv8 = self._engine.kv_int8_status
+                if kv8 is not None:
+                    out["kv_int8"] = {"state": kv8["state"], "reason": kv8["reason"]}
                 # Which side supplies the rotary positions behind a warm
                 # cache: the load line says it once, this says it for as long
                 # as the model is resident.
