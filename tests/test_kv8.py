@@ -6,6 +6,7 @@ plain-mlx stand-in, and the `nax`-marked tests run the real kernel where kv8's o
 availability() passes.
 """
 
+import contextlib
 from importlib.resources import files
 
 import pytest
@@ -14,6 +15,7 @@ mx = pytest.importorskip("mlx.core")
 
 from sous.engine import int8prefill, kv8, nax, tileattn  # noqa: E402 — after the guard
 from tests import kv8_fixtures as kfx  # noqa: E402
+from tests import tile_fixtures as tfx  # noqa: E402
 
 N0 = tileattn.N0
 HQ, HKV, D = tileattn.HQ, tileattn.HKV, tileattn.D
@@ -1247,3 +1249,401 @@ def test_mirror_trim_past_the_offset_lowers_n_to_the_new_offset(monkeypatch):
         assert cache.trim(kv8.N8 + 100) == kv8.N8 + 9
         assert mirror.n == cache.offset == 0
     assert _mirror_counts_since(before)["mirror_trims"] == 2
+
+
+# ---- dispatch: the two seams route each row to stock, the tile or kv8 ---------------
+
+# The second and third tile step boundaries at S = 20: below the floor the tile
+# serves (from N0), from the floor to the ceiling kv8, from the ceiling the tile.
+DISPATCH_S = 20
+DISPATCH_FLOOR = 1921
+DISPATCH_CEIL = 2561
+# The counters the seams move in kv8.calls; the mirror's own counters belong to
+# the mirror's tests.
+_DISPATCH_KV8_KEYS = (
+    "decode_kv8",
+    "verify_kv8",
+    "verify_rows_kv8",
+    "verify_launches_kv8",
+    "windows_capped",
+)
+
+
+@pytest.fixture
+def dispatch_lines(monkeypatch):
+    """The tile's flag at S = 20 with the stand-in tile, kv8's stand-in kernel, the
+    floor at 1921 and the ceiling at 2561, all for this test only."""
+    assert tileattn.boundaries(DISPATCH_CEIL, DISPATCH_S) == [
+        tileattn.N0,
+        DISPATCH_FLOOR,
+        DISPATCH_CEIL,
+    ]
+    tfx.hooked(monkeypatch, splits=DISPATCH_S)
+    monkeypatch.setattr(kv8, "tile8", kfx.stand_in_tile8)
+    monkeypatch.setattr(kv8, "N8", DISPATCH_FLOOR)
+    kfx.ceiling(monkeypatch, DISPATCH_CEIL)
+
+
+@contextlib.contextmanager
+def _dispatch_open(monkeypatch, caches):
+    """An unforced serving window over `caches`, as VLMEngine.decode() opens one
+    around a generation, closed on the way out whatever the test asserted."""
+    monkeypatch.setattr(kv8, "_active", 1)
+    monkeypatch.setattr(kv8, "_window", None)
+    window = kv8.open_window()
+    try:
+        yield window
+    finally:
+        kv8.close_window(caches)
+
+
+def _dispatch_rows(t, *, seed):
+    k_key, v_key = mx.random.split(mx.random.key(seed))
+    shape = (1, tileattn.HKV, t, tileattn.D)
+    keys = mx.random.normal(shape, key=k_key).astype(mx.bfloat16)
+    values = mx.random.normal(shape, key=v_key).astype(mx.bfloat16)
+    return keys, values
+
+
+def _dispatch_cache(n, *, seed=0):
+    """A KVCache holding n random bf16 rows, appended in one update as a prefill
+    segment appends them."""
+    from mlx_vlm.models.cache import KVCache
+
+    cache = KVCache()
+    cache.update_and_fetch(*_dispatch_rows(n, seed=seed))
+    mx.eval(cache.keys, cache.values)
+    return cache
+
+
+def _dispatch_append(cache, t, *, seed):
+    """t more rows through update_and_fetch, as a forward's projections append
+    them; returns the K/V views the attention call receives."""
+    keys, values = cache.update_and_fetch(*_dispatch_rows(t, seed=seed))
+    mx.eval(keys, values)
+    return keys, values
+
+
+def _dispatch_queries(t, *, seed):
+    """[1, 24, T, 256] bf16 query rows, a transposed [1, T, 24, 256] pool as
+    q_norm and rope hand them over."""
+    pool = mx.random.normal((1, t, tileattn.HQ, tileattn.D), key=mx.random.key(seed))
+    pool = pool.astype(mx.bfloat16)
+    mx.eval(pool)
+    return pool.transpose(0, 2, 1, 3)
+
+
+def _dispatch_decode(cache, *, seed):
+    """One decode step: a row appended, then the decode hook's decision on it. An
+    output of None means the hook handed the call to mlx-vlm's own function."""
+    keys, values = _dispatch_append(cache, 1, seed=seed)
+    q = _dispatch_queries(1, seed=seed + 1)
+    call = {"cache": cache, "scale": tileattn.SCALE, "mask": None}
+    return q, keys, values, tileattn._serve_decode((q, keys, values), call)
+
+
+def _dispatch_snapshot():
+    return dict(tileattn.calls), dict(kv8.calls)
+
+
+def _dispatch_moved(before):
+    """(tileattn counters, kv8's seam counters) that moved since `before`, by how much."""
+    tile_before, kv8_before = before
+    tile = {k: n - tile_before[k] for k, n in tileattn.calls.items() if n != tile_before[k]}
+    ours = {
+        k: kv8.calls[k] - kv8_before[k] for k in _DISPATCH_KV8_KEYS if kv8.calls[k] != kv8_before[k]
+    }
+    return tile, ours
+
+
+def _dispatch_mirror(cache):
+    return getattr(cache, kv8.MIRROR_ATTR, None)
+
+
+def _dispatch_kv8_row(q, keys, values, m):
+    """The one-row kv8 call at key count m over the real quantiser's codes of keys
+    [0, m): what a row kv8 serves must equal bit for bit."""
+    codes, sc = kv8.quantize(keys[:, :, :m], values[:, :, :m], m)
+    chunk = tileattn.chunk_for(m, DISPATCH_S)
+    return kfx.stand_in_tile8(q, codes, sc, m, chunk).transpose(0, 2, 1, 3)
+
+
+def _dispatch_tile_row(q, keys, values, m):
+    """The one-row call at key count m without kv8: the tile from N0, stock below."""
+    return tileattn.decode(q, keys[:, :, :m], values[:, :, :m], DISPATCH_S)
+
+
+def _dispatch_assert_rows(out, q, keys, values, prefix, kv8_rows):
+    """Every verify row r equals its one-row call at prefix + r + 1 keys: kv8's for
+    the key counts in `kv8_rows`, the tile's or stock's for the rest."""
+    assert out.shape == (1, tileattn.HQ, q.shape[2], tileattn.D) and out.dtype == mx.bfloat16
+    for r in range(q.shape[2]):
+        m = prefix + r + 1
+        qr = q[:, :, r : r + 1]
+        if m in kv8_rows:
+            want = _dispatch_kv8_row(qr, keys, values, m)
+        else:
+            want = _dispatch_tile_row(qr, keys, values, m)
+        assert mx.array_equal(out[:, :, r : r + 1], want).item(), (prefix, r, m)
+
+
+@pytest.mark.parametrize(
+    ("n", "path"),
+    [
+        pytest.param(tileattn.N0 - 1, "stock", id="below N0"),
+        pytest.param(tileattn.N0, "tile", id="at N0"),
+        pytest.param(DISPATCH_FLOOR - 1, "tile", id="below the floor"),
+        pytest.param(DISPATCH_FLOOR, "kv8", id="at the floor"),
+        pytest.param(DISPATCH_CEIL - 1, "kv8", id="below the ceiling"),
+    ],
+)
+def test_dispatch_a_decode_takes_its_path_by_key_count(dispatch_lines, monkeypatch, n, path):
+    """Stock below N0, the tile from N0 to the floor, kv8 from the floor up to the
+    ceiling; only a kv8 call builds a mirror, and decode_tile counts only the
+    tile's own calls."""
+    cache = _dispatch_cache(n - 1)
+    with _dispatch_open(monkeypatch, [cache]) as window:
+        before = _dispatch_snapshot()
+        q, keys, values, out = _dispatch_decode(cache, seed=n)
+        assert keys.shape[2] == cache.offset == n
+        moved = _dispatch_moved(before)
+        if path == "stock":
+            assert out is None
+            assert moved == ({"decode_stock": 1}, {})
+        elif path == "tile":
+            assert mx.array_equal(out, _dispatch_tile_row(q, keys, values, n)).item()
+            assert moved == ({"decode_tile": 1}, {})
+        else:
+            assert mx.array_equal(out, _dispatch_kv8_row(q, keys, values, n)).item()
+            assert moved == ({}, {"decode_kv8": 1})
+            assert _dispatch_mirror(cache).n == n
+        assert (_dispatch_mirror(cache) is not None) == (path == "kv8")
+        assert window.state != "capped"
+
+
+def test_dispatch_a_decode_from_the_ceiling_caps_the_window_and_the_tile_serves_it(
+    dispatch_lines, monkeypatch
+):
+    """The first call at the ceiling drops the mirror and caps the window, counted
+    once; that call and every later one run on the tile."""
+    cache = _dispatch_cache(DISPATCH_FLOOR + 8)
+    with _dispatch_open(monkeypatch, [cache]) as window:
+        _dispatch_decode(cache, seed=31)
+        assert _dispatch_mirror(cache) is not None
+        _dispatch_append(cache, DISPATCH_CEIL - 1 - cache.offset, seed=32)
+        for n in (DISPATCH_CEIL, DISPATCH_CEIL + 1):
+            before = _dispatch_snapshot()
+            q, keys, values, out = _dispatch_decode(cache, seed=n)
+            assert keys.shape[2] == n
+            assert mx.array_equal(out, _dispatch_tile_row(q, keys, values, n)).item()
+            capped = {"windows_capped": 1} if n == DISPATCH_CEIL else {}
+            assert _dispatch_moved(before) == ({"decode_tile": 1}, capped)
+            assert window.state == "capped" and _dispatch_mirror(cache) is None
+
+
+@pytest.mark.parametrize(
+    ("prefix", "t", "want_tile", "want_kv8", "kv8_rows"),
+    [
+        pytest.param(
+            DISPATCH_FLOOR - 4,
+            8,
+            {
+                "verify_calls": 1,
+                "verify_t8": 1,
+                "verify_rows_tile": 3,
+                "verify_launches": 1,
+                "verify_straddles": 1,
+            },
+            {"verify_kv8": 1, "verify_rows_kv8": 5, "verify_launches_kv8": 1},
+            range(DISPATCH_FLOOR, DISPATCH_FLOOR + 5),
+            id="straddles the floor",
+        ),
+        pytest.param(
+            DISPATCH_FLOOR + 8,
+            12,
+            {"verify_calls": 1, "verify_t9_up": 1, "verify_straddles": 1},
+            {"verify_kv8": 1, "verify_rows_kv8": 12, "verify_launches_kv8": 2},
+            range(DISPATCH_FLOOR + 9, DISPATCH_FLOOR + 21),
+            id="two kv8 runs",
+        ),
+        pytest.param(
+            DISPATCH_CEIL - 4,
+            8,
+            {
+                "verify_calls": 1,
+                "verify_t8": 1,
+                "verify_rows_tile": 5,
+                "verify_launches": 1,
+                "verify_straddles": 1,
+            },
+            {"verify_kv8": 1, "verify_rows_kv8": 3, "verify_launches_kv8": 1},
+            range(DISPATCH_CEIL - 3, DISPATCH_CEIL),
+            id="straddles the ceiling",
+        ),
+        pytest.param(
+            tileattn.N0 - 4,
+            8,
+            {
+                "verify_calls": 1,
+                "verify_t8": 1,
+                "verify_rows_stock": 3,
+                "verify_rows_tile": 5,
+                "verify_launches": 1,
+                "verify_straddles": 1,
+            },
+            {},
+            range(0),
+            id="stock and tile only",
+        ),
+        pytest.param(
+            1700,
+            5,
+            {"verify_calls": 1, "verify_t5": 1, "verify_rows_tile": 5, "verify_launches": 1},
+            {},
+            range(0),
+            id="tile only",
+        ),
+    ],
+)
+def test_dispatch_a_verify_serves_each_run_by_its_first_row(
+    dispatch_lines, monkeypatch, prefix, t, want_tile, want_kv8, kv8_rows
+):
+    """Each run of verify_plan goes stock, to kv8 or to the tile by its first row's
+    key count; a call with no run in [floor, ceiling) builds no mirror, and a call
+    that straddles the ceiling serves its rows below it and keeps its mirror."""
+    cache = _dispatch_cache(prefix)
+    with _dispatch_open(monkeypatch, [cache]) as window:
+        keys, values = _dispatch_append(cache, t, seed=prefix)
+        q = _dispatch_queries(t, seed=prefix + 1)
+        before = _dispatch_snapshot()
+        out = tileattn.serve_verify(q, keys, values, DISPATCH_S, cache)
+        assert _dispatch_moved(before) == (want_tile, want_kv8)
+        _dispatch_assert_rows(out, q, keys, values, prefix, kv8_rows)
+        assert (_dispatch_mirror(cache) is not None) == bool(kv8_rows)
+        assert window.state != "capped"
+
+
+def test_dispatch_a_verify_whose_first_row_is_at_the_ceiling_caps_and_the_tile_serves_it(
+    dispatch_lines, monkeypatch
+):
+    """A mirror built earlier in the window is dropped by the first call that
+    starts at the ceiling, and that call runs on the tile."""
+    cache = _dispatch_cache(DISPATCH_FLOOR + 8)
+    with _dispatch_open(monkeypatch, [cache]) as window:
+        _dispatch_decode(cache, seed=41)
+        assert _dispatch_mirror(cache) is not None
+        _dispatch_append(cache, DISPATCH_CEIL - 1 - cache.offset, seed=42)
+        keys, values = _dispatch_append(cache, 5, seed=43)
+        q = _dispatch_queries(5, seed=44)
+        before = _dispatch_snapshot()
+        out = tileattn.serve_verify(q, keys, values, DISPATCH_S, cache)
+        assert _dispatch_moved(before) == (
+            {"verify_calls": 1, "verify_t5": 1, "verify_rows_tile": 5, "verify_launches": 1},
+            {"windows_capped": 1},
+        )
+        assert window.state == "capped" and _dispatch_mirror(cache) is None
+        _dispatch_assert_rows(out, q, keys, values, DISPATCH_CEIL - 1, range(0))
+
+
+@pytest.mark.parametrize(
+    ("prefix", "t", "rows"),
+    [
+        pytest.param(DISPATCH_FLOOR + 8, 12, DISPATCH_FLOOR + 20, id="two kv8 runs"),
+        pytest.param(DISPATCH_CEIL - 4, 8, DISPATCH_CEIL, id="straddles the ceiling"),
+    ],
+)
+def test_dispatch_a_verify_quantises_its_rows_once(dispatch_lines, monkeypatch, prefix, t, rows):
+    """One prepare per call however many runs read the mirror; the window's first
+    build covers the committed prefix and the call's rows up to the ceiling, never
+    past it."""
+    prepared, quantised = [], []
+    prepare, quantize = kv8.prepare, kv8.quantize
+
+    def counted_prepare(cache, count):
+        prepared.append(count)
+        return prepare(cache, count)
+
+    def counted_quantize(k, v, out_rows):
+        quantised.append(k.shape[2])
+        return quantize(k, v, out_rows)
+
+    monkeypatch.setattr(kv8, "prepare", counted_prepare)
+    monkeypatch.setattr(kv8, "quantize", counted_quantize)
+    cache = _dispatch_cache(prefix)
+    with _dispatch_open(monkeypatch, [cache]):
+        keys, values = _dispatch_append(cache, t, seed=prefix)
+        q = _dispatch_queries(t, seed=prefix + 1)
+        tileattn.serve_verify(q, keys, values, DISPATCH_S, cache)
+        assert prepared == [t]
+        assert sum(quantised) == rows
+        assert _dispatch_mirror(cache) is not None
+
+
+def test_dispatch_serves_nothing_without_a_window(dispatch_lines, monkeypatch):
+    """kv8 active but no decode running (a prefill, a load-time probe): both seams
+    behave exactly as the tile does alone and no mirror is built."""
+    monkeypatch.setattr(kv8, "_active", 1)
+    monkeypatch.setattr(kv8, "_window", None)
+    cache = _dispatch_cache(DISPATCH_FLOOR + 8)
+    before = _dispatch_snapshot()
+    q, keys, values, out = _dispatch_decode(cache, seed=51)
+    assert mx.array_equal(out, _dispatch_tile_row(q, keys, values, DISPATCH_FLOOR + 9)).item()
+    keys, values = _dispatch_append(cache, 5, seed=52)
+    q = _dispatch_queries(5, seed=53)
+    out = tileattn.serve_verify(q, keys, values, DISPATCH_S, cache)
+    _dispatch_assert_rows(out, q, keys, values, DISPATCH_FLOOR + 9, range(0))
+    assert _dispatch_moved(before) == (
+        {
+            "decode_tile": 1,
+            "verify_calls": 1,
+            "verify_t5": 1,
+            "verify_rows_tile": 5,
+            "verify_launches": 1,
+        },
+        {},
+    )
+    assert _dispatch_mirror(cache) is None
+
+
+def test_dispatch_with_the_floor_at_n0_kv8_takes_the_first_tile_step(dispatch_lines, monkeypatch):
+    """With the floor at N0, kv8 serves from N0 and the tile serves no decode below
+    the ceiling."""
+    kfx.small_floor(monkeypatch)
+    assert kv8.N8 == tileattn.N0
+    cache = _dispatch_cache(tileattn.N0 - 1)
+    with _dispatch_open(monkeypatch, [cache]):
+        before = _dispatch_snapshot()
+        q, keys, values, out = _dispatch_decode(cache, seed=61)
+        assert mx.array_equal(out, _dispatch_kv8_row(q, keys, values, tileattn.N0)).item()
+        assert _dispatch_moved(before) == ({}, {"decode_kv8": 1})
+
+
+def test_dispatch_the_verifier_hands_its_layer_cache_to_serve_verify(dispatch_lines, monkeypatch):
+    """Through mlx-vlm's exact verifier on the tiny model: each full-attention
+    layer's call reaches serve_verify with that layer's own KVCache, and kv8
+    serves its rows from a mirror on that cache."""
+    lm = tfx.tiny_language_model()
+    prefix = DISPATCH_FLOOR + 8
+    ids = mx.random.randint(0, tfx.VOCAB, (prefix + 3,), key=mx.random.key(7)).tolist()
+    cache = tfx.prefill_cache(lm, ids[:prefix])
+    full = [c for c, layer in zip(cache, lm.layers, strict=True) if not layer.is_linear]
+    assert len(full) == 2
+    tfx.verify_ready(monkeypatch, lm)
+    seen = []
+    serve_verify = tileattn.serve_verify
+
+    def recording(queries, keys, values, splits, layer_cache):
+        seen.append(layer_cache)
+        return serve_verify(queries, keys, values, splits, layer_cache)
+
+    monkeypatch.setattr(tileattn, "serve_verify", recording)
+    with _dispatch_open(monkeypatch, full):
+        before = _dispatch_snapshot()
+        tfx.verify_forward(lm, cache, ids[prefix : prefix + 3])
+        assert [id(c) for c in seen] == [id(c) for c in full]
+        assert _dispatch_moved(before) == (
+            {"verify_calls": 2, "verify_t3": 2},
+            {"verify_kv8": 2, "verify_rows_kv8": 6, "verify_launches_kv8": 2},
+        )
+        assert all(_dispatch_mirror(c) is not None for c in full)
+    assert all(_dispatch_mirror(c) is None for c in full)
