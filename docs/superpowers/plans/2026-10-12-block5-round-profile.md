@@ -228,9 +228,10 @@ plain round `own` unless noted.
   buckets are the sorted thirds. Task 1 also lists three reserve turns per third, in
   order, for floor replacements. The list, each turn's `n`, predecessor and recorded
   length are written to `README.md` before any timing.
-- **Long pair (report-only):** two consecutive-turn pairs of the #130 sweep conversation
-  (`~/sous130-ctxsweep/turns.jsonl`), the turns nearest 128K and 190K rendered tokens with
-  their predecessors.
+- **Long pair (report-only):** from the full `replay-157.json` set (647 turns, 44K–229K; the
+  #130 sweep log holds only usage, and its request bodies were built from a since-changed
+  tree), the eligible turns nearest 128K and 190K rendered tokens whose ids extend their
+  predecessor, each with that predecessor.
 - **Keep-warm turn:** the first profile-set turn in picks145 order whose k−1 → k delta is
   1,000–4,000 tokens.
 - **Greedy check (report-only):** the first turn of each third at temperature 0.
@@ -522,8 +523,8 @@ memory file records the findings the same day.
 
 **Interfaces:**
 - Produces: `pins.PINNED` and `pins.check()` (raises `SystemExit` naming the first drifted
-  function); `turns.txt` (18 lines `third basename@index n_k n_{k-1} recorded_out`),
-  `reserve.txt`, `long.txt` (`sweep:<line k-1>`, `sweep:<line k>` pairs), `warm.txt`.
+  function); `turns.txt` (18 lines `third basename@index n_k n_{k-1} recorded_out target
+  key`), `reserve.txt`, `long.txt` (two `basename@index n_k n_{k-1}` lines), `warm.txt`.
 
 - [ ] **Step 1: Copy the reference scripts**
 
@@ -656,8 +657,8 @@ third (the next nearest unused pool turns). Expected: 18 picks (any skipped targ
 any second-per-subagent fill stated in README); `prev` present for every pick that is not
 a subagent's first turn. Spot-check `usage.output_tokens` against one long answer's text.
 If `gate157` exposes no `parse_picks`, parse as it does (`base@i,j`, `base:cap`, bare
-base). Then write `turns.txt`, `reserve.txt`, `long.txt` (the two sweep pairs by line
-number in `turns.jsonl`) and `warm.txt` (the keep-warm turn and its predecessor).
+base). Then write `turns.txt`, `reserve.txt`, `long.txt` (the two long turns, whose
+predecessors the driver derives as index − 1) and `warm.txt` (the keep-warm turn).
 
 ## Task 2: The stage-timer shim `prof.py`
 
@@ -1168,8 +1169,7 @@ The reviewer checks every bucket sum against section 3.2's table, the exclusions
   daemon, no fork `rmtree`), `GATE_MODES` (the timed-post mode sequence; the driver posts
   k−1, then k as `plain`, then k once per listed mode, writing `PROF_MODE_FILE` before each
   post), `GATE_SLEEP` (seconds slept before each timed post), `GATE_NOPOLL` (no `MemPoll`),
-  `GATE_XT=<seconds>` with `GATE_XT_LAUNCH=1` for the launch branch, `--turns-jsonl` and
-  `sweep:<line>` picks, the repost loop (reads the rounds file; ≤ 2 extra posts per turn
+  `GATE_XT=<seconds>` with `GATE_XT_LAUNCH=1` for the launch branch, the repost loop (reads the rounds file; ≤ 2 extra posts per turn
   and mode while under the floor, per arm in D1), reserve substitution, `ttft_s` and the
   take from `/sous/status` per post, the `post` records' `took_class` and `canary_dev`,
   and a start-up self-check that names any missing file)
@@ -1195,7 +1195,6 @@ mkdir -p rounds logs traces
 TURNS=(${(f)"$(cut -d' ' -f2 turns.txt)"})          # zsh does not word-split $TURNS
 XT=(${(f)"$(awk 'NR==1||NR==7||NR==13{print $2}' turns.txt)"})
 LONG=(${(f)"$(cut -d' ' -f1 long.txt)"})
-SWEEP=(--turns-jsonl ~/sous130-ctxsweep/turns.jsonl)
 job() {  # job <label> <temp> <block> <drafter:on|off> <arms> <max_tokens> <modes> <picks...>
   local label=$1 temp=$2 block=$3 drafter=$4 arms=$5 toks=$6 modes=$7; shift 7
   local extra=(--model 'prompt_cache_gb = 24' --model 'idle_unload_minutes = 1440')
@@ -1207,11 +1206,11 @@ job() {  # job <label> <temp> <block> <drafter:on|off> <arms> <max_tokens> <mode
     $TREE/.venv/bin/python driver.py $label $TREE $temp $toks "${extra[@]}" "$@" > logs/$label.out 2>&1
   echo "$label exit=$?"
 }
-GATE_TOOLS_ONLY=1 job warmforks 0.7 5 on "" 1 plain "${TURNS[@]}" "${LONG[@]}" "${SWEEP[@]}" --picks-file warm.txt
+GATE_TOOLS_ONLY=1 job warmforks 0.7 5 on "" 1 plain "${TURNS[@]}" "${LONG[@]}" --picks-file warm.txt
 job on     0.7 6 on 5k,6k 512 plain,lazy,sync,syncfine,syncfine,sync,lazy,plain "${TURNS[@]}"
 job off    0.7 0 off ""   512 plain,sync,syncfine,syncfine,sync,plain           "${TURNS[@]}"
 GATE_XT=1500 PROF_MARKER=1 job xt 0.7 5 on "" 512 plain,lazy,sync,syncfine,plain "${XT[@]}"
-job long   0.7 5 on ""    256 plain,syncfine,syncfine,plain "${LONG[@]}" "${SWEEP[@]}"
+job long   0.7 5 on ""    256 plain,syncfine,syncfine,plain "${LONG[@]}"
 job greedy 0   5 on ""    512 plain,sync,plain "${XT[@]}"
 GATE_SLEEP=0,1,3,10,30,90,90,30,10,3,1,0 GATE_NOPOLL=1 GATE_XT=1200 PROF_MARKER=1 PROF_CANARY=0 PROF_MICROBENCH=0 \
 job warm   0.7 5 on ""    128 plain,plain,plain,plain,plain,plain,plain,plain,plain,plain,plain,plain --picks-file warm.txt
