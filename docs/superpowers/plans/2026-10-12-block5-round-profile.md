@@ -143,7 +143,7 @@ measured in situ.
 | Bandwidth constant used below | 260 GB/s (the tile's measured rate; weights use 270 where the prior did) | #132 |
 | Turn-slot semantics | an exact-match repost is a miss (`reuse_length`); a turn slot is copied and left in place when `_make_room` can hold the copy, else moved; only the lowest boundary (the tools fork) is written to disk | `promptcache.py`, CLAUDE.md |
 | xctrace on the M5 over ssh | `--launch -- <python>` works: `metal-gpu-intervals` (1,063 rows for a 5 s loop; columns include start, duration, process, cmdbuffer-id, start-latency, state) and `gpu-performance-state-intervals` present; `gpu-shader-profiler-interval` empty; the "log archive is corrupt" error concerns os_log only. **`--attach` is untested.** | probe 2026-10-12, `/tmp/xt2.trace` on the M5 |
-| Production log | no organic `sous claude` use: 586 of 936 turns are the 2026-09-26 fan-out spike, the rest gates and smokes | daemon.log 2026-10-12 |
+| Production log | no organic `sous claude` use: 558 of the 691 served turns are the 2026-09-26 fan-out and cap-1 spike runs (all headless `claude -p`), the rest gates and smokes | daemon.log 2026-10-12, Task 7 |
 
 **The round** (mlx-vlm 0.7.2 `speculative/dflash.py:_dflash_rounds`, sous hooks in place):
 `_dflash_next_block_size` → draft (`DFlash2DraftModel.draft_block` or the inherited
