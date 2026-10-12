@@ -20,9 +20,11 @@ gives the same bits.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import logging
-from collections.abc import Callable
+import weakref
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from sous.engine import nax, tileattn
@@ -291,3 +293,341 @@ def availability() -> nax.Availability:
     if failed is not None:
         return nax.Availability(False, f"the int8 K/V kernels failed: {failed}")
     return nax.Availability(True)
+
+
+# --------------------------------------------------------------------------------
+# The serving window, the mirror and its trim wrap, the ceiling and the floor
+# --------------------------------------------------------------------------------
+
+# A mirror's capacity is a multiple of this many rows: the kernel's 16-byte
+# scale loads need each head plane of `sc` (cap x 4 bytes) to start 16-byte
+# aligned, and 256 is KVCache's own step.
+_CAP_STEP = 256
+# Set on the trim wrap, so a drop puts back only a trim this module installed.
+_TRIM_MARK = "_sous_kv8_trim"
+
+
+@dataclasses.dataclass
+class Window:
+    """One decode's serving window. `state` is "idle" until a call is served,
+    then "served", and "capped" once a call's first row is at or past the
+    ceiling, whether or not anything was served before it (`rows` may then be
+    0). `rows` counts the rows quantised in this window, `served` the calls
+    served from a mirror, `built` whether any mirror was built. `force` lifts
+    the ceiling: for the load-time probe and the tests only."""
+
+    serial: int
+    state: str = "idle"
+    rows: int = 0
+    served: int = 0
+    built: bool = False
+    force: bool = False
+
+
+@dataclasses.dataclass
+class Mirror:
+    """The int8 copy of one full-attention layer's committed K/V, kept on its
+    KVCache as MIRROR_ATTR. `codes` int8 [1, 4, cap, 512] holds each token's 256
+    K codes then its 256 V codes, `sc` fp16 [1, 4, cap, 2] its {sK, sV}; rows
+    [0, n) are valid and no read goes past n. `serial` is the window it was built
+    in. `original_trim` is the cache's own `trim` attribute from before the wrap,
+    or None when the class's method was in effect: dropping the mirror puts it
+    back."""
+
+    codes: Any
+    sc: Any
+    cap: int
+    n: int
+    serial: int
+    original_trim: Any
+
+
+# 1 only after enable() passed every gate and the probe: every enable() clears
+# it first, clear() clears it, and the probe raises it only while it runs. A
+# plain int, so nothing it holds outlives an unload.
+_active: int = 0
+# The ceiling L: kv8 serves only rows below it. enable() sets it from ceiling();
+# 0 serves nothing outside a forced window.
+_ceiling: int = 0
+# The open serving window, or None. One module global is enough: the engine's
+# generation lock serialises every forward, and every decode() runs on the
+# caller's session thread.
+_window: Window | None = None
+# The newest window's serial. Never reset, so a mirror an earlier window left on
+# a cache, an earlier load's included, is stale in every later window.
+_serial: int = 0
+# Per attention call or per window, not per turn: the tests read deltas, and so
+# can a harness that wraps the daemon. Nothing is logged per turn.
+calls: dict[str, int] = {
+    "decode_kv8": 0,  # one-row calls served from the mirror
+    "verify_kv8": 0,  # verify calls with at least one run served (the verify seam counts)
+    "verify_rows_kv8": 0,  # verify rows served from the mirror (the verify seam counts)
+    "verify_launches_kv8": 0,  # kv8 kernel runs of those calls (the verify seam counts)
+    "mirror_builds": 0,  # mirrors quantised from row 0
+    "mirror_rows": 0,  # rows quantised into a mirror, builds included
+    "mirror_trims": 0,  # KVCache.trim calls through the wrap
+    "mirror_grown": 0,  # capacity growths
+    "windows": 0,  # windows opened
+    "windows_capped": 0,  # windows that met a call at or past the ceiling
+}
+
+
+def _round_up(rows: int) -> int:
+    return -(-rows // _CAP_STEP) * _CAP_STEP
+
+
+def ceiling(window: int, splits: int) -> int:
+    """L for a `window`-token reserve at `splits` splits: the largest tile step
+    boundary b whose mirror fits beside the turn's bf16 KV at every instant,
+    else 0. With C = b rounded up to the capacity step, the rule is
+    1.504 C + 0.504 C / 16 + 272 <= window: the bf16 KV up to C and the mirror
+    at C (516 bytes per token per head against bf16's 1,024), one of the 16
+    full-attention layers' old mirror while a growth copies it, and the 16 rows
+    a straddling verify holds past L plus one capacity step. Being a step
+    boundary, L is a verify_plan cut, so no run straddles it."""
+    best = 0
+    for b in tileattn.boundaries(window, splits):
+        c = _round_up(b)
+        # The rule in thousandths, so a boundary on the margin is decided in exact
+        # integers (C // 16 is exact: C is a multiple of 256).
+        if 1504 * c + 504 * (c // 16) + 272_000 <= 1000 * window:
+            best = b
+    return best
+
+
+def _floor_reason(splits: int) -> str | None:
+    """Why N8 cannot be the floor at `splits` splits, or None. verify_plan cuts
+    at every step boundary, so a floor on one keeps every verify run wholly on
+    one side of it; a boundary at one S need not be one at another."""
+    if N8 in tileattn.boundaries(N8, splits):
+        return None
+    return f"floor {N8} keys is not a tile step boundary at {splits} splits"
+
+
+def open_window(*, force: bool = False) -> Window:
+    """Open one decode's serving window: until close_window(), serves() may
+    answer True and served calls build and read mirrors. `force` serves every
+    row from N8 whatever the ceiling."""
+    global _window, _serial
+    assert _window is None, "a kv8 serving window is already open"
+    _serial += 1
+    _window = Window(serial=_serial, force=force)
+    calls["windows"] += 1
+    return _window
+
+
+def close_window(cache: Sequence[Any]) -> tuple[str, int]:
+    """Close the window: drop every mirror and trim wrap in `cache` (the
+    decode's per-layer caches; layers without a mirror are passed over) and
+    return the window's state and the rows it quantised. When a mirror was
+    built, mlx's buffer cache is emptied: the mirrors' freed buffers would sit
+    there through the publish that follows the decode. With no window open
+    (clear() ran) the mirrors still go and the answer is ("off", 0): this runs
+    in a finally, where raising would mask the error in flight."""
+    global _window
+    window = _window
+    _window = None
+    for layer in cache:
+        _drop(layer)
+    if window is None:
+        return "off", 0
+    if window.built:
+        import mlx.core as mx
+
+        mx.clear_cache()
+    return window.state, window.rows
+
+
+def serving_now() -> bool:
+    """kv8 is active and a window is open that no call has capped."""
+    window = _window
+    return bool(_active) and window is not None and window.state != "capped"
+
+
+def serves(n_row: int) -> bool:
+    """Whether the row that sees n_row keys reads the mirror: N8 <= n_row < L in
+    an open, uncapped window (a forced one serves from N8 whatever L). A row's
+    path depends on its own key count alone, so a drafter-on and a drafter-off
+    decode of one request serve the same rows. The seams look this up through
+    the module on every call, so a harness may wrap it."""
+    window = _window
+    if not _active or window is None or window.state == "capped":
+        return False
+    return n_row >= N8 and (n_row < _ceiling or window.force)
+
+
+def observe_first_row(cache: Any, n_first: int) -> None:
+    """Both seams report an in-scope call's first row's key count here: the
+    verify seam for every call, before its runs, the decode seam for each call
+    it does not serve. At or past the ceiling the window caps, once, and this
+    layer's mirror goes (each layer's own call drops its own): the committed
+    prefix never shrinks inside a decode, so no later call of it could be
+    served. A forced window never caps."""
+    window = _window
+    if window is None or window.force or n_first < _ceiling:
+        return
+    if window.state != "capped":
+        window.state = "capped"
+        calls["windows_capped"] += 1
+    _drop(cache)
+
+
+def prepare(cache: Any, t: int) -> Mirror:
+    """`cache`'s mirror brought up to date for a served call that has just
+    appended t rows; once per served call, before any of its runs. Rows below
+    offset - t are the committed prefix, so n is clamped there, and then rows
+    [n, min(offset, L)) are quantised: no row at or past L is ever written. The
+    first served call of a window on this layer, or one meeting a mirror from
+    another window, builds it from row 0 instead; rows past the capacity grow
+    it first. `cache` is one layer's KVCache."""
+    window = _window
+    assert window is not None, "kv8.prepare outside a serving window"
+    offset = cache.offset
+    top = offset if window.force else min(offset, _ceiling)
+    window.served += 1
+    if window.state == "idle":
+        window.state = "served"
+    mirror = getattr(cache, MIRROR_ATTR, None)
+    if mirror is None or mirror.serial != window.serial:
+        return _build(cache, window, top)
+    # A defence: inside a window the trim wrap has already lowered n for every
+    # rollback.
+    mirror.n = min(mirror.n, offset - t)
+    if top > mirror.cap:
+        _grow(mirror, _capacity(offset, window))
+    start = mirror.n
+    if top > start:
+        codes, sc = quantize(
+            cache.keys[:, :, start:top, :], cache.values[:, :, start:top, :], top - start
+        )
+        # The Mirror holds the only reference to its buffers, so mlx donates them
+        # and both updates write in place.
+        mirror.codes[:, :, start:top, :] = codes
+        mirror.sc[:, :, start:top, :] = sc
+        mirror.n = top
+        _count_rows(window, top - start)
+    return mirror
+
+
+def _build(cache: Any, window: Window, top: int) -> Mirror:
+    """Rows [0, top) quantised in one dispatch straight into a fresh mirror at
+    the window's capacity (rows past top are left unwritten: no read reaches
+    them), and the cache's trim wrapped. A mirror from another window goes
+    first, but its wrap stays and serves the new one."""
+    attrs = vars(cache)
+    stale = attrs.pop(MIRROR_ATTR, None)
+    if stale is None:
+        original = attrs.get("trim")
+        object.__setattr__(cache, "trim", _wrap_trim(cache, original))
+    else:
+        original = stale.original_trim
+    # A stale mirror's buffers are freed before the new ones are allocated.
+    del stale
+    cap = _capacity(cache.offset, window)
+    codes, sc = quantize(cache.keys[:, :, :top, :], cache.values[:, :, :top, :], cap)
+    mirror = Mirror(
+        codes=codes, sc=sc, cap=cap, n=top, serial=window.serial, original_trim=original
+    )
+    object.__setattr__(cache, MIRROR_ATTR, mirror)
+    calls["mirror_builds"] += 1
+    window.built = True
+    _count_rows(window, top)
+    return mirror
+
+
+def _capacity(offset: int, window: Window) -> int:
+    """GROWTH rows of headroom past the offset, so a decode grows at most once
+    per GROWTH generated tokens, and never past L rounded up, the size
+    ceiling() priced (a forced window has no L)."""
+    cap = _round_up(offset + GROWTH)
+    return cap if window.force else min(cap, _round_up(_ceiling))
+
+
+def _grow(mirror: Mirror, cap: int) -> None:
+    """One layer's mirror widened to `cap` rows. The new buffers are evaluated
+    before the old ones are dropped, so the transient is this layer's old
+    buffer: left lazy, every layer's old buffer would live until the forward
+    is evaluated."""
+    import mlx.core as mx
+
+    extra = cap - mirror.cap
+    codes_tail = mx.zeros((1, tileattn.HKV, extra, 2 * tileattn.D), dtype=mx.int8)
+    sc_tail = mx.zeros((1, tileattn.HKV, extra, 2), dtype=mx.float16)
+    codes = mx.concatenate([mirror.codes, codes_tail], axis=2)
+    sc = mx.concatenate([mirror.sc, sc_tail], axis=2)
+    mx.eval(codes, sc)
+    mirror.codes, mirror.sc, mirror.cap = codes, sc, cap
+    calls["mirror_grown"] += 1
+
+
+def _count_rows(window: Window, rows: int) -> None:
+    calls["mirror_rows"] += rows
+    window.rows += rows
+
+
+def _wrap_trim(cache: Any, original: Any) -> Callable[[int], Any]:
+    """`cache`'s trim, then its mirror's n lowered to the new offset. Inside a
+    decode only KVCache.trim lowers an offset, and DFlash's commit and abort
+    both reach it as an instance call, so this wrap is what keeps a mirror
+    valid across rollbacks. `original` is the instance's own trim from before,
+    or None for the class's. The cache is held weakly: held strongly from its
+    own attribute, it would be a reference cycle whose K/V waits for the cycle
+    collector."""
+    ref = weakref.ref(cache)
+    method = type(cache).trim
+
+    def trim(n: int) -> Any:
+        target: Any = ref()
+        trimmed = method(target, n) if original is None else original(n)
+        mirror = getattr(target, MIRROR_ATTR, None)
+        if mirror is not None:
+            mirror.n = min(mirror.n, target.offset)
+        calls["mirror_trims"] += 1
+        return trimmed
+
+    setattr(trim, _TRIM_MARK, True)
+    return trim
+
+
+def _drop(cache: Any) -> None:
+    """`cache`'s mirror removed and the trim it wrapped put back. A cache
+    without one (a linear-attention layer's, or one never served) is passed
+    over, and a trim someone set over the wrap since is left alone."""
+    attrs = getattr(cache, "__dict__", None)
+    if attrs is None:
+        return
+    mirror = attrs.pop(MIRROR_ATTR, None)
+    if mirror is None or not getattr(attrs.get("trim"), _TRIM_MARK, False):
+        return
+    if mirror.original_trim is None:
+        del attrs["trim"]
+    else:
+        attrs["trim"] = mirror.original_trim
+
+
+def decode(queries: Any, cache: Any, splits: int) -> Any:
+    """A served one-row call: the mirror brought up to date with the call's own
+    row, then the kernel over all n = cache.offset keys, [1, 24, 1, 256] bf16."""
+    mirror = prepare(cache, 1)
+    calls["decode_kv8"] += 1
+    return decode_codes(queries, mirror.codes, mirror.sc, cache.offset, splits)
+
+
+def verify_run(queries: Any, mirror: Mirror, prefix: int, j: int, k: int, chunk: int) -> Any:
+    """One served run of a T-row verify call behind `prefix` keys: rows [j, k)
+    of `queries` [1, 24, T, 256], row r over keys [0, prefix + r], read from the
+    mirror prepare() returned for the call. Returns the contiguous
+    [1, k - j, 24, 256] a tile run returns, for the caller to concatenate along
+    axis 1. A launch only: the verify seam counts the call, its rows and its
+    launches."""
+    t = queries.shape[2]
+    rows = queries if (j, k) == (0, t) else queries[:, :, j:k, :]
+    return tile8(rows, mirror.codes, mirror.sc, prefix + k, chunk)
+
+
+def clear() -> None:
+    """Stop serving (VLMEngine.unload()): the flag and any open window go.
+    Mirrors live on caches that go with the engine, so nothing else is held."""
+    global _active, _window
+    _active = 0
+    _window = None

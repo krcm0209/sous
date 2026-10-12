@@ -5,6 +5,8 @@ skip marker.
 mlx is imported inside each helper, so importing this module needs only what
 `kv8.availability()` itself imports."""
 
+import contextlib
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 import pytest
@@ -162,3 +164,34 @@ def serving_codes(n: int, t: int, *, seed: int = 0) -> tuple[Any, Any, Any, Any,
     codes, sc = kv8.quantize(keys, values, cap)
     mx.eval(codes, sc)
     return queries, codes, sc, keys, values
+
+
+@contextlib.contextmanager
+def window(caches: Sequence[Any] = (), *, force: bool = True) -> Iterator[kv8.Window]:
+    """kv8 active and a serving window open for the with-block: forced (every
+    row from N8 served, whatever the ceiling) unless `force` is False, for a
+    cap test with ceiling() set. On the way out the window is closed, which
+    drops the mirrors and trim wraps on `caches`, unless the block closed it
+    itself, and the flag is put back."""
+    active = kv8._active
+    kv8._active = 1
+    opened = kv8.open_window(force=force)
+    try:
+        yield opened
+    finally:
+        if kv8._window is opened:
+            kv8.close_window(caches)
+        kv8._active = active
+
+
+def ceiling(monkeypatch: pytest.MonkeyPatch, L: int) -> None:
+    """kv8's ceiling at L keys for this test only, as enable() sets it from the
+    window: where an unforced window caps."""
+    monkeypatch.setattr(kv8, "_ceiling", L)
+
+
+def small_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """For this test only, kv8 serves from N0 and the probe's far mark is one the
+    stand-in reaches in seconds, whatever N8 and far mark the modules carry."""
+    monkeypatch.setattr(kv8, "N8", tileattn.N0)
+    monkeypatch.setattr(tileattn, "PROBE_FAR_KEYS", 3_000)
