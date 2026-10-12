@@ -764,7 +764,7 @@ def test_window_close_drops_every_mirror_and_wrap_and_reports_the_window(monkeyp
             kv8.prepare(cache, 1)
             assert getattr(vars(cache)["trim"], kv8._TRIM_MARK)
         assert (opened.state, opened.served, opened.built) == ("served", 2, True)
-        assert kv8.close_window(layers) == ("served", 2 * (kv8.N8 + 9))
+        assert kv8.close_window(layers) == ("served", kv8.N8 + 9)
     assert kv8._window is None and cleared == [True]
     before = dict(kv8.calls)
     for cache in kv:
@@ -1168,7 +1168,7 @@ def test_cap_a_call_at_the_ceiling_caps_once_and_drops_each_layers_mirror(monkey
         assert not kv8.serving_now() and not kv8.serves(kv8.N8 + 100)
         kv8.observe_first_row(second, 1925)
         assert _mirror_of(second) is None and "trim" not in vars(second)
-        assert kv8.close_window([first, second]) == ("capped", 2 * (kv8.N8 + 65))
+        assert kv8.close_window([first, second]) == ("capped", kv8.N8 + 65)
     counts = _mirror_counts_since(before)
     assert counts["windows_capped"] == 1 and counts["mirror_builds"] == 2
 

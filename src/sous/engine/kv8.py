@@ -318,7 +318,9 @@ class Window:
     ceiling, whether or not anything was served before it (`rows` may then be
     0). `rows` counts the rows quantised in this window, `served` the calls
     served from a mirror, `built` whether any mirror was built. `force` lifts
-    the ceiling: for the load-time probe and the tests only."""
+    the ceiling: for the load-time probe and the tests only. `layers` is the
+    number of mirrors built in this window: every full-attention layer builds
+    once, so `rows // layers` is the rows one layer quantised."""
 
     serial: int
     state: str = "idle"
@@ -326,6 +328,7 @@ class Window:
     served: int = 0
     built: bool = False
     force: bool = False
+    layers: int = 0
 
 
 @dataclasses.dataclass
@@ -423,7 +426,8 @@ def open_window(*, force: bool = False) -> Window:
 def close_window(cache: Sequence[Any]) -> tuple[str, int]:
     """Close the window: drop every mirror and trim wrap in `cache` (the
     decode's per-layer caches; layers without a mirror are passed over) and
-    return the window's state and the rows it quantised. When a mirror was
+    return the window's state and the rows it quantised per full-attention
+    layer (every layer quantises the same rows). When a mirror was
     built, mlx's buffer cache is emptied: the mirrors' freed buffers would sit
     there through the publish that follows the decode. With no window open
     (clear() ran) the mirrors still go and the answer is ("off", 0): this runs
@@ -439,7 +443,10 @@ def close_window(cache: Sequence[Any]) -> tuple[str, int]:
         import mlx.core as mx
 
         mx.clear_cache()
-    return window.state, window.rows
+    # Rows add up over the full-attention layers, which all quantise the same
+    # ones; the gauge is one layer's count. With nothing built (a window whose
+    # rows a test set directly) the raw count stands.
+    return window.state, window.rows // window.layers if window.layers else window.rows
 
 
 def serving_now() -> bool:
@@ -535,6 +542,7 @@ def _build(cache: Any, window: Window, top: int) -> Mirror:
     object.__setattr__(cache, MIRROR_ATTR, mirror)
     calls["mirror_builds"] += 1
     window.built = True
+    window.layers += 1
     _count_rows(window, top)
     return mirror
 

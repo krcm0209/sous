@@ -405,7 +405,8 @@ class PromptCacheStats:
     # What the int8 K/V mirror did in the same decode: "off" when no serving
     # window opened (kv8 not active for this load), "idle" when the context
     # stayed below the floor, "served" when kv8 served a call, "capped" when
-    # a call started at or past the ceiling; and the rows it quantised. A
+    # a call started at or past the ceiling; and the rows it quantised, per
+    # full-attention layer (every layer quantises the same rows). A
     # string gauge is assigned, never summed, like took_kind.
     kv8: str = "off"
     kv8_rows: int = 0

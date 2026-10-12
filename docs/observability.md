@@ -156,7 +156,8 @@ decode, `served` when at least one decode or verify call read it, and
 — from there every call of that decode ran on the bf16 attention tile,
 whether or not earlier calls were served, as the turn above did once its
 84,335-token prompt grew past a ceiling of 84,481. `kv8_rows` is how many
-rows the decode quantised into the copy: the whole context on its first
+rows the decode quantised into the copy, counted per layer (every
+full-attention layer quantises the same rows): the whole context on its first
 served call, then each call's new rows, counting again the rows a
 rejected draft rolled back and a later call re-quantised; 0 when nothing
 was served. The first served call is the decode's own last prompt token,

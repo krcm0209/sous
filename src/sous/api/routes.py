@@ -244,7 +244,8 @@ def _turn_summary(
         "accepted": result.accepted_tokens,
         "draft_context": result.draft_context,
         # Whether that decode read int8 K/V, and the rows it quantised for
-        # it: at long contexts decode_tps moves with this.
+        # it, per full-attention layer (every layer quantises the same rows):
+        # at long contexts decode_tps moves with this.
         "kv8": result.kv8,
         "kv8_rows": result.kv8_rows,
         "seconds": result.seconds,

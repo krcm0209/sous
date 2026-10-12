@@ -107,8 +107,9 @@ class TurnResult:
     accepted_tokens: int = 0
     draft_context: int = 0
     # Whether that decode read int8 K/V ("off", "idle", "served" or
-    # "capped") and the rows it quantised for it; "off" and 0 from an engine
-    # that never reports them.
+    # "capped") and the rows it quantised for it, per full-attention layer
+    # (every layer quantises the same rows); "off" and 0 from an engine that
+    # never reports them.
     kv8: str = "off"
     kv8_rows: int = 0
 
