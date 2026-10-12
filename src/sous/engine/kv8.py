@@ -789,9 +789,7 @@ def _distance(got: Any, want: Any) -> float:
 
     if not mx.all(mx.isfinite(got)).item():
         return float("inf")
-    g = got.astype(mx.float32)
-    w = want.astype(mx.float32)
-    return float(mx.sqrt(mx.mean((g - w) ** 2)) / mx.sqrt(mx.mean(w**2)))
+    return tileattn._rel_rms(got, want)
 
 
 def _rows(qpool: Any, start: int, t: int) -> Any:
@@ -1093,11 +1091,7 @@ def _probe_module(
     is never built."""
     import mlx.core as mx
 
-    language: Any = importlib.import_module(tileattn._DECODE_MODULE)
-    if not getattr(language.scaled_dot_product_attention, tileattn._HOOK_MARK, False):
-        language.scaled_dot_product_attention = tileattn._decode_wrapper(
-            language.scaled_dot_product_attention
-        )
+    tileattn.install_decode_hook()
     tileattn._active_splits = splits
     module = modules[0]
     hidden = module.o_proj.weight.shape[0]

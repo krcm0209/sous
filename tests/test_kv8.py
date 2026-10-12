@@ -469,15 +469,16 @@ def test_compile_probe_keeps_the_error_line_and_logs_the_report(monkeypatch, cap
 
 def test_compile_probe_runs_the_quantiser_and_every_row_variant(monkeypatch):
     """Only success is remembered: a failure is probed again on the next call."""
-    rows, quantised = [], []
+    rows, quantised, dtypes = [], [], set()
     quantize = kv8.quantize
 
     def counted(k, v, out_rows):
-        quantised.append((k.shape[2], out_rows))
+        quantised.append((k.shape[2], out_rows, k.dtype))
         return quantize(k, v, out_rows)
 
     def flaky(queries, codes, sc, n, chunk):
         rows.append(queries.shape[2])
+        dtypes.add(queries.dtype)
         if len(rows) == 1:
             raise RuntimeError("transient")
         return mx.zeros((1, queries.shape[2], HQ, D), dtype=mx.bfloat16)
@@ -489,7 +490,8 @@ def test_compile_probe_runs_the_quantiser_and_every_row_variant(monkeypatch):
     assert kv8._compile_probe() is None
     assert kv8._compile_probe() is None
     assert rows == [1, *range(1, tileattn.MAX_RUN + 1)]
-    assert quantised == [(N0, N0 + 256)] * 2
+    assert quantised == [(N0, N0 + 256, mx.bfloat16)] * 2
+    assert dtypes == {mx.bfloat16}
 
 
 # ---- the real kernel (needs the tensor units; skipped where they are absent) -----
@@ -649,7 +651,10 @@ def _mirror_fits(window, b):
     return 1.504 * c + 0.504 * c / 16 + 272 <= window
 
 
-@pytest.mark.parametrize(("window", "limit"), [(131072, 84481), (262144, 170241)])
+@pytest.mark.parametrize(
+    ("window", "limit"),
+    [(4096, 1921), (65536, 42241), (131072, 84481), (262144, 170241)],
+)
 def test_ceiling_is_the_last_step_boundary_whose_mirror_fits_beside_the_kv(window, limit):
     assert kv8.ceiling(window, _MIRROR_S) == limit
     bounds = tileattn.boundaries(window, _MIRROR_S)
@@ -660,6 +665,7 @@ def test_ceiling_is_the_last_step_boundary_whose_mirror_fits_beside_the_kv(windo
 def test_ceiling_is_zero_below_the_first_fitting_window():
     """N0 rounds up to a capacity of 1,536 rows, which needs a 2,631-token window."""
     assert kv8.ceiling(0, _MIRROR_S) == 0
+    assert kv8.ceiling(1535, _MIRROR_S) == 0
     assert kv8.ceiling(2630, _MIRROR_S) == 0
     assert kv8.ceiling(2631, _MIRROR_S) == tileattn.N0
 
@@ -1898,33 +1904,13 @@ def test_the_floor_is_a_step_boundary_at_every_measured_split():
         assert kv8.N8 in tileattn.boundaries(kv8.N8, splits), splits
 
 
-@pytest.mark.parametrize(
-    ("window", "limit"),
-    [
-        (0, 0),
-        (1535, 0),
-        (3000, 1536),
-        (4096, 1921),
-        (65_536, 42_241),
-        (131_072, 84_481),
-        (262_144, 170_241),
-    ],
-)
-def test_the_ceiling_is_the_last_step_boundary_whose_mirror_fits(window, limit):
-    assert kv8.ceiling(window, 20) == limit
-
-
 @pytest.mark.parametrize("splits", [10, 16, 20])
 @pytest.mark.parametrize("window", [4096, 32_768, 131_072, 262_144])
 def test_the_ceiling_fits_its_mirror_and_the_next_boundary_does_not(window, splits):
-    def fits(b: int) -> bool:
-        c = -(-b // 256) * 256
-        return 1.504 * c + 0.504 * c / 16 + 272 <= window
-
     limit = kv8.ceiling(window, splits)
     bounds = tileattn.boundaries(window + 32 * splits, splits)
-    assert limit in bounds and fits(limit)
-    assert not fits(bounds[bounds.index(limit) + 1])
+    assert limit in bounds and _mirror_fits(window, limit)
+    assert not _mirror_fits(window, bounds[bounds.index(limit) + 1])
 
 
 def test_the_kv8_pins_hold_on_the_locked_mlx_vlm():
@@ -1960,61 +1946,6 @@ def test_a_pinned_function_mlx_vlm_removed_counts_as_changed(monkeypatch):
     monkeypatch.delattr(KVCache, "prefix_cache_reserve")
     status = _refusal(tfx.tiny_language_model(), warned=True)
     assert status["reason"] == "mlx-vlm KVCache.prefix_cache_reserve changed"
-
-
-def test_compile_probe_runs_the_quantiser_and_every_row_count_once(monkeypatch):
-    _gate_state(monkeypatch)
-    monkeypatch.setattr(nax, "platform_reason", lambda: None)
-    monkeypatch.setattr(kv8, "_compile_ok", False)
-    seen: list = []
-    quantize = kv8.quantize
-
-    def spy_quantize(k, v, out_rows):
-        seen.append(("quantize", k.shape[2], out_rows, k.dtype))
-        return quantize(k, v, out_rows)
-
-    def spy_tile8(queries, codes, sc, n, chunk):
-        seen.append(("tile8", queries.shape[2], n, chunk, queries.dtype))
-        return kfx.stand_in_tile8(queries, codes, sc, n, chunk)
-
-    monkeypatch.setattr(kv8, "quantize", spy_quantize)
-    monkeypatch.setattr(kv8, "tile8", spy_tile8)
-    assert kv8.availability() == nax.Availability(True)
-    n0, chunk = tileattn.N0, tileattn.chunk_for(tileattn.N0, 20)
-    assert seen == [("quantize", n0, n0 + 256, mx.bfloat16)] + [
-        ("tile8", t, n0, chunk, mx.bfloat16) for t in range(1, tileattn.MAX_RUN + 1)
-    ]
-    assert kv8._compile_ok
-    seen.clear()
-    assert kv8.availability() == nax.Availability(True)
-    assert seen == []
-
-
-def test_availability_reports_the_error_line_and_remembers_only_success(monkeypatch, caplog):
-    _gate_state(monkeypatch)
-    monkeypatch.setattr(nax, "platform_reason", lambda: None)
-    monkeypatch.setattr(kv8, "_compile_ok", False)
-
-    def rejected(*args):
-        raise RuntimeError(_GATE_BUILD_ERROR)
-
-    monkeypatch.setattr(kv8, "tile8", rejected)
-    with caplog.at_level(logging.WARNING, logger="sous.engine.kv8"):
-        refused = kv8.availability()
-    assert refused == nax.Availability(
-        False, "the int8 K/V kernels failed: program_source:3:1: error: boom"
-    )
-    assert not kv8._compile_ok
-    # The reason keeps one line; the log keeps the compiler's whole report.
-    (record,) = [r for r in caplog.records if r.name == "sous.engine.kv8"]
-    assert record.levelno == logging.WARNING
-    assert record.getMessage() == (
-        f"int8 K/V mirror: the kernels failed to build or run:\n{_GATE_BUILD_ERROR}"
-    )
-    monkeypatch.setattr(kv8, "tile8", kfx.stand_in_tile8)
-    assert kv8.availability() == nax.Availability(True) and kv8._compile_ok
-    monkeypatch.setattr(kv8, "tile8", rejected)
-    assert kv8.availability() == nax.Availability(True)
 
 
 def test_enable_refuses_kernels_that_fail_to_build_with_the_error_line(monkeypatch):
