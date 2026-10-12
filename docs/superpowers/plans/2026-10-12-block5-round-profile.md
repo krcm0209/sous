@@ -351,14 +351,26 @@ tables: `metal-gpu-intervals` (rows filtered to the daemon's pid through the `pr
 cell's `fmt`) and `gpu-performance-state-intervals` (column mnemonics read from the
 export's schema; the parser fails if a column is missing).
 
-**Alignment by in-band marker.** The shim calibrates at install a matmul repeat count
-that runs ≈ 20 ms (recorded with its measured duration), then at each marker point runs
-three such bursts separated by 50 ms sleeps and records `perf_counter()` at each submit
-and return. The parser unions the pid's rows, splits them into bursts at gaps > 5 ms,
-matches three bursts of the recorded duration ±30 % with 40–60 ms gaps, fits the
-`perf_counter → trace time` offset from the three edges (spread < 2 ms, else it fails),
-and checks the end marker lands within 1 ms. Marker points: `begin_decode` and after the
-decode's last round (D3); after the last round only (D6).
+**Alignment by in-band marker** (`marker.py`; the details below were set by Task 3's
+probes on 2026-10-12, before D0). The shim calibrates at install a 4096² bf16 matmul
+repeat count (at least 2) whose burst runs ≈ 20 ms *when timed after a 50 ms sleep* (the
+GPU drops to its Minimum state within a 50 ms idle, so a back-to-back calibration would
+miss the window), then at each marker point waits for the GPU, sleeps 50 ms, runs three
+such bursts separated by 50 ms sleeps, sleeps 50 ms again, and records `perf_counter()`
+at each submit and return. The parser unions the pid's rows, splits them into bursts at
+gaps > 5 ms, matches three bursts of the recorded duration ±30 % whose trace gaps are
+within 5 ms of the host's recorded gaps (`submit[k+1] − done[k]`; a detached process's
+50 ms sleep measured 60 ms), fits every marker in the trace jointly (the offset most
+markers agree on within 1 ms is the reference; both clocks are mach time), and marks a
+post `aligned` only when all its markers agree with each other and with the reference
+within 1 ms. Marker points: `begin_decode` and after the decode's last round (D3); after
+the last round only (D6). Task 3's branch outcomes: `--attach` works (1,303 of 1,304 rows
+under the attached pid), so D3 gains two untraced plain posts per turn; the launch
+wrapper also delivers the environment and keeps the child's pid; the performance-state
+track is informative (Minimum → Medium → Maximum within ≈ 20 ms of load; no rows while
+idle) but device-wide and unfiltered by pid, so any D6 reading first checks that no other
+process has GPU rows inside the window. One `metal-gpu-intervals` row is one compute
+command buffer; `start-latency` is in ns; the process cell's `fmt` carries the pid.
 
 **Outputs per plain post:** per decode window (round 3's `t_start` to the last round's
 `t_end`) the GPU busy fraction, idle per round = `(1 − busy) × dt − mean measured gap`,
