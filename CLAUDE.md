@@ -380,7 +380,8 @@ goal.
   is the very call the method made, so nothing is appended twice. Verify
   rows arrive through verifyattn's wrapper, whose scope widens to every T
   from 1 while the flag is set. Inside a decode's serving window the rows
-  from `N8` up go to kv8 instead of the tile (`engine/kv8.py` bullet). The
+  from `N8` up to the ceiling `L` go to kv8 instead of the tile
+  (`engine/kv8.py` bullet). The
   flag `_active_splits` is a plain int, the active S or 0, never a model
   reference: the first statement of every
   `enable()` clears it, only an `active` result sets it, and
@@ -625,8 +626,8 @@ goal.
   verify row reads the same codes as the decode step at its key count:
   greedy parity with the drafter on or off holds as for the tile, while
   kv8 itself differs from the bf16 tile by the quantisation, not in the
-  last bits. The mirror exists only inside `VLMEngine.decode()`, which
-  calls `kv8.open_window()` inside the draft-context `seed` block
+  last bits. The mirror exists only inside `VLMEngine.decode()`, which,
+  when kv8 is active, calls `kv8.open_window()` inside the draft-context `seed` block
   immediately before `stream_generate` (so the one-row forward that ends
   the decode call's own prefill segment is covered) and
   `kv8.close_window(cache)` in that loop's `finally`: it drops every
@@ -660,7 +661,8 @@ goal.
   `n = min(n, offset)` after the original runs. The wrap is the
   mechanism; the clamp every served call runs first (`n = min(n, offset −
   T)`) and the rebuild from row 0 of a mirror from another window are
-  defences. A served call quantises `[n, offset)` once
+  defences. A served call quantises `[n, min(offset, L))` once (no row at
+  or past `L` is ever written)
   (`kv8.prepare(cache, t)`, before a verify's run loop): the first build
   writes the cap-sized buffers in one dispatch per layer, later calls
   slice-assign a row-sized output in place, and a growth (`GROWTH` = 4096
@@ -694,7 +696,7 @@ goal.
   no cycle. `enable()` runs after `projkernel.enable` (the tile's state is
   settled) and before the fork store and `measure_cache_budget` (the
   probe's arrays are released first); its first statement clears
-  `_active` and `_window`. It checks, in order: the config (`off`); the
+  `_active`, `_window` and `_ceiling`. It checks, in order: the config (`off`); the
   tile (`active`, else one INFO line and `unavailable` with the tile's
   reason or `attention tile off`); the source pins
   (`VALIDATED_KV8_SOURCES`: `KVCache.update_and_fetch`, `trim` and
@@ -708,7 +710,8 @@ goal.
   shared platform rule, then a compile and run of T = 1..8 and the
   quantiser, success remembered only); that `N8` is a step boundary for
   the active S; `L > N8` (else one INFO line); and the probe on the
-  `sous-model-load` thread. Pin drift, a compile or probe failure and any
+  `sous-model-load` thread. A floor that is not a step boundary, pin
+  drift, a compile or probe failure and any
   exception (logged with its traceback) are one `warnings.warn` plus
   `unavailable`. The probe proves the quantiser bitwise against the
   mlx-op reference on random, tie (power-of-two scale) and all-zero rows,
