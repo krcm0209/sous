@@ -384,7 +384,7 @@ the event whose [call, next call) window contains its start; a round is valid wh
 real-sync leaf eval received at least one interval. The summed interval duration is that
 eval's pure GPU time, and `host_eval − burst` its encode and sync overhead.
 
-### 3.4 In-process microbench (drafted daemon, at every turn end, session thread; never in D6)
+### 3.4 In-process microbench (drafted daemon, after each turn's last timed post, session thread; never in D6)
 
 48 independent copies of layer 1's real shapes with fresh random inputs of the real dtype
 (q, k `(1, T, 16, 128)` bf16; v `(1, T, 48, 128)` bf16; a, b `(1, T, 48)` bf16; `A_log`,
@@ -393,7 +393,9 @@ eval's pure GPU time, and `host_eval − burst` its encode and sync overhead.
 and, for the with-states variant, `state_steps=4` (three outputs, all evaluated). Per rep,
 the 48 calls are built and evaluated in **one** `mx.eval`; 20 interleaved reps per variant
 (T = 1, T = 5, T = 5 with states); `kernel_X = median(chain) − rt_us` of the same loop.
-L1's floor is `kernel_T1`; H3's store cost is `kernel_T5_states − kernel_T5`.
+L1's floor is `kernel_T1`; H3's store cost is `kernel_T5_states − kernel_T5`. The shim runs
+it only after a post whose mode string carries the `+microbench` suffix, which the driver
+writes before a turn's last timed post in D1; it never runs under `PROF_ALLOW_INACTIVE`.
 
 ### 3.5 Passes (daemons; one isolated HOME `~/sous-prof-home` shared by all; forks kept until the chain ends, then `rm -rf ~/sous-prof-home/.sous/forks`)
 
@@ -403,8 +405,8 @@ then the listed timed posts of k.
 | # | label | config | timed posts per turn (mode sequence) | turns | tokens | purpose |
 |---|---|---|---|---|---|---|
 | D0 | warmforks | production | one post per distinct tools hash among all turns below, `max_tokens 1`, untimed | ≈ 5–10 | 1 | write the tools forks to disk once |
-| D1 | on | drafter on, `speculative_block_size = 6`, shim lifts `SPECULATIVE_BLOCK_MAX` to 6, arms `5k,6k` drawn per round (seed 180) | plain, lazy, sync, syncfine, syncfine, sync, lazy, plain | 18 | 512 | H1–H3, H5–H7, H10; microbench |
-| D2 | off | drafter off (`speculative_draft_id = ""`) | plain, sync, syncfine, syncfine, sync, plain | 18 | 512 | T = 1 stage shares; step time |
+| D1 | on | drafter on, `speculative_block_size = 6`, shim lifts `SPECULATIVE_BLOCK_MAX` to 6, arms `5k,6k` drawn per round (seed 180) | plain, lazy, sync, syncfine, syncfine, sync, lazy, plain (the last carries `+microbench`) | 16 | 512 | H1–H3, H5–H7, H10; microbench |
+| D2 | off | drafter off (`speculative_draft_id = ""`) | plain, sync, syncfine, syncfine, sync, plain | 16 | 512 | T = 1 stage shares; step time |
 | D3 | xt | production (block 5, no arms), under xctrace | plain, lazy, sync, syncfine, plain (traced); with `--attach`, plus plain, plain untraced | 3 | 512 | H5 idle, per-eval overheads (3.6), threat 8 |
 | D4 | long | production | plain, syncfine, syncfine, plain | 2 | 256 | attention scaling (report-only) |
 | D5 | greedy | production, temperature 0 | plain, sync, plain | 3 | 512 | greedy verify path (report-only) |
