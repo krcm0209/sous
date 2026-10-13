@@ -1717,7 +1717,7 @@ def _drafted_vlm(monkeypatch, proj_state: str, tile_state: str = "off", **kwargs
     ("explicit", "tile_state", "proj_state", "block", "expected"),
     [
         # The kernel serves only where the tile does; the kernel's block wins.
-        (False, "active", "active", 3, 5),
+        (False, "active", "active", 3, 6),
         # Only the tile: the M5 Pro with the kernel switched off.
         (False, "active", "unavailable", 3, 4),
         (False, "active", "off", 3, 4),
@@ -1727,7 +1727,7 @@ def _drafted_vlm(monkeypatch, proj_state: str, tile_state: str = "off", **kwargs
         (False, "unavailable", "off", 3, 3),
         # The resolution does not lean on the block the config carried in.
         (False, "off", "off", 4, 3),
-        (False, "active", "active", 2, 5),
+        (False, "active", "active", 2, 6),
         # An explicit block, 0 included, always wins.
         (True, "active", "active", 3, 3),
         (True, "active", "active", 4, 4),

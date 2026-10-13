@@ -226,7 +226,7 @@ a load the kernel cannot serve, every load whose attention tile is not
 `projection_kernel` block carries the reason, and the log splits INFO and
 `WARNING` the way it does for the tile), and, whenever a drafter loaded,
 `draft_block=` (the verify block the engine pinned: the configured
-`speculative_block_size`, or for an unset one 5 where the projection kernel
+`speculative_block_size`, or for an unset one 6 where the projection kernel
 is active, 4 where only the attention tile is and 3 elsewhere, 0 being the
 drafter's own policy; the status
 document's engine block carries it as `draft_block`), then

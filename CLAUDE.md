@@ -567,7 +567,7 @@ goal.
   the kernel is blamed. Because the kernel makes a deeper block pay, an
   unset `[model].speculative_block_size` (`speculative_block_explicit`
   false) resolves in `VLMEngine.__init__`, when a drafter loaded and before
-  `_pin_block_size`, to `SPECULATIVE_BLOCK_KERNEL` = 5 where the kernel is
+  `_pin_block_size`, to `SPECULATIVE_BLOCK_KERNEL` = 6 where the kernel is
   `active`, else `SPECULATIVE_BLOCK_TILE` = 4 where the attention tile is
   (the M5 Pro with the kernel switched off, where #118 measured 4, or with
   a kernel that refused the load), else

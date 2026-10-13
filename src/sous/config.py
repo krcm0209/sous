@@ -78,10 +78,14 @@ SPECULATIVE_BLOCK_DEFAULT = 3
 # off (#118); 2 and 6 ran clearly slower, 5 level with 3.
 SPECULATIVE_BLOCK_TILE = 4
 # Where the projection kernel serves the load: its verify projections cost
-# about the same at 5 rows as at 4, so the deeper block's extra accepted
-# tokens come nearly free (1.10x block 4 without the kernel on the M5 Pro,
-# #148).
-SPECULATIVE_BLOCK_KERNEL = 5
+# about the same at 6 rows as at 4, so a deeper block's extra accepted
+# tokens come nearly free (block 5 ran 1.10x block 4 without the kernel on
+# the M5 Pro, #148). A sixth row paid only once the attention tile's
+# split-QK relay (#181) removed the step it cost the tile: block 6 ran
+# 0.997x block 5 before the relay (#157) and 1.049x on it (#181's rounds
+# gate, arms drawn per round over 127 distinct subagent turns at 44-88K,
+# 95% CI 1.018-1.083).
+SPECULATIVE_BLOCK_KERNEL = 6
 
 
 @dataclass(frozen=True)
@@ -115,7 +119,7 @@ class SousConfig:
     # the projection kernel serves the load, SPECULATIVE_BLOCK_TILE where only
     # the attention tile does, SPECULATIVE_BLOCK_DEFAULT everywhere else (the
     # field's own default, which is that last value). 0 hands the choice back
-    # to the drafter's adaptive policy. Above 5 is clamped
+    # to the drafter's adaptive policy. Above 6 is clamped
     # (SPECULATIVE_BLOCK_MAX).
     speculative_draft_id: str = "z-lab/Qwen3.8-27B-DFlash2"
     speculative_block_size: int = SPECULATIVE_BLOCK_DEFAULT
@@ -361,18 +365,20 @@ def _model_window(model: dict) -> int:
     return window
 
 
-# The largest verify block sous has validated in-tree. On the M5 Pro without
-# the projection kernel, a block-6 round cost twice a block-3 one and block 6
-# ran 0.8x block 3 on real subagent turns (#118); with the kernel, block 6 has
-# been measured only in an out-of-tree spike. Without the attention tile,
-# 6+ rows also leave mlx's fused vector-attention kernel (q_len x gqa <= 32:
-# 5 rows at the default model's gqa 6).
-SPECULATIVE_BLOCK_MAX = 5
+# The largest verify block sous has validated in-tree: 6, with the projection
+# kernel on the relay tile (SPECULATIVE_BLOCK_KERNEL). The clamp guards only
+# against blocks nothing has measured; an explicit 6 is honoured where it is
+# known to lose, since the intent is the user's: on the M5 Pro without the
+# kernel a block-6 round cost twice a block-3 one and block 6 ran 0.8x block 3
+# on real subagent turns (#118), and without the attention tile 6+ rows also
+# leave mlx's fused vector-attention kernel (q_len x gqa <= 32: 5 rows at the
+# default model's gqa 6).
+SPECULATIVE_BLOCK_MAX = 6
 
 
 def _speculative_block_size(model: dict) -> tuple[int, bool]:
     """Validated [model].speculative_block_size, and whether it was set: 0
-    (the drafter's own policy) or 2..5, degrading to the default with a
+    (the drafter's own policy) or 2..6, degrading to the default with a
     warning — same stance as the rest of the file. This one is a
     silent-truncation knob: mlx-vlm treats the value as the total verify-block
     size and ends its round loop when it is <= 1, so a configured 1 (or a

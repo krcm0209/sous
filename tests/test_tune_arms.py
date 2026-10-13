@@ -175,7 +175,7 @@ def test_a_configured_block_size_outside_the_curated_set_is_added(tmp_path):
         for a in arms
         if a.model_id == "mlx-community/Qwen3.8-27B-4bit" and a.drafter_id
     )
-    assert drafter_blocks == [2, 3, 4, 5]
+    assert drafter_blocks == [2, 3, 4, 5, 6]
 
 
 def test_a_table_model_gains_the_users_own_drafter(tmp_path):
@@ -432,7 +432,7 @@ def test_an_unset_block_resolves_to_the_kernels_where_the_static_check_passes(
     user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
     assert user.speculative_block_explicit is False
     resolved = resolve_block(user, _checkpoints())
-    assert resolved.speculative_block_size == SPECULATIVE_BLOCK_KERNEL == 5
+    assert resolved.speculative_block_size == SPECULATIVE_BLOCK_KERNEL == 6
     # Still unset: a proposal must never write the resolved block back.
     assert resolved.speculative_block_explicit is False
     assert asked == [(user, fx.qwen_27b(), "dflash")]
@@ -441,8 +441,8 @@ def test_an_unset_block_resolves_to_the_kernels_where_the_static_check_passes(
         resolved, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
     )
     current = [a for a in arms if a.current]
-    assert [(a.drafter_id, a.block_size) for a in current] == [("z-lab/Qwen3.8-27B-DFlash2", 5)]
-    assert current[0].label == "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @5"
+    assert [(a.drafter_id, a.block_size) for a in current] == [("z-lab/Qwen3.8-27B-DFlash2", 6)]
+    assert current[0].label == "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @6"
 
 
 def test_an_unset_block_resolves_to_the_tiles_where_only_the_tile_can_run(tmp_path, monkeypatch):
