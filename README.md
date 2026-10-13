@@ -69,8 +69,8 @@ What it will not do for you:
   before int8 prefill shipped on; [docs/configuration.md](docs/configuration.md)
   gives its gains). Scaled to the same memory bandwidth, its decode is
   within noise of what MTPLX, mlx-serve and mlx-dspark publish; Splash is
-  faster on the same weights, most at short context (see
-  [How it compares](#how-it-compares)).
+  faster on the same weights, by about 1.5x on real subagent turns measured
+  side by side (see [How it compares](#how-it-compares)).
 - **It runs one subagent at a time.** `sous claude` caps Claude Code at one
   subagent and one workflow agent at once, unless you set those caps
   yourself. Subagents served side by side evict each other's cached context:
@@ -159,17 +159,18 @@ Choose something else when:
   them with a placeholder.
 - **You want faster decode on Qwen:** Splash (in LM Studio, and since
   2026-10-12 as oMLX's external engine) is faster than sous with the same
-  weights and drafter. Its edge is largest at short context and on prompts
-  the drafter accepts well: it checks eight drafted tokens per step on
-  repacked weights in about 1.4 times the time of one plain step, where
-  sous's exact verifier makes five the practical limit. The one long-context
-  measurement published (an M4 Max, one growing conversation) shows that
-  edge shrinking: Splash fell from 78–81 tok/s at 3.5K tokens to 54.7 at 61K
-  and 33.3 at 230K, a 59 % drop, against sous's 15 % drop from 2K to 57K.
-  Scaled to the M5 Pro's bandwidth that is roughly 1.5x sous at short
-  context and 1.2–1.6x at the 44–88K tokens a subagent turn has, from
-  third-party runs with unstated prompts; no side-by-side on one machine
-  has been published. MTPLX and mlx-serve publish higher raw figures, on faster chips (M5 Max,
+  weights and drafter. Measured side by side on 2026-10-13 on this M5 Pro,
+  Splash 1.3.1 against sous at 6a835b5 on 68 replayed Claude Code subagent
+  turns of 44K–229K tokens, sampled as each ships: Splash decoded about 1.5x
+  as fast (1.54, 95 % turn-clustered interval 1.46–1.67; 1.59 under the
+  pre-registered window, which credits Splash's first batch), flat across
+  44K–77K of context and larger on short tool-call replies than on long
+  prose; cold time to first token was equal. Its edge is the verify: it
+  checks eight drafted tokens per step on repacked weights where sous's
+  exact verifier makes five the practical limit, and at these contexts both
+  engines slow with context at the same rate. Splash also keeps whole
+  conversation states on disk across restarts, where sous keeps only the
+  tool-block fork. MTPLX and mlx-serve publish higher raw figures, on faster chips (M5 Max,
   M4 Max) and, for mlx-serve, a short code prompt; mlx-dspark publishes
   about sous's figure on a slower M4 Pro, from one-line prompts. Scaled to
   the same bandwidth, all three come out near sous's. None has been
