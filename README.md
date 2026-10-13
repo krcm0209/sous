@@ -48,20 +48,29 @@ model: deciding what to delegate and reviewing what comes back.
 - **Tuned for your machine.** `sous tune` (about 15 minutes quick, about
   three hours in full) measures and grades candidate models on your Mac and
   proposes the configuration.
+- **Speed never changes the answer.** Every speed feature shipped behind a
+  pre-registered gate on real Claude Code subagent turns: greedy output with
+  the drafter equals output without it (68 of 68 turns, to 229K tokens), the
+  int8 copy of the context that decode reads moved the next-token
+  distribution by a mean KL of 0.0001 against the bf16 model, and `sous tune`
+  proposes only settings that cannot change what the model says. The numbers
+  are in the pull requests that shipped them.
 
 What it will not do for you:
 
-- **It is not fast.** The default model (Qwen3.8-27B, 4-bit, with a DFlash2
-  speculative drafter) decodes at about 31 tok/s with 2K tokens of context
-  and about 26.5 tok/s at 57K on an M5 Pro, sampling as shipped. It prefills
-  at about 480 tok/s on a 4K prompt and about 350 tok/s on a 61K one: a
-  subagent's first turn takes about three minutes when nothing is cached,
-  and 16 s from a fork (prefill figures measured before int8 prefill
-  shipped on; [docs/configuration.md](docs/configuration.md) gives its
-  gains). Its short-context decode speed, scaled to the same
-  memory bandwidth, is roughly what MTPLX, mlx-serve and mlx-dspark publish;
-  LM Studio's Splash engine is faster on an M5 Pro (see
-  [How it compares](#how-it-compares)).
+- **It is not the fastest Qwen engine.** The default model (Qwen3.8-27B,
+  4-bit, with a DFlash2 speculative drafter) decodes at about 31 tok/s with
+  2K tokens of context and about 26.5 tok/s at 57K on an M5 Pro, sampling as
+  shipped. Plain decode without the drafter runs at about 0.84 of the chip's
+  memory-bandwidth ceiling, so what is left is tokens accepted per step, not
+  kernel speed. It prefills at about 480 tok/s on a 4K prompt and about
+  350 tok/s on a 61K one: a subagent's first turn takes about three minutes
+  when nothing is cached, and 16 s from a fork (prefill figures measured
+  before int8 prefill shipped on; [docs/configuration.md](docs/configuration.md)
+  gives its gains). Scaled to the same memory bandwidth, its decode is
+  within noise of what MTPLX, mlx-serve and mlx-dspark publish; Splash is
+  faster on the same weights, by about 1.5x on real subagent turns measured
+  side by side (see [How it compares](#how-it-compares)).
 - **It runs one subagent at a time.** `sous claude` caps Claude Code at one
   subagent and one workflow agent at once, unless you set those caps
   yourself. Subagents served side by side evict each other's cached context:
@@ -92,12 +101,15 @@ What it will not do for you:
 ## How it compares
 
 Checked on 2026-09-25 against oMLX 0.7.0rc1, MTPLX 2.12.0, mlx-dspark 0.19.0,
-mlx-serve 26.9.5, claude-code-router 3.1.1, Ollama 0.34.4 and LM Studio 0.4.25.
+mlx-serve 26.9.5, claude-code-router 3.1.1, Ollama 0.34.4 and LM Studio 0.4.25;
+the Splash rows re-read on 2026-10-13, when oMLX merged Splash as an external
+engine in its own process and Splash 1.3 had started loading plain MLX
+checkpoints.
 
 | | Main loop runs on | Engine | Speculative decoding | Parallel requests | Prompt cache across sessions | Interface |
 |---|---|---|---|---|---|---|
 | **sous** | Claude, on your own login | MLX, one model | A draft model (DFlash2) | No, one turn at a time | Yes, at the end of the tool block; kept on disk | CLI, terminal UI |
-| [oMLX](https://github.com/jundot/omlx) | The local model | MLX, many models at once | A draft model or the model's MTP heads, opt-in | Yes, 8 by default | Yes, in 2K–4K-token blocks; kept on SSD (see below) | Menu-bar app, web dashboard, CLI |
+| [oMLX](https://github.com/jundot/omlx) | The local model | MLX, many models at once; Splash in its own process (since 2026-10-12) | A draft model or the model's MTP heads, opt-in | Yes, 8 by default | Yes, in 2K–4K-token blocks; kept on SSD (see below) | Menu-bar app, web dashboard, CLI |
 | [MTPLX](https://github.com/youssofal/MTPLX) | The local model | MLX, one model | The model's MTP heads, on its own model packs | Opt-in on the CLI; 4 for the app's Claude Code target | Yes, from the nearest saved checkpoint; kept on SSD | Mac app, CLI, web dashboard |
 | [mlx-dspark](https://github.com/ARahim3/mlx-dspark) | The local model | MLX, one model | Draft models (DSpark, DFlash), n-gram lookup | Opt-in | Yes, in memory (2 slots); lost on restart | Mac app, CLI |
 | [mlx-serve](https://github.com/ddalcu/mlx-serve) | The local model | MLX and llama.cpp, many models; no Python | The model's MTP heads, draft models, n-gram lookup | Opt-in | In memory, 2 GB by default; SSD opt-in | Menu-bar app, CLI, web console |
@@ -145,12 +157,20 @@ Choose something else when:
   four.
 - **You want images:** most of the engines above take them; sous replaces
   them with a placeholder.
-- **You want faster decode on Qwen:** LM Studio's Splash engine is faster
-  than sous on an M5 Pro with the same weights and drafter — by an
-  estimated 1.2–1.5x at short context and 1.2–1.4x at 51–57K. It drafts and
-  checks seven tokens per step in about 1.4 times the time sous takes for
-  one plain decode step, and it loses less speed as the context grows.
-  MTPLX and mlx-serve publish higher raw figures, on faster chips (M5 Max,
+- **You want faster decode on Qwen:** Splash (in LM Studio, and since
+  2026-10-12 as oMLX's external engine) is faster than sous with the same
+  weights and drafter. Measured side by side on 2026-10-13 on this M5 Pro,
+  Splash 1.3.1 against sous at 6a835b5 on 68 replayed Claude Code subagent
+  turns of 44K–229K tokens, sampled as each ships: Splash decoded about 1.5x
+  as fast (1.54, 95 % turn-clustered interval 1.46–1.67; 1.59 under the
+  pre-registered window, which credits Splash's first batch), flat across
+  44K–77K of context and larger on short tool-call replies than on long
+  prose; cold time to first token was equal. Its edge is the verify: it
+  checks eight drafted tokens per step on repacked weights where sous's
+  exact verifier makes five the practical limit, and at these contexts both
+  engines slow with context at the same rate. Splash also keeps whole
+  conversation states on disk across restarts, where sous keeps only the
+  tool-block fork. MTPLX and mlx-serve publish higher raw figures, on faster chips (M5 Max,
   M4 Max) and, for mlx-serve, a short code prompt; mlx-dspark publishes
   about sous's figure on a slower M4 Pro, from one-line prompts. Scaled to
   the same bandwidth, all three come out near sous's. None has been
@@ -387,6 +407,13 @@ Validated end to end on an M5 Pro / 64 GB with the default model
 - **Auto mode** (2026-09-14): with a `sous-local` subagent under Claude Code's
   auto mode, each classified action was one Sonnet 5 request through sous,
   1.2–1.8 s; reads and working-directory edits were approved without one.
+- **Int8 K/V mirror** (2026-10-13): on 64 real subagent turns of 44–88K
+  tokens, decode ran 1.077x [1.042, 1.114] with the mirror on against off in
+  same-hour ABBA order and 1.059x [1.036, 1.079] drawn per round; greedy
+  output with the drafter equalled output without it on 68 of 68 turns to
+  229K tokens; the next-token distribution moved by a mean KL of 0.0001
+  over 7,061 scored tokens; the tool-loop suite read within 0.004 of the
+  bf16 arm.
 
 ## Limitations
 
