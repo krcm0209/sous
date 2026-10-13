@@ -167,7 +167,7 @@ Choose something else when:
   44K–77K of context and larger on short tool-call replies than on long
   prose; cold time to first token was equal. Its edge is the verify: it
   checks eight drafted tokens per step on repacked weights where sous's
-  exact verifier makes five the practical limit, and at these contexts both
+  exact verifier makes six the practical limit, and at these contexts both
   engines slow with context at the same rate. Splash also keeps whole
   conversation states on disk across restarts, where sous keeps only the
   tool-block fork. MTPLX and mlx-serve publish higher raw figures, on faster chips (M5 Max,

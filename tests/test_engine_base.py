@@ -1728,12 +1728,15 @@ def _drafted_vlm(monkeypatch, proj_state: str, tile_state: str = "off", **kwargs
         # The resolution does not lean on the block the config carried in.
         (False, "off", "off", 4, 3),
         (False, "active", "active", 2, 6),
-        # An explicit block, 0 included, always wins.
+        # An explicit block, 0 included, always wins: the old kernel default
+        # carried explicitly over the kernel's 6, and 6 where no kernel runs.
         (True, "active", "active", 3, 3),
         (True, "active", "active", 4, 4),
+        (True, "active", "active", 5, 5),
         (True, "active", "off", 5, 5),
         (True, "active", "active", 0, 0),
         (True, "off", "off", 4, 4),
+        (True, "off", "off", 6, 6),
     ],
 )
 def test_vlm_engine_resolves_an_unset_draft_block_by_what_is_active(

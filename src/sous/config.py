@@ -80,11 +80,13 @@ SPECULATIVE_BLOCK_TILE = 4
 # Where the projection kernel serves the load: its verify projections cost
 # about the same at 6 rows as at 4, so a deeper block's extra accepted
 # tokens come nearly free (block 5 ran 1.10x block 4 without the kernel on
-# the M5 Pro, #148). A sixth row paid only once the attention tile's
-# split-QK relay (#181) removed the step it cost the tile: block 6 ran
-# 0.997x block 5 before the relay (#157) and 1.049x on it (#181's rounds
-# gate, arms drawn per round over 127 distinct subagent turns at 44-88K,
-# 95% CI 1.018-1.083).
+# the M5 Pro, #148). What a sixth row costs is its attention: block 6 ran
+# 0.997x block 5 on the attention tile before the split-QK relay (#157) and
+# 1.049x on the relay tile (#181's rounds gate, arms drawn per round over
+# 127 distinct subagent turns at 44-88K, 95% CI 1.018-1.083), measured
+# before the int8 K/V mirror, whose kernel pays a step of its own at six
+# rows (14.5 against 9.2 ms over 16 layers at 57K). The block is kept only
+# while it measures faster than 5 with everything on, by #157's rule.
 SPECULATIVE_BLOCK_KERNEL = 6
 
 
@@ -119,8 +121,8 @@ class SousConfig:
     # the projection kernel serves the load, SPECULATIVE_BLOCK_TILE where only
     # the attention tile does, SPECULATIVE_BLOCK_DEFAULT everywhere else (the
     # field's own default, which is that last value). 0 hands the choice back
-    # to the drafter's adaptive policy. Above 6 is clamped
-    # (SPECULATIVE_BLOCK_MAX).
+    # to the drafter's adaptive policy. Above SPECULATIVE_BLOCK_MAX it is
+    # clamped.
     speculative_draft_id: str = "z-lab/Qwen3.8-27B-DFlash2"
     speculative_block_size: int = SPECULATIVE_BLOCK_DEFAULT
     # Whether [model].speculative_block_size was set, a clamped value
@@ -147,9 +149,10 @@ class SousConfig:
     # kernel whose rows do not depend on how many rows or linears share the
     # call: every verify forward's and, so that greedy output stays the same
     # with the drafter on or off, every other target call of up to 8 rows,
-    # decode included. With it a 5-row verify round's projections cost about
-    # what 4 rows' do, which makes block 5 pay: 1.10x sampled decode over
-    # block 4 without the kernel on real subagent turns at 44-77K (M5 Pro).
+    # decode included. With it a deeper verify round's projections cost about
+    # what 4 rows' do, which makes a deeper block pay: block 5 ran 1.10x
+    # sampled decode over block 4 without the kernel on real subagent turns
+    # at 44-77K (M5 Pro).
     # One-row calls run on a one-row kernel with the same bits, so decode
     # without a drafter runs about as fast as with false (13.4 against 13.5
     # tok/s, M5 Pro, separate runs). Not bit-identical to
@@ -365,15 +368,15 @@ def _model_window(model: dict) -> int:
     return window
 
 
-# The largest verify block sous has validated in-tree: 6, with the projection
-# kernel on the relay tile (SPECULATIVE_BLOCK_KERNEL). The clamp guards only
-# against blocks nothing has measured; an explicit 6 is honoured where it is
-# known to lose, since the intent is the user's: on the M5 Pro without the
+# The largest verify block sous has validated in-tree, which is the
+# projection kernel's (SPECULATIVE_BLOCK_KERNEL). The clamp guards only
+# against blocks nothing has measured; an explicit value is honoured where it
+# is known to lose, since the intent is the user's: on the M5 Pro without the
 # kernel a block-6 round cost twice a block-3 one and block 6 ran 0.8x block 3
 # on real subagent turns (#118), and without the attention tile 6+ rows also
 # leave mlx's fused vector-attention kernel (q_len x gqa <= 32: 5 rows at the
 # default model's gqa 6).
-SPECULATIVE_BLOCK_MAX = 6
+SPECULATIVE_BLOCK_MAX = SPECULATIVE_BLOCK_KERNEL
 
 
 def _speculative_block_size(model: dict) -> tuple[int, bool]:
