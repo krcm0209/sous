@@ -95,7 +95,7 @@ def _targets(splits: int) -> dict[str, tuple[int, tuple[int, ...], int | None]]:
     return {
         "floor": (kv8.N8 - 86, (520, 521), None),
         "far": (tileattn.far_mark(splits) - 40, (160,), None),
-        "cap": (line - 200, (400,), line),
+        "cap": (line - 100, (400,), line),
     }
 
 
@@ -107,7 +107,8 @@ def _corpus(engine, n):
 
 
 def _prompt(engine, ids, target):
-    """A one-message conversation whose rendered prompt is target tokens, within SLACK."""
+    """(a one-message conversation whose rendered prompt is target tokens within SLACK, its
+    rendered length)."""
     k, n, messages = target, 0, []
     for _ in range(8):
         messages = [{"role": "user", "content": HEAD + engine._tokenizer.decode(ids[:k])}]
@@ -116,29 +117,36 @@ def _prompt(engine, ids, target):
             break
         k += target - n
     assert abs(n - target) <= SLACK, (target, n)
-    return messages
+    return messages, n
 
 
 def _generate(engine, prompts, peaks=None):
     """({(prompt, max_tokens): text}, {(prompt, max_tokens): (kv8 state, kv8 rows)},
-    kv8 counter deltas, tile counter deltas) at the engine's current block. With `peaks`
-    a dict, each call's peak Metal memory above what was resident before it (the loaded
-    weights) lands there under its (prompt, max_tokens)."""
+    kv8 counter deltas, tile counter deltas, {(prompt, max_tokens): tokens generated}) at
+    the engine's current block. With `peaks` a dict, each call's peak Metal memory above
+    what was resident before it (the loaded weights) lands there under its
+    (prompt, max_tokens)."""
     kv8_before, tile_before = dict(kv8.calls), dict(tileattn.calls)
-    texts, gauges = {}, {}
-    for name, (messages, caps, line) in prompts.items():
+    texts, gauges, generated = {}, {}, {}
+    for name, (messages, _, caps, line) in prompts.items():
         for cap in caps:
+            last: list[int] = [0]
+
+            def on_delta(delta, last=last):  # on the generation thread: no blocking, no raise
+                last[0] = delta.output_tokens
+
             resident = mx.get_active_memory()
             mx.reset_peak_memory()
             with _ceiling(line):
-                texts[(name, cap)] = engine.generate(messages, [], cap)
+                texts[(name, cap)] = engine.generate(messages, [], cap, on_delta)
             if peaks is not None:
                 peaks[(name, cap)] = (mx.get_peak_memory() - resident, resident)
             spec = engine.speculation()
             gauges[(name, cap)] = (spec.kv8, spec.kv8_rows)
+            generated[(name, cap)] = last[0]
     kv8_counts = {k: v - kv8_before[k] for k, v in kv8.calls.items()}
     tile_counts = {k: v - tile_before[k] for k, v in tileattn.calls.items()}
-    return texts, gauges, kv8_counts, tile_counts
+    return texts, gauges, kv8_counts, tile_counts, generated
 
 
 def _decode_peak(engine, messages, max_tokens):
@@ -158,18 +166,36 @@ def _decode_peak(engine, messages, max_tokens):
     return mx.get_peak_memory()
 
 
-def _rows_range(key, targets):
-    """(least, most or None) rows a decode's window has quantised per full-attention layer.
-    Where it serves throughout, the mirror is built at the first served call and then
-    extended to the last key a forward appended (the cap-th token is never fed back), so a
-    decode that stopped early falls short of the least. Where the ceiling cuts it, the
-    mirror stops at the line: at most that many with the drafter off (a drafter's rollbacks
-    re-quantise rows below the line, so the most holds only without one)."""
-    name, cap = key
-    target, _, line = targets[name]
+def _rows_range(key, prompts, generated, drafter):
+    """(least, most or None) rows a decode's window has quantised per full-attention layer,
+    from the prompt's rendered length n and the tokens the decode generated, g. mlx-vlm's
+    generate_step runs each token's forward before it yields that token, so a decode,
+    stopped by an end of turn or by max_tokens, ends with n + g keys. Where it serves
+    throughout, the mirror is built over the prefix at the first served call and follows
+    every key after it: exactly n + g rows with the drafter off. A drafter's rollbacks
+    re-quantise rows and its last token need not be fed back, so with one n + g - 1 is only
+    a floor. Where the ceiling cuts it, the mirror stops at the line: at most that many
+    with the drafter off (a drafter's re-quantised rows below the line can add more)."""
+    name, _ = key
+    _, n, _, line = prompts[name]
     if line is None:
-        return target - SLACK + cap - 1, None
-    return line - SLACK, line
+        end = n + generated[key]
+        return (end - 1, None) if drafter else (end, end)
+    return line - SLACK, None if drafter else line
+
+
+def _check_crossing(prompts, generated, splits, label):
+    """Each decode's last key reached its prompt's line by SLACK: an early end of turn is
+    reported as such, before any kv8 gauge is read."""
+    lines = {"floor": kv8.N8, "far": tileattn.far_mark(splits)}
+    for key, g in generated.items():
+        name, cap = key
+        _, n, _, line = prompts[name]
+        mark = line if line is not None else lines[name]
+        assert n + g - 1 >= mark + SLACK, (
+            f"{label}: generation ended before clearing the line: {key} prompt {n} tokens,"
+            f" generated {g} of {cap}, last key {n + g - 1} < line {mark} + {SLACK}"
+        )
 
 
 def _check_status(status, splits):
@@ -206,10 +232,10 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_kv8():
         targets = _targets(splits)
         ids = _corpus(stock, max(target for target, _, _ in targets.values()) + 64)
         prompts = {
-            name: (_prompt(stock, ids, target), caps, line)
+            name: (*_prompt(stock, ids, target), caps, line)
             for name, (target, caps, line) in targets.items()
         }
-        reference, reference_gauges, _, _ = _generate(stock, prompts)
+        reference, reference_gauges, _, _, reference_generated = _generate(stock, prompts)
 
     with _engine(kv_int8=True, drafter=False) as plain:
         status = plain.kv_int8_status
@@ -223,11 +249,20 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_kv8():
         far_end = targets["far"][0] + max(targets["far"][1])
         assert far_end + SLACK < status["ceiling"], (far_end, status)
         peaks: dict = {}
-        undrafted, plain_gauges, plain_counts, plain_tile = _generate(plain, prompts, peaks)
+        undrafted, plain_gauges, plain_counts, plain_tile, plain_generated = _generate(
+            plain, prompts, peaks
+        )
+        print(
+            "generated tokens, drafter off:"
+            + "".join(
+                f" {k[0]}/{k[1]} prompt {prompts[k[0]][1]} generated {g} kv8 {plain_gauges[k]};"
+                for k, g in plain_generated.items()
+            )
+        )
         # After _generate, which has taken its counter deltas: the far prompt twice more, with
         # kv8 on and with the flag clear (decode() then opens no window and the tile serves
         # every row). Outputs and gauges are discarded; only the decode-only peaks are kept.
-        far_messages, far_caps, _ = prompts["far"]
+        far_messages, _, far_caps, _ = prompts["far"]
         peak_on = _decode_peak(plain, far_messages, max(far_caps))
         kv8._active = 0
         try:
@@ -235,7 +270,7 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_kv8():
         finally:
             kv8._active = 1
 
-    drafted, drafted_gauges, drafted_counts, drafted_tile = {}, {}, {}, {}
+    drafted, drafted_gauges, drafted_counts, drafted_tile, drafted_generated = {}, {}, {}, {}, {}
     with _engine(kv_int8=True, drafter=True) as engine:
         _check_status(engine.kv_int8_status, splits)
         assert engine._draft_block_size == 5
@@ -246,6 +281,7 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_kv8():
                 drafted_gauges[block],
                 drafted_counts[block],
                 drafted_tile[block],
+                drafted_generated[block],
             ) = _generate(engine, prompts)
 
     # unload() cleared the flag: the off engine below starts from none.
@@ -253,7 +289,7 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_kv8():
 
     with _engine(kv_int8=False, drafter=True) as off:
         assert off.kv_int8_status["state"] == "off", off.kv_int8_status
-        again, again_gauges, off_counts, _ = _generate(off, prompts)
+        again, again_gauges, off_counts, _, again_generated = _generate(off, prompts)
 
     # Parity: greedy output is the same with the drafter on and off, at every block.
     for block in BLOCKS:
@@ -261,24 +297,33 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_kv8():
             assert drafted[block][key] == text, (f"block {block}", *key)
     assert again == reference
 
+    # Every decode reached its line: a short reply is named here, not read as a kv8 state.
+    _check_crossing(prompts, reference_generated, splits, "stock")
+    _check_crossing(prompts, plain_generated, splits, "kv8, drafter off")
+    for block in BLOCKS:
+        _check_crossing(prompts, drafted_generated[block], splits, f"kv8, block {block}")
+    _check_crossing(prompts, again_generated, splits, "off again")
+
     # The gauges: each decode's window state and the rows it quantised. A served or capped
     # window first built its mirror over the whole prefix, then followed the generation.
     for key, (state, rows) in plain_gauges.items():
         assert state == EXPECTED[key[0]], (key, state, rows)
-        least, most = _rows_range(key, targets)
+        least, most = _rows_range(key, prompts, plain_generated, drafter=False)
         assert rows >= least and (most is None or rows <= most), (key, state, rows, least, most)
     for block in BLOCKS:
         for key, (state, rows) in drafted_gauges[block].items():
             assert state == plain_gauges[key][0], (f"block {block}", key, state)
-            least = _rows_range(key, targets)[0]
+            least, _ = _rows_range(key, prompts, drafted_generated[block], drafter=True)
             assert rows >= least, (f"block {block}", key, state, rows, least)
     for gauges in (reference_gauges, again_gauges):
         assert set(gauges.values()) == {("off", 0)}, gauges
 
     # The counters. One decode per call (the prompt cache is off), so one window per call, and
     # one cap for the one capped prompt per pass.
-    calls = sum(len(caps) for _, caps, _ in prompts.values())
-    capped = sum(len(caps) for name, (_, caps, _) in prompts.items() if EXPECTED[name] == "capped")
+    calls = sum(len(caps) for _, _, caps, _ in prompts.values())
+    capped = sum(
+        len(caps) for name, (_, _, caps, _) in prompts.items() if EXPECTED[name] == "capped"
+    )
     assert plain_counts["windows"] == calls, plain_counts
     assert plain_counts["windows_capped"] == capped, plain_counts
     assert plain_counts["decode_kv8"] > 0, plain_counts
