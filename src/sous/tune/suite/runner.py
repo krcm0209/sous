@@ -63,6 +63,7 @@ class SuiteRun:
     greedy: bool
     attention_tile: bool
     projection_kernel: bool
+    kv_int8: bool
     window: int
     state: str
     outcome: str | None
@@ -78,7 +79,7 @@ class SuiteRun:
     transcript_path: str | None
 
     @property
-    def key(self) -> tuple[str, str, int, bool, bool, bool, bool]:
+    def key(self) -> tuple[str, str, int, bool, bool, bool, bool, bool]:
         """The arm this run measured — `Arm.suite_key`, never the label."""
         return (
             self.model_id,
@@ -88,6 +89,7 @@ class SuiteRun:
             self.greedy,
             self.attention_tile,
             self.projection_kernel,
+            self.kv_int8,
         )
 
     @property
@@ -100,11 +102,11 @@ class SuiteRun:
     @classmethod
     def from_dict(cls, d: dict) -> SuiteRun:
         # A row written before a setting existed ran without what it switches
-        # on — stock attention, stock projections — on every machine, so it
-        # reads False, and a resume under an arm that has the setting runs
-        # the task again rather than pool the two. Without the fallback,
-        # resuming such a run would raise KeyError.
-        d = {"attention_tile": False, "projection_kernel": False, **d}
+        # on — stock attention, stock projections, bf16 K/V — on every
+        # machine, so it reads False, and a resume under an arm that has the
+        # setting runs the task again rather than pool the two. Without the
+        # fallback, resuming such a run would raise KeyError.
+        d = {"attention_tile": False, "projection_kernel": False, "kv_int8": False, **d}
         return cls(**{f.name: d[f.name] for f in dataclasses.fields(cls)})
 
 
@@ -136,8 +138,8 @@ class CountingEngine:
     def __getattr__(self, name: str):
         # drafter, draft_block, positions, int8_prefill_status,
         # verify_attention_status, draft_context_status, attention_tile_status,
-        # projection_kernel_status: whatever the backend has, read through
-        # getattr(..., None) by ManagedEngine.
+        # projection_kernel_status, kv_int8_status: whatever the backend has,
+        # read through getattr(..., None) by ManagedEngine.
         return getattr(self._inner, name)
 
     def generate(
@@ -233,6 +235,7 @@ def _error_run(task: SuiteTask, index: int, arm: Arm, error: str) -> SuiteRun:
         greedy=arm.greedy,
         attention_tile=arm.attention_tile,
         projection_kernel=arm.projection_kernel,
+        kv_int8=arm.kv_int8,
         window=arm.window,
         state="error",
         outcome=None,
@@ -305,6 +308,7 @@ def run_one(
         greedy=arm.greedy,
         attention_tile=arm.attention_tile,
         projection_kernel=arm.projection_kernel,
+        kv_int8=arm.kv_int8,
         window=arm.window,
         state="failed" if failed else "done",
         outcome=None if failed else result.outcome,
@@ -346,16 +350,24 @@ def _check_int8(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> No
     )
 
 
-def _notice_unavailable(arm: Arm, what: str, status: dict | None, out: Callable[..., None]) -> None:
+def _notice_unavailable(
+    arm: Arm,
+    what: str,
+    status: dict | None,
+    out: Callable[..., None],
+    *,
+    runs: str = "stock",
+) -> None:
     """The notice for a setting the arm inherits and the engine reports
-    unavailable; any other state, or no status, prints nothing."""
+    unavailable; any other state, or no status, prints nothing. `runs` names
+    what the engine falls back to."""
     status = status or {}
     if status.get("state") != "unavailable":
         return
     reason = status.get("reason") or "no reason given"
     out(
         f"  {arm.label}: {what} unavailable here ({reason}); "
-        "the engine runs stock, as the daemon would"
+        f"the engine runs {runs}, as the daemon would"
     )
 
 
@@ -379,6 +391,17 @@ def _check_proj(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> No
     an engine without the kernel: no notice."""
     if arm.projection_kernel:
         _notice_unavailable(arm, "projection kernel", engine.projection_kernel_status, out)
+
+
+def _check_kv8(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> None:
+    """int8 K/V is inherited and unmeasured like the tile, so the same holds:
+    where the engine reports it unavailable, the daemon would serve this
+    checkpoint's attention from the bf16 cache, and the arm runs the same way
+    after a notice. The fallback is bf16 K/V, not stock: where only kv8
+    refused, the tile still serves. `off`, or no status, is the setting
+    switched off or an engine without it: no notice."""
+    if arm.kv_int8:
+        _notice_unavailable(arm, "int8 K/V", engine.kv_int8_status, out, runs="bf16 K/V")
 
 
 def _slug(label: str) -> str:
@@ -466,6 +489,7 @@ def _run_suite(
             _check_int8(arm, engine, out)
             _check_tile(arm, engine, out)
             _check_proj(arm, engine, out)
+            _check_kv8(arm, engine, out)
         except RuntimeError as e:
             check_error = str(e)
         if check_error is None:

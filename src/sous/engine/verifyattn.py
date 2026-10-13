@@ -435,7 +435,7 @@ def _wrap(cls: Any) -> None:
             if _post_ok(queries, keys, values, length) and tileattn.in_scope(
                 queries, keys, values, attention.scale
             ):
-                output = tileattn.serve_verify(queries, keys, values, splits)
+                output = tileattn.serve_verify(queries, keys, values, splits, cache)
             else:
                 tileattn.calls["verify_declined"] += 1
                 output = _stock_verify(queries, keys, values, cache, attention.scale, length)

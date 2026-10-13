@@ -161,7 +161,10 @@ goal.
   on disk written by a build with wrong KV would survive a restart, which is
   why the fork store's identity key hashes the engine sources
   (`forkstore.engine_epoch`: vlm.py, lm.py, int8prefill.py, tileattn.py,
-  projkernel.py, kernels/*.metal and *.h) beside the versions, the GPU and
+  projkernel.py, kernels/*.metal and *.h except the two kv8 kernels,
+  `attention_tile_kv8.metal` and `kv8_quant.metal`, which
+  `_EPOCH_EXCLUDED_KERNELS` names because they serve only inside a
+  generation and never touch stored KV) beside the versions, the GPU and
   the weights snapshot — any
   change to what a token id produces invalidates every file; `rm -rf
   ~/.sous/forks` is the manual eraser.
@@ -376,8 +379,10 @@ goal.
   are refused. Deciding after the projections is safe because the fallback
   is the very call the method made, so nothing is appended twice. Verify
   rows arrive through verifyattn's wrapper, whose scope widens to every T
-  from 1 while the flag is set. The flag `_active_splits` is a plain int,
-  the active S or 0, never a model reference: the first statement of every
+  from 1 while the flag is set. Inside a decode's serving window the rows
+  from `N8` up to the ceiling `L` go to kv8 instead of the tile
+  (`engine/kv8.py` bullet). The flag `_active_splits` is a plain int, the
+  active S or 0, never a model reference: the first statement of every
   `enable()` clears it, only an `active` result sets it, and
   `VLMEngine.unload()` clears it through `tileattn.clear()`. `enable()`
   checks, in order: the config; the shared platform rule
@@ -603,6 +608,151 @@ goal.
   kernel bitwise against the MMA kernel at T = 1, random and cancelling)
   and remembers success only: the lane map was probed on Apple GPUs,
   so a GPU where it differs skips rather than fails.
+- `engine/kv8.py` serves decode's one-row attention and the exact
+  verifier's attention from an int8 *mirror* of the bf16 KV cache, on the
+  attention tile's partition: `kernels/attention_tile_kv8.metal`
+  (`sous_kv8_tile_split`, the tile's split kernel over int8 K, V and Q; the
+  tile's reduce kernel is reused unchanged) and `kernels/kv8_quant.metal`
+  (`sous_kv8_quant`, the row quantiser, `common.h` only so it compiles on
+  any Metal GPU and CI tests it). K and V are symmetric int8 per (token, KV
+  head) with an fp16 scale (amax / 127, round half to even, codes in
+  [−127, 127], a scale that rounds to 0 divides by 1, so a zero row gives
+  codes 0); Q is quantised the same way inside the kernel with one fp32
+  scale per (query head, row); the K and Q scales multiply the finished
+  score and the V scale folds into the probability, so nothing is
+  dequantised in the loop. The mirror is a pure per-row function of the
+  bf16 rows, so bulk and incremental quantisation agree bit for bit and a
+  verify row reads the same codes as the decode step at its key count:
+  greedy parity with the drafter on or off holds as for the tile, while
+  kv8 itself differs from the bf16 tile by the quantisation, not in the
+  last bits. The mirror exists only inside `VLMEngine.decode()`, which,
+  when kv8 is active, calls `kv8.open_window()` inside the draft-context `seed` block
+  immediately before `stream_generate` (so the one-row forward that ends
+  the decode call's own prefill segment is covered) and
+  `kv8.close_window(cache)` in that loop's `finally`: it drops every
+  layer's mirror and trim wrap, returns `(state, rows)` for the
+  `Speculation` (`rows` one full-attention layer's count: every layer
+  quantises the same rows, and the window sums them over its `layers`), and
+  calls `mx.clear_cache()` when a mirror was built.
+  Every `prefill()`, the load-time probes and anything outside `decode()`
+  run with no window and never build or read a mirror, so the KVCache,
+  the slots, the forks and the fork store stay bf16 and nothing kv8
+  serves is ever persisted. The window is a module global (`_window`, a
+  `Window` with `serial`, `state` `idle`/`served`/`capped`, `rows`,
+  `served`, `built`, `force`, `layers`): one suffices because
+  `ManagedEngine._gen_lock` serialises every forward and every `decode()`
+  call site runs on the caller's session thread, and `close_window` runs
+  before `PrefixCache` restores or trims the cache, so no trim wrap is in
+  place when it does. A `Mirror` hangs off a full-attention layer's
+  `KVCache` as `MIRROR_ATTR` (`_sous_kv8`, set with `object.__setattr__`;
+  `fork_copy` builds a fresh cache, so a mirror never travels with a
+  fork): `codes` int8 `[1, 4, cap, 512]` (each token's K then its V, so
+  every 16-byte load stays aligned), `sc` fp16 `[1, 4, cap, 2]`, `cap` a
+  multiple of 256 and deliberately not `keys.shape[2]` (a cache's
+  capacity is routinely not a multiple of 4, and the 16-byte scale loads
+  need the plane stride to be a multiple of 16), `n` valid rows and the
+  `serial` of the window that built it. Validity follows the cache's
+  offset through `trim`, not through the calls kv8 serves: inside a
+  decode only `KVCache.trim` lowers an offset, and DFlash's commit and
+  abort both reach it as an instance call (`_trim_append_caches` resolves
+  `getattr(cache, "trim")`, `SpeculativeCacheTransaction.abort` calls
+  `cache.trim`), so the mirror shadows `trim` on the instance and sets
+  `n = min(n, offset)` after the original runs. The wrap is the
+  mechanism; the clamp every served call runs first (`n = min(n, offset −
+  T)`) and the rebuild from row 0 of a mirror from another window are
+  defences. A served call quantises `[n, min(offset, L))` once, so no row
+  at or past `L` is ever written (`kv8.prepare(cache, t)`, before a
+  verify's run loop): the first build writes the cap-sized buffers in one
+  dispatch per layer, later calls
+  slice-assign a row-sized output in place, and a growth (`GROWTH` = 4096
+  rows, never past `round_up(L, 256)`) goes layer by layer, each new
+  buffer evaluated before the old one is dropped. A row is served iff
+  `kv8.serves(n_row)` — a window is open and not capped and `N8 ≤ n_row
+  < L` (or the window is forced) — the one predicate both tile seams call
+  (decode: `n_keys`; a verify run: its first row's key count). `N8`
+  (4481, a module constant: the merge gate's round cells on the M5 Pro
+  measured kv8's saving net of the per-round quantiser negative at `N0`
+  and non-negative from 4,096 keys, hence the step boundary at or past
+  4,096) and `L` are tile step boundaries, so no
+  `verify_plan` run straddles either and a call mixes kv8 and the bf16
+  tile only across runs. `L` (`_ceiling`) is computed once by `enable()` with the pure
+  `ceiling(window, splits)` from `[model].max_context_tokens`: the largest
+  step boundary whose mirror fits beside the turn's bf16 KV inside the
+  window-sized reserve at every instant (`1.504·C + 0.504·C/16 + 272 ≤
+  window`, `C = round_up(L, 256)`: the bf16 KV, the mirror, one layer's old
+  buffer during a growth, and the rows a straddling verify holds past L),
+  about 84K at 131072 and 170K at 262144. The reserve, the slot budget and
+  the pressure valve are deliberately untouched: scaling the reserve would
+  cost 4–8 GiB of slot budget, and admitting against live memory would
+  make a prompt's output depend on slot occupancy. A call whose first row
+  is at or past `L` caps the window (`kv8.observe_first_row`: `state =
+  "capped"`, the mirrors dropped) and every later call of that decode runs
+  on the bf16 tile; the committed prefix never shrinks inside a decode, so
+  the cap is sticky and drafter-on and drafter-off serve exactly the same
+  rows. A window of 0 (every test-built engine) gives `L = 0`, which
+  serves nothing; `open_window(force=True)` lifts `L` for the probe and the
+  array-level tests only. `tileattn` imports `kv8` function-locally inside
+  its two seams and `kv8` imports `tileattn` at module level, so there is
+  no cycle. `enable()` runs after `projkernel.enable` (the tile's state is
+  settled) and before the fork store and `measure_cache_budget` (the
+  probe's arrays are released first); its first statement clears
+  `_active`, `_window` and `_ceiling`. It checks, in order: the config (`off`); the
+  tile (`active`, else one INFO line and `unavailable` with the tile's
+  reason or `attention tile off`); the source pins
+  (`VALIDATED_KV8_SOURCES`: `KVCache.update_and_fetch`, `trim` and
+  `prefix_cache_reserve`, the `cache_state` transaction, commit, abort and
+  rollback functions, `_dflash_rounds`, `_dflash_verify`,
+  `_dflash_verify_greedy`, `_reserve_dflash_target_cache`, the qwen3_5
+  `rollback_speculative_cache` and verifier `verify` — the mirror assumes
+  rows are appended through `update_and_fetch` and rolled back through the
+  instance `trim`, never replayed, and a cache moved onto a replaying path
+  would go stale with every other gate green); `availability()` (the
+  shared platform rule, then a compile and run of T = 1..8 and the
+  quantiser, success remembered only); that `N8` is a step boundary for
+  the active S; `L > N8` (else one INFO line); and the probe on the
+  `sous-model-load` thread. A floor that is not a step boundary, pin
+  drift, a compile or probe failure and any
+  exception (logged with its traceback) are one `warnings.warn` plus
+  `unavailable`. The probe proves the quantiser bitwise against the
+  mlx-op reference on random, tie (power-of-two scale) and all-zero rows,
+  bulk equal to incremental; the kernel within `REL_RMS_BOUND` (1e-2)
+  relative RMS of fp32 SDPA over the dequantised codes at N8 and the far
+  mark (T = 1, 5, 8, with a dominant key at n − 1 and a decoy at n); every
+  verify row `array_equal` its one-row call at N8, the next two step
+  boundaries and the far mark, T = 1..8; NaN scales and −128 codes past n
+  leaving the output bitwise unchanged and finite; the mirror rule on a
+  real `KVCache` (a trim through the wrap, appends with and without a
+  served call, the shrinking block across N8, a stale serial, a capacity
+  not a multiple of 4, a growth); quantisation error within
+  `STOCK_RMS_BOUND` (3e-2) of stock bf16 SDPA; and the model's own
+  attention module through the decode hook and, when verify attention is
+  active, through the verifier's wrapper, inside a forced window. It
+  raises `_active` and opens its window only while it runs, and in
+  `finally` closes the window, drops its mirrors, clears `_active`,
+  restores `kv8.calls`, `tileattn.calls` and `projkernel.calls` and calls
+  `mx.clear_cache()`. `VLMEngine.unload()` calls `kv8.clear()` (`_active`
+  and `_window`, nothing else: the mirrors live on caches dropped with
+  the engine). The constructors default it off (`VLMEngine(kv_int8=False,
+  kv_int8_window=0)`); only `default_engine_factory` hands them the
+  config's `true` and the window. Nothing is logged per turn; `kv8.calls`
+  (`decode_kv8`, `verify_kv8`, `verify_rows_kv8`, `verify_launches_kv8`,
+  `mirror_builds`, `mirror_rows`, `mirror_trims`, `mirror_grown`,
+  `windows`, `windows_capped`) counts every path for the tests and for
+  harnesses, and the turn line carries `kv8=` and `kv8_rows=` through
+  `Speculation` and the per-turn gauges. The fork key gains no field and
+  `kv8.py` stays out of `_EPOCH_FILES`; the two kernel files are kept out
+  of the kernels glob by `forkstore._EPOCH_EXCLUDED_KERNELS`, so a
+  kv8-only kernel edit never cold-starts the store (the seams in `vlm.py`
+  and `tileattn.py` are hashed as before). `sous tune` keys suite rows by
+  `kv_int8` (`Arm.kv_int8`, `SuiteRun.kv_int8`, older rows reading
+  `false`) and prints its notice only for `unavailable`, never for `off`.
+  Tests swap the plain-mlx stand-in in for `kv8.tile8`
+  (`tests/kv8_fixtures.py`), open windows through its `window()` context
+  manager, set `L` with `ceiling(monkeypatch, L)` and lower the floor
+  with `small_floor`; the `nax` tests skip on `kv8.availability()`, never
+  the tile's. Every kernel edit re-runs the exactness tests and the
+  T = 1..8 timings against the bf16 tile: the bits are what parity rests
+  on and the speed is the only reason the mirror exists.
 - `engine/draftctx.py` hands the DFlash drafter the prompt's hidden states on
   the hybrid prompt-cache path (#142). mlx-vlm's round loop
   (`speculative/dflash.py:_dflash_rounds`) gives the drafter, on its first

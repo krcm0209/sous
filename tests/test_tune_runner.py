@@ -118,7 +118,7 @@ def test_run_one_grades_a_solved_task_and_reads_every_metric_from_the_run(tmp_pa
     assert Path(run.transcript_path).is_file()
     written = (tmp_path / "s" / "project" / "rpn.py").read_text()
     assert written == (task.solution / "rpn.py").read_text()
-    assert run.key == (*_arm(tmp_path).key, False, False, True, True)
+    assert run.key == (*_arm(tmp_path).key, False, False, True, True, True)
 
 
 def test_a_command_outside_the_allowlist_is_denied_and_counted(tmp_path):
@@ -594,6 +594,7 @@ def test_suite_runs_round_trip_through_dicts(tmp_path):
         greedy=True,
         attention_tile=False,
         projection_kernel=False,
+        kv_int8=False,
         window=8192,
         state="done",
         outcome="completed",
@@ -609,7 +610,7 @@ def test_suite_runs_round_trip_through_dicts(tmp_path):
         transcript_path=None,
     )
     assert SuiteRun.from_dict(json.loads(json.dumps(run.as_dict()))) == run
-    assert run.key == ("org/m", "", 0, False, True, False, False)
+    assert run.key == ("org/m", "", 0, False, True, False, False, False)
 
 
 def test_estimate_seconds_scales_with_the_measured_speeds(tmp_path):
@@ -674,6 +675,7 @@ def test_a_row_written_before_the_attention_tile_existed_reads_as_stock(tmp_path
         greedy=False,
         attention_tile=True,
         projection_kernel=True,
+        kv_int8=True,
         window=8192,
         state="done",
         outcome="completed",
@@ -694,7 +696,7 @@ def test_a_row_written_before_the_attention_tile_existed_reads_as_stock(tmp_path
     # The arm inherits the tile's default, so a resume runs the task again
     # rather than counting the stock row toward the tile arm.
     assert arm.attention_tile is True
-    assert old.key == (*arm.key, False, False, False, True)
+    assert old.key == (*arm.key, False, False, False, True, True)
     assert old.key != arm.suite_key
 
 
@@ -820,6 +822,7 @@ def test_a_row_written_before_the_projection_kernel_existed_reads_as_stock(tmp_p
         greedy=False,
         attention_tile=True,
         projection_kernel=True,
+        kv_int8=True,
         window=8192,
         state="done",
         outcome="completed",
@@ -842,7 +845,7 @@ def test_a_row_written_before_the_projection_kernel_existed_reads_as_stock(tmp_p
     # The arm inherits the kernel's default, so a resume runs the task again
     # rather than counting the stock row toward the kernel arm.
     assert arm.projection_kernel is True
-    assert old.key == (*arm.key, False, False, True, False)
+    assert old.key == (*arm.key, False, False, True, False, True)
     assert old.key != arm.suite_key
     del row["attention_tile"]
     older = SuiteRun.from_dict(row)
@@ -923,3 +926,136 @@ def test_no_kernel_notice_when_it_is_active_off_unreported_or_not_inherited(tmp_
         assert len(outcome.runs) == 1 and outcome.error is None, name
         assert outcome.runs[0].projection_kernel is case.projection_kernel, name
         assert not any("projection kernel" in line for line in lines), (name, lines)
+
+
+def test_a_row_written_before_kv_int8_existed_reads_as_bf16(tmp_path):
+    arm = _arm(tmp_path)
+    row = SuiteRun(
+        task="t",
+        index=0,
+        label="m",
+        model_id="org/m",
+        drafter_id="",
+        block_size=0,
+        int8_prefill=False,
+        greedy=False,
+        attention_tile=True,
+        projection_kernel=True,
+        kv_int8=True,
+        window=8192,
+        state="done",
+        outcome="completed",
+        turns=3,
+        seconds=12.5,
+        output_tokens=400,
+        malformed=0,
+        repetitions=0,
+        approvals_denied=0,
+        grade=1.0,
+        grade_detail="1/1",
+        error=None,
+        transcript_path=None,
+    ).as_dict()
+    del row["kv_int8"]
+    old = SuiteRun.from_dict(row)
+    # No run from before the setting existed read int8 K/V, on any machine:
+    # the row is a bf16 row, and the settings it did record stay as written.
+    assert old.kv_int8 is False
+    assert (old.attention_tile, old.projection_kernel) == (True, True)
+    # The arm inherits the setting's default, so a resume runs the task again
+    # rather than counting the bf16 row toward the int8 arm.
+    assert arm.kv_int8 is True
+    assert old.key == (*arm.key, False, False, True, True, False)
+    assert old.key != arm.suite_key
+
+
+class _Kv8Unavailable(FakeEngine):
+    drafter = ""
+    kv_int8_status = {
+        "state": "unavailable",
+        "reason": "attention tile off",
+        "probe_seconds": None,
+        "floor": None,
+        "ceiling": None,
+    }
+
+
+def test_an_arm_that_inherits_kv_int8_runs_bf16_where_the_engine_cannot_serve_it(tmp_path):
+    """kv_int8 is inherited from the user's config and no arm measures it:
+    an engine that reports it unavailable runs the arm on bf16 K/V after a
+    notice, as the daemon would."""
+    lines = []
+    outcome = run_suite(
+        _arm(tmp_path),
+        [_task()],
+        runs=1,
+        done=set(),
+        record=lambda r: None,
+        scratch=tmp_path / "s",
+        out=lines.append,
+        factory=lambda mid: _Kv8Unavailable([FINISH]),
+        python=PYTHON,
+        active_memory=lambda: 0,
+    )
+    assert len(outcome.runs) == 1 and outcome.error is None
+    assert outcome.runs[0].kv_int8 is True
+    assert (
+        "  m: int8 K/V unavailable here (attention tile off); "
+        "the engine runs bf16 K/V, as the daemon would"
+    ) in lines
+
+
+def test_no_kv8_notice_when_it_is_active_off_unreported_or_not_inherited(tmp_path):
+    """`off` is the setting switched off or an engine without kv8 (the
+    mlx-lm backend), and an engine that reports nothing has none either:
+    neither is a machine where kv8 cannot run, so neither gets the notice."""
+
+    class Active(FakeEngine):
+        drafter = ""
+        kv_int8_status = {
+            "state": "active",
+            "reason": None,
+            "probe_seconds": 0.5,
+            "floor": 1536,
+            "ceiling": 84481,
+        }
+
+    class Off(FakeEngine):
+        drafter = ""
+        kv_int8_status = {
+            "state": "off",
+            "reason": None,
+            "probe_seconds": None,
+            "floor": None,
+            "ceiling": None,
+        }
+
+    class Silent(FakeEngine):
+        drafter = ""
+
+    arm = _arm(tmp_path)
+    bf16 = dataclasses.replace(
+        arm, kv_int8=False, config=dataclasses.replace(arm.config, kv_int8=False)
+    )
+    for name, case, engine in (
+        ("active", arm, Active),
+        ("off", arm, Off),
+        ("silent", arm, Silent),
+        ("bf16", bf16, _Kv8Unavailable),
+    ):
+        lines = []
+        outcome = run_suite(
+            case,
+            [_task()],
+            runs=1,
+            done=set(),
+            record=lambda r: None,
+            scratch=tmp_path / f"s-{name}",
+            out=lines.append,
+            factory=lambda mid, engine=engine: engine([FINISH]),
+            python=PYTHON,
+            active_memory=lambda: 0,
+        )
+        assert len(outcome.runs) == 1 and outcome.error is None, name
+        assert outcome.runs[0].kv_int8 is case.kv_int8, name
+        assert not any("int8 K/V" in line for line in lines), (name, lines)

@@ -310,6 +310,8 @@ TURN_GAUGES = frozenset(
         "drafted_tokens",
         "accepted_tokens",
         "draft_context",
+        "kv8",
+        "kv8_rows",
     }
 )
 _GAUGES = frozenset({"snapshot_bytes", "miss_lcp"}) | TURN_GAUGES
@@ -400,6 +402,14 @@ class PromptCacheStats:
     drafted_tokens: int = 0
     accepted_tokens: int = 0
     draft_context: int = 0
+    # What the int8 K/V mirror did in the same decode: "off" when no serving
+    # window opened (kv8 not active for this load), "idle" when the context
+    # stayed below the floor, "served" when kv8 served a call, "capped" when
+    # a call started at or past the ceiling; and the rows it quantised, per
+    # full-attention layer (every layer quantises the same rows). A
+    # string gauge is assigned, never summed, like took_kind.
+    kv8: str = "off"
+    kv8_rows: int = 0
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -467,12 +477,19 @@ class Speculation:
     neither), and the positions of context its first draft saw. The counts
     are zero without a drafter, or when the call never drafted; the context
     is measured only while the engine seeds it, and reads zero otherwise
-    whatever the drafter saw."""
+    whatever the drafter saw.
+
+    `kv8` and `kv8_rows` are the int8 K/V mirror's word on the same call,
+    drafter or not: the state its serving window closed in (`idle`, `served`
+    or `capped`; `off` when no window opened) and the rows it quantised, per
+    full-attention layer (every layer quantises the same rows)."""
 
     rounds: int = 0
     drafted: int = 0
     accepted: int = 0
     context: int = 0
+    kv8: str = "off"
+    kv8_rows: int = 0
 
 
 class CacheHooks(Protocol):
@@ -1488,10 +1505,12 @@ class PrefixCache:
 
 
 def _note_speculation(stats: PromptCacheStats, hooks: CacheHooks) -> None:
-    """Assign the decode's drafter gauges — the last decode call's, so a cold
-    retry's counts replace the failed warm attempt's."""
+    """Assign the decode's drafter and kv8 gauges — the last decode call's,
+    so a cold retry's values replace the failed warm attempt's."""
     spec = hooks.speculation()
     stats.draft_rounds = spec.rounds
     stats.drafted_tokens = spec.drafted
     stats.accepted_tokens = spec.accepted
     stats.draft_context = spec.context
+    stats.kv8 = spec.kv8
+    stats.kv8_rows = spec.kv8_rows

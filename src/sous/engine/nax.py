@@ -1,9 +1,9 @@
 """The tensor-unit ("NAX") platform rule sous's tensor-op kernels share.
 
-Both runtime-compiled kernels that use the Metal-4 tensor ops, int8 prefill's GEMM
-and the attention tile's split kernel, serve only where mlx itself would use the
-neural accelerators. On an older GPU the tensor ops run on the plain shader path,
-where neither kernel buys anything, so it is refused rather than merely slow.
+The runtime-compiled kernels that use the Metal-4 tensor ops, int8 prefill's GEMM
+and the attention tile's and kv8's split kernels, serve only where mlx itself would
+use the neural accelerators. On an older GPU the tensor ops run on the plain shader
+path, where none of them buys anything, so it is refused rather than merely slow.
 This module holds that rule and nothing else: no numerics, and mlx is imported
 only when the rule is read.
 """

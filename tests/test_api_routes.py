@@ -1662,9 +1662,9 @@ def test_a_claimed_model_id_cannot_forge_or_bloat_a_log_line(tmp_path: Path, cap
     lines = [line for line in err.splitlines() if "sous.api:" in line]
     assert lines, "expected at least one log line"
     for line in lines:
-        # The attributed turn line is ~470 chars with its prefix (~510 with a
-        # miss's diagnostics); the cap is here to catch an unbounded client
-        # string, not to pin a length.
+        # The attributed turn line is ~490 chars with its prefix (~550 with a
+        # miss's diagnostics and kv8's longest state); the cap is here to
+        # catch an unbounded client string, not to pin a length.
         assert len(line) < 600, line
         assert "A" * 20 not in line, line  # the oversized id never reaches it
         if "model=" in line:
@@ -1751,6 +1751,35 @@ def test_the_turn_line_attributes_a_hit(tmp_path: Path, capsys):
         assert key in f, key
     assert len(f["tools"]) == 8 and len(f["system"]) == 8
     assert "lcp" not in f and "bounds" not in f
+
+
+def test_the_turn_line_carries_the_kv8_gauges_after_the_drafters(tmp_path: Path, capsys):
+    """kv8= and kv8_rows= follow draft_context=: both describe the decode
+    behind decode_tps. A turn whose engine never reports them reads off and
+    0, the LM backend's answer too."""
+    inner = FakeEngine(["first", "second"])
+    inner.stats = dict(_ALL_GAUGES)
+    original = inner.generate
+
+    def generate(messages, tools, max_tokens, on_delta=None):
+        out = original(messages, tools, max_tokens, on_delta)
+        if len(inner.calls) == 2:
+            inner.stats = {
+                **_ALL_GAUGES,
+                "draft_context": 2047,
+                "kv8": "served",
+                "kv8_rows": 57344,
+            }
+        return out
+
+    inner.generate = generate  # ty: ignore[invalid-assignment]
+    app = _app(tmp_path, inner)
+    assert _post(app, _body()).status_code == 200
+    assert _post(app, _body()).status_code == 200
+    first, second = _turn_lines(capsys.readouterr().err)
+    assert (_fields(first)["kv8"], _fields(first)["kv8_rows"]) == ("off", "0")
+    assert (_fields(second)["kv8"], _fields(second)["kv8_rows"]) == ("served", "57344")
+    assert " draft_context=2047 kv8=served kv8_rows=57344 seconds=" in second
 
 
 def test_the_turn_line_names_a_disk_restore(tmp_path: Path, capsys):
@@ -1947,13 +1976,14 @@ def test_a_served_turn_is_recorded_with_the_lines_fields(tmp_path: Path):
     assert turn["prefill_tps"] == 3.0 and turn["decode_tps"] == 0.25
     assert turn["lcp"] is None and turn["lcp_region"] is None and turn["bounds"] is None
     assert turn["tools_hash"] is None and isinstance(turn["ts"], float)
+    assert turn["kv8"] == "off" and turn["kv8_rows"] == 0
     assert set(turn) == {
         "ts", "id", "model", "stream", "status", "error", "stop_reason", "cache", "took",
         "input_tokens", "output_tokens", "reused_tokens", "prefilled_tokens", "lcp",
         "lcp_region", "bounds", "forks", "evicted", "pressure", "load_s", "queue_s",
         "engine_wait_s", "tokenize_s", "ttft_s", "prefill_s", "decode_s", "persist_s",
         "restore_s", "prefill_tps", "decode_tps", "draft_rounds", "drafted", "accepted",
-        "draft_context", "seconds", "tools_hash", "system_hash",
+        "draft_context", "kv8", "kv8_rows", "seconds", "tools_hash", "system_hash",
     }  # fmt: skip
     _post(app, _body(stream=False))
     ids = [t["id"] for t in _recent(endpoint)]

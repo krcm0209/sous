@@ -243,6 +243,11 @@ def _turn_summary(
         "drafted": result.drafted_tokens,
         "accepted": result.accepted_tokens,
         "draft_context": result.draft_context,
+        # Whether that decode read int8 K/V, and the rows it quantised for
+        # it, per full-attention layer (every layer quantises the same rows):
+        # at long contexts decode_tps moves with this.
+        "kv8": result.kv8,
+        "kv8_rows": result.kv8_rows,
         "seconds": result.seconds,
         "tools_hash": chat.tools_hash or None,
         "system_hash": chat.system_hash or None,
@@ -271,6 +276,7 @@ def _turn_line(s: dict) -> str:
         f"prefill_tps={_opt(s['prefill_tps'])} decode_tps={_opt(s['decode_tps'])} "
         f"draft_rounds={s['draft_rounds']} drafted={s['drafted']} accepted={s['accepted']} "
         f"draft_context={s['draft_context']} "
+        f"kv8={s['kv8']} kv8_rows={s['kv8_rows']} "
         f"seconds={s['seconds']:.1f}{diag} "
         f"tools={s['tools_hash'] or '-'} system={s['system_hash'] or '-'}"
     )

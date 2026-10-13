@@ -245,6 +245,45 @@ def decode(queries: Any, keys: Any, values: Any, splits: int) -> Any:
     return tile(queries, keys, values, n, chunk).transpose(0, 2, 1, 3)
 
 
+def _verify_runs(
+    queries: Any,
+    keys: Any,
+    values: Any,
+    runs: list[tuple[int, int, int]],
+    served: Callable[[int, int, int], Any] | None = None,
+) -> Any:
+    """The run loop behind verify() and serve_verify(), as [1, 24, T, 256]. Each
+    run (j, k, chunk), in row order, is answered by one of three: grouped stock
+    calls when chunk is 0; `served(j, k, chunk)` when that returns a part (kv8,
+    reading its int8 mirror); one tile call otherwise. The tile and
+    kv8 parts are contiguous [1, k - j, 24, 256] (the stock part is a
+    transposed view of that shape), and the parts are concatenated on the row
+    axis. With one loop, a run kv8 leaves to the tile is sliced and launched
+    exactly as it is with kv8 off. A single run's part is used as it is, with
+    no concatenation."""
+    import mlx.core as mx
+
+    from sous.engine.verifyattn import grouped_attention
+
+    t = queries.shape[2]
+    prefix = keys.shape[2] - t
+    parts = []
+    for j, k, chunk in runs:
+        part = served(j, k, chunk) if served is not None and chunk else None
+        if part is None:
+            q = queries if (j, k) == (0, t) else queries[:, :, j:k, :]
+            kk = keys if k == t else keys[:, :, : prefix + k, :]
+            vv = values if k == t else values[:, :, : prefix + k, :]
+            if chunk:
+                part = tile(q, kk, vv, prefix + k, chunk)
+            else:
+                stock = grouped_attention(q, kk, vv, SCALE, prefix + j, _arch())
+                part = stock.transpose(0, 2, 1, 3)
+        parts.append(part)
+    out = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=1)
+    return out.transpose(0, 2, 1, 3)
+
+
 def verify(
     queries: Any,
     keys: Any,
@@ -256,29 +295,10 @@ def verify(
     [1, 24, T, 256]: one tile call per run of verify_plan(), grouped stock calls for
     the runs below N0, concatenated in row order. `runs` is that plan when the
     caller already has it."""
-    import mlx.core as mx
-
-    from sous.engine.verifyattn import grouped_attention
-
-    t = queries.shape[2]
-    n = keys.shape[2]
-    prefix = n - t
     if runs is None:
-        runs = verify_plan(prefix, t, splits)
-    if len(runs) == 1 and runs[0][2]:
-        return tile(queries, keys, values, n, runs[0][2]).transpose(0, 2, 1, 3)
-    parts = []
-    for j, k, chunk in runs:
-        q = queries if (j, k) == (0, t) else queries[:, :, j:k, :]
-        kk = keys if k == t else keys[:, :, : prefix + k, :]
-        vv = values if k == t else values[:, :, : prefix + k, :]
-        if chunk:
-            parts.append(tile(q, kk, vv, prefix + k, chunk))
-        else:
-            stock = grouped_attention(q, kk, vv, SCALE, prefix + j, _arch())
-            parts.append(stock.transpose(0, 2, 1, 3))
-    out = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=1)
-    return out.transpose(0, 2, 1, 3)
+        t = queries.shape[2]
+        runs = verify_plan(keys.shape[2] - t, t, splits)
+    return _verify_runs(queries, keys, values, runs)
 
 
 _compile_ok = False
@@ -360,10 +380,11 @@ def _plain_kv_cache(cache: Any) -> bool:
 
 
 def _serve_decode(args: tuple, kwargs: dict) -> Any | None:
-    """The tile's output for a one-row call it serves, else None, and the wrapper
-    then makes the very call Qwen3_5Attention.__call__ made: deciding after the
-    projections never appends to the cache twice. Multi-row (prefill) calls and
-    calls while the flag is clear are not counted."""
+    """The output for a one-row call the tile serves (or, from kv8's floor up to
+    its ceiling inside a decode, kv8), else None. On None the wrapper makes the
+    very call Qwen3_5Attention.__call__ made: deciding after the projections
+    never appends to the cache twice. Multi-row (prefill) calls and calls while
+    the flag is clear are not counted."""
     splits = _active_splits
     if not splits:
         return None
@@ -384,6 +405,15 @@ def _serve_decode(args: tuple, kwargs: dict) -> Any | None:
     if keys.shape[2] < N0:
         calls["decode_stock"] += 1
         return None
+    # Function-local: kv8 imports this module at its top.
+    from sous.engine import kv8
+
+    n = keys.shape[2]
+    if kv8.serves(n):
+        return kv8.decode(queries, cache, splits)
+    # At or past the ceiling this caps the window and drops the mirror. The key
+    # count never falls inside a decode, so every later call of it lands here too.
+    kv8.observe_first_row(cache, n)
     calls["decode_tile"] += 1
     return decode(queries, keys, values, splits)
 
@@ -413,22 +443,47 @@ def install_decode_hook() -> None:
         language.scaled_dot_product_attention = _decode_wrapper(current)
 
 
-def serve_verify(queries: Any, keys: Any, values: Any, splits: int) -> Any:
+def serve_verify(queries: Any, keys: Any, values: Any, splits: int, cache: Any) -> Any:
     """verify() for the exact verifier's hook, counted by T, by the rows each path
-    took and by the calls cut into more than one run."""
+    took and by the calls cut into more than one run. `cache` is the layer's
+    KVCache the rows were just appended to; a run kv8 serves reads that cache's
+    int8 mirror instead of the bf16 keys."""
+    # Function-local: kv8 imports this module at its top.
+    from sous.engine import kv8
+
     t = queries.shape[2]
-    runs = verify_plan(keys.shape[2] - t, t, splits)
+    prefix = keys.shape[2] - t
+    runs = verify_plan(prefix, t, splits)
     calls["verify_calls"] += 1
     calls[f"verify_t{t}" if t <= MAX_RUN else "verify_t9_up"] += 1
+    # Before any run asks kv8.serves: a call that starts at or past the ceiling
+    # must drop the mirror, not refresh it.
+    kv8.observe_first_row(cache, prefix + 1)
+    # A run's first row decides for the whole run: the floor and the ceiling are
+    # step boundaries, and verify_plan cuts at every one.
+    on_kv8 = {j for j, _, chunk in runs if chunk and kv8.serves(prefix + j + 1)}
     for j, k, chunk in runs:
-        if chunk:
+        if j in on_kv8:
+            kv8.calls["verify_rows_kv8"] += k - j
+            kv8.calls["verify_launches_kv8"] += 1
+        elif chunk:
             calls["verify_rows_tile"] += k - j
             calls["verify_launches"] += 1
         else:
             calls["verify_rows_stock"] += k - j
     if len(runs) > 1:
         calls["verify_straddles"] += 1
-    return verify(queries, keys, values, splits, runs)
+    if not on_kv8:
+        return _verify_runs(queries, keys, values, runs)
+    kv8.calls["verify_kv8"] += 1
+    # Once, before the first launch: every kv8 run reads the same mirror, so a call
+    # cut into several runs quantises its new rows once.
+    mirror = kv8.prepare(cache, t)
+
+    def kv8_part(j: int, k: int, chunk: int) -> Any:
+        return kv8.verify_run(queries, mirror, prefix, j, k, chunk) if j in on_kv8 else None
+
+    return _verify_runs(queries, keys, values, runs, kv8_part)
 
 
 # The dense Qwen3.5-family text model. The families that reuse its language

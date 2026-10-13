@@ -56,6 +56,16 @@ class LMEngine:
         # The projection kernel serves only modules an mlx-vlm qwen3_5 load
         # tagged, so mlx-lm's never reach it; reported off, as the tile is.
         self.projection_kernel_status = {"state": "off", "reason": None}
+        # kv8 serves only through the tile's hooks on an mlx-vlm qwen3_5
+        # load, so mlx-lm's models never reach it; reported off, with the
+        # keys kv8.enable's own `off` carries.
+        self.kv_int8_status = {
+            "state": "off",
+            "reason": None,
+            "probe_seconds": None,
+            "floor": None,
+            "ceiling": None,
+        }
         # Forks on disk, when the factory handed us a directory: built after
         # int8 has settled, since the key reads it. Tests and sous tune never
         # pass one, so nothing they build touches ~/.sous.
@@ -214,7 +224,8 @@ class LMEngine:
         return "".join(chunks)
 
     def speculation(self) -> Speculation:
-        # No drafter on this backend: every decode is plain.
+        # No drafter and no int8 mirror on this backend: every decode is
+        # plain, and the mirror's fields keep their `off` and 0.
         return Speculation()
 
     def copy_array(self, a: object) -> object:

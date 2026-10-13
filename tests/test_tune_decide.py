@@ -235,6 +235,7 @@ def _run(
         greedy=arm.greedy,
         attention_tile=arm.attention_tile,
         projection_kernel=arm.projection_kernel,
+        kv_int8=arm.kv_int8,
         window=arm.window,
         state=state,
         outcome="completed" if state == "done" else None,

@@ -253,6 +253,36 @@ def test_projection_kernel_rejects_non_booleans_with_a_warning(tmp_path: Path, b
     assert cfg.projection_kernel is False
 
 
+# ---- [model].kv_int8 ----------------------------------------------------------
+
+
+def test_kv_int8_defaults_on(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nid = 'x/y'\n")
+    assert load_config(p).kv_int8 is True
+    assert SousConfig().kv_int8 is True
+
+
+def test_kv_int8_reads_false_without_an_unknown_key_warning(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nkv_int8 = false\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cfg = load_config(p)
+    assert cfg.kv_int8 is False
+
+
+@pytest.mark.parametrize("bad", ['"yes"', "1", "0.5"])
+def test_kv_int8_rejects_non_booleans_with_a_warning(tmp_path: Path, bad: str):
+    p = tmp_path / "config.toml"
+    p.write_text(f"[model]\nkv_int8 = {bad}\n")
+    with pytest.warns(
+        UserWarning, match=r"\[model\]\.kv_int8 .* must be true or false; using false"
+    ):
+        cfg = load_config(p)
+    assert cfg.kv_int8 is False
+
+
 def test_speculative_defaults(tmp_path: Path):
     cfg = load_config(tmp_path / "nope.toml")
     assert cfg.speculative_draft_id == "z-lab/Qwen3.8-27B-DFlash2"

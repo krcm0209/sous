@@ -13,7 +13,7 @@ from sous.config import (
     SPECULATIVE_BLOCK_KERNEL,
     SPECULATIVE_BLOCK_TILE,
 )
-from sous.engine import draftctx, forkio, projkernel, tileattn
+from sous.engine import draftctx, forkio, kv8, projkernel, tileattn
 from sous.engine.base import Delta, OnDelta
 from sous.engine.forkstore import ForkStore, fork_key_fields
 from sous.engine.promptcache import (
@@ -77,6 +77,8 @@ class VLMEngine:
         int8_prefill: bool = False,
         attention_tile: bool = False,
         projection_kernel: bool = False,
+        kv_int8: bool = False,
+        kv_int8_window: int = 0,
         fork_dir: Path | None = None,
         fork_budget: int | None = None,
         weights_identity: str = "",
@@ -155,6 +157,20 @@ class VLMEngine:
             else:
                 self._draft_block_size = SPECULATIVE_BLOCK_DEFAULT
         _pin_block_size(self._draft, self._draft_block_size)
+        # After the projection kernel, once the tile's and the verifier's
+        # states are settled: kv8 serves only where the tile does and rides
+        # on its step schedule, its verify plan and, with a drafter, exact
+        # verify attention. Before the fork store and the budget, so the
+        # probe's mirrors and transient arrays are released when the budget
+        # is measured. The window is the served one: the mirror must fit
+        # beside the turn's bf16 KV inside the reserve sized from it.
+        self.kv_int8_status = kv8.enable(
+            self._model,
+            enabled=kv_int8,
+            tile_status=self.attention_tile_status,
+            verify_status=self.verify_attention_status,
+            window=kv_int8_window,
+        )
         # The drafter's context on the prompt-cache path: armed once the
         # drafter has settled, so one that failed to load leaves it off.
         self._draft_context = draftctx.enable(self._model, self._draft, self._draft_kind)
@@ -453,29 +469,53 @@ class VLMEngine:
         # cache outright rather than driving mlx-vlm's reuse path, and so
         # also owns the positions the suffix is encoded at (_positions).
         before = draftctx.rounds_snapshot(self._draft)
+        kv8_state, kv8_rows = "off", 0
         with self._draft_context.seed(draftctx.DraftContext.tail(context)):
-            for r in stream_generate(
-                model,
-                processor,
-                "",
-                max_tokens=max_tokens,
-                verbose=False,
-                prompt_cache=cache,
-                input_ids=mx.array(token_ids)[None],
-                **self._positions(cache, len(token_ids)),
-                **sampling,
-                **draft_kwargs,
-            ):
-                # Draft rows are the speculator's proposals, not accepted output;
-                # generate() skips them the same way.
-                if r.is_draft:
-                    continue
-                chunks.append(r.text)
-                if on_delta is not None:
-                    on_delta(Delta(r.text, r.generation_tokens, r.finish_reason))
+            # The int8 K/V mirror serves only inside this window, which spans
+            # the whole generation, the one-row forward that ends its own
+            # prefill segment included (that KV never outlives the turn), and
+            # nothing else: every prefill() runs with no window, so the bf16
+            # cache that forks, slots and the fork store see never meets a
+            # mirror.
+            kv8_window = bool(kv8._active)
+            if kv8_window:
+                kv8.open_window()
+            try:
+                for r in stream_generate(
+                    model,
+                    processor,
+                    "",
+                    max_tokens=max_tokens,
+                    verbose=False,
+                    prompt_cache=cache,
+                    input_ids=mx.array(token_ids)[None],
+                    **self._positions(cache, len(token_ids)),
+                    **sampling,
+                    **draft_kwargs,
+                ):
+                    # Draft rows are the speculator's proposals, not accepted
+                    # output; generate() skips them the same way.
+                    if r.is_draft:
+                        continue
+                    chunks.append(r.text)
+                    if on_delta is not None:
+                        on_delta(Delta(r.text, r.generation_tokens, r.finish_reason))
+            finally:
+                # Before PrefixCache restores or trims this cache, so no trim
+                # wrap is left on a layer when it does, and on this thread, so
+                # the mirrors' buffers leave mlx's cache before the publish
+                # that follows. An exception leaves _speculation as it was:
+                # a cold retry's decode supplies the next values.
+                if kv8_window:
+                    kv8_state, kv8_rows = kv8.close_window(cache)
         rounds, accepted, drafted = draftctx.rounds_since(self._draft, before)
         self._speculation = Speculation(
-            rounds=rounds, drafted=drafted, accepted=accepted, context=self._draft_context.fed()
+            rounds=rounds,
+            drafted=drafted,
+            accepted=accepted,
+            context=self._draft_context.fed(),
+            kv8=kv8_state,
+            kv8_rows=kv8_rows,
         )
         return "".join(chunks)
 
@@ -588,11 +628,13 @@ class VLMEngine:
         import mlx.core as mx
 
         # First, before anything below can raise: until the next load decides
-        # afresh, no call may reach the tile or the projection kernel on the
-        # strength of this model's gates. The kernel's tags stay on this
-        # model's modules, inert while its flag is clear.
+        # afresh, no call may reach the tile, the projection kernel or kv8 on
+        # the strength of this model's gates. The kernel's tags stay on this
+        # model's modules, inert while its flag is clear; kv8's mirrors live
+        # on caches that go with the engine.
         tileattn.clear()
         projkernel.clear()
+        kv8.clear()
         self.reset_prompt_cache()
         self._model = None
         self._processor = None

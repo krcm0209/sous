@@ -52,6 +52,9 @@ class Arm:
     # Inherited and keyed the same way, for the same reason: kernel and stock
     # projections differ in their last bits.
     projection_kernel: bool = True
+    # Inherited and keyed the same way: attention over int8 K/V differs from
+    # attention over bf16 K/V by the quantisation, not only in the last bits.
+    kv_int8: bool = True
     # True only for the winner stage's own int8 arm, built to *measure*
     # INT8 prefill: the engine refusing it must fail that arm. Every other
     # arm's int8_prefill is merely inherited from the user's config (every
@@ -69,17 +72,18 @@ class Arm:
         return (self.model_id, self.drafter_id, self.block_size)
 
     @property
-    def suite_key(self) -> tuple[str, str, int, bool, bool, bool, bool]:
+    def suite_key(self) -> tuple[str, str, int, bool, bool, bool, bool, bool]:
         """What identifies an arm across suite runs and a resume: the bench
         key, the one setting only the suite may change, and whether the
-        sampler is greedy, the attention tile and the projection kernel,
-        which every arm inherits."""
+        sampler is greedy, the attention tile, the projection kernel and
+        int8 K/V, which every arm inherits."""
         return (
             *self.key,
             self.int8_prefill,
             self.greedy,
             self.attention_tile,
             self.projection_kernel,
+            self.kv_int8,
         )
 
 
@@ -218,6 +222,7 @@ def _arm(
         greedy=user.temperature == 0,
         attention_tile=user.attention_tile,
         projection_kernel=user.projection_kernel,
+        kv_int8=user.kv_int8,
     )
 
 

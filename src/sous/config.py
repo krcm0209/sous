@@ -31,6 +31,7 @@ _KNOWN = {
         "int8_prefill",
         "attention_tile",
         "projection_kernel",
+        "kv_int8",
     },
 }
 
@@ -153,6 +154,23 @@ class SousConfig:
     # active, else 3. Active only where the attention tile is, `unavailable`
     # with the reason anywhere else. Read once, at daemon start.
     projection_kernel: bool = True
+    # Decode's and the exact verifier's attention read an int8 copy of the
+    # context's K/V (one symmetric scale per token and KV head) with int8
+    # queries on the tensor units' int8 rows, instead of the bf16 cache, from
+    # the kv8 floor up: half the bytes the attention tile streams. The
+    # attention output moves by 0.73% relative RMS (median over the default
+    # model's 16 full-attention layers, 1.76% at worst). The copy exists
+    # only inside a generation, so prefill, forks and the fork store stay
+    # bf16. It costs about half the bf16 KV of the rows it covers and must
+    # fit beside them in the window-sized reserve, so it serves only below
+    # a ceiling (about 84.5K keys at the 131072 window, 170K at 262144) and
+    # the rest of the generation runs on the tile. Which path a row takes
+    # depends only on its own key count, so greedy output with the drafter
+    # equals greedy output without it. Not bit-identical to the tile, hence
+    # the switch; false runs the tile.
+    # Active only where the attention tile is, `unavailable` with the
+    # reason anywhere else. Read once, at daemon start.
+    kv_int8: bool = True
     # Reuse one KV cache across the turns of a conversation, prefilling only
     # what it gained, instead of re-prefilling from scratch every turn. Works
     # because mlx streams are thread-scoped (#34): a slot only survives
@@ -470,6 +488,20 @@ def _projection_kernel(model: dict) -> bool:
     return False
 
 
+def _kv_int8(model: dict) -> bool:
+    """[model].kv_int8: true or false; anything else warns and means false,
+    the bf16 attention tile, by _int8_prefill's rule that a typo must not
+    select changed numerics."""
+    value = model.get("kv_int8", True)
+    if isinstance(value, bool):
+        return value
+    warnings.warn(
+        f"sous config: [model].kv_int8 {value!r} must be true or false; using false",
+        stacklevel=3,
+    )
+    return False
+
+
 # A registered name (letters, digits, dots, hyphens — RFC 3986's reg-name as
 # the DNS world actually spells it) or an IPv6 literal with its brackets
 # already stripped by urlsplit.
@@ -569,6 +601,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         int8_prefill=_int8_prefill(model),
         attention_tile=_attention_tile(model),
         projection_kernel=_projection_kernel(model),
+        kv_int8=_kv_int8(model),
         data_dir=(path.parent if path.parent != Path(".") else DEFAULT_DATA_DIR),
         config_path=path,
     )

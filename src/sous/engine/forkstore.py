@@ -56,6 +56,8 @@ MAX_FAILURES = 3
 # the identity key so a change to them can never be forgotten.
 _ENGINE_SOURCES = files("sous.engine")
 _EPOCH_FILES = ("vlm.py", "lm.py", "int8prefill.py", "tileattn.py", "projkernel.py")
+# Kernel sources the kernels/ scan skips (engine_epoch says why).
+_EPOCH_EXCLUDED_KERNELS = ("attention_tile_kv8.metal", "kv8_quant.metal")
 
 
 class ForkFileError(Exception):
@@ -247,6 +249,15 @@ def engine_epoch() -> str:
     # helper), so they are part of the numerics too.
     kernels = _ENGINE_SOURCES.joinpath("kernels")
     for entry in sorted(kernels.iterdir(), key=lambda e: e.name):
+        # The int8 K/V mirror's quantiser and attention kernel run only
+        # inside a generation, and the KV a generation appends is never
+        # stored: the prompt cache restores the snapshot taken before the
+        # decode, or drops the cache. Hashing them would cold-start every
+        # store on each edit to kernels no stored KV depends on, which is
+        # also why verifyattn.py is not in _EPOCH_FILES. The headers they
+        # include stay hashed: the stored-KV kernels include them too.
+        if entry.name in _EPOCH_EXCLUDED_KERNELS:
+            continue
         if entry.name.endswith((".metal", ".h")):
             h.update(entry.name.encode())
             h.update(entry.read_bytes())
