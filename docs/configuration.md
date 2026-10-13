@@ -247,7 +247,7 @@ Only a generation reads the copy. It is built from the bf16 cache on the
 first decode step at or past the floor and dropped when the generation ends,
 so prefill, the prompt cache, the on-disk forks and everything stored stay
 bf16, and the fork store does not depend on the setting. It serves attention
-from the floor, 1,536 keys (the model-load line's `kv_int8_floor=`), up to a
+from the floor, 4,481 keys (the model-load line's `kv_int8_floor=`), up to a
 ceiling set by `max_context_tokens` (`kv_int8_ceiling=`). The copy is half
 the size of the bf16 cache it mirrors and lives inside the memory the daemon
 already reserves for a turn's KV, so it serves only below the context length

@@ -670,9 +670,10 @@ goal.
   `kv8.serves(n_row)` — a window is open and not capped and `N8 ≤ n_row
   < L` (or the window is forced) — the one predicate both tile seams call
   (decode: `n_keys`; a verify run: its first row's key count). `N8`
-  (1536, a module constant equal to `N0` today, which may only ever move
-  to a later step boundary, where per-round quantisation no longer costs
-  more than kv8 saves) and `L` are tile step boundaries, so no
+  (4481, a module constant: the merge gate's round cells on the M5 Pro
+  measured kv8's saving net of the per-round quantiser negative at `N0`
+  and non-negative from 4,096 keys, hence the step boundary at or past
+  4,096) and `L` are tile step boundaries, so no
   `verify_plan` run straddles either and a call mixes kv8 and the bf16
   tile only across runs. `L` (`_ceiling`) is computed once by `enable()` with the pure
   `ceiling(window, splits)` from `[model].max_context_tokens`: the largest

@@ -37,10 +37,11 @@ from sous.engine.int8prefill import _error_line, _kernel, _kernel_text
 logger = logging.getLogger("sous.engine.kv8")
 
 # The first key count kv8 serves, a tile step boundary, so no verify run straddles
-# it; below it the tile's and the stock paths run unchanged. It sits at the tile's
-# N0 unless the int8 saving, net of the per-round quantisation, is measured below
-# zero somewhere above it.
-N8: int = 1536
+# it; below it the tile's and the stock paths run unchanged. The int8 saving net of
+# the per-round quantiser measured below zero at the tile's N0 on the M5 Pro (-0.05 ms
+# a 16-layer round at 1,536 keys) and above it from 4,096 keys up (+0.20 ms there,
+# +5.3 ms at 57K), so the floor is the step boundary at or past 4,096.
+N8: int = 4481
 # Rows a mirror is built or grown with past the call's own keys: at most one
 # growth per 4,096 generated tokens, 135 MB over 16 layers.
 GROWTH = 4096
