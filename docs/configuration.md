@@ -23,7 +23,7 @@ prompt_cache = true
 # prompt_cache_gb = 8
 # prompt_cache_disk_gb = "auto"
 speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
-# speculative_block_size = 5  # unset: 5 with the projection kernel, 4 with only the attention tile, else 3
+# speculative_block_size = 8  # unset: 8 with the projection kernel, 4 with only the attention tile, else 3
 int8_prefill = true
 attention_tile = true
 projection_kernel = true
@@ -203,11 +203,20 @@ default model and drafter, a block-5 round with the kernel cost 5 ms more than
 a block-4 round without it (115 against 110 ms) and produced 3.46 tokens
 against 3.00, so sampled decode at block 5 ran 1.10x block 4 without the
 kernel (95% CI 1.07–1.14) on 64 real subagent turns at 44–77K of context
-(#148). That is why an unset `speculative_block_size` is 5 wherever the kernel
-is active. Each row's output is bitwise independent of how many rows a call
-carries and of which projections share it, so greedy output with the drafter
-stays identical to output without it — and that is also why plain decode goes
-through the kernel. Decode's projections are one-row calls, which the
+(#148). Deeper still, the cost is attention, which steps with the tile's
+16-row groups: six verify rows × GQA 6 fill three groups and waste twelve,
+and block 6 measured 1.019x block 5 with the kernel and the int8 K/V mirror
+(95% CI 0.9995–1.043, arms drawn per round over 127 distinct subagent turns
+at 44–88K; PR #184, closed); eight rows fill the groups, the drafter is
+trained at block 8 and accepts 0.85–0.88 of positions 5–7, and block 8
+measured 1.087x block 5 on whole turns (95% CI 1.053–1.126, a pure-arm
+ABBA over 290 pairs of the same 145 turns; 1.17x per round with the arm
+drawn per round). That is why an unset `speculative_block_size` is 8
+wherever the kernel is active. Each row's
+output is bitwise independent of how many rows a call carries and of which
+projections share it, so greedy output with the drafter stays identical to
+output without it — and that is also why plain decode goes through the
+kernel. Decode's projections are one-row calls, which the
 simdgroup-matrix kernel serves on a fraction of its lanes, so they run on the
 one-row kernel instead, whose output is the same bit for bit. That took
 decode with no drafter from 10.2 to 13.4 tok/s on the first 16 of those turns
@@ -286,7 +295,7 @@ proposes it; it runs only when you set it.
 
 Speculative decoding (`speculative_draft_id`, `speculative_block_size`) is
 ~1.8x decode on the default model at short context with the shipped
-sampling; `""` disables it. Left unset, the block size is 5 where the
+sampling; `""` disables it. Left unset, the block size is 8 where the
 projection kernel is active, 4 where only the attention tile is (an M5 Pro
 with `projection_kernel = false`, or one where the kernel is `unavailable`)
 and 3 everywhere else; a value you set
@@ -313,12 +322,14 @@ through the sampled speculative walk, before the engine reached mlx-vlm's
 greedy branch, and that branch also drafts differently (#87). Without the
 projection kernel, block 4 measured best on those turns on the M5 Pro, sampled
 and greedy: +3–5% decode over block 3, with 2 and 6 clearly slower (about 0.8x block 3)
-and 5 level with 3, its interval overlapping 4's (#118); with it, block 5 is
-the faster one. 0 lets the drafter's adaptive policy pick the depth. Anything
-above 5 is clamped: block 6 ran 0.8x block 3 on the M5 Pro without the
-projection kernel, has been measured with it only in an out-of-tree spike, and
-without the attention tile 6+ verify rows also leave mlx's fused attention
-kernel. It auto-disables with a
+and 5 level with 3, its interval overlapping 4's (#118); with it, block 8
+is the faster one (above; 5 was until the int8 K/V mirror and the split-QK
+relay, and 6 never paid). 0 lets the drafter's adaptive policy pick the
+depth. Anything above 8 is clamped: the drafter is trained at block 8 and
+no deeper block has been measured in-tree. Set a deep block by hand only
+where the kernel is active: block 6 ran 0.8x block 3 on the M5 Pro without
+the projection kernel, and without the attention tile 6+ verify rows also
+leave mlx's fused attention kernel. It auto-disables with a
 warning when the drafter can't serve the configured model. On the prompt-cache
 path of a hybrid model the decode call itself prefills only the generation
 prompt, so the drafter is handed the newest window (2047 positions on the

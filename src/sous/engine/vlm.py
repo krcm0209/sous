@@ -143,10 +143,11 @@ class VLMEngine:
             tile_status=self.attention_tile_status,
         )
         # An unset block resolves only now that the tile and the kernel have
-        # settled: with the kernel a 5-row verify round's projections cost
-        # about what a 4-row round's do, so block 5 pays; with only the tile 4
-        # does (M5 Pro); anywhere else mlx-vlm's exact verifier collapses from
-        # T=4 (M2: 3.8x slower decode at 4 than at 3), so 3. The pin follows
+        # settled: with the kernel a deeper verify round's projections cost
+        # about what a 4-row round's do, so SPECULATIVE_BLOCK_KERNEL pays;
+        # with only the tile 4 does (M5 Pro); anywhere else mlx-vlm's exact
+        # verifier collapses from T=4 (M2: 3.8x slower decode at 4 than at
+        # 3), so 3. The pin follows
         # the resolution, and moving it this late changes nothing above:
         # neither the verifier's nor the tile's gates read the pin.
         if not draft_block_explicit and self._draft is not None:

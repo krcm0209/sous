@@ -38,7 +38,7 @@ FULL = (1, 3)  # their indices among the model's layers, and in its cache
 # L for every test here: the step boundary after 1,921 at S = 20. Far below the
 # ceiling of any real window, so the straddling cases stay a few rows long.
 CEILING = 2561
-BLOCK = 5  # the verify block the round-loop tests run, as the M5 Pro does
+BLOCK = 5  # the verify block the round-loop tests run
 PROMPT = 1600  # the engine tests' prompt: its last row lies past N8 and below CEILING
 # The kv8 counters a window and its forwards move; the mirror's own counters
 # (builds, rows, trims, growths) are read only where a test is about them.

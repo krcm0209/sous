@@ -59,18 +59,19 @@ model: deciding what to delegate and reviewing what comes back.
 What it will not do for you:
 
 - **It is not the fastest Qwen engine.** The default model (Qwen3.8-27B,
-  4-bit, with a DFlash2 speculative drafter) decodes at about 31 tok/s with
-  2K tokens of context and about 26.5 tok/s at 57K on an M5 Pro, sampling as
-  shipped. Plain decode without the drafter runs at about 0.84 of the chip's
-  memory-bandwidth ceiling, so what is left is tokens accepted per step, not
-  kernel speed. It prefills at about 480 tok/s on a 4K prompt and about
-  350 tok/s on a 61K one: a subagent's first turn takes about three minutes
+  4-bit, with a DFlash2 speculative drafter) decodes at about 29.5 tok/s at
+  57K of context on an M5 Pro, sampling as shipped (about 31 tok/s at 2K,
+  measured before the verify block moved from 5 to 8). Plain decode without
+  the drafter runs at about 0.84 of the chip's memory-bandwidth ceiling, so
+  what is left is tokens accepted per step, not kernel speed. It prefills
+  at about 480 tok/s on a 4K prompt and about 350 tok/s on a 61K one: a subagent's first turn takes about three minutes
   when nothing is cached, and 16 s from a fork (prefill figures measured
   before int8 prefill shipped on; [docs/configuration.md](docs/configuration.md)
   gives its gains). Scaled to the same memory bandwidth, its decode is
   within noise of what MTPLX, mlx-serve and mlx-dspark publish; Splash is
   faster on the same weights, by about 1.5x on real subagent turns measured
-  side by side (see [How it compares](#how-it-compares)).
+  side by side against sous at verify block 5, which block 8 has since
+  narrowed by about 1.09x (see [How it compares](#how-it-compares)).
 - **It runs one subagent at a time.** `sous claude` caps Claude Code at one
   subagent and one workflow agent at once, unless you set those caps
   yourself. Subagents served side by side evict each other's cached context:
@@ -165,10 +166,13 @@ Choose something else when:
   as fast (1.54, 95 % turn-clustered interval 1.46–1.67; 1.59 under the
   pre-registered window, which credits Splash's first batch), flat across
   44K–77K of context and larger on short tool-call replies than on long
-  prose; cold time to first token was equal. Its edge is the verify: it
-  checks eight drafted tokens per step on repacked weights where sous's
-  exact verifier makes five the practical limit, and at these contexts both
-  engines slow with context at the same rate. Splash also keeps whole
+  prose; cold time to first token was equal. Its edge was depth: it checks
+  eight drafted tokens per step on weights repacked at load, where sous's
+  exact verifier then ran five. sous now verifies eight too (block 8
+  decoded 1.087x block 5 on the same turns, 95 % CI 1.053–1.126), so the
+  remaining gap, not yet re-measured side by side, is about 1.4x and is the
+  step time: at these contexts both engines slow with context at the same
+  rate. Splash also keeps whole
   conversation states on disk across restarts, where sous keeps only the
   tool-block fork. MTPLX and mlx-serve publish higher raw figures, on faster chips (M5 Max,
   M4 Max) and, for mlx-serve, a short code prompt; mlx-dspark publishes
