@@ -718,7 +718,8 @@ VALIDATED_KV8_SOURCES: dict[tuple[str, str], str] = {
         "65153e7d0b6099869666eb4d10703056b0432c57025db76d808ff46e0c231ae9"
     ),
 }
-# The verify depth the probe's verifier step runs: the block-5 round's rows.
+# The verify depth the probe's verifier step runs; the exactness steps prove
+# every T from 1 to 8 on their own.
 _VERIFY_ROWS = 5
 # The row counts the exactness step runs at each of its two marks.
 _EXACT_ROWS = (1, 5, 8)

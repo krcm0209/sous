@@ -78,10 +78,17 @@ SPECULATIVE_BLOCK_DEFAULT = 3
 # off (#118); 2 and 6 ran clearly slower, 5 level with 3.
 SPECULATIVE_BLOCK_TILE = 4
 # Where the projection kernel serves the load: its verify projections cost
-# about the same at 5 rows as at 4, so the deeper block's extra accepted
-# tokens come nearly free (1.10x block 4 without the kernel on the M5 Pro,
-# #148).
-SPECULATIVE_BLOCK_KERNEL = 5
+# about the same at 8 rows as at 4, so a deeper block's extra accepted
+# tokens come nearly free (block 5 ran 1.10x block 4 without the kernel on
+# the M5 Pro, #148), and the DFlash2 drafter is trained at block 8, where
+# it accepts 0.85-0.88 of positions 5-7 against 0.80 of positions 1-4. What
+# a deeper block costs is its attention, which steps with the tile's 16-row
+# groups: six rows x GQA 6 fill three groups and waste twelve, so block 6
+# ran 1.019x block 5 with the kernel and the int8 K/V mirror (PR #184,
+# closed), while eight rows fill them and block 8 ran 1.087x block 5 on
+# whole turns (pure-arm ABBA, 95% CI 1.053-1.126, 290 pairs of 145 subagent
+# turns at 44-88K) and 1.17x per round with the arm drawn per round.
+SPECULATIVE_BLOCK_KERNEL = 8
 
 
 @dataclass(frozen=True)
@@ -115,8 +122,8 @@ class SousConfig:
     # the projection kernel serves the load, SPECULATIVE_BLOCK_TILE where only
     # the attention tile does, SPECULATIVE_BLOCK_DEFAULT everywhere else (the
     # field's own default, which is that last value). 0 hands the choice back
-    # to the drafter's adaptive policy. Above 5 is clamped
-    # (SPECULATIVE_BLOCK_MAX).
+    # to the drafter's adaptive policy. Above SPECULATIVE_BLOCK_MAX it is
+    # clamped.
     speculative_draft_id: str = "z-lab/Qwen3.8-27B-DFlash2"
     speculative_block_size: int = SPECULATIVE_BLOCK_DEFAULT
     # Whether [model].speculative_block_size was set, a clamped value
@@ -143,9 +150,10 @@ class SousConfig:
     # kernel whose rows do not depend on how many rows or linears share the
     # call: every verify forward's and, so that greedy output stays the same
     # with the drafter on or off, every other target call of up to 8 rows,
-    # decode included. With it a 5-row verify round's projections cost about
-    # what 4 rows' do, which makes block 5 pay: 1.10x sampled decode over
-    # block 4 without the kernel on real subagent turns at 44-77K (M5 Pro).
+    # decode included. With it a deeper verify round's projections cost about
+    # what 4 rows' do, which makes a deeper block pay: block 5 ran 1.10x
+    # sampled decode over block 4 without the kernel on real subagent turns
+    # at 44-77K (M5 Pro).
     # One-row calls run on a one-row kernel with the same bits, so decode
     # without a drafter runs about as fast as with false (13.4 against 13.5
     # tok/s, M5 Pro, separate runs). Not bit-identical to
@@ -361,18 +369,20 @@ def _model_window(model: dict) -> int:
     return window
 
 
-# The largest verify block sous has validated in-tree. On the M5 Pro without
-# the projection kernel, a block-6 round cost twice a block-3 one and block 6
-# ran 0.8x block 3 on real subagent turns (#118); with the kernel, block 6 has
-# been measured only in an out-of-tree spike. Without the attention tile,
-# 6+ rows also leave mlx's fused vector-attention kernel (q_len x gqa <= 32:
-# 5 rows at the default model's gqa 6).
-SPECULATIVE_BLOCK_MAX = 5
+# The largest verify block sous has validated in-tree, which is the
+# projection kernel's (SPECULATIVE_BLOCK_KERNEL). The clamp guards only
+# against blocks nothing has measured; an explicit value is honoured where it
+# is known to lose, since the intent is the user's: on the M5 Pro without the
+# kernel a block-6 round cost twice a block-3 one and block 6 ran 0.8x block 3
+# on real subagent turns (#118), and without the attention tile 6+ rows also
+# leave mlx's fused vector-attention kernel (q_len x gqa <= 32: 5 rows at the
+# default model's gqa 6).
+SPECULATIVE_BLOCK_MAX = SPECULATIVE_BLOCK_KERNEL
 
 
 def _speculative_block_size(model: dict) -> tuple[int, bool]:
     """Validated [model].speculative_block_size, and whether it was set: 0
-    (the drafter's own policy) or 2..5, degrading to the default with a
+    (the drafter's own policy) or 2..8, degrading to the default with a
     warning — same stance as the rest of the file. This one is a
     silent-truncation knob: mlx-vlm treats the value as the total verify-block
     size and ends its round loop when it is <= 1, so a configured 1 (or a

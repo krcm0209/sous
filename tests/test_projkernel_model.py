@@ -4,11 +4,11 @@ Acceptance bars (manual, on the M5 Pro; about 15 minutes, most of it five model 
 drafter-off decode on the kernel):
 - With the attention tile and the kernel on, an engine reports the kernel active; the test skips,
   naming the reason, where it cannot be.
-- An unset block resolves to 5 with the kernel active and to 4 with it off.
-- Greedy output with the DFlash2 drafter equals output without it at block 5, at blocks 8 and 12
-  set on the engine directly (config caps the block at 5), and at block 0, the drafter's own
-  policy. DFlash2's own policy verifies at most 5 rows (its runtime block is min(5, 8)), so block
-  12 is the one whose verify rows exceed 8 and are split into runs.
+- An unset block resolves to 8 with the kernel active and to 4 with it off.
+- Greedy output with the DFlash2 drafter equals output without it at block 8 (the resolved
+  block), at block 12 set on the engine directly (config caps the block at 8), and at block 0,
+  the drafter's own policy. DFlash2's own policy verifies at most 5 rows (its runtime block is
+  min(5, 8)), so block 12 is the one whose verify rows exceed 8 and are split into runs.
 - Over the kernel runs both hooks are reached, nothing is declined, and only block 12 splits.
 - An engine with the kernel off, built after the kernel engines unloaded, reproduces the output
   of one built before any of them, and makes no kernel call.
@@ -122,8 +122,8 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_the_kernel()
     drafted, drafted_counts = {}, {}
     with _engine(kernel=True, drafter=True) as engine:
         assert engine.projection_kernel_status["state"] == "active", engine.projection_kernel_status
-        assert engine._draft_block_size == 5
-        for block in (5, 8, SPLIT_BLOCK):
+        assert engine._draft_block_size == 8
+        for block in (8, SPLIT_BLOCK):
             engine._draft_block_size = block
             drafted[block], drafted_counts[block] = _generate(engine, prompts)
 

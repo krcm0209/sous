@@ -719,20 +719,20 @@ def _unset(tmp_path):
 
 B3 = CUR
 B4 = "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @4"
-B5 = "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @5"
+B8 = "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @8"
 
 
 def test_an_unset_block_is_measured_as_the_block_the_daemon_would_run(
     tmp_path, capsys, monkeypatch
 ):
     asked = _static_check(monkeypatch)
-    deps, _ = _deps(tmp_path, scores={B5: 20.0}, cached=(M, D, N))
+    deps, _ = _deps(tmp_path, scores={B8: 20.0}, cached=(M, D, N))
     assert main(_args(), config=_unset(tmp_path), **deps) == 0
     out = capsys.readouterr().out
     assert asked == [(M, fx.qwen_27b(), "dflash")]
     assert "speculative_block_size is unset and the projection kernel can run here" in out
     choice = out.split("## Choice", 1)[1]
-    assert f"  {B5}" in choice.splitlines()
+    assert f"  {B8}" in choice.splitlines()
     assert "the current arm is already the fastest measured" in choice
     assert "no config change" in choice and "Apply these changes" not in out
     assert (tmp_path / "config.toml").read_text() == "# mine\n[model]\n"

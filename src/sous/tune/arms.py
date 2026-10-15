@@ -16,9 +16,10 @@ from sous.config import (
 )
 from sous.tune.candidates import Candidate, Checkpoint, Fit, drafter_compatible, fit
 
-# The verify depths worth measuring per machine, up to the config's clamp: 5
-# pays on the M5 Pro where the projection kernel runs and 4 where it does not;
-# 2 and 3 are for machines where a verify row costs more.
+# The verify depths worth measuring per machine, up to the config's clamp:
+# SPECULATIVE_BLOCK_KERNEL pays on the M5 Pro where the projection kernel
+# runs and 4 where only the attention tile does; 2 and 3 are for machines
+# where a verify row costs more.
 BLOCK_SIZES = tuple(range(2, SPECULATIVE_BLOCK_MAX + 1))
 
 
@@ -198,7 +199,8 @@ def _arm(
         speculative_block_size=block if drafter_id else user.speculative_block_size,
         # Explicit, or the copy of the user's unset flag would let the engine
         # resolve the block at load: where the projection kernel runs, every
-        # drafter arm would measure block 5 whatever its label says.
+        # drafter arm would measure SPECULATIVE_BLOCK_KERNEL whatever its
+        # label says.
         speculative_block_explicit=True if drafter_id else user.speculative_block_explicit,
         max_context_tokens=min(user.max_context_tokens, f.window),
     )

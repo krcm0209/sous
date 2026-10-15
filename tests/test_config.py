@@ -296,7 +296,7 @@ def test_speculative_defaults(tmp_path: Path):
     assert SousConfig().speculative_block_explicit is False
 
 
-def test_speculative_block_resolutions_are_three_four_five_within_the_clamp():
+def test_speculative_block_resolutions_are_three_four_eight_within_the_clamp():
     from sous.config import (
         SPECULATIVE_BLOCK_DEFAULT,
         SPECULATIVE_BLOCK_KERNEL,
@@ -309,7 +309,7 @@ def test_speculative_block_resolutions_are_three_four_five_within_the_clamp():
         SPECULATIVE_BLOCK_TILE,
         SPECULATIVE_BLOCK_KERNEL,
         SPECULATIVE_BLOCK_MAX,
-    ) == (3, 4, 5, 5)
+    ) == (3, 4, 8, 8)
 
 
 def test_speculative_keys_from_toml_without_unknown_key_warnings(tmp_path: Path):
@@ -346,30 +346,29 @@ def test_speculative_block_size_one_or_negative_warns_and_uses_the_default(tmp_p
         ), bad
 
 
-def test_speculative_block_size_above_five_warns_and_is_clamped_to_five(tmp_path: Path):
-    """No block above 5 is validated in-tree (block 6 ran 0.8x block 3 on the M5
-    Pro without the projection kernel, and without the attention tile 6+ rows
-    leave mlx's fused attention kernel), so a larger block may be a loss the
-    user cannot see. Clamp, keeping the intent (as deep as validated), and say
-    so."""
-    for big in ("6", "9", "16"):
+def test_speculative_block_size_above_eight_warns_and_is_clamped_to_eight(tmp_path: Path):
+    """No block above 8 is validated in-tree (8 is the drafter's trained depth
+    and the deepest the projection kernel's gate measured), so a larger block
+    may be a loss the user cannot see. Clamp, keeping the intent (as deep as
+    validated), and say so."""
+    for big in ("9", "12", "16"):
         p = tmp_path / f"c{big}.toml"
         p.write_text(f"[model]\nspeculative_block_size = {big}\n")
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             cfg = load_config(p)
-        assert cfg.speculative_block_size == 5, big
+        assert cfg.speculative_block_size == 8, big
         assert cfg.speculative_block_explicit is True, big  # the intent stands
         assert any(
             str(w.message)
-            == f"sous config: [model].speculative_block_size {big} exceeds 5, the largest "
-            "verify block sous has validated in-tree; using 5"
+            == f"sous config: [model].speculative_block_size {big} exceeds 8, the largest "
+            "verify block sous has validated in-tree; using 8"
             for w in caught
         ), big
 
 
-def test_speculative_block_size_zero_and_two_to_five_accepted(tmp_path: Path):
-    for ok in (2, 3, 4, 5):
+def test_speculative_block_size_zero_and_two_to_eight_accepted(tmp_path: Path):
+    for ok in (2, 3, 4, 5, 6, 7, 8):
         p = tmp_path / f"c{ok}.toml"
         p.write_text(f"[model]\nspeculative_block_size = {ok}\n")
         with warnings.catch_warnings(record=True) as caught:

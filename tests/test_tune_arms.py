@@ -162,20 +162,23 @@ def test_a_configured_block_size_of_zero_for_auto_is_still_the_current_arm(tmp_p
 
 
 def test_a_configured_block_size_outside_the_curated_set_is_added(tmp_path):
-    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=4)
+    """The clamp leaves 0, the drafter's own policy, as the one configurable
+    block outside the curated set; it joins the measured blocks as its own
+    arm rather than displacing one."""
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", speculative_block_size=0)
     arms, _ = quick_arms(
         user, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
     )
     current = [a for a in arms if a.current]
     assert len(current) == 1
-    assert current[0].block_size == 4
-    assert current[0].label.endswith("@4")
+    assert current[0].block_size == 0
+    assert current[0].label.endswith("@auto")
     drafter_blocks = sorted(
         a.block_size
         for a in arms
         if a.model_id == "mlx-community/Qwen3.8-27B-4bit" and a.drafter_id
     )
-    assert drafter_blocks == [2, 3, 4, 5]
+    assert drafter_blocks == [0, 2, 3, 4, 5, 6, 7, 8]
 
 
 def test_a_table_model_gains_the_users_own_drafter(tmp_path):
@@ -432,7 +435,7 @@ def test_an_unset_block_resolves_to_the_kernels_where_the_static_check_passes(
     user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
     assert user.speculative_block_explicit is False
     resolved = resolve_block(user, _checkpoints())
-    assert resolved.speculative_block_size == SPECULATIVE_BLOCK_KERNEL == 5
+    assert resolved.speculative_block_size == SPECULATIVE_BLOCK_KERNEL == 8
     # Still unset: a proposal must never write the resolved block back.
     assert resolved.speculative_block_explicit is False
     assert asked == [(user, fx.qwen_27b(), "dflash")]
@@ -441,8 +444,8 @@ def test_an_unset_block_resolves_to_the_kernels_where_the_static_check_passes(
         resolved, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
     )
     current = [a for a in arms if a.current]
-    assert [(a.drafter_id, a.block_size) for a in current] == [("z-lab/Qwen3.8-27B-DFlash2", 5)]
-    assert current[0].label == "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @5"
+    assert [(a.drafter_id, a.block_size) for a in current] == [("z-lab/Qwen3.8-27B-DFlash2", 8)]
+    assert current[0].label == "Qwen3.8-27B-4bit + Qwen3.8-27B-DFlash2 @8"
 
 
 def test_an_unset_block_resolves_to_the_tiles_where_only_the_tile_can_run(tmp_path, monkeypatch):
@@ -490,7 +493,7 @@ def test_an_unset_block_is_not_resolved_for_a_target_on_the_text_only_backend(
 ):
     """Without vision_config the target loads on mlx-lm, where the factory drops
     the drafter: the daemon runs no block, so none is resolved and no line says
-    the configured arm is block 5."""
+    the configured arm is block 8."""
     asked = _static_check(monkeypatch)
     text_only = {k: v for k, v in fx.qwen_27b().items() if k != "vision_config"}
     cps = _checkpoints()
@@ -522,7 +525,7 @@ def test_an_unset_block_is_not_resolved_for_a_drafter_the_target_refuses(tmp_pat
 def test_every_drafter_arm_pins_the_block_its_label_names(tmp_path):
     """An unset block resolves at load, and replace() would hand every arm the
     user's unset flag: where the projection kernel runs, each drafter arm
-    would then load at block 5 whatever its label says."""
+    would then load at block 8 whatever its label says."""
     user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
     arms, _ = quick_arms(
         user, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
