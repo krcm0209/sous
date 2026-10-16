@@ -439,6 +439,12 @@ class ManagedEngine:
         return getattr(self._inner, "projection_kernel_status", None)
 
     @property
+    def projection_kernel_drafter_status(self) -> dict | None:
+        # Optional like the kernel's own: only a VLM load with a DFlash drafter
+        # has one, and the load line prints it only when it is not off.
+        return getattr(self._inner, "projection_kernel_drafter_status", None)
+
+    @property
     def kv_int8_status(self) -> dict | None:
         # Optional on purpose, like attention_tile_status: the VLM backend
         # reports whether kv8 serves this load, the LM backend reports it
@@ -760,6 +766,9 @@ class EngineManager:
             line += f" projection_kernel={proj['state']}"
             if proj["state"] == "active":
                 line += f" projection_kernel_probe_s={proj['probe_seconds']}"
+            drafter = getattr(engine, "projection_kernel_drafter_status", None)
+            if drafter is not None and drafter["state"] != "off":
+                line += f" projection_kernel_drafter={drafter['state']}"
         # Resolved at load, so the config alone cannot say which block runs:
         # an unset one is 5 where the kernel is active, 4 where only the
         # attention tile is and 3 elsewhere.
