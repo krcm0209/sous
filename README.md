@@ -64,14 +64,15 @@ What it will not do for you:
   measured before the verify block moved from 5 to 8). Plain decode without
   the drafter runs at about 0.84 of the chip's memory-bandwidth ceiling, so
   what is left is tokens accepted per step, not kernel speed. It prefills
-  at about 480 tok/s on a 4K prompt and about 350 tok/s on a 61K one: a subagent's first turn takes about three minutes
-  when nothing is cached, and 16 s from a fork (prefill figures measured
+  at about 480 tok/s on a 4K prompt and about 350 tok/s on a 61K one: a
+  subagent's first turn takes about three minutes when nothing is cached,
+  and 16 s from a fork (prefill figures measured
   before int8 prefill shipped on; [docs/configuration.md](docs/configuration.md)
   gives its gains). Scaled to the same memory bandwidth, its decode is
   within noise of what MTPLX, mlx-serve and mlx-dspark publish; Splash is
-  faster on the same weights, by about 1.5x on real subagent turns measured
-  side by side against sous at verify block 5, which block 8 has since
-  narrowed by about 1.09x (see [How it compares](#how-it-compares)).
+  faster on the same weights, by about 1.3x on real subagent turns measured
+  side by side, all of it step time now that both verify eight drafted
+  tokens per step (see [How it compares](#how-it-compares)).
 - **It runs one subagent at a time.** `sous claude` caps Claude Code at one
   subagent and one workflow agent at once, unless you set those caps
   yourself. Subagents served side by side evict each other's cached context:
@@ -160,21 +161,20 @@ Choose something else when:
   them with a placeholder.
 - **You want faster decode on Qwen:** Splash (in LM Studio, and since
   2026-10-12 as oMLX's external engine) is faster than sous with the same
-  weights and drafter. Measured side by side on 2026-10-13 on this M5 Pro,
-  Splash 1.3.1 against sous at 6a835b5 on 68 replayed Claude Code subagent
-  turns of 44K–229K tokens, sampled as each ships: Splash decoded about 1.5x
-  as fast (1.54, 95 % turn-clustered interval 1.46–1.67; 1.59 under the
-  pre-registered window, which credits Splash's first batch), flat across
-  44K–77K of context and larger on short tool-call replies than on long
-  prose; cold time to first token was equal. Its edge was depth: it checks
-  eight drafted tokens per step on weights repacked at load, where sous's
-  exact verifier then ran five. sous now verifies eight too (block 8
-  decoded 1.087x block 5 on the same turns, 95 % CI 1.053–1.126), so the
-  remaining gap, not yet re-measured side by side, is about 1.4x and is the
-  step time: at these contexts both engines slow with context at the same
-  rate. Splash also keeps whole
-  conversation states on disk across restarts, where sous keeps only the
-  tool-block fork. MTPLX and mlx-serve publish higher raw figures, on faster chips (M5 Max,
+  weights and drafter. Measured side by side on 2026-10-14 on this M5 Pro,
+  Splash 1.3.1 against sous at cc2626b (verify block 8) on 68 replayed
+  Claude Code subagent turns of 44K–229K tokens, sampled as each ships:
+  Splash decoded about 1.3x as fast (1.33, 95 % turn-clustered interval
+  1.24–1.44; 1.41 greedy), larger on short tool-call replies than on long
+  prose; cold time to first token was equal. The day before, against sous
+  at verify block 5, the same measurement read 1.54 (1.46–1.67). What
+  separates them now is step time, not depth: both verify eight drafted
+  tokens per step and accept about the same share (tokens per step within
+  5 %, interval including 1.00), and Splash's step on weights repacked at
+  load takes 103 ms where sous's takes 130 ms at these contexts (1.26,
+  1.25–1.29), both engines slowing with context at the same rate. Splash
+  also keeps whole conversation states on disk across restarts, where sous
+  keeps only the tool-block fork. MTPLX and mlx-serve publish higher raw figures, on faster chips (M5 Max,
   M4 Max) and, for mlx-serve, a short code prompt; mlx-dspark publishes
   about sous's figure on a slower M4 Pro, from one-line prompts. Scaled to
   the same bandwidth, all three come out near sous's. None has been
