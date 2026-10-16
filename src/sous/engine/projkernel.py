@@ -565,16 +565,32 @@ _TAG = "_sous_projection_kernel"
 # copies the wrapped function's __dict__, so the mark is still found when int8's
 # wrapper of nn.QuantizedLinear.__call__ sits on top of ours.
 _HOOK_MARK = "_sous_projection_kernel_hook"
+# The drafter's own linears carry a tag of their own and a flag of their own:
+# they shape proposals only, so none of the target's contracts (bitwise rows,
+# T-invariance, the one-row kernel) is owed to them, and a harness can toggle
+# the two routes apart.
+_DRAFT_TAG = "_sous_projection_kernel_draft"
 # 1 while the kernel serves, else 0: set only by an enable() that reached active,
 # cleared first by every enable(), by clear() and by the probe on its way out. A
 # plain int, so nothing it holds outlives an unload.
 _active = 0
+# The drafter's flag, with the same discipline: enable_drafter() clears it first
+# and sets it last, clear() clears it.
+_draft_active = 0
+# Stock quantized_matmul serves the drafter's shapes at 135-197 GB/s up to five
+# rows and falls to about 100 GB/s at eight, where the kernel reads at 126-177
+# (measured on the M5 Pro, 2026-10-16); below six rows the kernel also loses on
+# the drafter's narrow linears (N 256-1280). So the drafter's calls go to the
+# kernel from six rows up and stay stock below: a block-8 draft's eight-row
+# calls, never a block-5 draft's.
+_DRAFT_MIN_ROWS = 6
 # Per projection call, not per turn: the tests read deltas, and so can a harness
 # that wraps the daemon. Nothing is logged per turn.
 calls: dict[str, int] = {
     "verify_kernel": 0,  # verifier _linear/_linears calls the kernel served
     "verify_split": 0,  # of those, calls over MAX_ROWS rows cut into runs
     "plain_kernel": 0,  # QuantizedLinear calls the kernel served
+    "draft_kernel": 0,  # the drafter's own QuantizedLinear calls the kernel served
     "declined": 0,  # flag set and every linear tagged, refused for dtype or shape
     "one_row": 0,  # one-row kernel dispatches linears() served, one per linear
 }
@@ -613,12 +629,51 @@ def untag(model: Any) -> None:
             object.__setattr__(module, _TAG, False)
 
 
+def _draft_tagged(module: Any) -> bool:
+    return bool(getattr(module, _DRAFT_TAG, False))
+
+
+def _drafter_linears(drafter: Any) -> list[Any]:
+    """The QuantizedLinears the drafter owns: its tree minus the target's own
+    objects DFlash binds in (the lm_head, which carries the target's tag)."""
+    import mlx.nn as nn
+
+    out: list[Any] = []
+    seen: set[int] = set()
+    named = getattr(drafter, "named_modules", None)
+    for _, module in named() if callable(named) else ():
+        if (
+            isinstance(module, nn.QuantizedLinear)
+            and id(module) not in seen
+            and not _tagged(module)
+        ):
+            out.append(module)
+            seen.add(id(module))
+    return out
+
+
+def tag_drafter(drafter: Any) -> int:
+    """Tag the drafter's own linears with the drafter's tag and return how many;
+    enable_drafter() has checked each one eligible."""
+    linears = _drafter_linears(drafter)
+    for module in linears:
+        object.__setattr__(module, _DRAFT_TAG, True)
+    return len(linears)
+
+
+def untag_drafter(drafter: Any) -> None:
+    for module in _drafter_linears(drafter):
+        if _DRAFT_TAG in getattr(module, "__dict__", {}):
+            object.__setattr__(module, _DRAFT_TAG, False)
+
+
 def clear() -> None:
-    """Stop serving: both hooks hand every call on from here on. Tags left on an
-    unloaded model are inert while the flag is 0, and untagging it would need a
-    reference that keeps its weights alive."""
-    global _active
+    """Stop serving: both hooks hand every call on from here on, the drafter's
+    included. Tags left on an unloaded model are inert while the flags are 0,
+    and untagging it would need a reference that keeps its weights alive."""
+    global _active, _draft_active
     _active = 0
+    _draft_active = 0
 
 
 def _weights(module: Any) -> tuple[Any, Any, Any]:
@@ -685,6 +740,26 @@ def _serve_plain(module: Any, x: Any) -> Any | None:
     return _run_mma(x, [_weights(module)])[0]
 
 
+def _serve_draft(module: Any, x: Any) -> Any | None:
+    """The kernel's output for one call of a drafter-tagged module while the
+    drafter's flag is set and the call has _DRAFT_MIN_ROWS..MAX_ROWS rows, else
+    None. The drafter's context rows (one to a block's worth each round, the
+    whole seeded tail on a decode's first draft) fall below or above that and
+    stay stock; so does everything at block 5 and under."""
+    if not _draft_tagged(module):
+        return None
+    import mlx.core as mx
+
+    shape = x.shape
+    if not _DRAFT_MIN_ROWS <= math.prod(shape[:-1]) <= MAX_ROWS:
+        return None
+    if len(shape) < 2 or x.dtype != mx.bfloat16:
+        calls["declined"] += 1
+        return None
+    calls["draft_kernel"] += 1
+    return _run_mma(x, [_weights(module)])[0]
+
+
 def _wrap_linear(original: Callable[..., Any]) -> Callable[..., Any]:
     """The verifier hook for its single projections: o_proj, down_proj, out_proj
     and the verify head."""
@@ -725,6 +800,10 @@ def _wrap_call(original: Callable[..., Any]) -> Callable[..., Any]:
     def call(self: Any, x: Any) -> Any:
         if _active:
             out = _serve_plain(self, x)
+            if out is not None:
+                return out
+        if _draft_active:
+            out = _serve_draft(self, x)
             if out is not None:
                 return out
         return original(self, x)
@@ -1244,6 +1323,149 @@ def enable(
         # The warning carries one line; the traceback goes to the log.
         logger.warning("projection kernel: enabling failed", exc_info=True)
         return _refuse(str(e) or type(e).__name__, seconds)
+
+
+def _warm_up_drafter(linears: list[Any]) -> None:
+    """Compile and run the pipelines the drafter's shapes need at the rows the
+    hook serves, as warm_up() does for the target; the counters stay as found."""
+    import mlx.core as mx
+
+    shapes: dict[tuple[int, int], Any] = {}
+    for m in linears:
+        shapes.setdefault((_in_features(m), m.weight.shape[0]), m)
+    inputs = {k: mx.zeros((1, MAX_ROWS, k), dtype=mx.bfloat16) for k, _ in shapes}
+    mx.eval(list(inputs.values()))
+    counted = dict(calls)
+    try:
+        for (k, _), m in shapes.items():
+            mx.eval(
+                [mma(inputs[k][:, :t], [_weights(m)]) for t in range(_DRAFT_MIN_ROWS, MAX_ROWS + 1)]
+            )
+    finally:
+        calls.update(counted)
+
+
+def _probe_drafter(linears: list[Any]) -> str | None:
+    """None when the kernel's answer on each of the drafter's shapes, at the rows
+    the hook serves, is finite and within REL_RMS_BOUND of stock; else why not.
+    Proposals only, so no bitwise step: the target's probe already proved the
+    kernel's rows against each other, and a drafter shape it computes wrongly
+    would show here as distance from stock."""
+    import mlx.core as mx
+
+    shapes: dict[tuple[int, int], tuple[str, Any]] = {}
+    for m in linears:
+        shapes.setdefault(
+            (_in_features(m), m.weight.shape[0]), (f"K={_in_features(m)} N={m.weight.shape[0]}", m)
+        )
+    counted = dict(calls)
+    try:
+        for i, ((k, _), (name, m)) in enumerate(shapes.items()):
+            w, scales, biases = _weights(m)
+            x = mx.random.normal((1, MAX_ROWS, k), key=mx.random.key(900 + i)).astype(mx.bfloat16)
+            for t in (_DRAFT_MIN_ROWS, MAX_ROWS):
+                (got,) = mma(x[:, :t], [(w, scales, biases)])
+                want = mx.quantized_matmul(
+                    x[:, :t],
+                    w,
+                    scales=scales,
+                    biases=biases,
+                    transpose=True,
+                    group_size=_GROUP,
+                    bits=4,
+                )
+                distance = _stock_distance(got, want)
+                if not distance <= REL_RMS_BOUND:
+                    return (
+                        f"correctness: {name} at T={t} is {distance:.3g} from stock "
+                        f"(bound {REL_RMS_BOUND})"
+                    )
+        return None
+    finally:
+        calls.update(counted)
+        mx.clear_cache()
+
+
+def enable_drafter(drafter: Any, *, kernel_status: dict[str, Any]) -> dict[str, Any]:
+    """Decide whether the DFlash drafter's own linears run on the kernel from
+    _DRAFT_MIN_ROWS rows up; after enable(), on the loading thread. Returns the
+    status the engine exposes and never raises. `off` says the route does not
+    apply (the kernel itself is not active, or the drafter owns no quantized
+    linear); `stock` says a drafter the kernel cannot take (an ineligible
+    linear: one INFO line) or a warm-up or probe that failed (one warning);
+    either way the target's own route is untouched."""
+    global _draft_active
+    _draft_active = 0
+    seconds: float | None = None
+    try:
+        if kernel_status.get("state") != "active":
+            return {
+                "state": "off",
+                "reason": "projection kernel not active",
+                "linears": 0,
+                "probe_seconds": None,
+            }
+        linears = _drafter_linears(drafter)
+        if not linears:
+            return {
+                "state": "off",
+                "reason": "the drafter owns no quantized linear",
+                "linears": 0,
+                "probe_seconds": None,
+            }
+        for m in linears:
+            if not eligible(m):
+                reason = (
+                    f"a drafter linear the kernel cannot take "
+                    f"(K={_in_features(m)} N={m.weight.shape[0]})"
+                )
+                logger.info("projection kernel: drafter linears stay stock: %s", reason)
+                return {
+                    "state": "stock",
+                    "reason": reason,
+                    "linears": len(linears),
+                    "probe_seconds": None,
+                }
+        start = time.perf_counter()
+        try:
+            _warm_up_drafter(linears)
+            reason = _probe_drafter(linears)
+        except Exception as e:  # noqa: BLE001 — a shape this toolchain rejects stays stock
+            logger.warning("projection kernel: the drafter's warm-up failed", exc_info=True)
+            reason = f"warm-up: {_error_line(str(e) or type(e).__name__)}"
+        finally:
+            seconds = round(time.perf_counter() - start, 2)
+        if reason is not None:
+            warnings.warn(
+                f"sous: projection kernel: drafter linears stay stock ({reason})", stacklevel=2
+            )
+            logger.warning("projection kernel: drafter linears stay stock: %s", reason)
+            return {
+                "state": "stock",
+                "reason": reason,
+                "linears": len(linears),
+                "probe_seconds": seconds,
+            }
+        tagged = tag_drafter(drafter)
+        _draft_active = 1
+        logger.info(
+            "projection kernel: drafter: %d linears from %d rows, probe %.2fs",
+            tagged,
+            _DRAFT_MIN_ROWS,
+            seconds,
+        )
+        return {"state": "active", "reason": None, "linears": tagged, "probe_seconds": seconds}
+    except Exception as e:  # noqa: BLE001 — degrade, never block the model
+        _draft_active = 0
+        with contextlib.suppress(Exception):
+            untag_drafter(drafter)
+        logger.warning("projection kernel: enabling the drafter route failed", exc_info=True)
+        return {
+            "state": "stock",
+            "reason": str(e) or type(e).__name__,
+            "linears": 0,
+            "probe_seconds": seconds,
+        }
 
 
 def static_reason(config: Any, model_config: dict, drafter_kind: str | None) -> str | None:

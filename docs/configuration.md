@@ -218,7 +218,15 @@ projections share it, so greedy output with the drafter stays identical to
 output without it — and that is also why plain decode goes through the
 kernel. Decode's projections are one-row calls, which the
 simdgroup-matrix kernel serves on a fraction of its lanes, so they run on the
-one-row kernel instead, whose output is the same bit for bit. That took
+one-row kernel instead, whose output is the same bit for bit. The DFlash
+drafter's own linears (quantized the same way at load) ride the kernel too,
+but only from six rows up, where stock `quantized_matmul` drops to about 100
+GB/s on their shapes against the kernel's 126–177 and below which stock is as
+fast or faster: a block-8 draft's eight-row calls, never a block-5 draft's.
+They shape proposals only, so the drafter's probe is a distance check against
+stock, not a bitwise one, and the load line says `projection_kernel_drafter=`
+`active` (or `stock` with the reason in the log) beside the kernel's own
+state. That took
 decode with no drafter from 10.2 to 13.4 tok/s on the first 16 of those turns
 (1.32x), about the 13.5 tok/s it decodes with `false` there (measured in
 separate runs); before it, decode with no drafter ran about 0.78x. The kernel is

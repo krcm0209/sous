@@ -816,8 +816,9 @@ def fresh_target(tiny_target):
     projkernel.untag(tiny_target)
 
 
-def test_the_counters_name_the_five_paths():
+def test_the_counters_name_the_six_paths():
     assert set(projkernel.calls) == {
+        "draft_kernel",
         "verify_kernel",
         "verify_split",
         "plain_kernel",
@@ -2084,3 +2085,185 @@ def test_static_reason_keeps_the_kernels_own_model_types(monkeypatch):
     assert projkernel.static_reason(config, moe, "dflash") == (
         "unsupported model type 'qwen3_5_moe' (qwen3_5 only)"
     )
+
+
+# --------------------------------------------------------------------------------
+# The drafter's own linears: tagged apart, served from six rows
+# --------------------------------------------------------------------------------
+
+
+def _tiny_drafter(target):
+    """A quantized DFlash drafter bound to `target`, as the engine loads one: eight
+    linears of its own plus the target's lm_head."""
+    from mlx_vlm.speculative.drafters.qwen3_dflash.config import DFlashConfig
+    from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import DFlashDraftModel
+
+    vocab = target.args.vocab_size
+    drafter = DFlashDraftModel(
+        DFlashConfig(
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=128,
+            vocab_size=vocab,
+            mask_token_id=vocab - 1,
+            target_layer_ids=[1],
+            num_target_layers=4,
+        )
+    )
+    drafter.set_dtype(mx.bfloat16)
+    nn.quantize(drafter, group_size=64, bits=4)
+    drafter.bind(types.SimpleNamespace(language_model=target))
+    return drafter
+
+
+def test_the_drafter_tag_marks_its_own_linears_and_not_the_targets_head(fresh_target):
+    drafter = _tiny_drafter(fresh_target)
+    model = types.SimpleNamespace(language_model=fresh_target)
+    projkernel.tag(model)
+    assert projkernel.tag_drafter(drafter) == 8
+    owned = [
+        m
+        for _, m in drafter.named_modules()
+        if isinstance(m, nn.QuantizedLinear) and m is not fresh_target.lm_head
+    ]
+    assert all(projkernel._draft_tagged(m) and not projkernel._tagged(m) for m in owned)
+    # The head DFlash binds in is the target's object: the target's tag, never the drafter's.
+    assert projkernel._tagged(drafter.lm_head) and not projkernel._draft_tagged(drafter.lm_head)
+    projkernel.untag_drafter(drafter)
+    assert not any(projkernel._draft_tagged(m) for m in owned)
+    projkernel.untag(model)
+
+
+@pytest.mark.parametrize("rows", [6, 7, 8])
+def test_the_module_hook_serves_a_drafter_tagged_module_from_six_rows(monkeypatch, rows):
+    """Stock quantized_matmul falls off a cliff at eight rows (about 100 GB/s against
+    the kernel's 175 on the drafter's shapes) and is as fast or faster below six, so
+    the drafter's calls go to the kernel only from six rows up."""
+    pfx.hooked(monkeypatch)
+    monkeypatch.setattr(projkernel, "_draft_active", 1)
+    linear = pfx.rand_module(256, 256, 0)
+    object.__setattr__(linear, projkernel._DRAFT_TAG, True)
+    x = _acts(1, rows, 256)
+    before = dict(projkernel.calls)
+    got = linear(x)
+    assert _proj_counts_since(before) == {"draft_kernel": 1}
+    assert _bitwise(got, pfx.stand_in_mma(x, _triples(linear))[0])
+
+
+# case -> (draft flag, x, the counter it moves)
+_DRAFT_HANDED_ON = {
+    "flag clear": (0, lambda: _acts(1, 8, 256), None),
+    "five rows": (1, lambda: _acts(1, 5, 256), None),
+    "one row": (1, lambda: _acts(1, 1, 256), None),
+    "nine rows": (1, lambda: _acts(1, 9, 256), None),
+    "the context tail": (1, lambda: _acts(1, 2047, 256), None),
+    "float16": (1, lambda: _acts(1, 8, 256, dtype=mx.float16), "declined"),
+}
+
+
+@pytest.mark.parametrize("case", list(_DRAFT_HANDED_ON))
+def test_the_module_hook_hands_the_drafters_other_calls_on(monkeypatch, case):
+    flag, build, counter = _DRAFT_HANDED_ON[case]
+    seen = []
+
+    def original(self, x):
+        seen.append((self, x))
+        return "the wrapped method's answer"
+
+    hook = projkernel._wrap_call(original)
+    monkeypatch.setattr(projkernel, "_active", 1)
+    monkeypatch.setattr(projkernel, "_draft_active", flag)
+    monkeypatch.setattr(projkernel, "mma", _no_kernel)
+    linear = pfx.rand_module(256, 256, 0)
+    object.__setattr__(linear, projkernel._DRAFT_TAG, True)
+    x = build()
+    before = dict(projkernel.calls)
+    assert hook(linear, x) == "the wrapped method's answer"
+    ((got_self, got_x),) = seen
+    assert got_self is linear and got_x is x
+    assert _proj_counts_since(before) == ({} if counter is None else {counter: 1})
+
+
+def test_enable_drafter_tags_warms_probes_and_raises_its_own_flag(
+    monkeypatch, caplog, fresh_target
+):
+    tile = pfx.proj_ready(monkeypatch)
+    status = projkernel.enable(fresh_target, enabled=True, drafter_kind="dflash", tile_status=tile)
+    assert status["state"] == "active", status
+    drafter = _tiny_drafter(fresh_target)
+    before = dict(projkernel.calls)
+    with caplog.at_level(logging.INFO, logger="sous.engine.projkernel"):
+        got = projkernel.enable_drafter(drafter, kernel_status=status)
+    assert got == {
+        "state": "active",
+        "reason": None,
+        "linears": 8,
+        "probe_seconds": got["probe_seconds"],
+    }
+    assert isinstance(got["probe_seconds"], float)
+    assert projkernel._draft_active == 1 and projkernel._active == 1
+    assert projkernel.calls == before, "the warm-up and the probe leave the counters as found"
+    assert [r.getMessage() for r in caplog.records if "drafter" in r.getMessage()] == [
+        f"projection kernel: drafter: 8 linears from {projkernel._DRAFT_MIN_ROWS} rows, "
+        f"probe {got['probe_seconds']:.2f}s"
+    ]
+    # Served through the real hook at eight rows; handed on at five.
+    linear = drafter.layers[0].mlp.gate_proj
+    x8, x5 = _acts(1, 8, 256), _acts(1, 5, 256)
+    before = dict(projkernel.calls)
+    linear(x8)
+    assert _proj_counts_since(before) == {"draft_kernel": 1}
+    before = dict(projkernel.calls)
+    linear(x5)
+    assert _proj_counts_since(before) == {}
+    projkernel.clear()
+    assert projkernel._draft_active == 0 and projkernel._active == 0
+    projkernel.untag_drafter(drafter)
+
+
+@pytest.mark.parametrize("ending", ["kernel off", "no linears", "ineligible", "probe fails"])
+def test_enable_drafter_stays_stock_without_a_served_kernel_or_a_servable_drafter(
+    monkeypatch, caplog, fresh_target, ending
+):
+    tile = pfx.proj_ready(monkeypatch)
+    status = projkernel.enable(fresh_target, enabled=True, drafter_kind="dflash", tile_status=tile)
+    drafter = _tiny_drafter(fresh_target)
+    if ending == "kernel off":
+        status = {"state": "unavailable", "reason": "attention tile off", "probe_seconds": None}
+    elif ending == "no linears":
+        drafter = types.SimpleNamespace(named_modules=lambda: [])
+    elif ending == "ineligible":
+        object.__setattr__(drafter.layers[0].mlp.gate_proj, "bits", 8)
+    elif ending == "probe fails":
+        monkeypatch.setattr(
+            projkernel, "_probe_drafter", lambda linears: "correctness: gate_proj is off"
+        )
+    with (
+        caplog.at_level(logging.INFO, logger="sous.engine.projkernel"),
+        pytest.warns(UserWarning, match="drafter linears stay stock")
+        if ending == "probe fails"
+        else contextlib.nullcontext(),
+    ):
+        got = projkernel.enable_drafter(drafter, kernel_status=status)
+    assert got["state"] == ("off" if ending in ("kernel off", "no linears") else "stock"), got
+    assert got["reason"]
+    assert projkernel._draft_active == 0
+    if ending != "kernel off":
+        assert projkernel._active == 1, "the target's own route is untouched"
+    if hasattr(drafter, "layers"):
+        assert not any(
+            projkernel._draft_tagged(m)
+            for _, m in drafter.named_modules()
+            if isinstance(m, nn.QuantizedLinear)
+        )
+    levels = {r.levelno for r in caplog.records if "drafter" in r.getMessage()}
+    want = {
+        "kernel off": set(),
+        "no linears": set(),
+        "ineligible": {logging.INFO},
+        "probe fails": {logging.WARNING},
+    }
+    assert levels == want[ending]

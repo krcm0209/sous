@@ -170,6 +170,7 @@ def guard_proj_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(verifier, "_linear", verifier._linear)
     monkeypatch.setattr(verifier, "_linears", verifier._linears)
     monkeypatch.setattr(projkernel, "_active", projkernel._active)
+    monkeypatch.setattr(projkernel, "_draft_active", projkernel._draft_active)
     monkeypatch.setattr(
         int8prefill, "_QUANTIZED_LINEAR_WRAPPED", int8prefill._QUANTIZED_LINEAR_WRAPPED
     )

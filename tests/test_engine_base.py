@@ -1754,6 +1754,35 @@ def test_vlm_engine_resolves_an_unset_draft_block_by_what_is_active(
     assert drafter.prefer_requested_block_size is (expected > 0)
 
 
+@pytest.mark.parametrize("proj_state", ["active", "unavailable"])
+def test_vlm_engine_decides_the_drafters_kernel_route_after_the_kernels_own(
+    monkeypatch, proj_state
+):
+    """The drafter's own linears ride the kernel only where the kernel serves the
+    target; the engine asks after the kernel's state is settled, with the loaded
+    drafter and that state, and keeps the answer beside the kernel's."""
+    from sous.engine import projkernel
+
+    asked = []
+    real = projkernel.enable_drafter
+
+    def enable_drafter(drafter, *, kernel_status):
+        asked.append((drafter, kernel_status))
+        return real(drafter, kernel_status=kernel_status)
+
+    monkeypatch.setattr(projkernel, "enable_drafter", enable_drafter)
+    engine, drafter, _ = _drafted_vlm(monkeypatch, proj_state, "active")
+    assert asked == [(drafter, engine.projection_kernel_status)]
+    status = engine.projection_kernel_drafter_status
+    # The stub drafter is no module tree, so even an active kernel finds nothing to serve.
+    assert status["state"] == "off" and projkernel._draft_active == 0
+    assert status["reason"] == (
+        "the drafter owns no quantized linear"
+        if proj_state == "active"
+        else "projection kernel not active"
+    )
+
+
 def test_vlm_engine_built_directly_keeps_the_draft_block_it_was_given(monkeypatch):
     """Tests and scripts that build an engine themselves pass no flag; the
     block they ask for is the block they get, kernel or not."""
@@ -2981,6 +3010,48 @@ def test_get_logs_the_projection_kernel_state(caplog, tmp_path, status, tail):
         engine = _positional_factory(model_id)
         if status is not None:
             engine.projection_kernel_status = status  # ty: ignore[unresolved-attribute]
+        return engine
+
+    mgr = EngineManager(_cfg(tmp_path), engine_factory=factory)
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert len(lines) == 1 and lines[0].endswith(tail), lines
+
+
+@pytest.mark.parametrize(
+    ("drafter", "tail"),
+    [
+        (
+            {"state": "active", "reason": None, "linears": 47, "probe_seconds": 0.12},
+            " projection_kernel=active projection_kernel_probe_s=0.37"
+            " projection_kernel_drafter=active",
+        ),
+        (
+            {
+                "state": "stock",
+                "reason": "a drafter linear the kernel cannot take",
+                "linears": 47,
+                "probe_seconds": None,
+            },
+            " projection_kernel=active projection_kernel_probe_s=0.37"
+            " projection_kernel_drafter=stock",
+        ),
+        (
+            {"state": "off", "reason": None, "linears": 0, "probe_seconds": None},
+            " projection_kernel=active projection_kernel_probe_s=0.37",
+        ),
+    ],
+)
+def test_get_logs_the_drafter_route_beside_the_kernel_unless_it_is_off(
+    caplog, tmp_path, drafter, tail
+):
+    import logging
+
+    def factory(model_id):
+        engine = _positional_factory(model_id)
+        engine.projection_kernel_status = {"state": "active", "reason": None, "probe_seconds": 0.37}  # ty: ignore[unresolved-attribute]
+        engine.projection_kernel_drafter_status = drafter  # ty: ignore[unresolved-attribute]
         return engine
 
     mgr = EngineManager(_cfg(tmp_path), engine_factory=factory)

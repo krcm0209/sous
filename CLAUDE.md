@@ -501,10 +501,18 @@ goal.
   `Qwen3_5BatchInvariantForward` and inherit hook 1, so only the tag keeps
   them stock. Tags (`_TAG`, set with `object.__setattr__` so they stay out
   of mlx's parameter tree) go on every `QuantizedLinear` of the loaded
-  target's language model, `lm_head` included (497 on the default 27B);
-  the drafter's own linears are never tagged, and the greedy drafter's
-  head argmax (`quantized_argmax`) stays stock, since it shapes proposals
-  only. int8 prefill wraps the same `__call__` for its own tags at ≥ 128
+  target's language model, `lm_head` included (497 on the default 27B).
+  The drafter's own linears carry a tag of their own (`_DRAFT_TAG`) under a
+  flag of their own (`_draft_active`, `enable_drafter()` after `enable()`,
+  cleared with it), which hook 2 serves only from `_DRAFT_MIN_ROWS` = 6
+  rows to 8: stock `quantized_matmul` serves the drafter's shapes at
+  135–197 GB/s up to five rows and falls to about 100 at eight, where the
+  kernel reads at 126–177 (M5 Pro, 2026-10-16), so a block-8 draft's
+  eight-row calls go to the kernel and a block-5 draft's never do; they
+  shape proposals only, so no bitwise or T-invariance contract is owed to
+  them, their probe is relrms against stock, and the drafter stays out of
+  the fork key. The greedy drafter's head argmax (`quantized_argmax`) stays
+  stock, since it too shapes proposals only. int8 prefill wraps the same `__call__` for its own tags at ≥ 128
   rows on `shape[-2]`: the row ranges are disjoint and each wrapper falls
   through to what it wrapped, so install order does not matter — keep the
   two gates disjoint if either moves. The flag `_active` is a plain int, 1

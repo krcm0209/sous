@@ -142,6 +142,14 @@ class VLMEngine:
             drafter_kind=self._draft_kind if self._draft is not None else None,
             tile_status=self.attention_tile_status,
         )
+        # The drafter's own linears ride the same kernel from six rows up (its
+        # proposals only, so none of the target's contracts): decided after
+        # the kernel's own state, off wherever that is not active.
+        self.projection_kernel_drafter_status = (
+            projkernel.enable_drafter(self._draft, kernel_status=self.projection_kernel_status)
+            if self._draft is not None and self._draft_kind == "dflash"
+            else {"state": "off", "reason": None, "linears": 0, "probe_seconds": None}
+        )
         # An unset block resolves only now that the tile and the kernel have
         # settled: with the kernel a deeper verify round's projections cost
         # about what a 4-row round's do, so SPECULATIVE_BLOCK_KERNEL pays;
