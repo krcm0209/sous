@@ -503,8 +503,9 @@ goal.
   of mlx's parameter tree) go on every `QuantizedLinear` of the loaded
   target's language model, `lm_head` included (497 on the default 27B).
   The drafter's own linears carry a tag of their own (`_DRAFT_TAG`) under a
-  flag of their own (`_draft_active`, `enable_drafter()` after `enable()`,
-  cleared with it), which hook 2 serves only from `_DRAFT_MIN_ROWS` = 6
+  flag of their own (`_draft_active`, set by `enable_drafter()` after
+  `enable()`, which clears both, as `clear()` does), which hook 2 serves
+  only from `_DRAFT_MIN_ROWS` = 6
   rows to 8: stock `quantized_matmul` serves the drafter's shapes at
   135–197 GB/s up to five rows and falls to about 100 at eight, where the
   kernel reads at 126–177 (M5 Pro, 2026-10-16), so a block-8 draft's
@@ -592,11 +593,12 @@ goal.
   (`VLMEngine(projection_kernel=False, draft_block_explicit=True)`); only
   `default_engine_factory` hands them the config. Nothing is logged per
   turn; `projkernel.calls` (`verify_kernel`, `verify_split`,
-  `plain_kernel`, `declined`, and `one_row`, one per one-row dispatch
-  `linears()` serves; warm-up and probe leave them all as found) counts
+  `plain_kernel`, `draft_kernel`, `declined`, and `one_row`, one per one-row
+  dispatch `linears()` serves; warm-up and probe leave them all as found) counts
   every path for the tests and for
-  harnesses, and the load line carries `projection_kernel=` and, with a
-  drafter, `draft_block=`. The fork key records `proj` (`active`, else
+  harnesses, and the load line carries `projection_kernel=`, with a DFlash
+  drafter beside an active kernel `projection_kernel_drafter=active|stock`,
+  and, with a drafter, `draft_block=`. The fork key records `proj` (`active`, else
   `off`) and `projkernel.py` is in `_EPOCH_FILES`: the one-row forward that
   ends every prefill segment, and any tail of ≤ 8 rows, runs on the
   kernel, so stored KV and GDN state depend on it, while routing never

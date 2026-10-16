@@ -1276,12 +1276,15 @@ def enable(
     kernel. Returns the status the engine exposes and never raises: a model
     load must not fail because an accelerator is missing. probe_seconds covers
     the warm-up and the probe, the kernel's whole cost to a load."""
-    global _active
+    global _active, _draft_active
     # First, on every call: a flag left from an earlier load must never serve
-    # this one, whatever happens below. Tags left on an earlier model are inert
-    # while it is clear, and a reference kept to untag them would keep that
-    # model's weights alive past its unload, so they stay.
+    # this one, whatever happens below; the drafter's flag goes with it, since
+    # enable_drafter() runs only after an active enable(). Tags left on an
+    # earlier model are inert while the flags are clear, and a reference kept
+    # to untag them would keep that model's weights alive past its unload, so
+    # they stay.
     _active = 0
+    _draft_active = 0
     if not enabled:
         return {"state": "off", "reason": None, "probe_seconds": None}
     seconds: float | None = None
@@ -1363,7 +1366,7 @@ def _probe_drafter(linears: list[Any]) -> str | None:
         for i, ((k, _), (name, m)) in enumerate(shapes.items()):
             w, scales, biases = _weights(m)
             x = mx.random.normal((1, MAX_ROWS, k), key=mx.random.key(900 + i)).astype(mx.bfloat16)
-            for t in (_DRAFT_MIN_ROWS, MAX_ROWS):
+            for t in range(_DRAFT_MIN_ROWS, MAX_ROWS + 1):
                 (got,) = mma(x[:, :t], [(w, scales, biases)])
                 want = mx.quantized_matmul(
                     x[:, :t],
