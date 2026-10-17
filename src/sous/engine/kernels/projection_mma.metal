@@ -17,6 +17,13 @@
 // splits this file at the STAGED and GROUP_SUMS marker lines and fills in the
 // linear-selection code.
 //
+// With SLAB set (a header define, as PRESUM is) the plain and staged bodies read
+// slab-ordered weights (slab.py): each linear's planes are [tiles][G][256], so
+// column n's group g is the 32-byte code unit (n / 256 * G + g) * 256 + n % 256,
+// and the scale and bias of the same index. Only the addresses change, so a row's
+// bits are the mlx-layout body's. The layout is Splash's (incoai/splash), under
+// the same license.
+//
 // Plain body. Template: TR (rows, 1..8), KD (K), NLIN, N0..N3 (each linear's N),
 // CT1..CT3 (each later linear's first tile). Grid (128, tiles, 1), threadgroup
 // (128, 1, 1): one threadgroup per 32-column tile of one linear. A lane (fm, fn)
@@ -47,9 +54,15 @@
   const device bfloat *bcol[F];
   for (uint f = 0; f < F; ++f) {
     const uint n = min(base + f * 8 + fm, NL_ - 1);
+#if SLAB
+    wcol[f] = (const device uint8_t *)W_ + (ulong(n >> 8) * G * 256 + (n & 255)) * 32 + c * 8;
+    scol[f] = (const device bfloat *)S_ + ulong(n >> 8) * G * 256 + (n & 255);
+    bcol[f] = (const device bfloat *)B_ + ulong(n >> 8) * G * 256 + (n & 255);
+#else
     wcol[f] = (const device uint8_t *)W_ + ulong(n) * (KD / 2) + c * 8;
     scol[f] = (const device bfloat *)S_ + ulong(n) * G;
     bcol[f] = (const device bfloat *)B_ + ulong(n) * G;
+#endif
   }
   const uint r0 = fn, r1 = fn + 1;
   const bool v0 = r0 < TR, v1 = r1 < TR;
@@ -65,13 +78,23 @@
 
   // weights one group ahead
   uint2 wq[F];
+#if SLAB
+  for (uint f = 0; f < F; ++f)
+    wq[f] = (g0 < g1) ? *(const device uint2 *)(wcol[f] + ulong(g0) * 8192) : uint2(0);
+#else
   for (uint f = 0; f < F; ++f)
     wq[f] = (g0 < g1) ? *(const device uint2 *)(wcol[f] + ulong(g0) * 32) : uint2(0);
+#endif
   for (uint g = g0; g < g1; ++g) {
     uint2 wv[F];
     for (uint f = 0; f < F; ++f) wv[f] = wq[f];
+#if SLAB
+    if (g + 1 < g1)
+      for (uint f = 0; f < F; ++f) wq[f] = *(const device uint2 *)(wcol[f] + ulong(g + 1) * 8192);
+#else
     if (g + 1 < g1)
       for (uint f = 0; f < F; ++f) wq[f] = *(const device uint2 *)(wcol[f] + ulong(g + 1) * 32);
+#endif
 
     vec<bfloat, 4> ra0 = *(const device vec<bfloat, 4> *)(x0 + g * 64);
     vec<bfloat, 4> rb0 = *(const device vec<bfloat, 4> *)(x0 + g * 64 + 8);
@@ -104,8 +127,13 @@
       }
     }
     for (uint f = 0; f < F; ++f) {
+#if SLAB
+      const float scale = float(scol[f][ulong(g) * 256]);
+      const float bias = float(bcol[f][ulong(g) * 256]);
+#else
       const float scale = float(scol[f][g]);
       const float bias = float(bcol[f][g]);
+#endif
       acc[f] = fma(dot[f], scale, acc[f]);
       acc[f] = fma(sm, bias, acc[f]);
     }
@@ -163,8 +191,13 @@
   const device bfloat *bcol[F];
   for (uint f = 0; f < F; ++f) {
     const uint n = min(base + f * 8 + fm, NL_ - 1);
+#if SLAB
+    scol[f] = (const device bfloat *)S_ + ulong(n >> 8) * G * 256 + (n & 255);
+    bcol[f] = (const device bfloat *)B_ + ulong(n >> 8) * G * 256 + (n & 255);
+#else
     scol[f] = (const device bfloat *)S_ + ulong(n) * G;
     bcol[f] = (const device bfloat *)B_ + ulong(n) * G;
+#endif
   }
   // loader map: chunk q = i * 32 + lane -> column q / (2 GB), 16-byte chunk q % (2 GB)
   const device uint8_t *lsrc[NLD];
@@ -173,7 +206,13 @@
     const uint q = i * 32 + lane;
     const uint col = q / (2 * GB), ch = q % (2 * GB);
     const uint n = min(base + col, NL_ - 1);
+#if SLAB
+    // chunk ch is half ch & 1 of group ch / 2's unit, and a column's groups are 8192 bytes apart
+    lsrc[i] = (const device uint8_t *)W_ + (ulong(n >> 8) * G * 256 + (n & 255)) * 32 +
+              (ch >> 1) * 8192 + (ch & 1) * 16;
+#else
     lsrc[i] = (const device uint8_t *)W_ + ulong(n) * (KD / 2) + ch * 16;
+#endif
     // chunk ch = group gi (ch / 2), words 4 (ch & 1) .. +3 = uint2 slots c = 2 (ch & 1), +1
     const uint gi = ch >> 1, f = col >> 3, cm = col & 7;
     ldst[i] = ((gi * F + f) * 8 + cm) * 4 + 2 * (ch & 1);
@@ -191,7 +230,11 @@
 
   const uint g0 = (sk * G) / KS, g1 = ((sk + 1) * G) / KS;  // multiples of GB
   uint4 pre[NLD];
+#if SLAB
+  for (uint i = 0; i < NLD; ++i) pre[i] = *(const device uint4 *)(lsrc[i] + ulong(g0) * 8192);
+#else
   for (uint i = 0; i < NLD; ++i) pre[i] = *(const device uint4 *)(lsrc[i] + ulong(g0) * 32);
+#endif
   for (uint gs = g0; gs < g1; gs += GB) {
     simdgroup_barrier(mem_flags::mem_threadgroup);  // previous stage fully read
     for (uint i = 0; i < NLD; ++i) {
@@ -199,8 +242,14 @@
       stg[ldst[i] + 1] = pre[i].zw;
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
+#if SLAB
+    if (gs + GB < g1)
+      for (uint i = 0; i < NLD; ++i)
+        pre[i] = *(const device uint4 *)(lsrc[i] + ulong(gs + GB) * 8192);
+#else
     if (gs + GB < g1)
       for (uint i = 0; i < NLD; ++i) pre[i] = *(const device uint4 *)(lsrc[i] + ulong(gs + GB) * 32);
+#endif
     for (uint gi = 0; gi < GB; ++gi) {
       const uint g = gs + gi;
       uint2 wv[F];
@@ -239,8 +288,13 @@
         }
       }
       for (uint f = 0; f < F; ++f) {
+#if SLAB
+        const float scale = float(scol[f][ulong(g) * 256]);
+        const float bias = float(bcol[f][ulong(g) * 256]);
+#else
         const float scale = float(scol[f][g]);
         const float bias = float(bcol[f][g]);
+#endif
         acc[f] = fma(dot[f], scale, acc[f]);
         acc[f] = fma(sm, bias, acc[f]);
       }

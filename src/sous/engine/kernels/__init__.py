@@ -15,10 +15,12 @@ combines, and ``kv8_quant.metal`` the row quantiser that fills its int8 mirror;
 the quantiser uses no tensor ops, so CI runs its tests. ``projection_mma.metal``
 holds three, the plain kernel, the staged kernel and the group-sums kernel,
 divided at its ``// STAGED`` and ``// GROUP_SUMS`` lines; ``projection_mma.h``
-holds the 8x8x8 simdgroup multiply-accumulate helper and the presum switch.
-``projection_row.metal`` is the one-row kernel, which serves a single row in the
-same summation order with no MMA. None of the projection kernels uses tensor ops,
-so they compile on any Metal GPU and CI runs their tests.
+holds the 8x8x8 simdgroup multiply-accumulate helper and the presum and slab
+switches. ``projection_row.metal`` is the one-row kernel, which serves a single
+row in the same summation order with no MMA: two bodies, over mlx's layout and
+over slab-ordered weights, divided at its ``// SLAB`` line. None of the
+projection kernels uses tensor ops, so they compile on any Metal GPU and CI runs
+their tests.
 
 The int8 prefill kernels are derived from oMLX (jundot/omlx#3548) and the
 projection kernel in part from Splash (incoai/splash and its Apple7/8 port), both
