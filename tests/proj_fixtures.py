@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from sous.engine import int8prefill, projkernel
+from sous.engine import int8prefill, projkernel, slab
 from tests import tile_fixtures as tfx
 
 # Read once: a failed probe is not remembered, so each call would compile again.
@@ -78,22 +78,29 @@ def projection_inputs(
     return cancelling_activations(rows, k, layout, x_seed), weights
 
 
-def stand_in_mma(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]:
+def stand_in_mma(x: Any, weights: list[Any]) -> tuple[Any, ...]:
     """A plain-mlx model of projkernel.mma's contract: every linear dequantized in
     fp32 and applied to each row on its own (the same one-row matmul whatever the
     row count), rounded to bf16. A row's output depends on its own activations and
     its own linear and nothing else, the property the routing tests rely on. It
     refuses what the kernel refuses, so a hook that forgets to split a long verify
-    call fails here too."""
+    call fails here too. A slab entry (projkernel.Weights with a SlabInfo) is read
+    through slab.unpack, so it computes what its mlx arrays would."""
     import mlx.core as mx
 
     k = x.shape[-1]
     n_rows = x.size // k
     if x.dtype != mx.bfloat16 or not 1 <= n_rows <= projkernel.MAX_ROWS:
         raise ValueError(f"stand-in takes 1..{projkernel.MAX_ROWS} bf16 rows, got {x.shape}")
+    infos = [entry[3] if len(entry) == 4 else None for entry in weights]
+    if len({info is None for info in infos}) > 1:
+        raise ValueError("stand-in: a call mixes slab-ordered and mlx-layout linears")
     rows = x.reshape(n_rows, k).astype(mx.float32)
     outs = []
-    for w, scales, biases in weights:
+    for entry, info in zip(weights, infos, strict=True):
+        w, scales, biases = entry[:3]
+        if info is not None:
+            w, scales, biases = slab.unpack(w, scales, biases, info)
         dense = mx.dequantize(
             w, scales.astype(mx.float32), biases.astype(mx.float32), group_size=64, bits=4
         )
@@ -102,11 +109,13 @@ def stand_in_mma(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]
     return tuple(outs)
 
 
-def stand_in_one_row(x2: Any, w: Any, scales: Any, biases: Any) -> Any:
+def stand_in_one_row(x2: Any, w: Any, scales: Any, biases: Any, slab: Any = None) -> Any:
     """A plain-mlx model of projkernel.one_row's contract: one [1, K] row through
     one linear, the stand-in's own arithmetic, so it equals stand_in_mma's row
-    bit for bit as the real one-row kernel equals the MMA kernel's."""
-    return stand_in_mma(x2, [(w, scales, biases)])[0]
+    bit for bit as the real one-row kernel equals the MMA kernel's. A slab-only
+    linear's planes come with their SlabInfo as `slab`, as the real seam's do."""
+    entry = (w, scales, biases) if slab is None else projkernel.Weights(w, scales, biases, slab)
+    return stand_in_mma(x2, [entry])[0]
 
 
 def rand_module(n: int, k: int, seed: int) -> Any:

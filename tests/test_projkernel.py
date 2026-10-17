@@ -20,8 +20,15 @@ mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 np = pytest.importorskip("numpy")
 
-from sous.engine import gpucores, int8prefill, nax, projkernel  # noqa: E402 — after the guards
+from sous.engine import (  # noqa: E402 — after the guards
+    gpucores,
+    int8prefill,
+    nax,
+    projkernel,
+    slab,
+)
 from tests import proj_fixtures as pfx  # noqa: E402
+from tests import projtile_fixtures as ptfx  # noqa: E402
 from tests import tile_fixtures as tfx  # noqa: E402
 
 # ---- kernel source ---------------------------------------------------------------
@@ -66,19 +73,53 @@ def test_the_header_holds_mma8_and_the_presum_switch():
     assert "MetalPerformancePrimitives" not in header
 
 
-def test_the_one_row_kernel_is_one_body_with_its_tile_frozen():
+def test_the_mlx_layout_one_row_body_freezes_its_tile():
     """One simdgroup per column, four per threadgroup: the tile only sets the
     speed, but the launch sizes the grid from it, and its threadgroup memory
     (NSG * G * (RC + 1) fp32 values) caps the K the kernel takes at Apple's
     32 KB. Mode h only, the quarters added in the MMA kernel's order."""
-    body = _text("projection_row.metal")
-    assert "#include" not in body and "mpp::" not in body
+    assert "#include" not in _text("projection_row.metal")
+    body = projkernel._row_source()
+    assert "mpp::" not in body
     assert "constexpr uint RC = 1;" in body and "constexpr uint NSG = 4;" in body
     assert "as_type<half2>(" in body and "- half2(1024.0h)" in body
     assert body.count("((acc + a1) + a2) + a3") == 1
     assert (projkernel._ROW_COLS, projkernel._ROW_THREADS) == (1 * 4, 32 * 4)
     assert 4 * (projkernel._ROW_MAX_K // 64) * (1 + 1) * 4 == 32 * 1024
     assert projkernel._ROW_MAX_K >= 17_408, "the 27B's down projection"
+
+
+def test_the_bodies_carry_a_slab_switch_and_the_row_kernel_a_slab_body():
+    """Slab addressing is a header define, as PRESUM is: the preprocessor cannot
+    see a template argument. The MMA bodies switch only their weight, scale and
+    bias addresses on it; the one-row kernel's slab body is a body of its own,
+    after a marker line, with one lane per column of a 256-column tile and the
+    mlx-layout body's summation order."""
+    plain, staged, sums = projkernel._bodies()
+    unit = "(ulong(n >> 8) * G * 256 + (n & 255)) * 32"
+    for body in (plain, staged):
+        assert "#if SLAB" in body and unit in body
+        assert "scol[f][ulong(g) * 256]" in body and "bcol[f][ulong(g) * 256]" in body
+    assert "SLAB" not in sums
+    assert "#ifndef SLAB\n#define SLAB 0\n#endif" in _text("projection_mma.h")
+    for template in (
+        projkernel._dispatch(3, 1024, (72, 48))["template"],
+        projkernel._row_dispatch(1024, 544)["template"],
+        projkernel._row_dispatch(1024, 544, 3)["template"],
+    ):
+        assert all(name != "SLAB" for name, _ in template)
+    text = _text("projection_row.metal")
+    assert text.count("// SLAB\n") == 1 and text.count("\n// SLAB\n") == 1
+    mlx_body, slab_body = projkernel._row_source(), projkernel._row_slab_source()
+    assert text == mlx_body + "// SLAB\n" + slab_body
+    assert "#include" not in slab_body and "mpp::" not in slab_body
+    assert "const uint n = tile * 256 + r;" in slab_body
+    assert "threadgroup float gsum[G];" in slab_body and "constexpr uint KS = 4;" in slab_body
+    assert "as_type<half2>(" in slab_body and "- half2(1024.0h)" in slab_body
+    assert "ulong(g) * 8192" in slab_body
+    assert slab_body.count("((part[0] + part[1]) + part[2]) + part[3]") == 1
+    assert "if (n < ND)" in slab_body
+    assert projkernel._ROW_SLAB_THREADS == slab.TILE
 
 
 def test_the_linear_select_is_generated_per_count():
@@ -106,11 +147,16 @@ def test_every_kernel_is_built_with_safe_math_under_its_own_name(monkeypatch):
     for kind in projkernel.VARIANTS:
         for nl in range(1, 5):
             projkernel._projection_kernel(kind, nl)
+            projkernel._projection_kernel(kind, nl, True)
     projkernel._group_sums_kernel()
     projkernel._row_kernel()
+    projkernel._row_kernel(True)
     assert set(made) == {
-        f"sous_proj_{kind}_n{nl}" for kind in projkernel.VARIANTS for nl in range(1, 5)
-    } | {"sous_proj_group_sums", "sous_proj_row"}
+        f"sous_proj_{kind}{form}_n{nl}"
+        for kind in projkernel.VARIANTS
+        for form in ("", "_slab")
+        for nl in range(1, 5)
+    } | {"sous_proj_group_sums", "sous_proj_row", "sous_proj_row_slab"}
     for name, kwargs in made.items():
         assert kwargs["compile_options"] == {"math_mode": "safe"}, name
         assert kwargs.get("ensure_row_contiguous", True) is True, name
@@ -123,9 +169,25 @@ def test_every_kernel_is_built_with_safe_math_under_its_own_name(monkeypatch):
     assert "#define PRESUM 1" not in made["sous_proj_staged_n2"]["header"]
     assert made["sous_proj_plain_n1"]["input_names"] == ["x", "w0", "s0", "b0"]
     assert made["sous_proj_group_sums"]["output_names"] == ["sums"]
-    row = made["sous_proj_row"]
-    assert (row["input_names"], row["output_names"]) == (["x", "w", "scales", "biases"], ["y"])
-    assert row["source"] == _text("projection_row.metal")
+    # The slab bodies are the same source under a header define, never a template
+    # argument: the preprocessor cannot see one.
+    for kind in projkernel.VARIANTS:
+        for nl in range(1, 5):
+            mlx_form, slab_form = (made[f"sous_proj_{kind}{f}_n{nl}"] for f in ("", "_slab"))
+            assert slab_form["source"] == mlx_form["source"]
+            assert slab_form["input_names"] == mlx_form["input_names"]
+            header = slab_form["header"]
+            assert header.index("#define SLAB 1\n") < header.index("#ifndef SLAB")
+            assert "#define SLAB 1" not in mlx_form["header"]
+    assert "#define PRESUM 1\n" in made["sous_proj_staged_ps_slab_n2"]["header"]
+    assert "#define SLAB 1" not in made["sous_proj_group_sums"]["header"]
+    row, row_slab = made["sous_proj_row"], made["sous_proj_row_slab"]
+    for kernel in (row, row_slab):
+        names = (kernel["input_names"], kernel["output_names"])
+        assert names == (["x", "w", "scales", "biases"], ["y"])
+        assert kernel["header"] == _text("common.h")
+    assert row["source"] == projkernel._row_source()
+    assert row_slab["source"] == projkernel._row_slab_source()
 
 
 # ---- the variant choice ----------------------------------------------------------
@@ -770,6 +832,212 @@ def test_the_quarter_layouts_cancel_one_k_quarter_against_another(layout, first,
     source, mirror, _ = (np.flatnonzero(np.array(m)) for m in projkernel._mirror(k, layout))
     assert source[0] == starts[first] and source[-1] < starts[first + 1]
     assert mirror[0] == starts[second] and mirror[-1] < starts[second + 1]
+
+
+# ---- the slab form ----------------------------------------------------------------
+
+
+def _slab_entry(w, scales, biases):
+    """mlx's arrays repacked into slab planes, as the descriptor a slab-only module
+    hands the kernel."""
+    codes, s, b, info = slab.repack(w, scales, biases)
+    return projkernel.Weights(codes, s, b, info)
+
+
+def _identical(a, b) -> bool:
+    """Shape, dtype and every bit: a bf16 -0.0 is not +0.0 here."""
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    return mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item()
+
+
+@pfx.kernel
+@pytest.mark.parametrize("layout", pfx.LAYOUTS)
+@pytest.mark.parametrize(
+    ("k", "n"),
+    [(1024, 256), (1024, 544), (2048, 1024)],
+    ids=["k1024-n256", "k1024-n544", "k2048-n1024"],
+)
+def test_slab_bodies_equal_mlx_bodies(forced, layout, k, n):
+    """The slab bodies change where a (column, group) unit is read and nothing
+    else, so every row equals the mlx-layout body's bit for bit at every row
+    count, in every variant. N = 544 pads its last tile, and the second linear
+    (72 columns) pads too and is reached through the multi-linear selection;
+    linears() routes both forms alike, the one-row kernel's at T = 1 included."""
+    ns = (n, 72)
+    x, weights = pfx.projection_inputs(layout, 8, k, ns, x_seed=k + n, w_seed=n)
+    slabs = [_slab_entry(*w) for w in weights]
+    for t in range(1, projkernel.MAX_ROWS + 1):
+        want = projkernel._launch(forced, x[:t], weights)
+        got = projkernel._launch(forced, x[:t], slabs)
+        for g, w, width in zip(got, want, ns, strict=True):
+            assert g.shape == (t, width), (forced, t)
+            assert _identical(g, w), (forced, layout, k, n, t)
+        routed = projkernel.linears(x[:t], slabs)
+        for g, w in zip(routed, projkernel.linears(x[:t], weights), strict=True):
+            assert _identical(g, w), (forced, layout, k, n, t)
+
+
+@pfx.kernel
+@pytest.mark.parametrize("layout", pfx.LAYOUTS)
+@pytest.mark.parametrize(
+    ("k", "n"),
+    [(1024, 256), (1024, 544), (1088, 48)],
+    ids=["k1024-n256", "k1024-n544", "k1088-n48"],
+)
+def test_the_slab_one_row_kernel_equals_the_mlx_one_row_kernel(k, n, layout):
+    """One lane per column over slab planes, in the mlx-layout body's order:
+    the quarters, each group's dot chain from +0, the two-fma epilogue. K = 1088
+    splits its 17 groups unevenly; N = 544 and 48 pad their last tile."""
+    x, ((w, scales, biases),) = pfx.projection_inputs(layout, 3, k, (n,), x_seed=k, w_seed=n)
+    codes, s, b, info = _slab_entry(w, scales, biases)
+    for r in range(3):
+        row = x[r : r + 1]
+        got = projkernel._launch_row(row, codes, s, b, slab=info)
+        assert got.shape == (1, n) and got.dtype == mx.bfloat16
+        assert _identical(got, projkernel._launch_row(row, w, scales, biases)), (k, n, layout, r)
+
+
+@pfx.kernel
+def test_the_slab_one_row_kernel_equals_the_mlx_one_row_kernel_on_a_real_width_linear():
+    """The 27B's gate width on random rows, the backstop the mlx-layout one-row
+    kernel has: across tens of thousands of outputs a reordered sum lands a few
+    on another bf16."""
+    k, n, rows = 5120, 17_408, 4
+    x = pfx.activations(rows, k, 52)
+    weights = pfx.rand_linear(n, k, 53)
+    codes, s, b, info = _slab_entry(*weights)
+    got = mx.concatenate(
+        [projkernel._launch_row(x[r : r + 1], codes, s, b, slab=info) for r in range(rows)]
+    )
+    want = mx.concatenate([projkernel._launch_row(x[r : r + 1], *weights) for r in range(rows)])
+    assert _identical(got, want)
+
+
+_SLAB_QUARTERS = "((part[0] + part[1]) + part[2]) + part[3]"
+_SLAB_EPILOGUE = (
+    "acc = fma(dot, float(sc[ulong(g) * 256]), acc);\n"
+    "      acc = fma(gsum[g], float(bi[ulong(g) * 256]), acc);"
+)
+# The negative control's reorders as the slab body spells them: the products, the
+# group sum and the lane sum read as they do in the mlx-layout body.
+_SLAB_REORDERED = {
+    "quarters": (_SLAB_QUARTERS, "((part[0] + part[3]) + part[1]) + part[2]", "quarter"),
+    "paired quarters": (_SLAB_QUARTERS, "(part[0] + part[1]) + (part[2] + part[3])", "middle"),
+    "reversed quarters": (_SLAB_QUARTERS, "((part[3] + part[2]) + part[1]) + part[0]", "middle"),
+    "products": _REORDERED["products"],
+    "group sum": _REORDERED["group sum"],
+    "lane sum": _REORDERED["lane sum"],
+    "bias first": (
+        _SLAB_EPILOGUE,
+        "acc = fma(gsum[g], float(bi[ulong(g) * 256]), acc);\n"
+        "      acc = fma(dot, float(sc[ulong(g) * 256]), acc);",
+        "pair",
+    ),
+    "unfused epilogue": (
+        _SLAB_EPILOGUE,
+        "{ const float p = dot * float(sc[ulong(g) * 256]);\n"
+        "      const float pb = gsum[g] * float(bi[ulong(g) * 256]);\n"
+        "      acc = (acc + p) + pb; }",
+        "pair",
+    ),
+}
+
+
+@pfx.kernel
+@pytest.mark.parametrize("name", list(_SLAB_REORDERED))
+def test_a_slab_one_row_kernel_that_sums_in_another_order_is_caught(monkeypatch, name):
+    """The slab body's negative control: with one sum reordered, its layout tells
+    it apart from the mlx-layout one-row kernel, so the equality above is not
+    vacuous for the slab body either."""
+    order, other, layout = _SLAB_REORDERED[name]
+    text = projkernel._row_slab_source()
+    assert text.count(order) == 1
+    monkeypatch.setattr(int8prefill, "_kernels", {})
+    slug = name.replace(" ", "_")
+    monkeypatch.setattr(projkernel, "_ROW_SLAB_KERNEL", f"sous_proj_row_slab_reordered_{slug}")
+    reordered = text.replace(order, other)
+    monkeypatch.setattr(projkernel, "_row_slab_source", lambda: reordered)
+    x, ((w, scales, biases),) = pfx.projection_inputs(layout, 8, 1024, (256,), x_seed=11, w_seed=12)
+    codes, s, b, info = _slab_entry(w, scales, biases)
+    got = mx.concatenate(
+        [projkernel._launch_row(x[r : r + 1], codes, s, b, slab=info) for r in range(8)]
+    )
+    want = mx.concatenate(
+        [projkernel._launch_row(x[r : r + 1], w, scales, biases) for r in range(8)]
+    )
+    assert not mx.array_equal(got, want).item()
+
+
+def test_weights_is_a_bare_tuple_for_an_mlx_module_and_a_descriptor_for_a_slab_module():
+    """Every stand-in, probe and test that unpacks three fields keeps working on
+    an unconverted model; only a slab-only module's entry carries its SlabInfo."""
+    lm = ptfx.tiny_slab_model(scope="mlp")
+    q, gate = lm.model.layers[1].self_attn.q_proj, lm.model.layers[1].mlp.gate_proj
+    mlx_entry = projkernel._weights(q)
+    assert type(mlx_entry) is tuple and len(mlx_entry) == 3
+    assert all(a is b for a, b in zip(mlx_entry, (q.weight, q.scales, q.biases), strict=True))
+    slab_entry = projkernel._weights(gate)
+    assert isinstance(slab_entry, projkernel.Weights)
+    assert slab_entry.slab == slab.slab_info(gate) == slab.SlabInfo(n_real=512, k=256, tiles=2)
+    assert slab_entry.w is gate.weight and slab_entry.w.ndim == 1
+    assert projkernel._as_weights(mlx_entry) == projkernel.Weights(*mlx_entry, None)
+    assert projkernel._as_weights(slab_entry) is slab_entry
+
+
+def test_linears_refuses_a_call_mixing_slab_and_mlx_forms(no_launch):
+    """A dispatch compiles one form: the slab define addresses every linear of it."""
+    weights = [pfx.rand_linear(n, 256, 100 + i) for i, n in enumerate((256, 72))]
+    mixed = [_slab_entry(*weights[0]), weights[1]]
+    for rows in (1, 3):
+        with pytest.raises(ValueError, match="mixes slab-ordered and mlx-layout"):
+            projkernel.linears(mx.zeros((rows, 256), dtype=mx.bfloat16), mixed)
+
+
+def test_linears_refuses_slab_planes_off_their_descriptor(no_launch):
+    """The planes are flat: only the descriptor says what they hold, and planes of
+    another K or width would be read out of bounds."""
+    entry = _slab_entry(*pfx.rand_linear(256, 512, 110))
+    with pytest.raises(ValueError, match="K=256"):
+        projkernel.linears(mx.zeros((3, 256), dtype=mx.bfloat16), [entry])
+    short = entry._replace(w=entry.w[: entry.w.size // 2])
+    with pytest.raises(ValueError, match="planes"):
+        projkernel.linears(mx.zeros((3, 512), dtype=mx.bfloat16), [short])
+
+
+def test_the_descriptor_gives_k_and_n_for_a_converted_module():
+    """A slab-only module's planes are flat, so K and N come from its SlabInfo; the
+    dispatch key also names the form, since the slab bodies are pipelines of their
+    own."""
+    lm = ptfx.tiny_slab_model(scope="mlp")
+    layer = lm.model.layers[1]
+    mlp, attention = layer.mlp, layer.self_attn
+    assert projkernel._in_features(mlp.gate_proj) == 256
+    assert projkernel._in_features(mlp.down_proj) == 512
+    assert projkernel._dispatch_key((mlp.gate_proj, mlp.up_proj)) == (256, (512, 512), True)
+    assert projkernel._dispatch_key((mlp.down_proj,)) == (512, (256,), True)
+    assert projkernel._dispatch_key((attention.q_proj, attention.k_proj, attention.v_proj)) == (
+        256,
+        (2048, 512, 512),
+        False,
+    )
+    assert projkernel._dispatch_key((attention.o_proj,)) == (1024, (256,), False)
+
+
+def test_the_stand_ins_accept_a_slab_entry():
+    """The stand-ins read a slab entry through slab.unpack, so they compute what
+    they compute over mlx's arrays, bit for bit, and refuse a mixed call as the
+    kernel does."""
+    weights = [pfx.rand_linear(n, 256, 120 + i) for i, n in enumerate((544, 72))]
+    slabs = [_slab_entry(*w) for w in weights]
+    x = pfx.activations(5, 256, seed=12)
+    for got, want in zip(pfx.stand_in_mma(x, slabs), pfx.stand_in_mma(x, weights), strict=True):
+        assert _identical(got, want)
+    codes, s, b, info = slabs[0]
+    got = pfx.stand_in_one_row(x[:1], codes, s, b, slab=info)
+    assert _identical(got, pfx.stand_in_one_row(x[:1], *weights[0]))
+    with pytest.raises(ValueError, match="mixes"):
+        pfx.stand_in_mma(x, [slabs[0], weights[1]])
 
 
 # ---- routing: the tags, the flag and the two hooks ---------------------------------
@@ -1611,6 +1879,66 @@ def test_warm_up_leaves_the_counters_as_it_found_them(monkeypatch):
     assert projkernel.calls == before
 
 
+@pytest.mark.parametrize(
+    "real", [False, pytest.param(True, marks=pfx.kernel)], ids=["stand-in", "kernel"]
+)
+def test_warm_up_covers_a_converted_model(monkeypatch, real):
+    """A slab-only module's dispatch keys and one-row shapes are pipelines of
+    their own beside the mlx-layout ones, even where K and N coincide (gate and
+    up alone against k, v, in_proj_qkv and lm_head): each runs once at every
+    row count, and the counters are left as found."""
+    pfx.guard_proj_state(monkeypatch)
+    if not real:
+        pfx.stand_ins(monkeypatch)
+    mma, one_row = projkernel.mma, projkernel.one_row
+    seen: list = []
+    rows: list = []
+    inside = [False]
+
+    def spy(x, weights):
+        entries = [projkernel._as_weights(e) for e in weights]
+        ns = tuple(e.slab.n_real if e.slab else e.w.shape[0] for e in entries)
+        seen.append((x.shape[-1], ns, entries[0].slab is not None, x.shape[1]))
+        inside[0] = True
+        try:
+            return mma(x, weights)
+        finally:
+            inside[0] = False
+
+    def row_spy(x2, w, scales, biases, slab=None):
+        # the real `mma` reaches the one-row kernel too, at T = 1; these are the
+        # one-row pipelines warm_up() states in their own right
+        if not inside[0]:
+            rows.append((x2.shape, w.shape[0] if slab is None else slab.n_real, slab is not None))
+        if slab is None:
+            return one_row(x2, w, scales, biases)
+        return one_row(x2, w, scales, biases, slab=slab)
+
+    monkeypatch.setattr(projkernel, "mma", spy)
+    monkeypatch.setattr(projkernel, "one_row", row_spy)
+    before = dict(projkernel.calls)
+    projkernel.warm_up(ptfx.tiny_slab_model(scope="mlp"))
+    assert projkernel.calls == before
+    keys = [
+        (256, (2048, 512, 512), False),  # q+k+v
+        (256, (512, 256, 4, 4), False),  # in_proj qkv+z+b+a
+        (256, (512,), False),  # lm_head, k, v and in_proj_qkv alone
+        (256, (2048,), False),  # q alone
+        (256, (256,), False),  # in_proj_z and out_proj alone
+        (256, (4,), False),  # in_proj_b and in_proj_a alone
+        (1024, (256,), False),  # o
+        (256, (512, 512), True),  # gate+up
+        (256, (512,), True),  # gate and up alone
+        (512, (256,), True),  # down
+    ]
+    expected = sorted((*key, t) for key in keys for t in range(1, projkernel.MAX_ROWS + 1))
+    assert sorted(seen) == expected
+    shapes = {(256, 2048), (256, 512), (256, 256), (256, 4), (1024, 256)}
+    want = sorted([(k, n, False) for k, n in shapes] + [(256, 512, True), (512, 256, True)])
+    assert sorted((shape[1], n, form) for shape, n, form in rows) == want
+    assert all(shape[0] == 1 for shape, _, _ in rows)
+
+
 def _probe_model(monkeypatch, mma=None):
     """A tiny model as enable() hands it to the probe: tagged, both hooks in
     place, the flag clear, and `mma` (the stand-in by default) as the kernel."""
@@ -1654,6 +1982,33 @@ def test_probe_passes_the_real_kernel(monkeypatch):
     lm = _probe_model(monkeypatch)
     pfx.real_kernel(monkeypatch)
     assert _run_probe(lm) is None
+
+
+@pytest.mark.parametrize(
+    "real", [False, pytest.param(True, marks=pfx.kernel)], ids=["stand-in", "kernel"]
+)
+def test_the_probe_passes_a_converted_model_on_its_own_forms(monkeypatch, real):
+    """Every step reads the descriptor: the hooks serve the slab-only MLP, the
+    stock reference of a slab-only linear is its unpacked arrays, and the
+    one-row check holds the slab one-row kernel to the slab MMA bodies."""
+    lm = ptfx.tiny_slab_model(scope="mlp")
+    pfx.hooked(monkeypatch)
+    if real:
+        pfx.real_kernel(monkeypatch)
+    monkeypatch.setattr(projkernel, "_active", 0)
+    projkernel.tag(lm)
+    one_row = projkernel.one_row
+    forms: set = set()
+
+    def row_spy(x2, w, scales, biases, slab=None):
+        forms.add(slab is not None)
+        if slab is None:
+            return one_row(x2, w, scales, biases)
+        return one_row(x2, w, scales, biases, slab=slab)
+
+    monkeypatch.setattr(projkernel, "one_row", row_spy)
+    assert _run_probe(lm) is None
+    assert forms == {False, True}
 
 
 def test_probe_fails_one_row_for_a_one_row_kernel_that_differs(monkeypatch):

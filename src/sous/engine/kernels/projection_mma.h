@@ -1,9 +1,14 @@
 // The projection kernel's header, prepended by projkernel.py after common.h. The
-// staged kernel that reads presummed activations has PRESUM set to 1 ahead of it.
+// staged kernel that reads presummed activations has PRESUM set to 1 ahead of it,
+// and a kernel that reads slab-ordered weights (slab.py's layout) SLAB.
 #include <metal_simdgroup_matrix>
 
 #ifndef PRESUM
 #define PRESUM 0
+#endif
+
+#ifndef SLAB
+#define SLAB 0
 #endif
 
 // One 8x8x8 simdgroup_multiply_accumulate on a lane's two elements of each operand,
