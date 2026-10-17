@@ -413,7 +413,11 @@ def test_plan_for_call_needs_planes_and_a_plan(monkeypatch):
     mlp = root.model.layers[0].mlp
     qkv = (attention.q_proj, attention.k_proj, attention.v_proj)
     gdn_call = (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a)
-    call = projtile.plan_for_call
+
+    def call(linears):
+        launches = projtile.plan_for_call(linears)
+        return None if launches is None else tuple(launch.plan for launch in launches)
+
     # The production table holds none of the tiny model's keys.
     assert call(qkv) is None and call((mlp.gate_proj, mlp.up_proj)) is None
 
@@ -423,6 +427,14 @@ def test_plan_for_call_needs_planes_and_a_plan(monkeypatch):
     # One plan per launch: a stack the call covers whole, the GDN call's two.
     assert call(qkv) == (plans[(256, (2048, 512, 512))],)
     assert call(gdn_call) == (plans[(256, (512, 256))], plans[(256, (4, 4))])
+    # Each launch carries its key and its linears, so verify() never works them out again.
+    launches = projtile.plan_for_call(gdn_call)
+    assert launches is not None
+    assert [launch.key for launch in launches] == [(256, (512, 256)), (256, (4, 4))]
+    assert [tuple(map(id, launch.members)) for launch in launches] == [
+        tuple(map(id, gdn_call[:2])),
+        tuple(map(id, gdn_call[2:])),
+    ]
     # gate+up is the dual's key; every lone linear is keyed by its own width.
     assert call((mlp.gate_proj, mlp.up_proj)) == (plans[(256, (512, 512))],)
     assert call((mlp.down_proj,)) == (plans[(512, (256,))],)
@@ -719,10 +731,10 @@ def test_clear_drops_the_flag_the_window_the_round_flag_and_the_scope(monkeypatc
 
 
 def _plans(linears) -> tuple:
-    """plan_for_call's plans for a call the test expects the tile to serve."""
-    plans = projtile.plan_for_call(linears)
-    assert plans is not None
-    return plans
+    """plan_for_call's launches for a call the test expects the tile to serve."""
+    launches = projtile.plan_for_call(linears)
+    assert launches is not None
+    return launches
 
 
 def _distinct_plans(monkeypatch) -> dict:
@@ -833,6 +845,28 @@ def test_verify_runs_gate_and_up_as_one_dual_launch_and_keeps_a_batch(monkeypatc
         assert _same(out, _alone(member, x))
 
 
+def test_a_cut_of_the_whole_output_is_the_launch_itself(monkeypatch):
+    """Eight 2-D rows through a linear whose width fills its tiles take the
+    launch's output as it is, adding no slice and no reshape to the graph; fewer
+    rows, or a leading batch dimension, are still cut and shaped."""
+    _distinct_plans(monkeypatch)
+    returned = []
+
+    def tile(x8, codes, scales, biases, info, plan):
+        returned.append(ptfx.stand_in_tile(x8, codes, scales, biases, info, plan))
+        return returned[-1]
+
+    monkeypatch.setattr(projtile, "tile", tile)
+    up = ptfx.tiny_slab_model(seed=0, scope="mlp").model.layers[0].mlp.up_proj
+    x = pfx.activations(8, 256, seed=6)
+    (out,) = projtile.verify((up,), x, _plans((up,)))
+    assert out is returned[-1]
+    (out,) = projtile.verify((up,), x[:5], _plans((up,)))
+    assert out.shape == (5, 512) and _same(out, returned[-1][:5])
+    (out,) = projtile.verify((up,), x.reshape(1, 8, 256), _plans((up,)))
+    assert out.shape == (1, 8, 512) and _same(out[0], returned[-1])
+
+
 def test_plain_on_a_stack_member_launches_its_own_tiles(monkeypatch):
     """q, k and v each read only their own tiles of the q+k+v planes at their own
     alone plan; in_proj_b and in_proj_a share one tile, so each runs the b+a stack
@@ -899,6 +933,13 @@ def test_a_stack_run_must_be_its_members_in_order(monkeypatch):
     x = pfx.activations(2, 256, seed=5).reshape(1, 2, 256)
     with pytest.raises(ValueError):
         projtile.verify((q, v, k), x, _plans((q, k, v)))
+    # Launches of another call, or of one linear more or fewer, are refused too.
+    with pytest.raises(ValueError):
+        projtile.verify((q, k, v), x, _plans((later.q_proj, later.k_proj, later.v_proj)))
+    with pytest.raises(ValueError):
+        projtile.verify((q, k), x, _plans((q, k, v)))
+    with pytest.raises(ValueError):
+        projtile.plain(k, x, _plans((v,)))
     projtile.drop_stacks(root)
     assert all(projtile.INDEX_ATTR not in vars(m) for m in (q, k, v))
 

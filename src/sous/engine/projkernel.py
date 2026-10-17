@@ -864,12 +864,12 @@ def _serve_verify(linears: Any, x: Any) -> tuple[Any, ...] | None:
     # the tile can serve (outside the window, a round the harness closed) never
     # pays for the lookup; likewise the MMA path's entries are built only for a run
     # it serves. Every verifier projection of every round passes through here.
-    plans = projtile.plan_for_call(linears) if projtile.serves(batch * rows, hook=1) else None
+    launches = projtile.plan_for_call(linears) if projtile.serves(batch * rows, hook=1) else None
 
     def run(part: Any) -> tuple[Any, ...]:
-        if plans is not None and projtile.serves(part.size // part.shape[-1], hook=1):
+        if launches is not None and projtile.serves(part.size // part.shape[-1], hook=1):
             calls["verify_tile"] += 1
-            return projtile.verify(linears, part, plans)
+            return projtile.verify(linears, part, launches)
         return _run_mma(part, [_weights(m) for m in linears])
 
     if rows <= step:
@@ -907,10 +907,10 @@ def _serve_plain(module: Any, x: Any) -> Any | None:
         from sous.engine import projtile
 
         if projtile.serves(rows, hook=2):
-            plans = projtile.plan_for_call((module,))
-            if plans is not None:
+            launches = projtile.plan_for_call((module,))
+            if launches is not None:
                 calls["plain_tile"] += 1
-                return projtile.plain(module, x, plans)
+                return projtile.plain(module, x, launches)
     calls["plain_kernel"] += 1
     return _run_mma(x, [_weights(module)])[0]
 

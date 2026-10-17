@@ -1550,6 +1550,25 @@ def test_a_key_outside_the_plan_table_is_served_by_the_mma_kernel(monkeypatch):
     assert seen == [(5, 2)]
 
 
+def test_a_call_with_one_launch_unplanned_stays_on_the_mma_kernel_whole(monkeypatch):
+    """The GDN call takes two launches, qkv+z and b+a: without b+a's key the
+    whole four-linear call runs on the MMA kernel, qkv+z included, never split
+    between the two paths."""
+    root = _tile_target(monkeypatch)
+    plans = dict(projtile.PLANS)
+    del plans[(256, (4, 4))]
+    monkeypatch.setattr(projtile, "PLANS", plans)
+    seen = _recording_mma(monkeypatch)
+    gdn = root.model.layers[0].linear_attn
+    gdn_call = (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a)
+    with ptfx.window():
+        before = dict(projkernel.calls)
+        outs = projkernel._verifier_class()()._linears(gdn_call, _acts(1, 5, 256))
+    assert _proj_counts_since(before) == {"verify_kernel": 1}
+    assert seen == [(5, 4)]
+    assert [o.shape for o in outs] == [(1, 5, 512), (1, 5, 256), (1, 5, 4), (1, 5, 4)]
+
+
 def _close(got, want) -> bool:
     """Within a few bf16 ulps: the stand-in over a wider stack is a matmul of
     another width, which need not sum a column in the same order."""

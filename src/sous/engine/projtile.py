@@ -31,9 +31,10 @@ from __future__ import annotations
 import functools
 import itertools
 import logging
+import operator
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from sous.engine import int8prefill, nax, projkernel, slab
 from sous.engine.int8prefill import _error_line, _kernel, _kernel_text
@@ -76,7 +77,8 @@ class Stack:
 
 
 def stack_of(module: Any) -> Stack | None:
-    return getattr(module, STACK_ATTR, None)
+    # From the instance dict, for the reason slab.slab_info reads its marker there.
+    return vars(module).get(STACK_ATTR)
 
 
 def _mlp_linears(root: Any) -> Iterator[Any]:
@@ -344,7 +346,7 @@ def _launches(linears: Sequence[Any]) -> list[_Launch] | None:
         return None
     if len(linears) == 1:
         (module,) = linears
-        if infos[0] is None and getattr(module, INDEX_ATTR, None) is None:
+        if infos[0] is None and vars(module).get(INDEX_ATTR) is None:
             return None
         key = (projkernel._in_features(module), (projkernel._out_features(module),))
         return [(key, (module,))]
@@ -363,7 +365,7 @@ def _launches(linears: Sequence[Any]) -> list[_Launch] | None:
         while stop < len(linears) and stacks[stop] is stack:
             stop += 1
         run = tuple(linears[start:stop])
-        indices = [getattr(m, INDEX_ATTR, None) for m in run]
+        indices = [vars(m).get(INDEX_ATTR) for m in run]
         if stack is None or indices != list(range(len(stack.slices))):
             return None
         launches.append((stack.key, run))
@@ -371,21 +373,31 @@ def _launches(linears: Sequence[Any]) -> list[_Launch] | None:
     return launches
 
 
-def plan_for_call(linears: Sequence[Any]) -> tuple[Plan, ...] | None:
-    """One plan per launch a verifier or module call of ``linears`` takes, in call
-    order, or None when _launches refuses the call or any launch's key has no
-    plan: the whole call then stays on the projection kernel, never split between
-    the two."""
+class Launch(NamedTuple):
+    """One launch of a call: its key, the linears it serves in call order, and the
+    plan it runs at."""
+
+    key: Key
+    members: tuple[Any, ...]
+    plan: Plan
+
+
+def plan_for_call(linears: Sequence[Any]) -> tuple[Launch, ...] | None:
+    """The launches a verifier or module call of ``linears`` takes, in call order,
+    each with its plan, or None when _launches refuses the call or any launch's
+    key has no plan: the whole call then stays on the projection kernel, never
+    split between the two. verify() and plain() launch from what this returns, so
+    a call's launches are worked out once per call, not again per run."""
     launches = _launches(linears)
     if launches is None:
         return None
-    plans: list[Plan] = []
-    for key, _ in launches:
+    out: list[Launch] = []
+    for key, members in launches:
         plan = PLANS.get(key)
         if plan is None:
             return None
-        plans.append(plan)
-    return tuple(plans)
+        out.append(Launch(key, members, plan))
+    return tuple(out)
 
 
 def check_plan(info: SlabInfo, plan: Plan, *, dual: bool = False) -> str | None:
@@ -753,8 +765,11 @@ def _padded(x: Any) -> tuple[Any, int]:
 
 def _cut(y8: Any, rows: int, x: Any, start: int, stop: int) -> Any:
     """Columns [start, stop) of the call's rows of a launch's [8, n_pad] output, in
-    x's leading shape."""
-    return y8[:rows, start:stop].reshape(*x.shape[:-1], stop - start)
+    x's leading shape. A cut of the whole output adds no slice, and 2-D rows no
+    reshape: each graph node costs host time on every run of every round."""
+    whole = rows == MAX_ROWS and start == 0 and stop == y8.shape[1]
+    y = y8 if whole else y8[:rows, start:stop]
+    return y if x.ndim == 2 else y.reshape(*x.shape[:-1], stop - start)
 
 
 def _alone(module: Any, x8: Any, rows: int, x: Any, plan: Plan) -> Any:
@@ -771,7 +786,7 @@ def _alone(module: Any, x8: Any, rows: int, x: Any, plan: Plan) -> Any:
     stack = stack_of(module)
     if stack is None:
         raise ValueError("projection tile: a linear without planes")
-    start, stop = stack.slices[getattr(module, INDEX_ATTR)]
+    start, stop = stack.slices[vars(module)[INDEX_ATTR]]
     whole = stack.info
     if start % slab.TILE or (stop % slab.TILE and stop != whole.n_real):
         y = tile(x8, stack.codes, stack.scales, stack.biases, whole, plan)
@@ -790,24 +805,25 @@ def _alone(module: Any, x8: Any, rows: int, x: Any, plan: Plan) -> Any:
     return _cut(tile(x8, *planes, own, plan), rows, x, 0, stop - start)
 
 
-def _launches_at(linears: Sequence[Any], plans: Sequence[Plan]) -> list[_Launch]:
-    launches = _launches(linears)
-    if launches is None or len(launches) != len(plans):
-        raise ValueError("projection tile: plan_for_call does not serve this call at these plans")
-    return launches
+def _check_call(linears: Sequence[Any], launches: Sequence[Launch]) -> None:
+    """Refuse launches that are not a call of exactly ``linears``, in order, by
+    identity: the hook hands each call its own plan_for_call(), so a mismatch is a
+    caller's bug, never a fallback."""
+    members = [member for launch in launches for member in launch.members]
+    if len(members) != len(linears) or not all(map(operator.is_, members, linears, strict=True)):
+        raise ValueError("projection tile: the launches are not plan_for_call's for this call")
 
 
-def verify(linears: Sequence[Any], x: Any, plans: Sequence[Plan]) -> tuple[Any, ...]:
+def verify(linears: Sequence[Any], x: Any, launches: Sequence[Launch]) -> tuple[Any, ...]:
     """One verifier run on the tile: x [..., K] bf16 of 1..MAX_ROWS rows (the
-    product of its leading dimensions) through ``linears`` at ``plans``,
+    product of its leading dimensions) through ``linears`` as ``launches``,
     plan_for_call's for them; one launch per stack, dual or lone linear, and each
     linear's columns cut back to [..., n_real], in call order. Raises ValueError
-    for a call plan_for_call refuses: the hook asks it first, so a raise is a
-    caller's bug, never a fallback."""
-    launches = _launches_at(linears, plans)
+    when ``launches`` are not that call's."""
+    _check_call(linears, launches)
     x8, rows = _padded(x)
     outs: list[Any] = []
-    for (_, members), plan in zip(launches, plans, strict=True):
+    for _, members, plan in launches:
         if len(members) == 1:
             outs.append(_alone(members[0], x8, rows, x, plan))
             continue
@@ -831,11 +847,11 @@ def verify(linears: Sequence[Any], x: Any, plans: Sequence[Plan]) -> tuple[Any, 
     return tuple(outs)
 
 
-def plain(module: Any, x: Any, plans: Sequence[Plan]) -> Any:
+def plain(module: Any, x: Any, launches: Sequence[Launch]) -> Any:
     """One module call on the tile: x [..., K] bf16 of 2..MAX_ROWS rows through
-    ``module`` at ``plans``, plan_for_call's for the module alone; [..., n_real].
-    A stack member launches only its own tiles where it can (_alone). Raises
-    ValueError for a module plan_for_call refuses, as verify() does."""
-    _launches_at((module,), plans)
+    ``module`` as ``launches``, plan_for_call's for the module alone; [...,
+    n_real]. A stack member launches only its own tiles where it can (_alone).
+    Raises ValueError when ``launches`` are not that call's, as verify() does."""
+    _check_call((module,), launches)
     x8, rows = _padded(x)
-    return _alone(module, x8, rows, x, plans[0])
+    return _alone(module, x8, rows, x, launches[0].plan)

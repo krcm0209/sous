@@ -91,5 +91,8 @@ def unpack(codes: Any, scales: Any, biases: Any, info: SlabInfo) -> tuple[Any, A
 
 
 def slab_info(module: Any) -> SlabInfo | None:
-    """The marker of a slab-only module, None for one holding mlx's layout."""
-    return getattr(module, SLAB_ATTR, None)
+    """The marker of a slab-only module, None for one holding mlx's layout. Read
+    from the instance dict, where object.__setattr__ put it: a getattr that misses
+    goes through nn.Module's __getattr__ and raises inside it, six times the cost,
+    on a path every projection call of a decode takes."""
+    return vars(module).get(SLAB_ATTR)
