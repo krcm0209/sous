@@ -1,18 +1,21 @@
 """The projection tile (sous.engine.projtile) and the slab layout it reads
 (sous.engine.slab): the layout and its inverse, the slab-only MLP conversion and
-its revert, the stacked copies of the attention and GDN linears, and the fork
-key's reading of the markers. Plain mlx: nothing here needs tensor units."""
+its revert, the stacked copies of the attention and GDN linears, the fork key's
+reading of the markers, and the tile kernel with its plans. Plain mlx except the
+`tile_nax` tests, which run the kernel on the tensor units."""
 
 import types
+from typing import Any
 
 import pytest
 
 mx = pytest.importorskip("mlx.core")
 np = pytest.importorskip("numpy")
 
-from sous.engine import projtile, slab  # noqa: E402 — after the guards
+from sous.engine import int8prefill, projtile, slab  # noqa: E402 — after the guards
 from tests import proj_fixtures as pfx  # noqa: E402
 from tests import projtile_fixtures as ptfx  # noqa: E402
+from tests.projtile_fixtures import tile_nax  # noqa: E402
 
 K = 1024
 _UINT = {1: mx.uint8, 2: mx.uint16, 4: mx.uint32}
@@ -349,3 +352,413 @@ def test_fork_key_state_is_off_for_a_model_without_dense_mlps():
     )
     assert projtile.fork_key_state(root) == "off"
     assert projtile.fork_key_state(types.SimpleNamespace()) == "off"
+
+
+# ---- the plans -------------------------------------------------------------------
+
+P = projtile.Plan
+
+# The six fused keys at the plans tuned for them on the M5 Pro, then the alone forms
+# decode's two-to-eight-row calls reach.
+_TABLE = {
+    (5120, (12288, 1024, 1024)): P(128, 8, 80, True),  # q+k+v
+    (6144, (5120,)): P(256, 8, 20, True, 2),  # o_proj, out_proj
+    (5120, (10240, 6144)): P(128, 8, 80, True),  # in_proj_qkv+in_proj_z
+    (5120, (48, 48)): P(128, 8, 2, True, 8),  # in_proj_b+in_proj_a
+    (5120, (17408, 17408)): P(128, 4, 100, True),  # gate+up, the dual
+    (17408, (5120,)): P(256, 8, 20, True, 2),  # down
+    (5120, (12288,)): P(128, 8, 80, True),  # q
+    (5120, (1024,)): P(128, 8, 8, True),  # k, v
+    (5120, (10240,)): P(128, 4, 80, True),  # in_proj_qkv
+    (5120, (6144,)): P(128, 8, 48, True),  # in_proj_z
+    (5120, (48,)): P(128, 8, 2, True, 8),  # in_proj_b, in_proj_a: the b+a stack's tile
+    (5120, (17408,)): P(256, 4, 68, True),  # gate, up
+}
+_DUAL = (5120, (17408, 17408))
+
+
+def test_the_six_fused_plans_match_the_spike_and_the_alone_forms_the_spec():
+    assert projtile.PLANS == _TABLE
+    for key, plan in _TABLE.items():
+        assert projtile.plan_for(key) == plan
+        k, ns = key
+        n = ns[0] if key == _DUAL else sum(ns)
+        info = slab.SlabInfo(n_real=n, k=k, tiles=-(-n // 256))
+        assert projtile.check_plan(info, plan, dual=key == _DUAL) is None, key
+    assert projtile.plan_for((5120, (248320,))) is None  # lm_head
+    assert projtile.plan_for((4096, (256,))) is None
+    assert projtile.PLANS[(5120, (48, 48))].label == "TN128/S8/G2/pipe x8"
+    assert projtile.PLANS[(5120, (17408,))].label == "TN256/S4/G68/pipe"
+    assert P(128, 8, 40, False).label == "TN128/S8/G40/seq"
+    # availability() compiles every plan the table holds, and nothing else.
+    assert {P(*shape) for shape in projtile.DISTINCT_SHAPES} == set(_TABLE.values())
+
+
+def test_measured_cores_is_the_m5_pro():
+    assert frozenset({20}) == projtile.MEASURED_CORES
+
+
+def test_mlp_keys_name_the_dual_each_linear_alone_and_down():
+    want = [(256, (512, 512)), (256, (512,)), (512, (256,))]
+    assert projtile.MLP_KEYS(pfx.tiny_quantized_model(seed=0)) == want
+    assert projtile.MLP_KEYS(ptfx.tiny_slab_model(seed=0)) == want
+    assert projtile.MLP_KEYS(types.SimpleNamespace()) == []
+
+
+def test_plan_for_call_needs_planes_and_a_plan(monkeypatch):
+    root = ptfx.tiny_slab_model(seed=0)
+    gdn = root.model.layers[0].linear_attn
+    attention = root.model.layers[1].self_attn
+    mlp = root.model.layers[0].mlp
+    qkv = (attention.q_proj, attention.k_proj, attention.v_proj)
+    gdn_call = (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a)
+    call = projtile.plan_for_call
+    # The production table holds none of the tiny model's keys.
+    assert call(qkv) is None and call((mlp.gate_proj, mlp.up_proj)) is None
+
+    # A distinct plan per key, so each lookup shows which key it took.
+    plans = {key: P(128, 4, i + 1, True) for i, key in enumerate(ptfx.TINY_PLANS)}
+    monkeypatch.setattr(projtile, "PLANS", plans)
+    # One plan per launch: a stack the call covers whole, the GDN call's two.
+    assert call(qkv) == (plans[(256, (2048, 512, 512))],)
+    assert call(gdn_call) == (plans[(256, (512, 256))], plans[(256, (4, 4))])
+    # gate+up is the dual's key; every lone linear is keyed by its own width.
+    assert call((mlp.gate_proj, mlp.up_proj)) == (plans[(256, (512, 512))],)
+    assert call((mlp.down_proj,)) == (plans[(512, (256,))],)
+    assert call((mlp.up_proj,)) == (plans[(256, (512,))],)
+    assert call((attention.q_proj,)) == (plans[(256, (2048,))],)
+    assert call((attention.v_proj,)) == (plans[(256, (512,))],)
+    assert call((attention.o_proj,)) == (plans[(1024, (256,))],)
+    assert call((gdn.in_proj_z,)) == (plans[(256, (256,))],)
+    assert call((gdn.in_proj_a,)) == (plans[(256, (4,))],)
+    # Part of a stack, a mix of forms, three slab-only linears: no launch takes them.
+    assert call(gdn_call[:3]) is None
+    assert call(qkv[:2]) is None
+    assert call((mlp.gate_proj, attention.q_proj)) is None
+    assert call((mlp.gate_proj, mlp.up_proj, mlp.down_proj)) is None
+    # A linear without planes: the head, and the attention and GDN linears at scope
+    # mlp, which never copies them.
+    assert call((root.lm_head,)) is None
+    narrow = ptfx.tiny_slab_model(seed=0, scope="mlp")
+    narrow_gdn = narrow.model.layers[0].linear_attn
+    assert call((narrow.model.layers[1].self_attn.q_proj,)) is None
+    assert call((narrow_gdn.in_proj_qkv, narrow_gdn.in_proj_z)) is None
+    assert call((narrow_gdn.in_proj_b,)) is None
+    mlp_narrow = narrow.model.layers[2].mlp
+    assert call((mlp_narrow.gate_proj, mlp_narrow.up_proj)) == (plans[(256, (512, 512))],)
+    plain = pfx.tiny_quantized_model(seed=0).model.layers[0].mlp
+    assert call((plain.gate_proj, plain.up_proj)) is None
+    # A key the table lacks takes the whole call off the tile, the GDN pair's too.
+    del plans[(256, (512, 512))], plans[(256, (4, 4))]
+    assert call((mlp.gate_proj, mlp.up_proj)) is None
+    assert call(gdn_call) is None
+    assert call((mlp.gate_proj,)) == (plans[(256, (512,))],)
+
+
+_INFO = slab.SlabInfo(n_real=4160, k=2048, tiles=17)
+
+
+@pytest.mark.parametrize(
+    ("info", "plan", "dual", "words"),
+    [
+        (slab.SlabInfo(512, 2112, 2), P(128, 8, 4, True), False, "K=2112"),
+        (_INFO, P(512, 8, 4, True), False, "N=4352"),
+        (_INFO, P(64, 8, 4, True), False, "TN=64"),
+        (_INFO, P(128, 2, 4, True), False, "S=2"),
+        (_INFO, P(256, 16, 4, True), False, "S=16"),
+        (_INFO, P(128, 8, 0, True), False, "GROUPS=0"),
+        (_INFO, P(128, 8, 4, True, 0), False, "SPLITS=0"),
+        (_INFO, P(128, 8, 4, True, 9), False, "SPLITS=9"),
+        (_INFO, P(128, 8, 4, True, 2), True, "dual"),
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_check_plan_refuses_what_the_kernel_cannot_take(info, plan, dual, words):
+    reason = projtile.check_plan(info, plan, dual=dual)
+    assert reason is not None and words in reason
+
+
+def test_check_plan_takes_every_split_up_to_k_over_256():
+    for splits in range(1, 9):
+        assert projtile.check_plan(_INFO, P(128, 8, 4, True, splits)) is None
+    assert projtile.check_plan(_INFO, P(256, 4, 1, False), dual=True) is None
+
+
+# ---- the kernel ------------------------------------------------------------------
+
+
+def _tile_sources() -> tuple[str, str, str]:
+    body = int8prefill._kernel_text("projection_tile.metal")
+    return body, int8prefill._kernel_text("projection_tile.h"), body.split("// REDUCE\n")[-1]
+
+
+def test_the_kernel_sources_split_at_reduce_and_carry_three_barriers():
+    """The barriers are the prologue fill and the closing barrier per tile in the
+    body, and the refill in FINISH_GROUP; a missing prologue or closing barrier is
+    invisible to every output test, so their presence is pinned here."""
+    body, header, reduce_body = _tile_sources()
+    assert body.count("// REDUCE") == 1
+    tile_body = body.split("// REDUCE\n")[0]
+    assert tile_body.count("threadgroup_barrier(") == 2
+    assert reduce_body.count("threadgroup_barrier(") == 0
+    assert header.count("threadgroup_barrier(") == 1
+    assert header.index("#define FINISH_GROUP") < header.index("threadgroup_barrier(")
+    # MSL 4.1 rejects a cooperative tensor's decltype that keeps its address space.
+    for text in (tile_body, header):
+        assert text.count("decltype(") == text.count("remove_addrspace_t<decltype(")
+    assert tile_body.count("decltype(") == 3
+    assert "matmul2d_descriptor::mode::multiply)" in tile_body
+    assert reduce_body.lstrip().startswith("#pragma clang fp reassociate(off)")
+
+
+def test_pad8_appends_zero_rows_and_keeps_eight():
+    x = pfx.activations(8, 256, seed=1)
+    assert projtile.pad8(x) is x
+    zeros = mx.zeros((8, 256), dtype=mx.bfloat16)
+    for t in range(1, 8):
+        got = projtile.pad8(x[:t])
+        assert got.shape == (8, 256) and got.dtype == mx.bfloat16
+        assert _same(got[:t], x[:t]) and _same(got[t:], zeros[t:])
+    for bad in (x[:0], mx.concatenate([x, x[:1]]), x.reshape(1, 8, 256)):
+        with pytest.raises(ValueError):
+            projtile.pad8(bad)
+
+
+def _capture_tile_launches(monkeypatch) -> list[dict]:
+    """Every tile launch as a dict of what it was handed; each returns zeros of its
+    shapes and nothing compiles."""
+    launches: list[dict] = []
+
+    def kernel(name, input_names, output_names, source, header, **options):
+        def launch(*, inputs, template, grid, threadgroup, output_shapes, output_dtypes):
+            launches.append(
+                {
+                    "name": name,
+                    "input_names": input_names,
+                    "output_names": output_names,
+                    "source": source,
+                    "header": header,
+                    "options": options,
+                    "inputs": inputs,
+                    "template": dict(template),
+                    "grid": grid,
+                    "threadgroup": threadgroup,
+                    "shapes": output_shapes,
+                    "dtypes": output_dtypes,
+                }
+            )
+            return [mx.zeros(s, dtype=d) for s, d in zip(output_shapes, output_dtypes, strict=True)]
+
+        return launch
+
+    monkeypatch.setattr(projtile, "_kernel", kernel)
+    return launches
+
+
+def test_run_launches_the_plans_grid_and_the_split_reduce(monkeypatch):
+    """The kernel object per (DUAL, SPLITOUT) and its header, the template, the
+    persistent grid and the split's fixed-order reduce; nothing compiles here."""
+    n, k, n_pad = 4160, 2048, 4352
+    codes, scales, biases, info = slab.repack(*pfx.rand_linear(n, k, seed=1))
+    up = slab.repack(*pfx.rand_linear(n, k, seed=3))[:3]
+    x8 = pfx.activations(8, k, seed=2)
+    body, header, reduce_body = _tile_sources()
+    tile_body = body.split("// REDUCE\n")[0]
+    common, nax_h = int8prefill._kernel_text("common.h"), int8prefill._kernel_text("nax.h")
+    safe = {"compile_options": {"math_mode": "safe"}}
+    launches = _capture_tile_launches(monkeypatch)
+
+    y = projtile.run(x8, codes, scales, biases, info, P(128, 8, 80, True))
+    assert y.shape == (8, n_pad) and y.dtype == mx.bfloat16
+    (one,) = launches
+    assert one["name"] == "sous_proj_tile_d0_s0"
+    assert one["header"] == common + "#define DUAL 0\n#define SPLITOUT 0\n" + nax_h + header
+    assert one["source"] == tile_body and one["options"] == safe
+    assert one["input_names"] == ["x", "w0", "sc0", "bi0"] and one["output_names"] == ["y0"]
+    assert all(a is b for a, b in zip(one["inputs"], (x8, codes, scales, biases), strict=True))
+    assert one["template"] == {
+        "N": n_pad, "K": k, "TN": 128, "S": 8, "GROUPS": 80, "PIPE": True, "SPLITS": 1
+    }  # fmt: skip
+    assert (one["grid"], one["threadgroup"]) == ((80 * 8 * 32, 1, 1), (256, 1, 1))
+    assert (one["shapes"], one["dtypes"]) == ([(8, n_pad)], [mx.bfloat16])
+
+    launches.clear()
+    y = projtile.run(x8, codes, scales, biases, info, P(256, 8, 20, True, 2))
+    assert y.shape == (8, n_pad) and y.dtype == mx.bfloat16
+    split, reduce = launches
+    assert split["name"] == "sous_proj_tile_d0_s1"
+    assert split["header"] == common + "#define DUAL 0\n#define SPLITOUT 1\n" + nax_h + header
+    assert split["template"]["SPLITS"] == 2 and split["template"]["TN"] == 256
+    assert (split["grid"], split["threadgroup"]) == ((20 * 8 * 32, 2, 1), (256, 1, 1))
+    assert (split["shapes"], split["dtypes"]) == ([(2, 8, n_pad)], [mx.float32])
+    assert reduce["name"] == "sous_proj_tile_reduce"
+    # The reduce uses no tensor ops, so its header leaves nax.h out.
+    assert reduce["header"] == common and reduce["source"] == reduce_body
+    assert reduce["options"] == safe and reduce["inputs"][0].shape == (2, 8, n_pad)
+    assert reduce["template"] == {"TOTAL": 8 * n_pad, "SPLITS": 2}
+    assert (reduce["grid"], reduce["threadgroup"]) == ((8 * n_pad, 1, 1), (256, 1, 1))
+    assert (reduce["shapes"], reduce["dtypes"]) == ([(8, n_pad)], [mx.bfloat16])
+
+    launches.clear()
+    y0, y1 = projtile.run_dual(x8, (codes, scales, biases), up, info, P(128, 4, 100, True))
+    assert y0.shape == y1.shape == (8, n_pad)
+    (dual,) = launches
+    assert dual["name"] == "sous_proj_tile_d1_s0"
+    assert dual["header"] == common + "#define DUAL 1\n#define SPLITOUT 0\n" + nax_h + header
+    assert dual["input_names"] == ["x", "w0", "sc0", "bi0", "w1", "sc1", "bi1"]
+    assert dual["output_names"] == ["y0", "y1"]
+    assert all(a is b for a, b in zip(dual["inputs"][4:], up, strict=True))
+    assert (dual["grid"], dual["threadgroup"]) == ((100 * 4 * 32, 1, 1), (128, 1, 1))
+    assert dual["shapes"] == [(8, n_pad), (8, n_pad)]
+
+
+def test_the_reduce_grid_rounds_up_to_whole_threadgroups(monkeypatch):
+    codes, scales, biases, info = slab.repack(*pfx.rand_linear(96, 1024, seed=1))
+    launches = _capture_tile_launches(monkeypatch)
+    projtile.run(
+        pfx.activations(8, 1024, seed=2), codes, scales, biases, info, P(128, 8, 2, True, 4)
+    )
+    # 8 rows of one 256-column tile: 2048 elements, eight threadgroups of 256.
+    assert launches[-1]["grid"] == (2048, 1, 1)
+
+
+def test_run_and_run_dual_refuse_what_the_kernel_cannot_take(monkeypatch):
+    """Refused before anything launches, so a caller's bug never reaches the GPU."""
+    codes, scales, biases, info = slab.repack(*pfx.rand_linear(512, 1024, seed=1))
+    planes = (codes, scales, biases)
+    x8 = pfx.activations(8, 1024, seed=2)
+    launches = _capture_tile_launches(monkeypatch)
+    with pytest.raises(ValueError, match="SPLITS=5"):
+        projtile.run(x8, *planes, info, P(128, 8, 4, True, 5))
+    with pytest.raises(ValueError, match=r"\[8, 1024\] bf16"):
+        projtile.run(x8[:5], *planes, info, P(128, 8, 4, True))
+    with pytest.raises(ValueError, match=r"\[8, 1024\] bf16"):
+        projtile.run(x8.astype(mx.float16), *planes, info, P(128, 8, 4, True))
+    with pytest.raises(ValueError, match="planes"):
+        projtile.run(x8, codes[:-8], scales, biases, info, P(128, 8, 4, True))
+    with pytest.raises(ValueError, match="planes"):
+        projtile.run(x8, codes, scales, biases[:-1], info, P(128, 8, 4, True))
+    with pytest.raises(ValueError, match="dual"):
+        projtile.run_dual(x8, planes, planes, info, P(128, 8, 4, True, 2))
+    with pytest.raises(ValueError, match="planes"):
+        projtile.run_dual(x8, planes, (codes, scales[:-1], biases), info, P(128, 8, 4, True))
+    assert launches == []
+
+
+def test_the_seams_are_the_real_launches():
+    assert projtile.tile is projtile.run and projtile.tile_dual is projtile.run_dual
+
+
+def test_the_stand_ins_keep_the_kernels_contract():
+    """[8, n_pad] bf16 with zero columns past N, and the kernel's refusals."""
+    codes, scales, biases, info = slab.repack(*pfx.rand_linear(300, 1024, seed=1))
+    x8 = pfx.activations(8, 1024, seed=2)
+    y = ptfx.stand_in_tile(x8, codes, scales, biases, info, P(128, 8, 4, True))
+    assert y.shape == (8, 512) and y.dtype == mx.bfloat16
+    assert not mx.any(y[:, 300:]).item() and mx.any(y[:, :300]).item()
+    with pytest.raises(ValueError):
+        ptfx.stand_in_tile(x8[:4], codes, scales, biases, info, P(128, 8, 4, True))
+    with pytest.raises(ValueError):
+        ptfx.stand_in_tile_dual(
+            x8, (codes, scales, biases), (codes, scales, biases), info, P(128, 8, 4, True, 2)
+        )
+
+
+# ---- the kernel on the tensor units ----------------------------------------------
+
+TILE_K = 2048
+# (codes, scales, biases), or mlx's (weight, scales, biases).
+_Planes = tuple[Any, Any, Any]
+
+
+def _tile_linear(n: int, seed: int) -> tuple[_Planes, slab.SlabInfo, _Planes]:
+    """A random projection as slab planes, its SlabInfo, and mlx's arrays."""
+    linear = pfx.rand_linear(n, TILE_K, seed)
+    codes, scales, biases, info = slab.repack(*linear)
+    return (codes, scales, biases), info, linear
+
+
+def _shape_id(shape) -> str:
+    return P(*shape).label.replace("/", "-").replace(" ", "-")
+
+
+@tile_nax
+@pytest.mark.parametrize("shape", projtile.DISTINCT_SHAPES, ids=_shape_id)
+@pytest.mark.parametrize("n", [512, 96, 4160], ids=lambda n: f"n{n}")
+def test_every_row_is_independent_of_the_row_count(shape, n):
+    """Every row at T = 1..8 equals the same row run alone; rows past T and columns
+    past N come out zero; a NaN in one row reaches that row and no other."""
+    plan = P(*shape)
+    planes, info, _ = _tile_linear(n, seed=n)
+    x = pfx.activations(8, TILE_K, seed=1)
+    alone = [projtile.run(projtile.pad8(x[r : r + 1]), *planes, info, plan)[:1] for r in range(8)]
+    mx.eval(alone)
+    for t in range(1, 9):
+        y = projtile.run(projtile.pad8(x[:t]), *planes, info, plan)
+        for r in range(t):
+            assert _same(y[r : r + 1], alone[r]), (t, r)
+        assert not mx.any(y[t:]).item()
+        assert not mx.any(y[:, n:]).item()
+    nan_row = mx.full((1, TILE_K), float("nan"), dtype=mx.bfloat16)
+    y = projtile.run(mx.concatenate([x[:3], nan_row, x[4:]]), *planes, info, plan)
+    for r in range(8):
+        if r != 3:
+            assert _same(y[r : r + 1], alone[r]), r
+    assert mx.all(mx.isnan(y[3, :n])).item()
+
+
+@tile_nax
+@pytest.mark.parametrize("shape", [s for s in projtile.DISTINCT_SHAPES if s[4] > 1], ids=_shape_id)
+def test_the_split_reduce_adds_partials_in_order(shape):
+    plan = P(*shape)
+    planes, info, _ = _tile_linear(4160, seed=5)
+    x8 = pfx.activations(8, TILE_K, seed=6)
+    part = projtile._partials(x8, *planes, info, plan)
+    assert part.shape == (plan.splits, 8, info.n_pad) and part.dtype == mx.float32
+    total = mx.zeros((8, info.n_pad), dtype=mx.float32)
+    for s in range(plan.splits):
+        total = total + part[s]
+    assert _same(projtile.run(x8, *planes, info, plan), total.astype(mx.bfloat16))
+
+
+@tile_nax
+@pytest.mark.parametrize("shape", [s for s in projtile.DISTINCT_SHAPES if s[4] == 1], ids=_shape_id)
+@pytest.mark.parametrize("n", [512, 4160], ids=lambda n: f"n{n}")
+def test_the_dual_launch_equals_two_single_launches(shape, n):
+    plan = P(*shape)
+    gate, info, _ = _tile_linear(n, seed=11)
+    up, _, _ = _tile_linear(n, seed=12)
+    x8 = pfx.activations(8, TILE_K, seed=13)
+    y0, y1 = projtile.run_dual(x8, gate, up, info, plan)
+    assert _same(y0, projtile.run(x8, *gate, info, plan))
+    assert _same(y1, projtile.run(x8, *up, info, plan))
+
+
+def _f64(a) -> np.ndarray:
+    return np.array(a.astype(mx.float32), dtype=np.float64)
+
+
+def _rel_rms(got: np.ndarray, want: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((got - want) ** 2)) / np.sqrt(np.mean(want**2)))
+
+
+@tile_nax
+@pytest.mark.parametrize("shape", projtile.DISTINCT_SHAPES, ids=_shape_id)
+def test_the_tile_is_at_the_bf16_floor_against_an_fp32_reference(shape):
+    """Against the product of the activations and the weights dequantised with
+    their scales and biases upcast to fp32 (taken in float64), the tile's relative
+    RMS is within TILE_FLOOR_FACTOR of the floor, that reference rounded to bf16:
+    one bf16 rounding, and an fp32 sum that adds nothing visible to it."""
+    plan, n = P(*shape), 4160
+    gate, info, gate_linear = _tile_linear(n, seed=21)
+    up, _, up_linear = _tile_linear(n, seed=22)
+    x8 = pfx.activations(8, TILE_K, seed=23)
+    outs = [(projtile.run(x8, *gate, info, plan), gate_linear)]
+    if plan.splits == 1:
+        duals = projtile.run_dual(x8, gate, up, info, plan)
+        outs += zip(duals, (gate_linear, up_linear), strict=True)
+    for y, (w, s, b) in outs:
+        dense = mx.dequantize(w, s.astype(mx.float32), b.astype(mx.float32), group_size=64, bits=4)
+        ref = _f64(x8) @ _f64(dense).T
+        floor = _rel_rms(_f64(mx.array(ref.astype(np.float32)).astype(mx.bfloat16)), ref)
+        assert _rel_rms(_f64(y[:, :n]), ref) <= projtile.TILE_FLOOR_FACTOR * floor
