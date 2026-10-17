@@ -1,7 +1,8 @@
 """The projection tile (sous.engine.projtile) and the slab layout it reads
 (sous.engine.slab): the layout and its inverse, the slab-only MLP conversion and
 its revert, the stacked copies of the attention and GDN linears, the fork key's
-reading of the markers, and the tile kernel with its plans. Plain mlx except the
+reading of the markers, the tile kernel with its plans, and the routing state and
+launches the projection kernel's hooks reach it through. Plain mlx except the
 `tile_nax` tests, which run the kernel on the tensor units."""
 
 import types
@@ -12,7 +13,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 np = pytest.importorskip("numpy")
 
-from sous.engine import int8prefill, projtile, slab  # noqa: E402 — after the guards
+from sous.engine import int8prefill, projkernel, projtile, slab  # noqa: E402 — after the guards
 from tests import proj_fixtures as pfx  # noqa: E402
 from tests import projtile_fixtures as ptfx  # noqa: E402
 from tests.projtile_fixtures import tile_nax  # noqa: E402
@@ -662,6 +663,244 @@ def test_the_stand_ins_keep_the_kernels_contract():
         ptfx.stand_in_tile_dual(
             x8, (codes, scales, biases), (codes, scales, biases), info, P(128, 8, 4, True, 2)
         )
+
+
+# ---- routing: the flag, the window, the round flag and the launches ---------------
+
+
+@pytest.mark.parametrize("active", [0, 1], ids=["off", "active"])
+@pytest.mark.parametrize("opened", [False, True], ids=["closed", "open"])
+@pytest.mark.parametrize("round_flag", [0, 1], ids=["round-0", "round-1"])
+def test_serves_needs_the_flag_the_window_and_the_round_flag(
+    monkeypatch, active, opened, round_flag
+):
+    """With all three set, hook 1 serves a run of any rows (a one-row remainder of
+    a cut verify included) and hook 2 a call of two to eight; else neither."""
+    ptfx.guard_tile_state(monkeypatch)
+    monkeypatch.setattr(projtile, "_active", active)
+    monkeypatch.setattr(projtile, "_window", projtile.Window(serial=0) if opened else None)
+    monkeypatch.setattr(projtile, "_round_flag", round_flag)
+    on = bool(active and opened and round_flag)
+    for rows in (1, 2, 8, 9):
+        assert projtile.serves(rows, hook=1) is on, rows
+        assert projtile.serves(rows, hook=2) is (on and 2 <= rows <= 8), rows
+
+
+def test_open_window_resets_the_round_flag_and_close_window_never_raises(monkeypatch):
+    ptfx.guard_tile_state(monkeypatch)
+    monkeypatch.setattr(projtile, "_active", 1)
+    projtile.close_window()  # nothing open
+    assert projtile._window is None
+    projtile.set_round_flag(0)
+    projtile.open_window()
+    first = projtile._window
+    assert first is not None and projtile._round_flag == 1 and projtile.serves(5, hook=1)
+    # The per-round lever closes the tile and leaves the window open.
+    projtile.set_round_flag(0)
+    assert projtile._window is first and not projtile.serves(5, hook=1)
+    projtile.close_window()
+    projtile.close_window()
+    assert projtile._window is None and not projtile.serves(5, hook=1)
+    # The next decode's window is a new one, and its rounds serve again.
+    projtile.open_window()
+    second = projtile._window
+    assert second is not None and second.serial > first.serial
+    assert projtile._round_flag == 1 and projtile.serves(5, hook=1)
+
+
+def test_clear_drops_the_flag_the_window_the_round_flag_and_the_scope(monkeypatch):
+    ptfx.guard_tile_state(monkeypatch)
+    monkeypatch.setattr(projtile, "_active", 1)
+    monkeypatch.setattr(projtile, "_scope", "all")
+    projtile.open_window()
+    projtile.clear()
+    state = (projtile._active, projtile._window, projtile._round_flag, projtile._scope)
+    assert state == (0, None, 0, None)
+
+
+def _plans(linears) -> tuple:
+    """plan_for_call's plans for a call the test expects the tile to serve."""
+    plans = projtile.plan_for_call(linears)
+    assert plans is not None
+    return plans
+
+
+def _distinct_plans(monkeypatch) -> dict:
+    """A distinct plan per tiny key, so each launch shows which key it took."""
+    plans = {key: P(128, 4, i + 1, True) for i, key in enumerate(ptfx.TINY_PLANS)}
+    monkeypatch.setattr(projtile, "PLANS", plans)
+    return plans
+
+
+def _recorded_launches(monkeypatch) -> list[tuple]:
+    """The stand-ins behind both tile seams, each launch recorded as (seam, the
+    SlabInfo it was handed, its plan, the codes it read)."""
+    launches: list[tuple] = []
+
+    def tile(x8, codes, scales, biases, info, plan):
+        launches.append(("tile", info, plan, codes))
+        return ptfx.stand_in_tile(x8, codes, scales, biases, info, plan)
+
+    def tile_dual(x8, gate, up, info, plan):
+        launches.append(("dual", info, plan, gate[0]))
+        return ptfx.stand_in_tile_dual(x8, gate, up, info, plan)
+
+    monkeypatch.setattr(projtile, "tile", tile)
+    monkeypatch.setattr(projtile, "tile_dual", tile_dual)
+    return launches
+
+
+def _stack_columns(stack, x, plan) -> Any:
+    """The stand-in's [8, n_pad] over a whole stack for x's rows: what each member's
+    slice is cut from."""
+    k = x.shape[-1]
+    x8 = projtile.pad8(x.reshape(x.size // k, k))
+    return ptfx.stand_in_tile(x8, stack.codes, stack.scales, stack.biases, stack.info, plan)
+
+
+def _alone(module, x) -> Any:
+    """The stand-in over the module's own arrays (or its own slab planes)."""
+    return pfx.stand_in_mma(x, [projkernel._weights(module)])[0]
+
+
+def _close(got, want) -> bool:
+    """Within a few bf16 ulps: a stand-in over a wider stack is a matmul of another
+    width, which need not sum a column in the same order."""
+    diff = mx.max(mx.abs(got.astype(mx.float32) - want.astype(mx.float32))).item()
+    return diff <= 1e-2 * mx.max(mx.abs(want.astype(mx.float32))).item()
+
+
+def test_verify_slices_a_stack_back_to_its_members(monkeypatch):
+    plans = _distinct_plans(monkeypatch)
+    launches = _recorded_launches(monkeypatch)
+    root = ptfx.tiny_slab_model(seed=0)
+    attention = root.model.layers[1].self_attn
+    qkv = (attention.q_proj, attention.k_proj, attention.v_proj)
+    stack = projtile.stack_of(attention.q_proj)
+    assert stack is not None
+    x = pfx.activations(5, 256, seed=1).reshape(1, 5, 256)
+    outs = projtile.verify(qkv, x, _plans(qkv))
+    plan = plans[(256, (2048, 512, 512))]
+    assert [(seam, info, p) for seam, info, p, _ in launches] == [("tile", stack.info, plan)]
+    assert launches[0][3] is stack.codes
+    assert isinstance(outs, tuple)
+    assert [o.shape for o in outs] == [(1, 5, 2048), (1, 5, 512), (1, 5, 512)]
+    y8 = _stack_columns(stack, x, plan)
+    for out, member, (start, stop) in zip(outs, qkv, stack.slices, strict=True):
+        assert _same(out, y8[:5, start:stop].reshape(1, 5, stop - start))
+        assert _close(out, _alone(member, x))
+
+
+def test_the_gdn_call_runs_as_two_launches(monkeypatch):
+    plans = _distinct_plans(monkeypatch)
+    launches = _recorded_launches(monkeypatch)
+    root = ptfx.tiny_slab_model(seed=0)
+    gdn = root.model.layers[2].linear_attn
+    call = (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a)
+    qkvz, ba = projtile.stack_of(gdn.in_proj_qkv), projtile.stack_of(gdn.in_proj_b)
+    assert qkvz is not None and ba is not None
+    x = pfx.activations(3, 256, seed=2).reshape(1, 3, 256)
+    outs = projtile.verify(call, x, _plans(call))
+    first, second = plans[(256, (512, 256))], plans[(256, (4, 4))]
+    assert [(seam, info, p) for seam, info, p, _ in launches] == [
+        ("tile", qkvz.info, first),
+        ("tile", ba.info, second),
+    ]
+    assert [o.shape for o in outs] == [(1, 3, 512), (1, 3, 256), (1, 3, 4), (1, 3, 4)]
+    pieces = [(qkvz, first, 0), (qkvz, first, 1), (ba, second, 0), (ba, second, 1)]
+    for out, member, (stack, plan, index) in zip(outs, call, pieces, strict=True):
+        start, stop = stack.slices[index]
+        want = _stack_columns(stack, x, plan)[:3, start:stop].reshape(1, 3, stop - start)
+        assert _same(out, want)
+        assert _close(out, _alone(member, x))
+
+
+def test_verify_runs_gate_and_up_as_one_dual_launch_and_keeps_a_batch(monkeypatch):
+    """Two slab-only linears of one shape share one dual launch; rows are the
+    product of the leading dimensions, so a batch of two runs is one launch too."""
+    plans = _distinct_plans(monkeypatch)
+    launches = _recorded_launches(monkeypatch)
+    mlp = ptfx.tiny_slab_model(seed=0, scope="mlp").model.layers[0].mlp
+    pair = (mlp.gate_proj, mlp.up_proj)
+    x = pfx.activations(6, 256, seed=3).reshape(2, 3, 256)
+    gate, up = projtile.verify(pair, x, _plans(pair))
+    info = slab.slab_info(mlp.gate_proj)
+    assert [(seam, i, p) for seam, i, p, _ in launches] == [
+        ("dual", info, plans[(256, (512, 512))])
+    ]
+    for out, member in zip((gate, up), pair, strict=True):
+        assert out.shape == (2, 3, 512)
+        assert _same(out, _alone(member, x))
+
+
+def test_plain_on_a_stack_member_launches_its_own_tiles(monkeypatch):
+    """q, k and v each read only their own tiles of the q+k+v planes at their own
+    alone plan; in_proj_b and in_proj_a share one tile, so each runs the b+a stack
+    and takes its slice."""
+    plans = _distinct_plans(monkeypatch)
+    launches = _recorded_launches(monkeypatch)
+    root = ptfx.tiny_slab_model(seed=0)
+    attention = root.model.layers[1].self_attn
+    stack = projtile.stack_of(attention.q_proj)
+    assert stack is not None
+    groups = stack.info.groups
+    x = pfx.activations(3, 256, seed=4).reshape(1, 3, 256)
+    for member, (start, stop) in zip(
+        (attention.q_proj, attention.k_proj, attention.v_proj), stack.slices, strict=True
+    ):
+        launches.clear()
+        out = projtile.plain(member, x, _plans((member,)))
+        t0, t1 = start // slab.TILE, stop // slab.TILE
+        ((seam, info, plan, codes),) = launches
+        assert seam == "tile" and plan == plans[(256, (stop - start,))]
+        assert info == slab.SlabInfo(n_real=stop - start, k=256, tiles=t1 - t0)
+        words = groups * slab.TILE * slab.UNIT_BYTES // 4
+        assert _same(codes, stack.codes[t0 * words : t1 * words])
+        assert out.shape == (1, 3, stop - start)
+        assert _same(out, _alone(member, x))
+
+    gdn = root.model.layers[0].linear_attn
+    ba = projtile.stack_of(gdn.in_proj_b)
+    assert ba is not None
+    for member, (start, stop) in zip((gdn.in_proj_b, gdn.in_proj_a), ba.slices, strict=True):
+        launches.clear()
+        out = projtile.plain(member, x, _plans((member,)))
+        ((seam, info, plan, codes),) = launches
+        assert (seam, info, plan) == ("tile", ba.info, plans[(256, (4,))])
+        assert codes is ba.codes
+        assert _same(out, _stack_columns(ba, x, plan)[:3, start:stop].reshape(1, 3, 4))
+        assert _close(out, _alone(member, x))
+
+    # A slab-only linear reads its own planes whole.
+    launches.clear()
+    up = root.model.layers[0].mlp.up_proj
+    out = projtile.plain(up, x, _plans((up,)))
+    assert [(seam, info, p) for seam, info, p, _ in launches] == [
+        ("tile", slab.slab_info(up), plans[(256, (512,))])
+    ]
+    assert launches[0][3] is up.weight
+    assert _same(out, _alone(up, x))
+
+
+def test_a_stack_run_must_be_its_members_in_order(monkeypatch):
+    """Every member carries its index in its stack, and a run of a call is the
+    stack's launch only when it is the stack's members in order: k and v share a
+    width, so widths alone would take q+v+k for q+k+v and hand k v's columns."""
+    _distinct_plans(monkeypatch)
+    root = ptfx.tiny_slab_model(seed=0)
+    attention = root.model.layers[1].self_attn
+    q, k, v = attention.q_proj, attention.k_proj, attention.v_proj
+    assert [getattr(m, projtile.INDEX_ATTR) for m in (q, k, v)] == [0, 1, 2]
+    assert projtile.plan_for_call((q, k, v)) is not None
+    assert projtile.plan_for_call((q, v, k)) is None
+    assert projtile.plan_for_call((q, q, q)) is None
+    later = root.model.layers[3].self_attn
+    assert projtile.plan_for_call((q, later.k_proj, later.v_proj)) is None
+    x = pfx.activations(2, 256, seed=5).reshape(1, 2, 256)
+    with pytest.raises(ValueError):
+        projtile.verify((q, v, k), x, _plans((q, k, v)))
+    projtile.drop_stacks(root)
+    assert all(projtile.INDEX_ATTR not in vars(m) for m in (q, k, v))
 
 
 # ---- the kernel on the tensor units ----------------------------------------------

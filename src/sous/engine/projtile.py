@@ -18,6 +18,11 @@ eight rows, a call of fewer padded with zero rows, so a row's bits never depend
 on how many rows share the call. It runs only at the plans in ``PLANS``, tuned
 on the M5 Pro; a key outside the table stays on the projection kernel.
 
+It serves only inside a decode's window (``open_window``), reached through the
+projection kernel's two hooks: the verifier's runs (``verify``) and a module's
+calls of two to eight rows (``plain``), each when ``serves()`` and
+``plan_for_call()`` say so; every other call keeps the projection kernel's path.
+
 mlx is imported inside each function.
 """
 
@@ -44,6 +49,10 @@ logger = logging.getLogger("sous.engine.projtile")
 # mlx's parameter tree whatever it holds: its planes are a copy, not the module's
 # parameters, and no tree walk may see or count them twice.
 STACK_ATTR = "_sous_tile"
+# Each member's position in its stack's slices, set beside STACK_ATTR the same way:
+# a call is a stack's launch only when its linears are the members in order, and a
+# member called alone finds its own columns by it.
+INDEX_ATTR = "_sous_tile_index"
 
 # (K, the members' real widths in call order): what picks a stack's plan.
 Key = tuple[int, tuple[int, ...]]
@@ -171,8 +180,9 @@ def _stack_bytes(key: Key) -> int:
 
 def build_stacks(root: Any, *, keys_with_plans: Callable[[Key], bool]) -> int:
     """A stack for every group whose key ``keys_with_plans`` accepts, set as one
-    shared Stack on each member; returns the bytes built. One group at a time,
-    evaluated by repack, so the peak is one group's transient."""
+    shared Stack on each member beside the member's index in it; returns the bytes
+    built. One group at a time, evaluated by repack, so the peak is one group's
+    transient."""
     import mlx.core as mx
 
     built = 0
@@ -187,21 +197,24 @@ def build_stacks(root: Any, *, keys_with_plans: Callable[[Key], bool]) -> int:
         codes, scales, biases, info = slab.repack(*arrays)
         slices = tuple(itertools.pairwise(itertools.accumulate(key[1], initial=0)))
         stack = Stack(codes, scales, biases, info, slices, key)
-        for member in group:
+        for index, member in enumerate(group):
             object.__setattr__(member, STACK_ATTR, stack)
+            object.__setattr__(member, INDEX_ATTR, index)
         built += codes.nbytes + scales.nbytes + biases.nbytes
     mx.clear_cache()
     return built
 
 
 def drop_stacks(root: Any) -> None:
-    """Take the stack off every member; its planes go with the last reference."""
+    """Take the stack and the index off every member; the planes go with the last
+    reference."""
     import mlx.core as mx
 
     for group in stack_groups(root):
         for member in group:
-            if STACK_ATTR in vars(member):
-                object.__delattr__(member, STACK_ATTR)
+            for name in (STACK_ATTR, INDEX_ATTR):
+                if name in vars(member):
+                    object.__delattr__(member, name)
     mx.clear_cache()
 
 
@@ -310,13 +323,19 @@ def plan_for(key: Key) -> Plan | None:
     return PLANS.get(key)
 
 
-def _call_keys(linears: Sequence[Any]) -> tuple[Key, ...] | None:
-    """The key of each launch a call of ``linears`` takes, in call order: a lone
-    linear's own K and width (the alone form, whether it is slab-only or a stack
-    member); gate+up's (two slab-only linears of one shape, one dual launch); a
-    stack's key for each run of linears that covers its stack whole (the GDN call
-    makes two, qkv+z and b+a). None when a linear has no planes, the forms mix, or
-    a run covers part of a stack."""
+# One launch of a call: its key, and the linears it serves in call order.
+_Launch = tuple[Key, tuple[Any, ...]]
+
+
+def _launches(linears: Sequence[Any]) -> list[_Launch] | None:
+    """The launches a call of ``linears`` takes, in call order, each as its key and
+    the linears it serves: a lone linear keyed by its own K and width (the alone
+    form, whether it is slab-only or a stack member); gate+up (two slab-only
+    linears of one shape) as one dual launch; and, for a call of stacked linears,
+    one launch per run of them that is a stack's members whole and in order (the
+    GDN call makes two, qkv+z and b+a). None when a linear has no planes, the
+    forms mix, or a run is not its stack's members in order: widths alone would
+    take q+v+k for q+k+v, k and v being one width."""
     if not linears:
         return None
     infos = [slab.slab_info(m) for m in linears]
@@ -325,39 +344,43 @@ def _call_keys(linears: Sequence[Any]) -> tuple[Key, ...] | None:
         return None
     if len(linears) == 1:
         (module,) = linears
-        return ((projkernel._in_features(module), (projkernel._out_features(module),)),)
+        if infos[0] is None and getattr(module, INDEX_ATTR, None) is None:
+            return None
+        key = (projkernel._in_features(module), (projkernel._out_features(module),))
+        return [(key, (module,))]
     if all(info is not None for info in infos):
         first = infos[0]
         if len(infos) == 2 and first is not None and infos[1] == first:
-            return ((first.k, (first.n_real, first.n_real)),)
+            return [((first.k, (first.n_real, first.n_real)), tuple(linears))]
         return None
     if any(info is not None for info in infos):
         return None
-    keys: list[Key] = []
+    launches: list[_Launch] = []
     start = 0
     while start < len(linears):
         stack = stacks[start]
         stop = start + 1
         while stop < len(linears) and stacks[stop] is stack:
             stop += 1
-        widths = tuple(projkernel._out_features(m) for m in linears[start:stop])
-        if stack is None or widths != stack.key[1]:
+        run = tuple(linears[start:stop])
+        indices = [getattr(m, INDEX_ATTR, None) for m in run]
+        if stack is None or indices != list(range(len(stack.slices))):
             return None
-        keys.append(stack.key)
+        launches.append((stack.key, run))
         start = stop
-    return tuple(keys)
+    return launches
 
 
 def plan_for_call(linears: Sequence[Any]) -> tuple[Plan, ...] | None:
     """One plan per launch a verifier or module call of ``linears`` takes, in call
-    order, or None when any linear has no planes or any launch's key has no plan:
-    the whole call then stays on the projection kernel, never split between the
-    two."""
-    keys = _call_keys(linears)
-    if keys is None:
+    order, or None when _launches refuses the call or any launch's key has no
+    plan: the whole call then stays on the projection kernel, never split between
+    the two."""
+    launches = _launches(linears)
+    if launches is None:
         return None
     plans: list[Plan] = []
-    for key in keys:
+    for key, _ in launches:
         plan = PLANS.get(key)
         if plan is None:
             return None
@@ -644,3 +667,175 @@ def availability() -> nax.Availability:
     if failed is not None:
         return nax.Availability(False, f"the projection tile kernels failed: {failed}")
     return nax.Availability(True)
+
+
+# --------------------------------------------------------------------------------
+# Routing: the flag, the decode window, the round flag and the launches
+# --------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Window:
+    """One decode's window: the tile serves only while one is open."""
+
+    serial: int
+
+
+# 1 while the tile serves: set only by an enable() that reached active, cleared by
+# every enable() first and by clear(). A plain int, as every flag here is, so
+# nothing it holds outlives an unload.
+_active = 0
+# What enable() made servable: "all" (the MLP slab-only, the attention and GDN
+# linears stacked) or "mlp"; None while the tile is not active.
+_scope: str | None = None
+# The open window, or None. One module global suffices: the engine's generation
+# lock serialises every forward, and decode() opens and closes it on the caller's
+# session thread.
+_window: Window | None = None
+# The newest window's serial, never reset, so no two windows of a process share one.
+_serial = 0
+# A harness's per-round lever, read by serves() and never by the window: at 0 an
+# open window's calls stay on the projection kernel. Every open_window() sets it
+# to 1, so production, which never touches it, serves every round of every decode.
+_round_flag = 0
+
+
+def open_window() -> None:
+    """Open one decode's window and set the round flag: until close_window(),
+    serves() answers for the tile. A window still open is replaced, not refused:
+    whatever left it open, this decode's window is the one that should serve."""
+    global _window, _serial, _round_flag
+    _serial += 1
+    _window = Window(serial=_serial)
+    _round_flag = 1
+
+
+def close_window() -> None:
+    """Close the window, open or not. Never raises: decode() calls it first in its
+    finally, where a raise would mask the error in flight and skip kv8's close."""
+    global _window
+    _window = None
+
+
+def set_round_flag(value: int) -> None:
+    """0 keeps the calls of the rounds that follow on the projection kernel inside
+    an open window; anything else serves them on the tile again."""
+    global _round_flag
+    _round_flag = 1 if value else 0
+
+
+def serves(rows: int, *, hook: int) -> bool:
+    """Whether a call of ``rows`` rows runs on the tile: only while it is active, a
+    window is open and the round flag is set. Hook 1 (a verifier run, at most
+    MAX_ROWS rows after the cut) at any rows, a one-row remainder included, so a
+    verify never mixes paths; hook 2 (a module call) at 2..MAX_ROWS, one row being
+    the one-row kernel's. The projection kernel's seams look this up through the
+    module on every call, so a harness may wrap it."""
+    return bool(
+        _active and _window is not None and _round_flag and (hook == 1 or 2 <= rows <= MAX_ROWS)
+    )
+
+
+def clear() -> None:
+    """Stop serving (VLMEngine.unload()): the flag, the window, the round flag and
+    the scope go. The planes live on the modules and go with the model."""
+    global _active, _window, _round_flag, _scope
+    _active, _window, _round_flag, _scope = 0, None, 0, None
+
+
+def _padded(x: Any) -> tuple[Any, int]:
+    """x [..., K] as the [8, K] a launch reads, and its rows: the product of the
+    leading dimensions."""
+    k = x.shape[-1]
+    rows = x.size // k
+    return pad8(x.reshape(rows, k)), rows
+
+
+def _cut(y8: Any, rows: int, x: Any, start: int, stop: int) -> Any:
+    """Columns [start, stop) of the call's rows of a launch's [8, n_pad] output, in
+    x's leading shape."""
+    return y8[:rows, start:stop].reshape(*x.shape[:-1], stop - start)
+
+
+def _alone(module: Any, x8: Any, rows: int, x: Any, plan: Plan) -> Any:
+    """One linear's own launch at its alone plan. A slab-only linear reads its
+    planes. A stack member whose columns start and end on tile edges reads only
+    its own tiles, a contiguous range of every plane ([T][G][256] units), so a
+    member called alone costs its own bytes rather than its stack's; one sharing
+    a tile with another member (in_proj_b and in_proj_a share b+a's one tile)
+    runs its whole stack and takes its columns."""
+    info = slab.slab_info(module)
+    if info is not None:
+        y = tile(x8, module.weight, module.scales, module.biases, info, plan)
+        return _cut(y, rows, x, 0, info.n_real)
+    stack = stack_of(module)
+    if stack is None:
+        raise ValueError("projection tile: a linear without planes")
+    start, stop = stack.slices[getattr(module, INDEX_ATTR)]
+    whole = stack.info
+    if start % slab.TILE or (stop % slab.TILE and stop != whole.n_real):
+        y = tile(x8, stack.codes, stack.scales, stack.biases, whole, plan)
+        return _cut(y, rows, x, start, stop)
+    t0, t1 = start // slab.TILE, -(-stop // slab.TILE)
+    planes = (stack.codes, stack.scales, stack.biases)
+    if (t0, t1) != (0, whole.tiles):
+        units = whole.groups * slab.TILE
+        words = units * slab.UNIT_BYTES // 4
+        planes = (
+            stack.codes[t0 * words : t1 * words],
+            stack.scales[t0 * units : t1 * units],
+            stack.biases[t0 * units : t1 * units],
+        )
+    own = SlabInfo(n_real=stop - start, k=whole.k, tiles=t1 - t0)
+    return _cut(tile(x8, *planes, own, plan), rows, x, 0, stop - start)
+
+
+def _launches_at(linears: Sequence[Any], plans: Sequence[Plan]) -> list[_Launch]:
+    launches = _launches(linears)
+    if launches is None or len(launches) != len(plans):
+        raise ValueError("projection tile: plan_for_call does not serve this call at these plans")
+    return launches
+
+
+def verify(linears: Sequence[Any], x: Any, plans: Sequence[Plan]) -> tuple[Any, ...]:
+    """One verifier run on the tile: x [..., K] bf16 of 1..MAX_ROWS rows (the
+    product of its leading dimensions) through ``linears`` at ``plans``,
+    plan_for_call's for them; one launch per stack, dual or lone linear, and each
+    linear's columns cut back to [..., n_real], in call order. Raises ValueError
+    for a call plan_for_call refuses: the hook asks it first, so a raise is a
+    caller's bug, never a fallback."""
+    launches = _launches_at(linears, plans)
+    x8, rows = _padded(x)
+    outs: list[Any] = []
+    for (_, members), plan in zip(launches, plans, strict=True):
+        if len(members) == 1:
+            outs.append(_alone(members[0], x8, rows, x, plan))
+            continue
+        info = slab.slab_info(members[0])
+        if info is not None:
+            gate, up = members
+            ys = tile_dual(
+                x8,
+                (gate.weight, gate.scales, gate.biases),
+                (up.weight, up.scales, up.biases),
+                info,
+                plan,
+            )
+            outs += [_cut(y, rows, x, 0, info.n_real) for y in ys]
+            continue
+        stack = stack_of(members[0])
+        if stack is None:
+            raise ValueError("projection tile: a linear without planes")
+        y = tile(x8, stack.codes, stack.scales, stack.biases, stack.info, plan)
+        outs += [_cut(y, rows, x, start, stop) for start, stop in stack.slices]
+    return tuple(outs)
+
+
+def plain(module: Any, x: Any, plans: Sequence[Plan]) -> Any:
+    """One module call on the tile: x [..., K] bf16 of 2..MAX_ROWS rows through
+    ``module`` at ``plans``, plan_for_call's for the module alone; [..., n_real].
+    A stack member launches only its own tiles where it can (_alone). Raises
+    ValueError for a module plan_for_call refuses, as verify() does."""
+    _launches_at((module,), plans)
+    x8, rows = _padded(x)
+    return _alone(module, x8, rows, x, plans[0])

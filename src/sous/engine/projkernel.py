@@ -722,9 +722,11 @@ _DRAFT_MIN_ROWS = 6
 # Per projection call, not per turn: the tests read deltas, and so can a harness
 # that wraps the daemon. Nothing is logged per turn.
 calls: dict[str, int] = {
-    "verify_kernel": 0,  # verifier _linear/_linears calls the kernel served
+    "verify_kernel": 0,  # verifier _linear/_linears calls served, run by run here or on the tile
     "verify_split": 0,  # of those, calls over MAX_ROWS rows cut into runs
+    "verify_tile": 0,  # runs of those the projection tile served
     "plain_kernel": 0,  # QuantizedLinear calls the kernel served
+    "plain_tile": 0,  # QuantizedLinear calls the projection tile served
     "draft_kernel": 0,  # the drafter's own QuantizedLinear calls the kernel served
     "declined": 0,  # a route's flag set and every linear tagged, refused for dtype or shape
     "one_row": 0,  # one-row kernel dispatches linears() served, one per linear
@@ -838,7 +840,10 @@ def _serve_verify(linears: Any, x: Any) -> tuple[Any, ...] | None:
     A call of more than MAX_ROWS rows (block 0 lets the drafter's own policy
     verify 16) is cut along T into runs of at most MAX_ROWS: a row's bits do not
     depend on the rows beside it, so every run equals its rows computed one at a
-    time, as decode computes them."""
+    time, as decode computes them. Inside the projection tile's decode window a
+    run goes to the tile instead when every linear of the call has a launch
+    there at a tuned plan; else the whole call stays here, so no call mixes the
+    two."""
     if not linears or not all(_tagged(m) for m in linears):
         return None
     import mlx.core as mx
@@ -851,32 +856,61 @@ def _serve_verify(linears: Any, x: Any) -> tuple[Any, ...] | None:
     if not step or not rows:
         calls["declined"] += 1
         return None
-    weights = [_weights(m) for m in linears]
     calls["verify_kernel"] += 1
+    # Function-local: projtile imports this module.
+    from sous.engine import projtile
+
+    # Hook 1's answer does not depend on a run's rows, so a call none of whose runs
+    # the tile can serve (outside the window, a round the harness closed) never
+    # pays for the lookup; likewise the MMA path's entries are built only for a run
+    # it serves. Every verifier projection of every round passes through here.
+    plans = projtile.plan_for_call(linears) if projtile.serves(batch * rows, hook=1) else None
+
+    def run(part: Any) -> tuple[Any, ...]:
+        if plans is not None and projtile.serves(part.size // part.shape[-1], hook=1):
+            calls["verify_tile"] += 1
+            return projtile.verify(linears, part, plans)
+        return _run_mma(part, [_weights(m) for m in linears])
+
     if rows <= step:
-        return _run_mma(x, weights)
+        return run(x)
     calls["verify_split"] += 1
-    runs = [_run_mma(x[:, j : j + step], weights) for j in range(0, rows, step)]
+    runs = [run(x[:, j : j + step]) for j in range(0, rows, step)]
     return tuple(mx.concatenate(list(parts), axis=1) for parts in zip(*runs, strict=True))
 
 
 def _serve_plain(module: Any, x: Any) -> Any | None:
     """The kernel's output for one call of a tagged module while the flag is set,
     else None, and the wrapper calls the method it wrapped: mlx's, or int8's,
-    which takes its own calls of 128 rows and more. Rows are the product of the
-    leading dimensions, so this serves one-row decode, a last prefill chunk of
-    at most MAX_ROWS rows and the one-row forward that ends every prefill
-    segment, and nothing longer."""
+    which takes its own calls of 128 rows and more, and a slab-only module's
+    from nine. Rows are the product of the leading dimensions, so this serves
+    one-row decode, a last prefill chunk of at most MAX_ROWS rows and the
+    one-row forward that ends every prefill segment, and nothing longer. Inside
+    the projection tile's decode window a call of two rows and more on a module
+    with planes there (the decode's own generation-prompt chunk) goes to the
+    tile; one row stays on the one-row kernel."""
     if not _tagged(module):
         return None
     import mlx.core as mx
 
     shape = x.shape
-    if not 1 <= math.prod(shape[:-1]) <= MAX_ROWS:
+    rows = math.prod(shape[:-1])
+    if not 1 <= rows <= MAX_ROWS:
         return None
     if len(shape) < 2 or x.dtype != mx.bfloat16:
         calls["declined"] += 1
         return None
+    # Never for one row: one-row decode calls every projection of the model per
+    # token, and pays nothing here for the tile.
+    if rows > 1:
+        # Function-local: projtile imports this module.
+        from sous.engine import projtile
+
+        if projtile.serves(rows, hook=2):
+            plans = projtile.plan_for_call((module,))
+            if plans is not None:
+                calls["plain_tile"] += 1
+                return projtile.plain(module, x, plans)
     calls["plain_kernel"] += 1
     return _run_mma(x, [_weights(module)])[0]
 

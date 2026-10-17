@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 import warnings
 from collections.abc import Callable, Iterable
 from importlib.resources import files
@@ -38,7 +39,9 @@ GROUP = 64
 MIN_ROWS = 128
 # A slab-only module's floor: stock quantized_matmul cannot read its flat planes,
 # and the projection kernel serves its calls of up to 8 rows, so every call of 9
-# rows and more is int8's, whatever the Stage-A pass costs at that size.
+# rows and more is int8's, whatever the Stage-A pass costs at that size. Its rows
+# are the product of the leading dimensions, as the projection kernel counts them,
+# so no batch shape falls between the two.
 SLAB_MIN_ROWS = 9
 # The PR's best Q4 tile: BM = 2 * 16 * WM rows, BN = 32 * WN columns, 32 * WM * WN
 # threads per threadgroup. The seven tile variants are within ~3% of each other.
@@ -65,8 +68,9 @@ def _kernel_text(name: str) -> str:
 _kernels: dict[str, Callable[..., list[Any]]] = {}
 
 # Served calls by path, for the tests and for harnesses that wrap the daemon;
-# nothing is logged per turn. int8_small: calls of SLAB_MIN_ROWS..MIN_ROWS - 1 rows
-# on slab-only modules (one per MLP call, one per linear called on its own).
+# nothing is logged per turn. int8_small: calls on slab-only modules that only their
+# own floor admits, under MIN_ROWS in the last leading dimension, which stock served
+# before the conversion (one per MLP call, one per linear called on its own).
 calls: dict[str, int] = {"int8_small": 0}
 
 
@@ -318,15 +322,16 @@ def _tagged(module: Any) -> bool:
 
 
 def _rows_ok(x: Any, slab: SlabInfo | None = None) -> bool:
-    """Whether int8 takes a call of ``x``: MIN_ROWS rows and more, or from
-    SLAB_MIN_ROWS on a module whose SlabInfo is ``slab``."""
+    """Whether int8 takes a call of ``x``: MIN_ROWS rows and more in its last
+    leading dimension, or, on a module whose SlabInfo is ``slab``, SLAB_MIN_ROWS
+    and more across all of them (Stage A flattens them)."""
     import mlx.core as mx
 
-    return (
-        x.ndim >= 2
-        and x.dtype in (mx.bfloat16, mx.float16)
-        and (x.shape[-2] >= MIN_ROWS or (slab is not None and x.shape[-2] >= SLAB_MIN_ROWS))
-    )
+    if x.ndim < 2 or x.dtype not in (mx.bfloat16, mx.float16):
+        return False
+    if slab is not None and math.prod(x.shape[:-1]) >= SLAB_MIN_ROWS:
+        return True
+    return x.shape[-2] >= MIN_ROWS
 
 
 def _count(x: Any) -> None:

@@ -26,6 +26,7 @@ from sous.engine import (  # noqa: E402 — after the guards
     int8prefill,
     nax,
     projkernel,
+    projtile,
     slab,
 )
 from tests import proj_fixtures as pfx  # noqa: E402
@@ -1085,12 +1086,14 @@ def fresh_target(tiny_target):
     projkernel.untag(tiny_target)
 
 
-def test_the_counters_name_the_six_paths():
+def test_the_counters_name_the_eight_paths():
     assert set(projkernel.calls) == {
         "draft_kernel",
         "verify_kernel",
         "verify_split",
+        "verify_tile",
         "plain_kernel",
+        "plain_tile",
         "declined",
         "one_row",
     }
@@ -1433,6 +1436,230 @@ def test_int8_and_the_kernel_share_quantized_linear_in_either_order(monkeypatch,
     assert _bitwise(linear(between), stock(linear, between))
     assert int8_rows == [130]
     assert _proj_counts_since(before) == {"plain_kernel": 1}
+
+
+# ---- routing to the projection tile ------------------------------------------------
+
+
+def _tile_target(monkeypatch, *, scope="all"):
+    """The tiny model slab-only (its attention and GDN linears stacked at scope
+    "all") and tagged, behind both hooks, with the stand-ins as the projection
+    kernel and as the tile. Serving on the tile still needs ptfx.window()."""
+    ptfx.hooked_tile(monkeypatch)
+    root = ptfx.tiny_slab_model(seed=0, scope=scope)
+    projkernel.tag(root)
+    return root
+
+
+def _no_mma(x, weights):
+    raise AssertionError("a run the tile serves reached the projection kernel")
+
+
+def _recording_mma(monkeypatch) -> list[tuple[int, int]]:
+    """The stand-in as the projection kernel, each launch recorded as (rows,
+    linears)."""
+    seen: list[tuple[int, int]] = []
+
+    def recording(x, weights):
+        seen.append((x.size // x.shape[-1], len(weights)))
+        return pfx.stand_in_mma(x, weights)
+
+    monkeypatch.setattr(projkernel, "mma", recording)
+    return seen
+
+
+@pytest.mark.parametrize(("t", "runs"), [(5, 1), (12, 2), (9, 2)])
+def test_the_verifier_hook_serves_every_run_on_the_tile_while_the_window_is_open(
+    monkeypatch, t, runs
+):
+    """A call past eight rows is cut into runs first, and every run, a one-row
+    remainder included, runs on the tile: none reaches the MMA kernel, and each
+    row equals the same row verified alone."""
+    root = _tile_target(monkeypatch)
+    monkeypatch.setattr(projkernel, "mma", _no_mma)
+    attention = root.model.layers[1].self_attn
+    qkv = (attention.q_proj, attention.k_proj, attention.v_proj)
+    verifier = projkernel._verifier_class()()
+    x = _acts(1, t, 256)
+    with ptfx.window():
+        before = dict(projkernel.calls)
+        outs = verifier._linears(qkv, x)
+        moved = _proj_counts_since(before)
+        alone = [verifier._linears(qkv, x[:, r : r + 1]) for r in range(t)]
+    split = {"verify_split": 1} if runs > 1 else {}
+    assert moved == {"verify_kernel": 1, "verify_tile": runs, **split}
+    for i, (out, width) in enumerate(zip(outs, (2048, 512, 512), strict=True)):
+        assert out.shape == (1, t, width)
+        for r in range(t):
+            assert _bitwise(out[:, r : r + 1], alone[r][i]), (i, r)
+
+
+def test_every_verifier_call_of_a_converted_load_runs_on_the_tile(monkeypatch):
+    """q+k+v, the GDN four (two launches), gate+up (the dual), down, o_proj and
+    out_proj: each call one served run."""
+    root = _tile_target(monkeypatch)
+    monkeypatch.setattr(projkernel, "mma", _no_mma)
+    gdn = root.model.layers[0].linear_attn
+    attention = root.model.layers[1].self_attn
+    mlp = root.model.layers[0].mlp
+    verifier = projkernel._verifier_class()()
+    cases = [
+        (verifier._linears, (attention.q_proj, attention.k_proj, attention.v_proj), 256),
+        (verifier._linears, (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a), 256),
+        (verifier._linears, (mlp.gate_proj, mlp.up_proj), 256),
+        (verifier._linear, mlp.down_proj, 512),
+        (verifier._linear, attention.o_proj, 1024),
+        (verifier._linear, gdn.out_proj, 256),
+    ]
+    with ptfx.window():
+        for method, linears, k in cases:
+            before = dict(projkernel.calls)
+            method(linears, _acts(1, 5, k))
+            assert _proj_counts_since(before) == {"verify_kernel": 1, "verify_tile": 1}, k
+
+
+def test_a_call_with_an_unservable_linear_stays_on_the_mma_kernel_whole(monkeypatch):
+    """At scope mlp the attention and GDN linears hold no planes, and the head never
+    does: inside the window their calls stay on the MMA kernel, every run of them."""
+    root = _tile_target(monkeypatch, scope="mlp")
+    seen = _recording_mma(monkeypatch)
+    gdn = root.model.layers[0].linear_attn
+    gdn_call = (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a)
+    verifier = projkernel._verifier_class()()
+    with ptfx.window():
+        before = dict(projkernel.calls)
+        verifier._linears(gdn_call, _acts(1, 12, 256))
+        verifier._linear(root.lm_head, _acts(1, 5, 256))
+    assert _proj_counts_since(before) == {"verify_kernel": 2, "verify_split": 1}
+    assert seen == [(8, 4), (4, 4), (5, 1)]
+
+
+def test_a_key_outside_the_plan_table_is_served_by_the_mma_kernel(monkeypatch):
+    """No default plan: without gate+up's key the MLP's fused call runs on the MMA
+    kernel whole, while down, whose key the table holds, stays on the tile."""
+    root = _tile_target(monkeypatch)
+    plans = dict(projtile.PLANS)
+    del plans[(256, (512, 512))]
+    monkeypatch.setattr(projtile, "PLANS", plans)
+    seen = _recording_mma(monkeypatch)
+    mlp = root.model.layers[0].mlp
+    with ptfx.window():
+        before = dict(projkernel.calls)
+        projkernel._verifier_class()()._feed_forward(mlp, _acts(1, 5, 256))
+    assert _proj_counts_since(before) == {"verify_kernel": 2, "verify_tile": 1}
+    assert seen == [(5, 2)]
+
+
+def _close(got, want) -> bool:
+    """Within a few bf16 ulps: the stand-in over a wider stack is a matmul of
+    another width, which need not sum a column in the same order."""
+    diff = mx.max(mx.abs(got.astype(mx.float32) - want.astype(mx.float32))).item()
+    return diff <= 1e-2 * mx.max(mx.abs(want.astype(mx.float32))).item()
+
+
+@pytest.mark.parametrize("rows", range(1, 9))
+def test_the_module_hook_routes_two_to_eight_rows_to_the_tile_inside_the_window_only(
+    monkeypatch, rows
+):
+    """Inside the window a call of two to eight rows runs on the tile and a call of
+    one on the one-row kernel; outside it, every one of them on the projection
+    kernel. A stack member reads its own tiles (k), a slab-only linear its own
+    planes (gate), a member sharing a tile the whole stack (in_proj_a)."""
+    root = _tile_target(monkeypatch)
+    # The real dispatcher over the stand-ins, so a one-row call shows its dispatch.
+    monkeypatch.setattr(projkernel, "mma", projkernel.linears)
+    monkeypatch.setattr(projkernel, "_launch", _stand_in_launch)
+    layer0 = root.model.layers[0]
+    x = _acts(1, rows, 256)
+    one = {"plain_kernel": 1, "one_row": 1}
+    for module, exact in (
+        (root.model.layers[1].self_attn.k_proj, True),
+        (layer0.mlp.gate_proj, True),
+        (layer0.linear_attn.in_proj_a, False),
+    ):
+        with ptfx.window():
+            before = dict(projkernel.calls)
+            inside = module(x)
+            assert _proj_counts_since(before) == (one if rows == 1 else {"plain_tile": 1})
+        before = dict(projkernel.calls)
+        outside = module(x)
+        assert _proj_counts_since(before) == (one if rows == 1 else {"plain_kernel": 1})
+        assert inside.shape == outside.shape == (1, rows, projkernel._out_features(module))
+        assert (_bitwise if exact else _close)(inside, outside)
+
+
+@pytest.mark.parametrize("shape", [(1, 9), (1, 127), (2, 5)])
+def test_nine_to_127_rows_on_a_slab_only_module_fall_through_to_int8(monkeypatch, shape):
+    """The projection kernel hands a call past eight rows on, window or not, and on
+    a slab-only module, whose planes stock cannot read, int8's wrapper takes it
+    from nine rows: rows are the product of the leading dimensions on both sides,
+    so a batch of two five-row calls is int8's too."""
+    root = _tile_target(monkeypatch)
+    stock = inspect.unwrap(nn.QuantizedLinear.__call__)
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", stock)
+    monkeypatch.setattr(int8prefill, "_QUANTIZED_LINEAR_WRAPPED", False)
+    int8prefill.install_wrappers([])
+    projkernel.install_hooks()
+    served = []
+
+    def qmm(qa, sa, ra, w, scales, biases, *, slab=None):
+        assert slab is not None, "the module is slab-only"
+        served.append((qa.shape[0], slab))
+        return mx.zeros((qa.shape[0], slab.n_real), dtype=mx.bfloat16)
+
+    monkeypatch.setattr(int8prefill, "qmm", qmm)
+    gate = root.model.layers[0].mlp.gate_proj
+    object.__setattr__(gate, int8prefill._TAG, True)
+    x = _acts(*shape, 256)
+    before, small = dict(projkernel.calls), int8prefill.calls["int8_small"]
+    with ptfx.window():
+        assert projkernel._serve_plain(gate, x) is None
+        out = gate(x)
+    assert out.shape == (*shape, 512)
+    assert served == [(shape[0] * shape[1], slab.slab_info(gate))]
+    assert int8prefill.calls["int8_small"] == small + 1
+    assert _proj_counts_since(before) == {}
+
+
+def test_the_round_flag_closes_the_tile_for_one_round(monkeypatch):
+    """The gate's per-round lever: at 0 the window's calls take the projection
+    kernel's paths, and the next window, as the next decode opens it, serves on
+    the tile again."""
+    root = _tile_target(monkeypatch)
+    attention = root.model.layers[1].self_attn
+    qkv = (attention.q_proj, attention.k_proj, attention.v_proj)
+    verifier = projkernel._verifier_class()()
+    x = _acts(1, 5, 256)
+
+    def one_round():
+        before = dict(projkernel.calls)
+        verifier._linears(qkv, x)
+        attention.q_proj(x[:, :3])
+        return _proj_counts_since(before)
+
+    on_tile = {"verify_kernel": 1, "verify_tile": 1, "plain_tile": 1}
+    with ptfx.window():
+        projtile.set_round_flag(0)
+        assert one_round() == {"verify_kernel": 1, "plain_kernel": 1}
+        projtile.set_round_flag(1)
+        assert one_round() == on_tile
+        projtile.set_round_flag(0)
+    with ptfx.window():
+        assert one_round() == on_tile
+
+
+def test_the_drafters_own_linears_never_reach_the_tile(monkeypatch):
+    """A drafter-tagged module is the projection kernel's from six rows, inside the
+    window too, even one that holds a stack."""
+    _tile_target(monkeypatch)
+    monkeypatch.setattr(projkernel, "_draft_active", 1)
+    member = ptfx.tiny_slab_model(seed=1).model.layers[1].self_attn.k_proj
+    assert projtile.stack_of(member) is not None
+    object.__setattr__(member, projkernel._DRAFT_TAG, True)
+    with ptfx.window():
+        before = dict(projkernel.calls)
+        member(_acts(1, 7, 256))
+    assert _proj_counts_since(before) == {"draft_kernel": 1}
 
 
 # ---- the gates, the pins, the warm-up, the probe and enable() -----------------------

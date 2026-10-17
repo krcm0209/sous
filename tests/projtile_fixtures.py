@@ -1,16 +1,19 @@
 """Shared helpers for the projection tile's tests: the tiny qwen3_5 model with its
 MLP held slab-only (and, at scope "all", its attention and GDN linears stacked), a
 projection whose width pads, the `tile_nax` skip marker, plans for the tiny model's
-keys, and plain-mlx stand-ins for the tile's two launches.
+keys, plain-mlx stand-ins for the tile's two launches, and the routing state's
+guard, its decode window and the hooks with the stand-ins behind them.
 
 mlx is imported inside each helper, so importing this module needs only what
 `projtile.availability()` itself imports."""
 
+import contextlib
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
 
-from sous.engine import projkernel, projtile, slab
+from sous.engine import int8prefill, projkernel, projtile, slab
 from tests import proj_fixtures as pfx
 
 # Read once: a failed compile is not remembered, so each call would compile again.
@@ -101,3 +104,41 @@ def stand_in_tile_dual(
     """projtile.tile_dual's contract as two stand_in_tile launches."""
     _check_launch(x8, info, plan, dual=True)
     return stand_in_tile(x8, *gate_planes, info, plan), stand_in_tile(x8, *up_planes, info, plan)
+
+
+def guard_tile_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Registers restores for what the routing tests move: the flag, the window,
+    the round flag, the scope, the plan table, and the projection kernel's and
+    int8's counters (each count restored in place, since the modules read the
+    dicts they hold)."""
+    for name in ("_active", "_window", "_round_flag", "_scope", "PLANS"):
+        monkeypatch.setattr(projtile, name, getattr(projtile, name))
+    for counters in (projkernel.calls, int8prefill.calls):
+        for key, count in counters.items():
+            monkeypatch.setitem(counters, key, count)
+
+
+@contextlib.contextmanager
+def window() -> Iterator[projtile.Window]:
+    """The tile's decode window open for the with-block, as decode() opens it, and
+    closed on the way out unless the block closed it itself."""
+    projtile.open_window()
+    opened = projtile._window
+    assert opened is not None
+    try:
+        yield opened
+    finally:
+        if projtile._window is opened:
+            projtile.close_window()
+
+
+def hooked_tile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pfx.hooked() (both hooks, the kernel's flag, its stand-ins), the tiny model's
+    plans, the tile's flag and the stand-ins behind the tile's two seams, for this
+    test only. Serving still needs a window: window()."""
+    guard_tile_state(monkeypatch)
+    pfx.hooked(monkeypatch)
+    tiny_plans(monkeypatch)
+    monkeypatch.setattr(projtile, "_active", 1)
+    monkeypatch.setattr(projtile, "tile", stand_in_tile)
+    monkeypatch.setattr(projtile, "tile_dual", stand_in_tile_dual)

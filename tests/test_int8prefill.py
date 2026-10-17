@@ -576,6 +576,12 @@ def test_rows_ok_admits_nine_rows_on_a_slab_only_module_and_not_otherwise():
     assert i8._rows_ok(rows(9, mx.float16), info)
     assert not i8._rows_ok(rows(9, mx.float32), info)
     assert not i8._rows_ok(mx.zeros((256,), dtype=mx.bfloat16), info)
+    # A slab-only module's rows are the product of the leading dimensions, as the
+    # projection kernel counts them: the two gates meet at nine rows whatever the
+    # batch. Every other module keeps its floor on the last of them.
+    assert i8._rows_ok(mx.zeros((2, 5, 256), dtype=mx.bfloat16), info)
+    assert not i8._rows_ok(mx.zeros((2, 4, 256), dtype=mx.bfloat16), info)
+    assert not i8._rows_ok(mx.zeros((2, 100, 256), dtype=mx.bfloat16))
 
 
 def test_a_nine_row_mlp_call_on_a_converted_module_routes_to_int8_with_one_stage(
@@ -640,6 +646,33 @@ def test_a_nine_row_call_of_a_slab_only_linear_routes_alone(monkeypatch, wrapper
     assert served == [slab_info(converted)] and i8.calls["int8_small"] == 1
     assert plain(x).shape == (1, 9, 512)
     assert len(served) == 1 and i8.calls["int8_small"] == 1
+
+
+def test_a_batch_of_short_calls_on_a_slab_only_linear_routes_as_its_total_rows(
+    monkeypatch, wrappers
+):
+    """[2, 5, K] is ten rows: past the projection kernel's eight, and stock cannot
+    read the planes, so int8 takes it in one GEMM over the flattened rows."""
+    served = []
+
+    def either(*args, slab=None):
+        served.append((args[0].shape[0], slab))
+        return _either_form_qmm(*args, slab=slab)
+
+    monkeypatch.setattr(i8, "qmm", either)
+    monkeypatch.setitem(i8.calls, "int8_small", 0)
+    stock = pfx.tiny_quantized_model(seed=0).model.layers[0].mlp.gate_proj
+    converted = ptfx.tiny_slab_model(seed=0, scope="mlp").model.layers[0].mlp.gate_proj
+    object.__setattr__(converted, i8._TAG, True)
+    x = pfx.activations(10, 256, seed=8).reshape(2, 5, 256)
+    got = converted(x)
+    assert served == [(10, slab_info(converted))] and i8.calls["int8_small"] == 1
+    want = stock(x)
+    assert got.shape == want.shape == (2, 5, 512)
+    rel = mx.sqrt(mx.mean((got - want).astype(mx.float32) ** 2)) / mx.sqrt(
+        mx.mean(want.astype(mx.float32) ** 2)
+    )
+    assert rel.item() < 3e-2
 
 
 def test_linear_int8_hands_qmm_a_slab_only_for_a_slab_only_module(monkeypatch):
