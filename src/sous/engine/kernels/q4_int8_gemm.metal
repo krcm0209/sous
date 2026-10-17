@@ -16,6 +16,18 @@
 // Layout benchmark 2026-09-11, M=2048 (M5 Pro, applegpu_g17s), TOP/s stored vs
 // transposed: gate_up 39.2/50.9, down 34.8/43.3, gdn_qkv 38.2/49.9, gdn_out
 // 36.3/45.2 -> transposed kept.
+//
+// With SLAB set (a header define: the preprocessor cannot see a template argument)
+// the weights are a slab-only module's flat planes (slab.py), read in place:
+// column n's group g is the 32-byte unit ((n >> 8) * groups + g) * 256 + (n & 255)
+// of the codes, and the scale and bias of the same index, so a lane's four
+// adjacent scales stay contiguous. A threadgroup's BN columns start at a multiple
+// of BN, which divides 256, so no read leaves one slab tile. Only addresses change:
+// the arithmetic, and so the bits, are the mlx-layout read's. The layout is
+// Splash's (incoai/splash), under the same license.
+#ifndef SLAB
+#define SLAB 0
+#endif
   constexpr int kFragM = 16, kFragN = 32, kFragK = 16, kDestElems = 16, kSteps = 4;
   constexpr int TM = 2;
   constexpr int TBM = TM * kFragM * WM;
@@ -54,15 +66,26 @@
   float Cf[TM][kDestElems];
   UNROLL for (int i = 0; i < TM; ++i) { UNROLL for (int e = 0; e < kDestElems; ++e) Cf[i][e] = 0.0f; }
 
+#if SLAB
+  const device uint32_t* wbase =
+      w + (size_t((col_base + int(coord.y)) >> 8) * size_t(groups) * 256 + size_t((col_base + int(coord.y)) & 255)) * words;
+  const int w_stride8 = 8 * words;
+  const int w_stride16 = kFragM * words;
+#else
   const device uint32_t* wbase = w + size_t(col_base + int(coord.y)) * size_t(groups) * words;
   const int w_stride8 = 8 * groups * words;
   const int w_stride16 = kFragM * groups * words;
+#endif
   const int cx = int(coord.x) >> 2;
 
   for (int g = 0; g < groups; ++g) {
     uint2 wg[4];
     UNROLL for (int q = 0; q < 4; ++q) {
+#if SLAB
+      const device uint32_t* wr = wbase + (q & 1) * w_stride8 + (q >> 1) * w_stride16 + size_t(g) * 256 * words;
+#else
       const device uint32_t* wr = wbase + (q & 1) * w_stride8 + (q >> 1) * w_stride16 + size_t(g) * words;
+#endif
       wg[q] = reinterpret_cast<const device uint2*>(wr)[cx];
     }
     UNROLL for (int t = 0; t < kSteps; ++t) {
@@ -85,6 +108,15 @@
     }
     vec<T, 4> sv[2];
     vec<T, 4> bv[2];
+#if SLAB
+    const size_t s_unit = (size_t(n_run0 >> 8) * size_t(groups) + size_t(g)) * 256 + size_t(n_run0 & 255);
+    const device T* srow = scales + s_unit;
+    const device T* brow = biases + s_unit;
+    UNROLL for (int h = 0; h < 2; ++h) {
+      sv[h] = *reinterpret_cast<const device vec<T, 4>*>(srow + h * kFragM);
+      bv[h] = *reinterpret_cast<const device vec<T, 4>*>(brow + h * kFragM);
+    }
+#else
     const device T* srow = scales + size_t(g) * size_t(N);
     const device T* brow = biases + size_t(g) * size_t(N);
     UNROLL for (int h = 0; h < 2; ++h) {
@@ -92,6 +124,7 @@
       sv[h] = *reinterpret_cast<const device vec<T, 4>*>(srow + n0);
       bv[h] = *reinterpret_cast<const device vec<T, 4>*>(brow + n0);
     }
+#endif
     const device short* rrow = ra + size_t(g) * size_t(M);
     float r_g[TM][2];
     UNROLL for (int i = 0; i < TM; ++i) { UNROLL for (int r = 0; r < 2; ++r) {
