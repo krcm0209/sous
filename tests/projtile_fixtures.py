@@ -1,8 +1,9 @@
 """Shared helpers for the projection tile's tests: the tiny qwen3_5 model with its
 MLP held slab-only (and, at scope "all", its attention and GDN linears stacked), a
 projection whose width pads, the `tile_nax` skip marker, plans for the tiny model's
-keys, plain-mlx stand-ins for the tile's two launches, and the routing state's
-guard, its decode window and the hooks with the stand-ins behind them.
+keys, plain-mlx stand-ins for the tile's two launches and int8's GEMM, the routing
+state's guard, its decode window, the hooks with the stand-ins behind them, and
+everything enable() needs to reach active on any GPU.
 
 mlx is imported inside each helper, so importing this module needs only what
 `projtile.availability()` itself imports."""
@@ -13,7 +14,8 @@ from typing import Any
 
 import pytest
 
-from sous.engine import int8prefill, projkernel, projtile, slab
+from sous.engine import int8prefill, nax, projkernel, projtile, slab
+from sous.engine.slab import unpack
 from tests import proj_fixtures as pfx
 
 # Read once: a failed compile is not remembered, so each call would compile again.
@@ -142,3 +144,68 @@ def hooked_tile(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(projtile, "_active", 1)
     monkeypatch.setattr(projtile, "tile", stand_in_tile)
     monkeypatch.setattr(projtile, "tile_dual", stand_in_tile_dual)
+
+
+def unreorder(qa: Any) -> Any:
+    """int8prefill.reorder_k's inverse: (c, a, b, j) -> (c, a, j, b) within each
+    64-code group."""
+    m, k = qa.shape
+    return qa.reshape(m, k // 64, 4, 2, 2, 4).transpose(0, 1, 2, 3, 5, 4).reshape(m, k)
+
+
+def reference_qmm(qa: Any, sa: Any, ra: Any, w: Any, scales: Any, biases: Any) -> Any:
+    """A plain-mlx model of int8prefill.qmm's contract over mlx's layout: Stage A's
+    rows put back in K order and rescaled, times the dequantized weights, in fp32,
+    rounded to the scales' dtype."""
+    import mlx.core as mx
+
+    x_hat = unreorder(qa).astype(mx.float32) * sa[:, None]
+    wd = mx.dequantize(w, scales, biases, group_size=64, bits=4, mode="affine")
+    return (x_hat @ wd.astype(mx.float32).T).astype(scales.dtype)
+
+
+def slab_reference_qmm(
+    qa: Any, sa: Any, ra: Any, w: Any, scales: Any, biases: Any, *, slab: Any = None
+) -> Any:
+    """reference_qmm taking qmm's slab keyword: a slab-only module's planes are read
+    back through slab.unpack, so it computes what mlx's arrays would."""
+    if slab is not None:
+        w, scales, biases = unpack(w, scales, biases, slab)
+    return reference_qmm(qa, sa, ra, w, scales, biases)
+
+
+def ready_model(*, seed: int = 0) -> Any:
+    """pfx.tiny_quantized_model() as an active projection kernel and an active int8
+    prefill leave it for projtile.enable(): every projection tagged for the kernel's
+    hooks, and the MLP and the eligible GDN linears for int8's wrappers."""
+    root = pfx.tiny_quantized_model(seed=seed)
+    projkernel.tag(root)
+    int8prefill._tag(root)
+    return root
+
+
+def tile_ready(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Every projtile.enable() guard that reads the machine or compiles a tensor-op
+    kernel passes on any GPU: pfx.proj_ready()'s platform rule, 20 cores,
+    projection-kernel stand-ins and pins; the tile's availability, pins and
+    real-shape compile; the stand-ins behind the tile's two seams and behind int8's
+    GEMM; the tiny model's plans; and the projection kernel's hooks installed with
+    its flag set, as its active enable() leaves them. Registers guard_tile_state's
+    restores and returns the statuses an active load hands enable(), as keywords.
+    The model comes from ready_model()."""
+    tile_status = pfx.proj_ready(monkeypatch)
+    guard_tile_state(monkeypatch)
+    projkernel.install_hooks()
+    monkeypatch.setattr(projkernel, "_active", 1)
+    monkeypatch.setattr(projtile, "availability", lambda: nax.Availability(True))
+    monkeypatch.setattr(projtile, "_pins_reason", lambda: None)
+    monkeypatch.setattr(projtile, "_compile_real_shapes", lambda root: None)
+    monkeypatch.setattr(projtile, "tile", stand_in_tile)
+    monkeypatch.setattr(projtile, "tile_dual", stand_in_tile_dual)
+    monkeypatch.setattr(int8prefill, "qmm", slab_reference_qmm)
+    tiny_plans(monkeypatch)
+    return {
+        "kernel_status": {"state": "active", "reason": None, "probe_seconds": 0.5},
+        "tile_status": tile_status,
+        "int8_status": {"state": "active", "reason": None, "routed": 24},
+    }

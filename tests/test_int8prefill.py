@@ -16,15 +16,11 @@ mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
 from sous.engine import int8prefill as i8  # noqa: E402 — after the importorskip guards
-from sous.engine.slab import SLAB_ATTR, SlabInfo, repack, slab_info, unpack  # noqa: E402
+from sous.engine.slab import SLAB_ATTR, SlabInfo, repack, slab_info  # noqa: E402
 from tests import proj_fixtures as pfx  # noqa: E402
 from tests import projtile_fixtures as ptfx  # noqa: E402
 
-
-def _unreorder(qa):
-    """Inverse of reorder_k: (c, a, b, j) -> (c, a, j, b) within each 64-code group."""
-    m, k = qa.shape
-    return qa.reshape(m, k // 64, 4, 2, 2, 4).transpose(0, 1, 2, 3, 5, 4).reshape(m, k)
+_unreorder = ptfx.unreorder
 
 
 # ---- K-order --------------------------------------------------------------------
@@ -467,18 +463,8 @@ def test_eligible_linear_table():
 # ---- routing (any Metal GPU: qmm is replaced by an exact-enough reference) ------
 
 
-def _reference_qmm(qa, sa, ra, w, scales, biases):
-    x_hat = _unreorder(qa).astype(mx.float32) * sa[:, None]
-    wd = mx.dequantize(w, scales, biases, group_size=64, bits=4, mode="affine")
-    return (x_hat @ wd.astype(mx.float32).T).astype(scales.dtype)
-
-
-def _either_form_qmm(qa, sa, ra, w, scales, biases, *, slab=None):
-    """_reference_qmm taking qmm's slab keyword: a slab-only module's planes are
-    read back through slab.unpack, so it computes what mlx's arrays would."""
-    if slab is not None:
-        w, scales, biases = unpack(w, scales, biases, slab)
-    return _reference_qmm(qa, sa, ra, w, scales, biases)
+_reference_qmm = ptfx.reference_qmm
+_either_form_qmm = ptfx.slab_reference_qmm
 
 
 class _TinyGDN(nn.Module):

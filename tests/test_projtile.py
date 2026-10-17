@@ -2,18 +2,32 @@
 (sous.engine.slab): the layout and its inverse, the slab-only MLP conversion and
 its revert, the stacked copies of the attention and GDN linears, the fork key's
 reading of the markers, the tile kernel with its plans, and the routing state and
-launches the projection kernel's hooks reach it through. Plain mlx except the
-`tile_nax` tests, which run the kernel on the tensor units."""
+launches the projection kernel's hooks reach it through, and enable() with its
+guards, memory rule, warm-up and probe. Plain mlx except the `tile_nax` tests,
+which run the kernel on the tensor units."""
 
+import contextlib
+import gc
+import logging
 import types
+import warnings
+import weakref
 from typing import Any
 
 import pytest
 
 mx = pytest.importorskip("mlx.core")
 np = pytest.importorskip("numpy")
+nn = pytest.importorskip("mlx.nn")
 
-from sous.engine import int8prefill, projkernel, projtile, slab  # noqa: E402 — after the guards
+from sous.engine import (  # noqa: E402 — after the guards
+    gpucores,
+    int8prefill,
+    nax,
+    projkernel,
+    projtile,
+    slab,
+)
 from tests import proj_fixtures as pfx  # noqa: E402
 from tests import projtile_fixtures as ptfx  # noqa: E402
 from tests.projtile_fixtures import tile_nax  # noqa: E402
@@ -1042,3 +1056,917 @@ def test_the_tile_is_at_the_bf16_floor_against_an_fp32_reference(shape):
         ref = _f64(x8) @ _f64(dense).T
         floor = _rel_rms(_f64(mx.array(ref.astype(np.float32)).astype(mx.bfloat16)), ref)
         assert _rel_rms(_f64(y[:, :n]), ref) <= projtile.TILE_FLOOR_FACTOR * floor
+
+
+# ---- enable(): the guards, the memory rule, the warm-up and the probe --------------
+
+G = 2**30
+_BUILD_ERROR = "Unable to build metal library\nprogram_source:3:1: error: boom"
+
+
+class _Records(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@contextlib.contextmanager
+def _tile_log():
+    """Every record the tile's logger emits inside the block, INFO included; they
+    still propagate, so a test's own caplog sees them too."""
+    logger = logging.getLogger("sous.engine.projtile")
+    handler, level = _Records(), logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield handler.records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+
+
+def _enable(root, ready, **overrides) -> dict:
+    """enable() as an active load calls it, with what a test overrides: a dflash
+    drafter, the automatic budget, 64 GiB of headroom and an 8 GiB reserve."""
+    kwargs: dict[str, Any] = {
+        "config_value": True,
+        **ready,
+        "drafter_kind": "dflash",
+        "cache_budget": None,
+        "headroom_bytes": 64 * G,
+        "reserve_bytes": 8 * G,
+        **overrides,
+    }
+    return projtile.enable(root, **kwargs)
+
+
+def _gated(root, ready, **overrides) -> tuple[dict, list[str], list[logging.LogRecord]]:
+    """enable() with every warning and the tile's log records caught."""
+    with warnings.catch_warnings(record=True) as caught, _tile_log() as records:
+        warnings.simplefilter("always")
+        status = _enable(root, ready, **overrides)
+    messages = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    return status, messages, records
+
+
+def _infos(records) -> list[str]:
+    return [r.getMessage() for r in records if r.levelno == logging.INFO]
+
+
+def _planned(key) -> bool:
+    return projtile.plan_for(key) is not None
+
+
+def _marked(root) -> tuple[int, int, int]:
+    """(slab-only MLP linears, linears carrying a stack, linears carrying an index)."""
+    linears = [m for _, m in root.named_modules() if isinstance(m, nn.QuantizedLinear)]
+    return (
+        sum(slab.SLAB_ATTR in vars(m) for m in linears),
+        sum(projtile.STACK_ATTR in vars(m) for m in linears),
+        sum(projtile.INDEX_ATTR in vars(m) for m in linears),
+    )
+
+
+# The tiny model: 12 MLP linears and 18 stacked attention and GDN linears.
+_CONVERTED = (12, 18, 18)
+_MLP_ONLY = (12, 0, 0)
+_UNTOUCHED = (0, 0, 0)
+
+
+def _refusal(root, ready, *, warned: bool, **overrides) -> dict:
+    """enable() expected to refuse. A load the tile does not apply to is one INFO
+    line and no warning; one where it should have run and did not is exactly one
+    warning, on one line, in the tile's words. Either way the routing state is
+    clear and nothing of the tile is left on the model."""
+    status, messages, records = _gated(root, ready, **overrides)
+    infos = _infos(records)
+    assert status["state"] == "unavailable", status
+    assert set(status) == {
+        "state",
+        "scope",
+        "reason",
+        "copy_gb",
+        "probe_seconds",
+        "budget_left_gib",
+    }
+    assert (status["scope"], status["copy_gb"], status["budget_left_gib"]) == (None, None, None)
+    if warned:
+        assert messages == [
+            f"sous: projection tile unavailable ({status['reason']}); "
+            "verify runs the projection kernel"
+        ]
+        assert not any(m.startswith("projection tile unavailable") for m in infos), infos
+    else:
+        assert messages == []
+        assert infos == [f"projection tile unavailable: {status['reason']}"]
+    assert (projtile._active, projtile._scope, projtile._window) == (0, None, None)
+    assert _marked(root) == _UNTOUCHED
+    assert projtile.fork_key_state(root) == "off"
+    return status
+
+
+def test_enable_off_returns_before_any_guard(monkeypatch):
+    ready = ptfx.tile_ready(monkeypatch)
+    monkeypatch.setattr(projtile, "_active", 1)
+    monkeypatch.setattr(projtile, "_scope", "all")
+    projtile.open_window()
+
+    def untouchable(*args, **kwargs):
+        raise AssertionError("a guard ran while the tile is off")
+
+    for name in (
+        "_kernel_reason",
+        "_drafter_reason",
+        "_int8_reason",
+        "_cores_reason",
+        "_model_reason",
+        "_pins_reason",
+        "availability",
+        "_compile_real_shapes",
+        "copy_decision",
+        "convert_mlp",
+        "build_stacks",
+        "warm_up",
+        "probe",
+    ):
+        monkeypatch.setattr(projtile, name, untouchable)
+    root = ptfx.ready_model()
+    status, messages, records = _gated(root, ready, config_value=False, drafter_kind=None)
+    assert status == {
+        "state": "off",
+        "scope": None,
+        "reason": None,
+        "copy_gb": None,
+        "probe_seconds": None,
+        "budget_left_gib": None,
+    }
+    assert messages == [] and records == []
+    state = (projtile._active, projtile._scope, projtile._window, projtile._round_flag)
+    assert state == (0, None, None, 0)
+    assert _marked(root) == _UNTOUCHED
+
+
+_GUARD_REASONS = [
+    "projection kernel off",
+    "macOS 15.5 < 26.2",
+    "no drafter",
+    "int8 prefill off",
+    "GPU core count 16 not measured (measured: 20)",
+    "no tuned plan for (256, (512, 512))",
+    "mlx 0.99.0 not validated",
+    "the projection tile kernels failed: program_source:3:1: error: boom",
+    "real shapes: program_source:3:1: error: boom",
+    "floor: model.layers.1.mlp.down_proj is 0.01 from its fp32 reference",
+]
+# The kernel, the attention tile, the drafter, int8 prefill, the core count and the
+# model only say the tile does not apply to this load. Pin drift, kernels this OS
+# rejects (at the probe's shapes or the model's) and a failed probe say it should
+# have run and did not.
+_GUARD_WARNS = [False] * 6 + [True] * 4
+
+
+@pytest.mark.parametrize("first", range(len(_GUARD_REASONS)))
+def test_enable_names_the_first_failing_guard_in_order(monkeypatch, first):
+    """Guard `first` and every guard after it fail; the reason is guard `first`'s."""
+    ready = ptfx.tile_ready(monkeypatch)
+    root = ptfx.ready_model()
+    overrides: dict = {}
+    device = str(mx.device_info()["device_name"])
+
+    def fails(root):
+        raise RuntimeError(_BUILD_ERROR)
+
+    without_dual = {k: p for k, p in projtile.PLANS.items() if k != (256, (512, 512))}
+    breakers = [
+        lambda: overrides.update(kernel_status={"state": "off", "reason": None}),
+        lambda: overrides.update(
+            tile_status={"state": "unavailable", "reason": _GUARD_REASONS[1], "splits": None}
+        ),
+        lambda: overrides.update(drafter_kind=None),
+        lambda: overrides.update(int8_status={"state": "off", "reason": None, "routed": 0}),
+        lambda: monkeypatch.setattr(
+            gpucores, "read", lambda: gpucores.GPUCores(16, device, None, "iokit")
+        ),
+        lambda: monkeypatch.setattr(projtile, "PLANS", without_dual),
+        lambda: monkeypatch.setattr(projtile, "_pins_reason", lambda: _GUARD_REASONS[6]),
+        lambda: monkeypatch.setattr(
+            projtile, "availability", lambda: nax.Availability(False, _GUARD_REASONS[7])
+        ),
+        lambda: monkeypatch.setattr(projtile, "_compile_real_shapes", fails),
+        lambda: monkeypatch.setattr(projtile, "probe", lambda root, scope: _GUARD_REASONS[9]),
+    ]
+    for brk in breakers[first:]:
+        brk()
+    status = _refusal(root, ready, warned=_GUARD_WARNS[first], **overrides)
+    assert status["reason"] == _GUARD_REASONS[first]
+    # The cost is reported once the kernels at the model's shapes have started.
+    assert (status["probe_seconds"] is None) == (first < 8)
+
+
+def _untag_int8(root):
+    object.__setattr__(root.model.layers[2].mlp.down_proj, int8prefill._TAG, False)
+
+
+def _untag_kernel(root):
+    object.__setattr__(root.model.layers[2].mlp.up_proj, projkernel._TAG, False)
+
+
+def _fp16_scales(root):
+    module = root.model.layers[3].self_attn.k_proj
+    module.scales = module.scales.astype(mx.float16)
+
+
+@pytest.mark.parametrize(
+    ("breaker", "reason"),
+    [
+        (_untag_int8, "projection model.layers.2.mlp.down_proj is not routed by int8 prefill"),
+        (
+            _untag_kernel,
+            "projection model.layers.2.mlp.up_proj is not routed by the projection kernel",
+        ),
+        (
+            _fp16_scales,
+            "projection model.layers.3.self_attn.k_proj is not affine 4-bit gs64 with bf16 "
+            "scales in mlx's layout",
+        ),
+    ],
+    ids=["int8", "kernel", "eligible"],
+)
+def test_enable_refuses_a_model_whose_linears_its_paths_cannot_take(monkeypatch, breaker, reason):
+    """A slab-only linear that no path routes would reach stock, which raises on
+    flat planes; a linear it would copy must be one the kernel decodes. Either
+    only says the tile does not apply to this model."""
+    ready = ptfx.tile_ready(monkeypatch)
+    root = ptfx.ready_model()
+    breaker(root)
+    assert _refusal(root, ready, warned=False)["reason"] == reason
+
+
+def test_enable_refuses_a_model_without_a_dense_mlp(monkeypatch):
+    ready = ptfx.tile_ready(monkeypatch)
+    root = types.SimpleNamespace(model=types.SimpleNamespace(layers=[]))
+    with _tile_log() as records:
+        status = _enable(root, ready)
+    assert (status["state"], status["reason"]) == ("unavailable", "no dense MLP")
+    assert _infos(records) == ["projection tile unavailable: no dense MLP"]
+
+
+def test_enable_refuses_an_exception_in_a_guard_with_its_error_line(monkeypatch, caplog):
+    ready = ptfx.tile_ready(monkeypatch)
+    error = RuntimeError(_BUILD_ERROR)
+
+    def broken(root):
+        raise error
+
+    monkeypatch.setattr(projtile, "_model_reason", broken)
+    status = _refusal(ptfx.ready_model(), ready, warned=True)
+    assert status["reason"] == "program_source:3:1: error: boom"
+    assert status["probe_seconds"] is None
+    (record,) = [r for r in caplog.records if r.getMessage() == "projection tile: enabling failed"]
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is not None and record.exc_info[1] is error
+
+
+# (config value, configured budget, headroom, copy, reserve, copies, text); the
+# automatic rule keeps 2 GiB of slack beside the reserve.
+COPY_CASES = [
+    (True, None, 35 * G, 4 * G, 16 * G, False,
+     "copy would leave 13.0 GiB of prompt-cache budget (< 14)"),
+    (True, None, 44 * G, 4 * G, 16 * G, True, "budget left 22.0 GiB"),
+    (True, 12 * G, 35 * G, 4 * G, 16 * G, True,
+     "configured budget 12.0 GiB fits beside the copy; budget left 13.0 GiB"),
+    (True, 14 * G, 35 * G, 4 * G, 16 * G, False,
+     "configured budget 14.0 GiB does not fit beside the copy; budget left 13.0 GiB"),
+    (True, 0, 20 * G, 4 * G, 16 * G, False,
+     "configured budget 0.0 GiB does not fit beside the copy; budget left -2.0 GiB"),
+    (True, None, None, 4 * G, 16 * G, False, "headroom unreadable"),
+    (True, 12 * G, None, 4 * G, 16 * G, False, "headroom unreadable"),
+    ("mlp", None, 44 * G, 4 * G, 16 * G, False, "scope mlp by config"),
+    ("all", None, 20 * G, 4 * G, 16 * G, True, "scope all by config; budget left -2.0 GiB"),
+    ("all", 12 * G, None, 4 * G, 16 * G, True, "scope all by config; budget left unknown"),
+]  # fmt: skip
+
+
+def _copy_id(case) -> str:
+    config, budget, headroom, *_ = case
+    gib = lambda v: "auto" if v is None else f"{v // G}G"  # noqa: E731
+    return f"{config}-budget-{gib(budget)}-headroom-{gib(headroom)}"
+
+
+@pytest.mark.parametrize("case", COPY_CASES, ids=[_copy_id(c) for c in COPY_CASES])
+def test_copy_decision_table(case):
+    """Bytes in, the copy and why out; never a warning, even where a configured
+    budget no longer fits: the user chose it."""
+    config, budget, headroom, copy, reserve, copies, text = case
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        got = projtile.copy_decision(config, budget, headroom, copy, reserve)
+    assert got == (copies, text)
+    assert caught == []
+
+
+def test_enable_converts_the_mlp_and_builds_stacks_at_scope_all(monkeypatch):
+    ready = ptfx.tile_ready(monkeypatch)
+    root = ptfx.ready_model()
+    copy = projtile.copy_bytes(root, keys_with_plans=_planned)
+    counted = (dict(projkernel.calls), dict(int8prefill.calls))
+    status, messages, records = _gated(root, ready, headroom_bytes=40 * G, reserve_bytes=8 * G)
+    assert messages == []
+    seconds = status["probe_seconds"]
+    assert isinstance(seconds, float)
+    left = round((40 * G - copy - 8 * G - 2 * G) / G, 2)
+    assert status == {
+        "state": "active",
+        "scope": "all",
+        "reason": None,
+        "copy_gb": copy / 1e9,
+        "probe_seconds": seconds,
+        "budget_left_gib": left,
+    }
+    assert (projtile._active, projtile._scope, projtile._window) == (1, "all", None)
+    assert _marked(root) == _CONVERTED
+    assert projtile.fork_key_state(root) == "active"
+    assert _infos(records) == [
+        f"projection tile: scope=all copy={copy / 1e9:.1f} GB budget left {left:.1f} GiB "
+        f"probe {seconds:.2f}s"
+    ]
+    # The counters are as the load found them: a load serves no call.
+    assert (dict(projkernel.calls), dict(int8prefill.calls)) == counted
+
+
+@pytest.mark.parametrize(
+    ("config", "headroom", "why"),
+    [
+        (True, 19 * G, "copy would leave 13.0 GiB of prompt-cache budget (< 14)"),
+        ("mlp", 64 * G, "scope mlp by config"),
+        (True, None, "headroom unreadable"),
+    ],
+    ids=["shortfall", "config", "unreadable"],
+)
+def test_enable_serves_mlp_only_when_the_copy_is_skipped(monkeypatch, config, headroom, why):
+    """No copy: the MLP is still converted and served, the attention and GDN
+    linears keep the projection kernel, and the one INFO line names why."""
+    ready = ptfx.tile_ready(monkeypatch)
+    root = ptfx.ready_model()
+    status, messages, records = _gated(
+        root, ready, config_value=config, headroom_bytes=headroom, reserve_bytes=4 * G
+    )
+    assert messages == []
+    assert (status["state"], status["scope"], status["reason"]) == ("active", "mlp", why)
+    assert status["copy_gb"] is None
+    left = None if headroom is None else round((headroom - 4 * G - 2 * G) / G, 2)
+    assert status["budget_left_gib"] == left
+    assert (projtile._active, projtile._scope) == (1, "mlp")
+    assert _marked(root) == _MLP_ONLY
+    budget = "unknown" if left is None else f"{left:.1f} GiB"
+    assert _infos(records) == [
+        f"projection tile: scope=mlp copy=0.0 GB budget left {budget} "
+        f"probe {status['probe_seconds']:.2f}s ({why})"
+    ]
+
+
+def _arrays_of(root) -> list[tuple[str, tuple]]:
+    return [
+        (path, (m.weight, m.scales, m.biases))
+        for path, m in root.named_modules()
+        if isinstance(m, nn.QuantizedLinear)
+    ]
+
+
+@pytest.mark.parametrize("failure", ["returns", "raises"])
+def test_a_failed_probe_reverts_the_conversion_bitwise_and_drops_the_stacks(
+    monkeypatch, caplog, failure
+):
+    ready = ptfx.tile_ready(monkeypatch)
+    root = ptfx.ready_model()
+    before = _arrays_of(root)
+    seen: list = []
+
+    def failing(root, scope):
+        seen.append((_marked(root), scope))
+        if failure == "raises":
+            raise RuntimeError("device lost")
+        return "isolation: a NaN in row 3 changed the other rows of model.layers.1.mlp.down_proj"
+
+    monkeypatch.setattr(projtile, "probe", failing)
+    status = _refusal(root, ready, warned=True)
+    assert seen == [(_CONVERTED, "all")]
+    assert isinstance(status["probe_seconds"], float)
+    if failure == "raises":
+        assert status["reason"] == "device lost"
+        (record,) = [
+            r for r in caplog.records if r.getMessage() == "projection tile: enabling failed"
+        ]
+        assert record.exc_info is not None
+    after = _arrays_of(root)
+    assert [path for path, _ in after] == [path for path, _ in before]
+    for (path, got), (_, want) in zip(after, before, strict=True):
+        for g, w in zip(got, want, strict=True):
+            assert _same(g, w), path
+
+
+def test_a_revert_that_raises_leaves_the_markers_authoritative(monkeypatch, caplog):
+    """The stacks still go; the linears the revert could not reach stay slab-only,
+    marked, and keyed so: every reader is marker-driven."""
+    ready = ptfx.tile_ready(monkeypatch)
+    root = ptfx.ready_model()
+    monkeypatch.setattr(projtile, "probe", lambda root, scope: "floor: boom")
+
+    def revert_fails(root):
+        raise RuntimeError("revert failed")
+
+    monkeypatch.setattr(projtile, "revert_mlp", revert_fails)
+    status, messages, _ = _gated(root, ready)
+    assert status["state"] == "unavailable" and status["reason"] == "floor: boom"
+    assert len(messages) == 1
+    assert _marked(root) == _MLP_ONLY
+    assert projtile.fork_key_state(root) == "active"
+    assert any("revert" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
+
+def test_a_conversion_that_converts_nothing_refuses_the_load(monkeypatch):
+    """A root the conversion finds no MLP under would otherwise go on to serve an
+    unconverted model as converted."""
+    ready = ptfx.tile_ready(monkeypatch)
+    monkeypatch.setattr(projtile, "convert_mlp", lambda root: 0)
+    status = _refusal(ptfx.ready_model(), ready, warned=True)
+    assert status["reason"] == "the MLP conversion converted no linear"
+    assert isinstance(status["probe_seconds"], float)
+
+
+def test_enable_compiles_the_real_shapes_before_converting(monkeypatch):
+    ready = ptfx.tile_ready(monkeypatch)
+    root = ptfx.ready_model()
+    order: list = []
+    convert = projtile._convert
+
+    def recording_convert(module):
+        order.append("convert")
+        convert(module)
+
+    monkeypatch.setattr(projtile, "_convert", recording_convert)
+    monkeypatch.setattr(
+        projtile, "_compile_real_shapes", lambda r: order.append(("compile", _marked(r)))
+    )
+    assert _enable(root, ready)["state"] == "active"
+    assert order[0] == ("compile", _UNTOUCHED) and order[1:] == ["convert"] * 12
+
+    # A toolchain that rejects them refuses the load with the model never touched.
+    order.clear()
+    fresh = ptfx.ready_model(seed=1)
+
+    def fails(root):
+        raise RuntimeError(_BUILD_ERROR)
+
+    monkeypatch.setattr(projtile, "_compile_real_shapes", fails)
+    status = _refusal(fresh, ready, warned=True)
+    assert status["reason"] == "real shapes: program_source:3:1: error: boom"
+    assert order == []
+
+
+def test_compile_real_shapes_runs_every_mlp_path_on_zero_planes(monkeypatch):
+    """Before anything is converted: the slab MMA bodies at T = 1..8 over gate+up
+    and each linear, the slab one-row body and int8's slab GEMM, at every distinct
+    MLP shape, on planes of their own; the counters are left as found."""
+    pfx.proj_ready(monkeypatch)
+    root = ptfx.ready_model()
+    seen: dict[str, list] = {"mma": [], "row": [], "qmm": []}
+
+    def mma(x, weights):
+        seen["mma"].append((x.shape[0], tuple(w.slab for w in weights)))
+        return pfx.stand_in_mma(x, weights)
+
+    def one_row(x2, w, scales, biases, slab=None):
+        seen["row"].append(slab)
+        return pfx.stand_in_one_row(x2, w, scales, biases, slab=slab)
+
+    def qmm(qa, sa, ra, w, scales, biases, *, slab=None):
+        seen["qmm"].append((qa.shape[0], slab))
+        assert not mx.any(w).item() and not mx.any(scales).item()
+        return ptfx.slab_reference_qmm(qa, sa, ra, w, scales, biases, slab=slab)
+
+    monkeypatch.setattr(projkernel, "mma", mma)
+    monkeypatch.setattr(projkernel, "one_row", one_row)
+    monkeypatch.setattr(int8prefill, "qmm", qmm)
+    counted = dict(projkernel.calls)
+    projtile._compile_real_shapes(root)
+    up = slab.SlabInfo(n_real=512, k=256, tiles=2)
+    down = slab.SlabInfo(n_real=256, k=512, tiles=1)
+    groups = [(up, up), (up,), (down,)]
+    assert seen["mma"] == [(t, g) for g in groups for t in range(1, 9)]
+    assert seen["row"] == [up, down]
+    assert seen["qmm"] == [(int8prefill.SLAB_MIN_ROWS, up), (int8prefill.SLAB_MIN_ROWS, down)]
+    assert projkernel.calls == counted
+    assert _marked(root) == _UNTOUCHED
+
+
+def test_no_plane_outlives_its_model(monkeypatch):
+    ready = ptfx.tile_ready(monkeypatch)
+    root = ptfx.ready_model()
+    assert _enable(root, ready, config_value="all")["state"] == "active"
+    stack = projtile.stack_of(root.model.layers[1].self_attn.q_proj)
+    assert stack is not None
+    refs = [weakref.ref(stack.codes), weakref.ref(root.model.layers[0].mlp.gate_proj.weight)]
+    del stack, root
+    gc.collect()
+    assert [ref() for ref in refs] == [None, None]
+
+
+def _probe_ready(monkeypatch, scope: str = "all"):
+    """The tiny model converted (and, at scope all, stacked) as enable() leaves it
+    before the probe, behind ready hooks and stand-ins."""
+    ptfx.tile_ready(monkeypatch)
+    root = ptfx.ready_model()
+    projtile.convert_mlp(root)
+    if scope == "all":
+        projtile.build_stacks(root, keys_with_plans=_planned)
+    return root
+
+
+def test_the_probe_passes_the_stand_ins_and_leaves_its_state(monkeypatch):
+    for scope in ("all", "mlp"):
+        root = _probe_ready(monkeypatch, scope)
+        counted = (dict(projkernel.calls), dict(int8prefill.calls))
+        projtile.set_round_flag(0)
+        assert projtile.probe(root, scope) is None
+        assert (dict(projkernel.calls), dict(int8prefill.calls)) == counted
+        state = (projtile._active, projtile._window, projtile._round_flag)
+        assert state == (0, None, 0)
+
+
+def _nonzero_rows(x8) -> int:
+    return int(mx.sum(mx.any(x8 != 0, axis=1)).item())
+
+
+def _scaled(y, factor):
+    return (y.astype(mx.float32) * factor).astype(mx.bfloat16)
+
+
+def _by_rows(x8, codes, scales, biases, info, plan):
+    """Rows that move with the number of rows in the launch."""
+    y = ptfx.stand_in_tile(x8, codes, scales, biases, info, plan)
+    return _scaled(y, 1 + _nonzero_rows(x8) / 64)
+
+
+def _off_the_floor(x8, codes, scales, biases, info, plan):
+    """T-invariant and isolated, but 1 % off everywhere: what a kernel that lost
+    precision would look like to every check but the floor."""
+    return _scaled(ptfx.stand_in_tile(x8, codes, scales, biases, info, plan), 1.01)
+
+
+def _mixes_rows(x8, codes, scales, biases, info, plan):
+    """Exact on finite rows, but a NaN in one row reaches every row."""
+    y = ptfx.stand_in_tile(x8, codes, scales, biases, info, plan)
+    return y + 0 * mx.sum(y, axis=0, keepdims=True)
+
+
+_QKV = (
+    "model.layers.1.self_attn.q_proj+model.layers.1.self_attn.k_proj"
+    "+model.layers.1.self_attn.v_proj"
+)
+
+
+@pytest.mark.parametrize(
+    ("broken", "reason"),
+    [
+        (_by_rows, f"T-invariance: {_QKV} at T=2 differs from its rows alone"),
+        (_off_the_floor, "floor: model.layers.1.self_attn.q_proj is "),
+        (_mixes_rows, "isolation: a NaN in row 3 changed the other rows of "),
+    ],
+    ids=["t-invariance", "floor", "isolation"],
+)
+def test_probe_fails_t_invariance_floor_and_isolation_for_broken_stand_ins(
+    monkeypatch, broken, reason
+):
+    root = _probe_ready(monkeypatch)
+    monkeypatch.setattr(projtile, "tile", broken)
+    got = projtile.probe(root, "all")
+    assert got is not None and got.startswith(reason), got
+    assert projtile._active == 0
+
+
+@pytest.mark.parametrize("dual", [False, True], ids=["single", "dual"])
+def test_probe_covers_the_dual_launch_and_the_mlp_at_scope_mlp(monkeypatch, dual):
+    """At scope mlp the probe still checks the MLP's launches: the dual's and each
+    linear's own."""
+    root = _probe_ready(monkeypatch, "mlp")
+    if dual:
+
+        def broken_dual(x8, gate, up, info, plan):
+            return tuple(
+                _scaled(y, 1.01) for y in ptfx.stand_in_tile_dual(x8, gate, up, info, plan)
+            )
+
+        monkeypatch.setattr(projtile, "tile_dual", broken_dual)
+        want = "floor: model.layers.1.mlp.gate_proj is "
+    else:
+        monkeypatch.setattr(projtile, "tile", _off_the_floor)
+        want = "floor: model.layers.1.mlp.down_proj is "
+    got = projtile.probe(root, "mlp")
+    assert got is not None and got.startswith(want), got
+
+
+def _nudged(y):
+    """One bf16 ulp off in the first column of the first row."""
+    bits = y.view(mx.uint16)
+    nudged = mx.where(
+        (mx.arange(bits.shape[-2])[:, None] == 0) & (mx.arange(bits.shape[-1]) == 0),
+        bits ^ 1,
+        bits,
+    )
+    return nudged.view(mx.bfloat16)
+
+
+@pytest.mark.parametrize("path", ["mma", "one_row", "int8"])
+def test_probe_fails_slab_parity_for_a_slab_path_that_differs(monkeypatch, path):
+    """The slab-only MLP's bodies must equal mlx's layout bit for bit: the
+    projection kernel's at T = 1..8, its one-row kernel, int8's GEMM at 9, 64 and
+    128 rows."""
+    root = _probe_ready(monkeypatch)
+    if path == "mma":
+        mma = projkernel.mma
+
+        def slab_off(x, weights):
+            outs = mma(x, weights)
+            if isinstance(weights[0], projkernel.Weights) and x.size // x.shape[-1] == 3:
+                return tuple(_nudged(o.reshape(-1, o.shape[-1])).reshape(o.shape) for o in outs)
+            return outs
+
+        monkeypatch.setattr(projkernel, "mma", slab_off)
+        want = (
+            "slab: model.layers.1.mlp.gate_proj differs from mlx's layout on the "
+            "projection kernel at T=3"
+        )
+    elif path == "one_row":
+        row = projkernel.one_row
+
+        def slab_off_row(x2, w, scales, biases, slab=None):
+            if slab is None:
+                return row(x2, w, scales, biases)
+            return _nudged(row(x2, w, scales, biases, slab=slab))
+
+        monkeypatch.setattr(projkernel, "one_row", slab_off_row)
+        want = "slab: model.layers.1.mlp.gate_proj differs from mlx's layout on the one-row kernel"
+    else:
+
+        def slab_off_qmm(qa, sa, ra, w, scales, biases, *, slab=None):
+            y = ptfx.slab_reference_qmm(qa, sa, ra, w, scales, biases, slab=slab)
+            return _nudged(y) if slab is not None and qa.shape[0] == 64 else y
+
+        monkeypatch.setattr(int8prefill, "qmm", slab_off_qmm)
+        want = (
+            "slab: model.layers.1.mlp.gate_proj differs from mlx's layout on int8's GEMM at 64 rows"
+        )
+    assert projtile.probe(root, "all") == want
+
+
+def test_probe_fails_slab_parity_where_only_a_cancelling_layout_shows_it(monkeypatch):
+    """The cancelling linears repacked as slab planes: a one-row slab body off only
+    where large terms cancel passes every random row and fails here."""
+    root = _probe_ready(monkeypatch)
+    row = projkernel.one_row
+
+    def off_where_cancelling(x2, w, scales, biases, slab=None):
+        if slab is None:
+            return row(x2, w, scales, biases)
+        y = row(x2, w, scales, biases, slab=slab)
+        big = mx.max(mx.abs(x2.astype(mx.float32))).item() > 50
+        return _nudged(y) if big and slab.n_real == projtile._CANCEL_N else y
+
+    monkeypatch.setattr(projkernel, "one_row", off_where_cancelling)
+    got = projtile.probe(root, "all")
+    assert got is not None and got.startswith("slab: a quarter-cancelling K=256 linear "), got
+
+
+def test_probe_fails_routing_when_the_hooks_never_reach_the_tile(monkeypatch):
+    root = _probe_ready(monkeypatch)
+    monkeypatch.setattr(projtile, "serves", lambda rows, *, hook: False)
+    assert projtile.probe(root, "all") == (
+        "routing: the exact verifier's MLP did not reach the tile inside the window"
+    )
+
+
+def test_probe_fails_routing_when_the_tile_serves_outside_the_window(monkeypatch):
+    root = _probe_ready(monkeypatch)
+    monkeypatch.setattr(projtile, "serves", lambda rows, *, hook: bool(projtile._active))
+    assert projtile.probe(root, "all") == "routing: the tile served the MLP outside the window"
+
+
+def test_probe_restores_its_state_when_it_raises(monkeypatch):
+    root = _probe_ready(monkeypatch)
+
+    def fails(*args):
+        raise RuntimeError("device lost")
+
+    monkeypatch.setattr(projtile, "tile", fails)
+    counted = dict(projkernel.calls)
+    with pytest.raises(RuntimeError, match="device lost"):
+        projtile.probe(root, "all")
+    assert (projtile._active, projtile._window) == (0, None)
+    assert projkernel.calls == counted
+
+
+def test_warm_up_runs_the_int8_slab_gemm_once_per_mlp_shape(monkeypatch):
+    """And every launch the model reaches on the tile, and the slab bodies per MLP
+    shape, each on zero rows; the counters are left as found."""
+    root = _probe_ready(monkeypatch)
+    gemms: list = []
+    launches: set = set()
+
+    def qmm(qa, sa, ra, w, scales, biases, *, slab=None):
+        gemms.append((qa.shape[0], slab))
+        return ptfx.slab_reference_qmm(qa, sa, ra, w, scales, biases, slab=slab)
+
+    def tile(x8, codes, scales, biases, info, plan):
+        launches.add(("tile", info.k, info.n_pad))
+        return ptfx.stand_in_tile(x8, codes, scales, biases, info, plan)
+
+    def tile_dual(x8, gate, up, info, plan):
+        launches.add(("dual", info.k, info.n_pad))
+        return ptfx.stand_in_tile_dual(x8, gate, up, info, plan)
+
+    monkeypatch.setattr(int8prefill, "qmm", qmm)
+    monkeypatch.setattr(projtile, "tile", tile)
+    monkeypatch.setattr(projtile, "tile_dual", tile_dual)
+    counted = (dict(projkernel.calls), dict(int8prefill.calls))
+    projtile.warm_up(root, "all")
+    up = slab.slab_info(root.model.layers[0].mlp.up_proj)
+    down = slab.slab_info(root.model.layers[0].mlp.down_proj)
+    assert gemms == [(int8prefill.SLAB_MIN_ROWS, up), (int8prefill.SLAB_MIN_ROWS, down)]
+    assert launches == {
+        ("dual", 256, 512),  # gate+up
+        ("tile", 256, 512),  # gate, up, k, v alone
+        ("tile", 512, 256),  # down
+        ("tile", 256, 3072),  # q+k+v
+        ("tile", 256, 2048),  # q alone
+        ("tile", 1024, 256),  # o_proj
+        ("tile", 256, 768),  # in_proj_qkv+in_proj_z
+        ("tile", 256, 256),  # in_proj_b+in_proj_a, in_proj_z alone, out_proj
+    }
+    assert (dict(projkernel.calls), dict(int8prefill.calls)) == counted
+    # At scope mlp only the MLP's launches.
+    launches.clear()
+    gemms.clear()
+    narrow = ptfx.tiny_slab_model(seed=1, scope="mlp")
+    projtile.warm_up(narrow, "mlp")
+    assert launches == {("dual", 256, 512), ("tile", 256, 512), ("tile", 512, 256)}
+    assert len(gemms) == 2
+
+
+# The 27B's config.json as sous tune reads it.
+_CONFIG_27B: dict[str, Any] = {
+    "model_type": "qwen3_5",
+    "quantization": {"group_size": 64, "bits": 4, "mode": "affine"},
+    "text_config": {
+        "hidden_size": 5120,
+        "intermediate_size": 17408,
+        "num_hidden_layers": 64,
+        "full_attention_interval": 4,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "linear_num_key_heads": 16,
+        "linear_key_head_dim": 128,
+        "linear_num_value_heads": 48,
+        "linear_value_head_dim": 128,
+    },
+}
+_SWITCHES = {
+    "projection_tile": True,
+    "projection_kernel": True,
+    "attention_tile": True,
+    "int8_prefill": True,
+}
+
+
+def _with_text(**changes) -> dict:
+    return {**_CONFIG_27B, "text_config": {**_CONFIG_27B["text_config"], **changes}}
+
+
+@pytest.mark.parametrize(
+    ("switches", "model_config", "drafter_kind", "reason"),
+    [
+        ({}, _CONFIG_27B, "dflash", None),
+        ({"projection_tile": "mlp"}, _CONFIG_27B, "dflash", None),
+        ({"projection_tile": "all"}, _CONFIG_27B, "dflash", None),
+        ({"projection_tile": False}, _CONFIG_27B, "dflash", "projection tile off"),
+        ({"projection_kernel": False}, _CONFIG_27B, "dflash", _GUARD_REASONS[0]),
+        ({}, _CONFIG_27B, None, _GUARD_REASONS[2]),
+        ({"int8_prefill": False}, _CONFIG_27B, "dflash", _GUARD_REASONS[3]),
+        (
+            {},
+            _with_text(intermediate_size=13824),
+            "dflash",
+            "no tuned plan for (5120, (13824, 13824))",
+        ),
+    ],
+    ids=["active", "mlp", "all", "off", "kernel-off", "no-drafter", "int8-off", "no-plan"],
+)
+def test_static_reason_mirrors_enable(monkeypatch, switches, model_config, drafter_kind, reason):
+    """Decided from the config, config.json and the machine alone, in enable()'s
+    order and words: the switch, the kernel's whole static check (which carries
+    the tile's), the drafter, int8 prefill, the core count, then the plans for
+    the MLP's keys."""
+    pfx.proj_ready(monkeypatch)
+    config = types.SimpleNamespace(**{**_SWITCHES, **switches})
+    assert projtile.static_reason(config, model_config, drafter_kind) == reason
+
+
+def test_static_reason_reads_the_core_count_against_the_tiles_own_set(monkeypatch):
+    pfx.proj_ready(monkeypatch)
+    config = types.SimpleNamespace(**_SWITCHES)
+    monkeypatch.setattr(projtile, "MEASURED_CORES", frozenset({24}))
+    assert projtile.static_reason(config, _CONFIG_27B, "dflash") == (
+        "GPU core count 20 not measured (measured: 24)"
+    )
+
+
+def test_static_reason_reads_nothing_while_the_tile_is_off(monkeypatch):
+    pfx.proj_ready(monkeypatch)
+
+    def untouchable(*args, **kwargs):
+        raise AssertionError("read the machine for a switched-off tile")
+
+    monkeypatch.setattr(projkernel, "static_reason", untouchable)
+    monkeypatch.setattr(gpucores, "read", untouchable)
+    config = types.SimpleNamespace(**{**_SWITCHES, "projection_tile": False})
+    assert projtile.static_reason(config, {}, None) == "projection tile off"
+
+
+_TINY_TEXT = (
+    "hidden_size",
+    "intermediate_size",
+    "num_hidden_layers",
+    "full_attention_interval",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "linear_num_key_heads",
+    "linear_key_head_dim",
+    "linear_num_value_heads",
+    "linear_value_head_dim",
+)
+
+
+def test_static_copy_bytes_matches_copy_bytes_on_the_tiny_model(monkeypatch):
+    ptfx.tiny_plans(monkeypatch)
+    root = pfx.tiny_quantized_model()
+    text = {name: getattr(root.args, name) for name in _TINY_TEXT}
+    want = projtile.copy_bytes(root, keys_with_plans=_planned)
+    assert want > 0
+    kinds = [
+        "linear_attention" if layer.is_linear else "full_attention" for layer in root.model.layers
+    ]
+    by_types = {k: v for k, v in text.items() if k != "full_attention_interval"}
+    for config in (
+        {"text_config": text},
+        text,
+        {"text_config": {**by_types, "layer_types": kinds}},
+    ):
+        assert projtile.static_copy_bytes(config) == want
+    # A key without a plan is left out of both.
+    plans = dict(projtile.PLANS)
+    del plans[(256, (4, 4))]
+    monkeypatch.setattr(projtile, "PLANS", plans)
+    fewer = projtile.copy_bytes(root, keys_with_plans=_planned)
+    assert fewer < want and projtile.static_copy_bytes(text) == fewer
+
+
+def test_static_copy_bytes_of_the_27b():
+    """64 layers, every fourth full attention: per linear-attention layer qkv+z
+    (16384 wide), b+a (96, one tile) and out_proj; per full-attention layer q+k+v
+    (14336) and o_proj; 9/16 byte per padded weight."""
+    linear = (16384 * 5120 + 256 * 5120 + 5120 * 6144) * 9 // 16
+    full = (14336 * 5120 + 5120 * 6144) * 9 // 16
+    assert projtile.static_copy_bytes(_CONFIG_27B) == 48 * linear + 16 * full == 4_093_378_560
+
+
+@tile_nax
+@pytest.mark.parametrize("scope", ["all", "mlp"])
+def test_enable_goes_active_on_the_real_kernels(monkeypatch, scope):
+    """The real tile, projection kernel, one-row kernel and int8 GEMM, through the
+    real availability, real-shape compile, warm-up and probe, on the tiny model at
+    the tiny plans."""
+    ptfx.guard_tile_state(monkeypatch)
+    tile_status = pfx.proj_ready(monkeypatch, real_pins=True)
+    pfx.real_kernel(monkeypatch)
+    projkernel.install_hooks()
+    monkeypatch.setattr(projkernel, "_active", 1)
+    ptfx.tiny_plans(monkeypatch)
+    root = ptfx.ready_model()
+    status = projtile.enable(
+        root,
+        config_value=scope,
+        kernel_status={"state": "active", "reason": None, "probe_seconds": 0.5},
+        tile_status=tile_status,
+        int8_status={"state": "active", "reason": None, "routed": 24},
+        drafter_kind="dflash",
+        cache_budget=None,
+        headroom_bytes=None,
+        reserve_bytes=0,
+    )
+    assert (status["state"], status["scope"]) == ("active", scope), status
+    assert _marked(root) == (_CONVERTED if scope == "all" else _MLP_ONLY)

@@ -23,6 +23,12 @@ projection kernel's two hooks: the verifier's runs (``verify``) and a module's
 calls of two to eight rows (``plain``), each when ``serves()`` and
 ``plan_for_call()`` say so; every other call keeps the projection kernel's path.
 
+``enable()`` decides it per load, after the projection kernel, the drafter's route
+and int8 prefill: guards that say whether the tile applies here, a compile of the
+slab paths at the model's own shapes, the memory rule that picks the scope
+(``copy_decision``: the MLP alone, or the attention and GDN copies too), the
+conversion, a warm-up and a probe. A failure after the conversion reverts it.
+
 mlx is imported inside each function.
 """
 
@@ -32,12 +38,16 @@ import functools
 import itertools
 import logging
 import operator
+import time
+import traceback
+import warnings
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
-from sous.engine import int8prefill, nax, projkernel, slab
+from sous.engine import gpucores, int8prefill, nax, projkernel, slab, tileattn
 from sous.engine.int8prefill import _error_line, _kernel, _kernel_text
+from sous.engine.promptcache import CACHE_BUDGET_SLACK
 from sous.engine.slab import SlabInfo
 
 logger = logging.getLogger("sous.engine.projtile")
@@ -855,3 +865,840 @@ def plain(module: Any, x: Any, launches: Sequence[Launch]) -> Any:
     _check_call((module,), launches)
     x8, rows = _padded(x)
     return _alone(module, x8, rows, x, launches[0].plan)
+
+
+# --------------------------------------------------------------------------------
+# The guards, the memory rule, the warm-up, the probe and enable()
+# --------------------------------------------------------------------------------
+
+# The prompt-cache budget, in GiB, the automatic rule must still leave beside the
+# attention and GDN copies, else the tile serves the MLP alone: the budget
+# docs/configuration.md gives a fork kept beside a retaining conversation. A copy
+# that evicts the forks costs more prefill than it saves decode.
+TILE_COPY_MIN_BUDGET_GIB = 14
+_GIB = 1 << 30
+# The probe's through-the-hooks rows and the row it plants a NaN in, as the
+# projection kernel's probe takes them.
+_PROBE_ROWS = 5
+_NAN_ROW = 3
+# The rows the probe holds int8's slab GEMM to its mlx-layout read at: its floor
+# for a slab-only module, a middle count, and where it takes every module's calls.
+_INT8_ROWS = (int8prefill.SLAB_MIN_ROWS, 64, int8prefill.MIN_ROWS)
+# The width of the probe's cancelling linears: one slab tile, and N % 64 == 0 as
+# int8's GEMM needs.
+_CANCEL_N = slab.TILE
+
+
+def _status(
+    state: str,
+    *,
+    scope: str | None = None,
+    reason: str | None = None,
+    copy_gb: float | None = None,
+    probe_seconds: float | None = None,
+    budget_left_gib: float | None = None,
+) -> dict[str, Any]:
+    return {
+        "state": state,
+        "scope": scope,
+        "reason": reason,
+        "copy_gb": copy_gb,
+        "probe_seconds": probe_seconds,
+        "budget_left_gib": budget_left_gib,
+    }
+
+
+def _refuse(
+    reason: str, probe_seconds: float | None = None, *, expected: bool = False
+) -> dict[str, Any]:
+    """This load cannot use the tile: report why. An `expected` refusal says only
+    that the tile does not apply here (the projection kernel, the attention tile,
+    the drafter, int8 prefill, the GPU, the model), which is how most Macs load a
+    default-on tile: one INFO line, and the reason in the status. Any other
+    refusal means it should have run and did not (pin drift, a kernel this OS
+    rejects, a failed probe): one warning, since a switch that is silently inert
+    there hides a fault."""
+    # A compiler error runs to dozens of lines; the status needs the one naming it.
+    reason = _error_line(reason)
+    if expected:
+        logger.info("projection tile unavailable: %s", reason)
+    else:
+        warnings.warn(
+            f"sous: projection tile unavailable ({reason}); verify runs the projection kernel",
+            stacklevel=3,
+        )
+    return _status("unavailable", reason=reason, probe_seconds=probe_seconds)
+
+
+def _kernel_reason(kernel_status: dict[str, Any] | None) -> str | None:
+    """The tile rides on the projection kernel: its hooks are the only way in, and
+    its paths serve everything the tile does not."""
+    state = (kernel_status or {}).get("state")
+    if state == "active":
+        return None
+    if state == "off":
+        return "projection kernel off"
+    return (kernel_status or {}).get("reason") or f"projection kernel {state or 'unknown'}"
+
+
+def _drafter_reason(drafter_kind: str | None) -> str | None:
+    """The tile serves the DFlash round's verify: without a drafter a decode has no
+    verify run, and its two-to-eight-row calls alone do not pay for the load."""
+    if drafter_kind is None:
+        return "no drafter"
+    return projkernel._drafter_kind_reason(drafter_kind)
+
+
+def _int8_reason(int8_status: dict[str, Any] | None) -> str | None:
+    """A slab-only MLP linear's calls of nine rows and more can go nowhere but
+    int8's slab GEMM: stock reads mlx's layout only."""
+    state = (int8_status or {}).get("state")
+    return None if state == "active" else f"int8 prefill {state or 'unknown'}"
+
+
+def _cores_reason() -> str | None:
+    """The plans are tuned for one wave of threadgroups on the measured core
+    counts; another GPU would run them, but at a speed nobody measured."""
+    import mlx.core as mx
+
+    cores, reason = gpucores.matched_cores(str(mx.device_info().get("device_name", "")))
+    if cores is None:
+        return reason
+    if cores not in MEASURED_CORES:
+        measured = ", ".join(str(c) for c in sorted(MEASURED_CORES))
+        return f"GPU core count {cores} not measured (measured: {measured})"
+    return None
+
+
+def _has_plan(key: Key) -> bool:
+    return plan_for(key) is not None
+
+
+def _no_plan(key: Key) -> str:
+    """Shared by enable() and static_reason(): one text for both."""
+    return f"no tuned plan for {key}"
+
+
+def _path(root: Any, module: Any) -> str:
+    return next((p for p, m in root.named_modules() if m is module), "?")
+
+
+def _model_reason(root: Any) -> str | None:
+    """Why this model is not one the tile takes, or None. Every MLP linear is
+    converted whatever the scope, so each must be eligible (affine 4-bit gs64,
+    bf16 scales and biases, mlx's layout still) and routed by both of the paths
+    that will serve it: the projection kernel's hooks up to MAX_ROWS rows and
+    int8's wrappers from nine; stock would raise on its flat planes. Every MLP key
+    needs a tuned plan the kernel can run. A copied linear needs only to be
+    eligible: a group without a plan is not copied, and the projection kernel
+    keeps it."""
+    mlp = list(_mlp_linears(root))
+    if not mlp:
+        return "no dense MLP"
+    copied = [m for group in stack_groups(root) if _has_plan(_key(group)) for m in group]
+    for module in mlp + copied:
+        if not projkernel.eligible(module):
+            return (
+                f"projection {_path(root, module)} is not affine 4-bit gs64 with bf16 "
+                "scales in mlx's layout"
+            )
+        if not projkernel._tagged(module):
+            return f"projection {_path(root, module)} is not routed by the projection kernel"
+    for module in mlp:
+        if not int8prefill._tagged(module):
+            return f"projection {_path(root, module)} is not routed by int8 prefill"
+    for key in MLP_KEYS(root):
+        plan = plan_for(key)
+        if plan is None:
+            return _no_plan(key)
+        k, ns = key
+        dual = len(ns) == 2
+        n = ns[0] if dual else sum(ns)
+        reason = check_plan(SlabInfo(n_real=n, k=k, tiles=-(-n // slab.TILE)), plan, dual=dual)
+        if reason is not None:
+            return f"the plan for {key}: {reason}"
+    return None
+
+
+def _pins_reason() -> str | None:
+    """Which pinned dependency drifted, or None. The tile is reached only through
+    the projection kernel's hooks, and its slab paths only through the kernel's
+    and int8's own seams, so the kernel's pins (mlx itself, and every mlx-vlm
+    function that decides a projection reaches a hook) are the tile's."""
+    return projkernel._pins_reason()
+
+
+def budget_left(headroom_bytes: int | None, copy_bytes: int, reserve_bytes: int) -> int | None:
+    """The prompt-cache budget the automatic rule (promptcache.auto_cache_budget)
+    leaves once the copy is made: headroom, read before the copy with the drafter
+    already loaded, minus the copy, the turn's own reserve and the slack. None
+    when the headroom could not be read."""
+    if headroom_bytes is None:
+        return None
+    return headroom_bytes - copy_bytes - reserve_bytes - CACHE_BUDGET_SLACK
+
+
+def copy_decision(
+    config_value: bool | str,
+    cache_budget: int | None,
+    headroom_bytes: int | None,
+    copy_bytes: int,
+    reserve_bytes: int,
+) -> tuple[bool, str]:
+    """Whether to make the attention and GDN copies, and why, all in bytes: the
+    MLP's conversion is size-neutral, the copies are not. "mlp" never copies,
+    "all" always does; true copies only while the prompt cache keeps a budget
+    worth having beside them: TILE_COPY_MIN_BUDGET_GIB under the automatic
+    budget, the configured budget itself under an explicit one. Never a warning:
+    a skipped copy still serves the MLP, and a configured budget is the user's
+    choice. Shared with sous tune, which reports the scope a load would take."""
+    left = budget_left(headroom_bytes, copy_bytes, reserve_bytes)
+    after = "unknown" if left is None else f"{left / _GIB:.1f} GiB"
+    if config_value == "mlp":
+        return False, "scope mlp by config"
+    if config_value == "all":
+        return True, f"scope all by config; budget left {after}"
+    if left is None:
+        return False, "headroom unreadable"
+    if cache_budget is None:
+        if left >= TILE_COPY_MIN_BUDGET_GIB * _GIB:
+            return True, f"budget left {after}"
+        return False, (
+            f"copy would leave {after} of prompt-cache budget (< {TILE_COPY_MIN_BUDGET_GIB})"
+        )
+    configured = f"configured budget {cache_budget / _GIB:.1f} GiB"
+    if left >= cache_budget:
+        return True, f"{configured} fits beside the copy; budget left {after}"
+    return False, f"{configured} does not fit beside the copy; budget left {after}"
+
+
+def _zero_weights(n: int, k: int) -> projkernel.Weights:
+    """Slab planes of zeros for an [n, k] projection, unevaluated."""
+    import mlx.core as mx
+
+    info = SlabInfo(n_real=n, k=k, tiles=-(-n // slab.TILE))
+    units = info.n_pad * info.groups
+    codes = mx.zeros((units * slab.UNIT_BYTES // 4,), dtype=mx.uint32)
+    scales = mx.zeros((units,), dtype=mx.bfloat16)
+    biases = mx.zeros((units,), dtype=mx.bfloat16)
+    return projkernel.Weights(codes, scales, biases, info)
+
+
+def _mlp_groups(root: Any) -> list[tuple[Any, ...]]:
+    """One group per projection-kernel dispatch a slab-only MLP reaches: gate+up as
+    the verifier fuses them, then each linear alone, deduplicated by K and widths."""
+    groups: dict[tuple[int, tuple[int, ...]], tuple[Any, ...]] = {}
+    for layer in getattr(getattr(root, "model", None), "layers", ()):
+        mlp = getattr(layer, "mlp", None)
+        linears = [getattr(mlp, name, None) for name in _MLP_NAMES]
+        if any(m is None for m in linears):
+            continue
+        gate, up, down = linears
+        for group in ((gate, up), (gate,), (up,), (down,)):
+            key = (
+                projkernel._in_features(group[0]),
+                tuple(projkernel._out_features(m) for m in group),
+            )
+            groups.setdefault(key, group)
+    return list(groups.values())
+
+
+def _slab_paths(groups: Sequence[Sequence[projkernel.Weights]], inputs: dict[int, Any]) -> None:
+    """Run each path a slab-only linear takes outside the tile once: the projection
+    kernel's slab bodies at T = 1..MAX_ROWS over every group, and over every lone
+    linear its one-row slab body and int8's slab GEMM. The GEMM's row count is a
+    runtime input, so one count compiles it; ``inputs`` holds SLAB_MIN_ROWS rows
+    per K, already evaluated."""
+    import mlx.core as mx
+
+    for weights in groups:
+        info = weights[0].slab
+        if info is None:
+            raise ValueError("projection tile: a slab path handed mlx's layout")
+        x = inputs[info.k]
+        mx.eval([projkernel.mma(x[:t], list(weights)) for t in range(1, MAX_ROWS + 1)])
+        if len(weights) > 1:
+            continue
+        (entry,) = weights
+        # The real `mma` already sends T = 1 to the one-row kernel; this states it,
+        # so a stand-in `mma` that does not still leaves it covered.
+        if info.k <= projkernel._ROW_MAX_K:
+            mx.eval(projkernel._row(x[:1], entry))
+        stage = int8prefill.stage_a(x)
+        mx.eval(int8prefill.qmm(*stage, entry.w, entry.scales, entry.biases, slab=info))
+
+
+def _compile_real_shapes(root: Any) -> None:
+    """Compile and run, on zero planes at every distinct shape the model's MLP
+    holds, every path a slab-only MLP linear is served by outside the tile: the
+    projection kernel's slab bodies at T = 1..MAX_ROWS (gate+up fused, each linear
+    alone), its one-row slab body and int8's slab GEMM. Before anything is
+    converted, so a toolchain that rejects one at these shapes refuses the tile
+    with the model untouched rather than through the revert. Raises what the
+    kernels raise. The planes and rows are built and evaluated before the first
+    launch: a compile failure with a CPU-stream op in flight deadlocks mlx's
+    exception path. The counters are left as found."""
+    import mlx.core as mx
+
+    planes: dict[tuple[int, int], projkernel.Weights] = {}
+    groups: list[list[projkernel.Weights]] = []
+    for group in _mlp_groups(root):
+        k = projkernel._in_features(group[0])
+        entries = []
+        for module in group:
+            n = projkernel._out_features(module)
+            if (k, n) not in planes:
+                planes[(k, n)] = _zero_weights(n, k)
+            entries.append(planes[(k, n)])
+        groups.append(entries)
+    inputs = {
+        k: mx.zeros((int8prefill.SLAB_MIN_ROWS, k), dtype=mx.bfloat16)
+        for k in sorted({k for k, _ in planes})
+    }
+    mx.eval(list(planes.values()), list(inputs.values()))
+    counted = dict(projkernel.calls)
+    try:
+        _slab_paths(groups, inputs)
+    finally:
+        projkernel.calls.update(counted)
+
+
+def _call_shape(launches: Sequence[Launch]) -> tuple[Any, ...]:
+    """What tells two calls' launches apart: each launch's key, member count and
+    form."""
+    return tuple(
+        (launch.key, len(launch.members), slab.slab_info(launch.members[0]) is not None)
+        for launch in launches
+    )
+
+
+def _tile_calls(root: Any, scope: str) -> list[tuple[tuple[Any, ...], tuple[Launch, ...]]]:
+    """One call, with its launches, per distinct set of launches the model reaches
+    on the tile: each layer's verifier calls (gate+up and down; at scope "all" the
+    attention or GDN input projections whole and o_proj or out_proj) and every
+    linear of them alone, as a module call of two to eight rows reaches it. A call
+    whose key has no plan stays on the projection kernel and is left out."""
+    candidates: list[tuple[Any, ...]] = []
+    for layer in root.model.layers:
+        mlp = layer.mlp
+        candidates += [(mlp.gate_proj, mlp.up_proj), (mlp.down_proj,)]
+        candidates += [(mlp.gate_proj,), (mlp.up_proj,)]
+        if scope != "all":
+            continue
+        if layer.is_linear:
+            gdn = layer.linear_attn
+            inputs = (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a)
+            output = gdn.out_proj
+        else:
+            attention = layer.self_attn
+            inputs = (attention.q_proj, attention.k_proj, attention.v_proj)
+            output = attention.o_proj
+        candidates += [inputs, (output,), *((m,) for m in inputs)]
+    seen: set[tuple[Any, ...]] = set()
+    calls_: list[tuple[tuple[Any, ...], tuple[Launch, ...]]] = []
+    for call in candidates:
+        launches = plan_for_call(call)
+        if launches is None or _call_shape(launches) in seen:
+            continue
+        seen.add(_call_shape(launches))
+        calls_.append((call, launches))
+    return calls_
+
+
+def warm_up(root: Any, scope: str) -> None:
+    """Compile and run, once the model is converted (and, at scope "all", copied),
+    every launch it reaches on the tile, the dual included, and every path its
+    slab-only MLP takes outside the tile, each on zero rows: no compile first
+    happens inside a user's turn, and a kernel that fails at the model's real
+    planes fails here, inside enable()'s revert. The rows are built and evaluated
+    before the first launch, for the deadlock _compile_real_shapes() describes;
+    the counters are left as found."""
+    import mlx.core as mx
+
+    calls_ = _tile_calls(root, scope)
+    groups = [
+        [projkernel._as_weights(projkernel._weights(m)) for m in group]
+        for group in _mlp_groups(root)
+    ]
+    ks = {projkernel._in_features(call[0]) for call, _ in calls_}
+    ks |= {entry.slab.k for group in groups for entry in group if entry.slab is not None}
+    inputs = {k: mx.zeros((int8prefill.SLAB_MIN_ROWS, k), dtype=mx.bfloat16) for k in sorted(ks)}
+    mx.eval(list(inputs.values()))
+    counted = dict(projkernel.calls)
+    try:
+        for call, launches in calls_:
+            x = inputs[projkernel._in_features(call[0])]
+            mx.eval(verify(call, x[:MAX_ROWS], launches))
+        _slab_paths(groups, inputs)
+    finally:
+        projkernel.calls.update(counted)
+
+
+def _as_mlx(module: Any) -> tuple[Any, Any, Any]:
+    """The planes the tile reads for ``module`` back in mlx's layout, evaluated: a
+    slab-only linear's own, or its columns of its stack's copy."""
+    import mlx.core as mx
+
+    info = slab.slab_info(module)
+    if info is not None:
+        arrays = slab.unpack(module.weight, module.scales, module.biases, info)
+    else:
+        stack = stack_of(module)
+        if stack is None:
+            raise ValueError("projection tile: a linear without planes")
+        start, stop = stack.slices[vars(module)[INDEX_ATTR]]
+        whole = slab.unpack(stack.codes, stack.scales, stack.biases, stack.info)
+        arrays = tuple(a[start:stop] for a in whole)
+    w, scales, biases = (mx.contiguous(a) for a in arrays)
+    mx.eval(w, scales, biases)
+    return w, scales, biases
+
+
+def _reference(x: Any, w: Any, scales: Any, biases: Any) -> Any:
+    """x [T, K] through one linear in fp32: the weights dequantised with scales and
+    biases upcast to fp32, every product and sum an fp32 elementwise op, not a
+    matmul, which on the tensor units may run at TF32. A row at a time, so one
+    [N, K] product is alive at once; evaluated."""
+    import mlx.core as mx
+
+    dense = mx.dequantize(
+        w, scales.astype(mx.float32), biases.astype(mx.float32), group_size=slab.GROUP, bits=4
+    )
+    x32 = x.astype(mx.float32)
+    rows = []
+    for r in range(x.shape[0]):
+        row = mx.sum(dense * x32[r], axis=-1)
+        mx.eval(row)
+        rows.append(row)
+    out = mx.stack(rows)
+    mx.eval(out)
+    return out
+
+
+def _check_tile_call(
+    call: tuple[Any, ...], launches: tuple[Launch, ...], names: list[str], key: Any
+) -> str | None:
+    """One call on the tile, at its plans, on its real planes: every row at T =
+    1..MAX_ROWS equals the same row at T = 1; each linear's rows sit within
+    TILE_FLOOR_FACTOR of the bf16 floor against an fp32 reference (block
+    invariance compares the tile with itself; this catches a kernel that lost
+    precision); and a NaN in one row leaves the others bitwise alone."""
+    import mlx.core as mx
+
+    label = "+".join(names)
+    k = projkernel._in_features(call[0])
+    x = mx.random.normal((MAX_ROWS, k), key=key).astype(mx.bfloat16)
+    nan = mx.array(float("nan"), dtype=mx.bfloat16)
+    x_nan = mx.where(mx.arange(MAX_ROWS)[:, None] == _NAN_ROW, nan, x)
+    mx.eval(x, x_nan)
+    alone = [verify(call, x[r : r + 1], launches) for r in range(MAX_ROWS)]
+    rows = [mx.concatenate([outs[i] for outs in alone]) for i in range(len(call))]
+    mx.eval(rows)
+    del alone
+    full: tuple[Any, ...] = ()
+    for t in range(1, MAX_ROWS + 1):
+        full = verify(call, x[:t], launches)
+        same = mx.stack([mx.array_equal(o, r[:t]) for o, r in zip(full, rows, strict=True)])
+        if not mx.all(same).item():
+            return f"T-invariance: {label} at T={t} differs from its rows alone"
+    for module, got, name in zip(call, full, names, strict=True):
+        ref = _reference(x, *_as_mlx(module))
+        floor = tileattn._rel_rms(ref.astype(mx.bfloat16), ref)
+        error = projkernel._stock_distance(got, ref)
+        if not error <= TILE_FLOOR_FACTOR * floor:
+            return (
+                f"floor: {name} is {error:.4g} from its fp32 reference, above "
+                f"{TILE_FLOOR_FACTOR}x the bf16 floor {floor:.4g}"
+            )
+        del ref
+    keep = mx.array([r for r in range(MAX_ROWS) if r != _NAN_ROW])
+    for got, clean, name in zip(verify(call, x_nan, launches), full, names, strict=True):
+        if not mx.array_equal(mx.take(got, keep, axis=0), mx.take(clean, keep, axis=0)).item():
+            return f"isolation: a NaN in row {_NAN_ROW} changed the other rows of {name}"
+    return None
+
+
+def _slab_cases(mlp: Any, names: dict[int, str]) -> list[tuple[str, Any, list[Any], list[Any]]]:
+    """(label, [MIN_ROWS, K] rows, the slab entries, the same linears in mlx's
+    layout): the MLP's own linears alone, gate+up fused, then a synthetic linear
+    at each of the MLP's K in each CANCELLING layout, repacked. Evaluated."""
+    import mlx.core as mx
+
+    linears = (mlp.gate_proj, mlp.up_proj, mlp.down_proj)
+    entries = {id(m): projkernel._weights(m) for m in linears}
+    mlx_form = {id(m): _as_mlx(m) for m in linears}
+    rows: dict[int, Any] = {}
+    cases: list[tuple[str, Any, list[Any], list[Any]]] = []
+    for i, module in enumerate(linears):
+        k = projkernel._in_features(module)
+        if k not in rows:
+            rows[k] = mx.random.normal((int8prefill.MIN_ROWS, k), key=mx.random.key(200 + i))
+            rows[k] = rows[k].astype(mx.bfloat16)
+        cases.append(
+            (names.get(id(module), "?"), rows[k], [entries[id(module)]], [mlx_form[id(module)]])
+        )
+    gate, up = mlp.gate_proj, mlp.up_proj
+    cases.append(
+        (
+            f"{names.get(id(gate), '?')}+{names.get(id(up), '?')}",
+            rows[projkernel._in_features(gate)],
+            [entries[id(gate)], entries[id(up)]],
+            [mlx_form[id(gate)], mlx_form[id(up)]],
+        )
+    )
+    for i, k in enumerate(sorted(rows)):
+        keys = mx.random.split(mx.random.key(300 + i), len(projkernel.CANCELLING))
+        for j, layout in enumerate(projkernel.CANCELLING):
+            x, (linear,) = projkernel._cancelling_case(
+                int8prefill.MIN_ROWS, k, (_CANCEL_N,), layout, keys[j]
+            )
+            codes, scales, biases, info = slab.repack(*linear)
+            cases.append(
+                (
+                    f"a {layout}-cancelling K={k} linear",
+                    x,
+                    [projkernel.Weights(codes, scales, biases, info)],
+                    [linear],
+                )
+            )
+    mx.eval(list(rows.values()), [case[2:] for case in cases])
+    return cases
+
+
+def _check_slab(label: str, x: Any, entries: list[Any], mlx_form: list[Any]) -> str | None:
+    """One case's slab paths bitwise against mlx's layout: the projection kernel at
+    T = 1..MAX_ROWS and, for a lone linear, the one-row kernel on each of those
+    rows and int8's GEMM at each of _INT8_ROWS."""
+    import mlx.core as mx
+
+    checks: list[tuple[str, Any]] = []
+    for t in range(1, MAX_ROWS + 1):
+        got, want = projkernel.mma(x[:t], entries), projkernel.mma(x[:t], mlx_form)
+        where = f"the projection kernel at T={t}"
+        checks += [(where, mx.array_equal(g, w)) for g, w in zip(got, want, strict=True)]
+    if len(entries) == 1:
+        (entry,), (linear,) = entries, mlx_form
+        for r in range(MAX_ROWS):
+            row = x[r : r + 1]
+            same = mx.array_equal(projkernel._row(row, entry), projkernel._row(row, linear))
+            checks.append(("the one-row kernel", same))
+        for m in _INT8_ROWS:
+            stage = int8prefill.stage_a(x[:m])
+            got = int8prefill.qmm(*stage, entry.w, entry.scales, entry.biases, slab=entry.slab)
+            checks.append(
+                (f"int8's GEMM at {m} rows", mx.array_equal(got, int8prefill.qmm(*stage, *linear)))
+            )
+    same = mx.stack([check for _, check in checks])
+    mx.eval(same)
+    for i, (where, _) in enumerate(checks):
+        if not same[i].item():
+            return f"slab: {label} differs from mlx's layout on {where}"
+    return None
+
+
+def _check_routing(mlp: Any) -> str | None:
+    """One decode-shaped call through both hooks: the exact verifier's
+    feed-forward over _PROBE_ROWS rows and the MLP's own call of as many. Inside a
+    window the tile serves all of it; outside, none of it, and the projection
+    kernel serves it. The flag is raised for the step; probe() clears it."""
+    import mlx.core as mx
+
+    global _active
+    x = mx.random.normal((1, _PROBE_ROWS, projkernel._in_features(mlp.gate_proj)))
+    x = x.astype(mx.bfloat16)
+    mx.eval(x)
+    verifier = projkernel._verifier_class()()
+    counts = projkernel.calls
+    _active = 1
+    open_window()
+    try:
+        before = dict(counts)
+        mx.eval(verifier._feed_forward(mlp, x))
+        middle = dict(counts)
+        mx.eval(mlp(x))
+        inside = dict(counts)
+    finally:
+        close_window()
+    mx.eval(verifier._feed_forward(mlp, x), mlp(x))
+    after = dict(counts)
+    if middle["verify_tile"] - before["verify_tile"] != 2:
+        return "routing: the exact verifier's MLP did not reach the tile inside the window"
+    if inside["plain_tile"] - middle["plain_tile"] != 3:
+        return "routing: the MLP's own calls did not reach the tile inside the window"
+    if after["verify_tile"] != inside["verify_tile"] or after["plain_tile"] != inside["plain_tile"]:
+        return "routing: the tile served the MLP outside the window"
+    if (
+        after["verify_kernel"] - inside["verify_kernel"],
+        after["plain_kernel"] - inside["plain_kernel"],
+    ) != (2, 3):
+        return "routing: outside the window the MLP did not reach the projection kernel"
+    return None
+
+
+def _probe_steps(root: Any, scope: str) -> str | None:
+    """Every input is made with GPU ops and evaluated before the launches that
+    read it, for the deadlock _compile_real_shapes() describes."""
+    import mlx.core as mx
+
+    layers = list(root.model.layers)
+    full = next((layer for layer in layers if not layer.is_linear), None)
+    linear = next((layer for layer in layers if layer.is_linear), None)
+    if full is None or linear is None:
+        return "the model lacks a full-attention or a linear-attention layer"
+    names = {id(module): path for path, module in root.named_modules()}
+
+    # On the tile, the first full-attention layer's MLP (layer 3 of the 27B) and,
+    # at scope "all", its attention and the first linear-attention layer's GDN
+    # (layer 0): the verifier's calls, then each of their linears alone.
+    mlp = full.mlp
+    calls_: list[tuple[Any, ...]] = [(mlp.gate_proj, mlp.up_proj), (mlp.down_proj,)]
+    if scope == "all":
+        attention, gdn = full.self_attn, linear.linear_attn
+        calls_ = [
+            (attention.q_proj, attention.k_proj, attention.v_proj),
+            (attention.o_proj,),
+            *calls_,
+            (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a),
+            (gdn.out_proj,),
+        ]
+    calls_ += [(m,) for call in list(calls_) if len(call) > 1 for m in call]
+    # The guards gave every MLP key a plan; a copied group without one was not
+    # copied, and the projection kernel keeps its calls.
+    converted = {id(mlp.gate_proj), id(mlp.up_proj), id(mlp.down_proj)}
+    for seed, call in enumerate(calls_, start=1):
+        launches = plan_for_call(call)
+        call_names = [names.get(id(m), "?") for m in call]
+        if launches is None:
+            if id(call[0]) in converted:
+                return f"no launch on the tile for {'+'.join(call_names)}"
+            continue
+        reason = _check_tile_call(call, launches, call_names, mx.random.key(seed))
+        if reason is not None:
+            return reason
+
+    # Off the tile: the slab-only MLP's other paths, bitwise against mlx's layout.
+    for case in _slab_cases(mlp, names):
+        reason = _check_slab(*case)
+        if reason is not None:
+            return reason
+
+    return _check_routing(mlp)
+
+
+def probe(root: Any, scope: str) -> str | None:
+    """None when the tile may serve this converted (and, at scope "all", copied)
+    model on this GPU, else why not. Runs on the loading thread after the
+    warm-up; raises the flag and opens a window only around the calls that must
+    reach the hooks, and leaves the flag clear, the window closed, the round flag
+    and the counters as it found them. Its arrays are gone before the cache is
+    cleared."""
+    import mlx.core as mx
+
+    global _active, _window, _round_flag
+    round_flag = _round_flag
+    counted = (dict(projkernel.calls), dict(int8prefill.calls))
+    try:
+        return _probe_steps(root, scope)
+    except BaseException as e:
+        # The traceback holds the steps' frames, and every probe array in them,
+        # until the caller has handled the error: drop them now.
+        traceback.clear_frames(e.__traceback__)
+        raise
+    finally:
+        _active, _window, _round_flag = 0, None, round_flag
+        projkernel.calls.update(counted[0])
+        int8prefill.calls.update(counted[1])
+        mx.clear_cache()
+
+
+def _undo(root: Any) -> None:
+    """Take a refused load back to mlx's layout: the MLP reverted, then the copies
+    dropped. A revert that raises leaves the linears it did not reach slab-only and
+    marked; every reader is marker-driven, so they keep their slab paths and the
+    fork key reads them as converted."""
+    try:
+        revert_mlp(root)
+    except Exception:  # noqa: BLE001 — the markers stay authoritative
+        logger.warning(
+            "projection tile: the revert failed; the linears it did not reach keep "
+            "their slab paths",
+            exc_info=True,
+        )
+    try:
+        drop_stacks(root)
+    except Exception:  # noqa: BLE001 — a copy left behind is served by nothing
+        logger.warning("projection tile: dropping the copies failed", exc_info=True)
+
+
+def enable(
+    model: Any,
+    *,
+    config_value: bool | str,
+    kernel_status: dict[str, Any],
+    tile_status: dict[str, Any],
+    int8_status: dict[str, Any],
+    drafter_kind: str | None,
+    cache_budget: int | None,
+    headroom_bytes: int | None,
+    reserve_bytes: int,
+) -> dict[str, Any]:
+    """Decide whether this load's verify projections run on the tile, and at which
+    scope; on the loading thread, after the projection kernel, the drafter's
+    route and int8 prefill. ``cache_budget`` is the configured prompt-cache budget
+    in bytes (None when automatic), ``headroom_bytes`` live_headroom() read now,
+    ``reserve_bytes`` the turn's own reserve. Returns the status the engine
+    exposes and never raises: a model load must not fail because an accelerator
+    is missing. probe_seconds covers the real-shape compile, the conversion, the
+    copy, the warm-up and the probe, the tile's whole cost to a load."""
+    global _active, _scope
+    # First, on every call: a flag, a window or a scope left from an earlier load
+    # must never serve this one, whatever happens below.
+    clear()
+    if not config_value:
+        return _status("off")
+    root: Any = None
+    touched = False
+    seconds: float | None = None
+    try:
+        reason = (
+            _kernel_reason(kernel_status)
+            or projkernel._tile_reason(tile_status)
+            or _drafter_reason(drafter_kind)
+            or _int8_reason(int8_status)
+            or _cores_reason()
+        )
+        if reason is not None:
+            return _refuse(reason, expected=True)
+        root = int8prefill._root(model)
+        reason = _model_reason(root)
+        if reason is not None:
+            return _refuse(reason, expected=True)
+        reason = _pins_reason()
+        if reason is None:
+            available = availability()
+            if not available.available:
+                reason = available.reason or "the projection tile kernels did not run"
+        if reason is not None:
+            return _refuse(reason)
+        built, why, scope = 0, None, "mlp"
+        start = time.perf_counter()
+        try:
+            try:
+                _compile_real_shapes(root)
+            except Exception as e:  # noqa: BLE001 — a kernel this OS rejects refuses the load
+                # The one-line reason cannot carry a compiler's full report; the log can.
+                logger.warning(
+                    "projection tile: the kernels failed at the model's shapes", exc_info=True
+                )
+                reason = f"real shapes: {_error_line(str(e) or type(e).__name__)}"
+            else:
+                wanted = copy_bytes(root, keys_with_plans=_has_plan)
+                copy, why = copy_decision(
+                    config_value, cache_budget, headroom_bytes, wanted, reserve_bytes
+                )
+                touched = True
+                if convert_mlp(root) == 0:
+                    raise RuntimeError("the MLP conversion converted no linear")
+                if copy:
+                    built, scope = build_stacks(root, keys_with_plans=_has_plan), "all"
+                warm_up(root, scope)
+                reason = probe(root, scope)
+        finally:
+            seconds = round(time.perf_counter() - start, 2)
+        if reason is not None:
+            if touched:
+                _undo(root)
+            return _refuse(reason, seconds)
+        left = budget_left(headroom_bytes, built, reserve_bytes)
+        left_gib = None if left is None else round(left / _GIB, 2)
+        _active, _scope = 1, scope
+        logger.info(
+            "projection tile: scope=%s copy=%.1f GB budget left %s probe %.2fs%s",
+            scope,
+            built / 1e9,
+            "unknown" if left_gib is None else f"{left_gib:.1f} GiB",
+            seconds,
+            f" ({why})" if scope == "mlp" else "",
+        )
+        return _status(
+            "active",
+            scope=scope,
+            reason=why if scope == "mlp" else None,
+            copy_gb=built / 1e9 if scope == "all" else None,
+            probe_seconds=seconds,
+            budget_left_gib=left_gib,
+        )
+    except Exception as e:  # noqa: BLE001 — degrade, never block the model
+        clear()
+        # The frames hold the failed step's arrays: release them before the revert.
+        traceback.clear_frames(e.__traceback__)
+        # The warning carries one line; the traceback goes to the log.
+        logger.warning("projection tile: enabling failed", exc_info=True)
+        if touched:
+            _undo(root)
+        return _refuse(str(e) or type(e).__name__, seconds)
+
+
+def static_reason(config: Any, model_config: dict, drafter_kind: str | None) -> str | None:
+    """Why the tile would not be active for this config, model and drafter, or None
+    when it would be, decided without loading anything (sous tune). It mirrors
+    enable()'s order and words: the switch, the projection kernel's whole static
+    check (which carries the attention tile's), the drafter, int8 prefill, the
+    core count, then the plans for the MLP's keys read from config.json. What only
+    a load can see, a probe or a compile failure, pin drift, is beyond it."""
+    if not config.projection_tile:
+        return "projection tile off"
+    reason = projkernel.static_reason(config, model_config, drafter_kind)
+    if reason is not None:
+        return reason
+    reason = _drafter_reason(drafter_kind)
+    if reason is not None:
+        return reason
+    if not config.int8_prefill:
+        return "int8 prefill off"
+    reason = _cores_reason()
+    if reason is not None:
+        return reason
+    text = model_config.get("text_config", model_config)
+    hidden, inner = text.get("hidden_size"), text.get("intermediate_size")
+    for key in ((hidden, (inner, inner)), (hidden, (inner,)), (inner, (hidden,))):
+        if not _has_plan(key):
+            return _no_plan(key)
+    return None
+
+
+def _layer_kinds(text: dict) -> list[bool]:
+    """Whether each layer is linear attention, from config.json's layer_types or,
+    as mlx-vlm reads it, every full_attention_interval-th layer full."""
+    types = text.get("layer_types")
+    if types:
+        return [kind == "linear_attention" for kind in types]
+    interval = text.get("full_attention_interval", 4)
+    return [(i + 1) % interval != 0 for i in range(text["num_hidden_layers"])]
+
+
+def static_copy_bytes(model_config: dict) -> int:
+    """copy_bytes() from config.json alone, for sous tune: the padded planes of
+    every attention and GDN stack whose key has a plan, layer by layer as
+    stack_groups() builds them. q_proj carries the attention output gate, so it is
+    twice the heads' width."""
+    text = model_config.get("text_config", model_config)
+    hidden = text["hidden_size"]
+    heads = text["num_attention_heads"]
+    head_dim = text.get("head_dim") or hidden // heads
+    kv = text["num_key_value_heads"] * head_dim
+    key_dim = text["linear_num_key_heads"] * text["linear_key_head_dim"]
+    v_heads = text["linear_num_value_heads"]
+    value_dim = v_heads * text["linear_value_head_dim"]
+    linear: list[Key] = [
+        (hidden, (2 * key_dim + value_dim, value_dim)),
+        (hidden, (v_heads, v_heads)),
+        (value_dim, (hidden,)),
+    ]
+    full: list[Key] = [(hidden, (2 * heads * head_dim, kv, kv)), (heads * head_dim, (hidden,))]
+    return sum(
+        _stack_bytes(key)
+        for is_linear in _layer_kinds(text)
+        for key in (linear if is_linear else full)
+        if _has_plan(key)
+    )
