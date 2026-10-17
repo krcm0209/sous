@@ -13,7 +13,7 @@ from sous.config import (
     SPECULATIVE_BLOCK_KERNEL,
     SPECULATIVE_BLOCK_TILE,
 )
-from sous.engine import draftctx, forkio, kv8, projkernel, tileattn
+from sous.engine import draftctx, forkio, kv8, projkernel, projtile, tileattn
 from sous.engine.base import Delta, OnDelta
 from sous.engine.forkstore import ForkStore, fork_key_fields
 from sous.engine.promptcache import (
@@ -77,6 +77,7 @@ class VLMEngine:
         int8_prefill: bool = False,
         attention_tile: bool = False,
         projection_kernel: bool = False,
+        projection_tile: bool | str = False,
         kv_int8: bool = False,
         kv_int8_window: int = 0,
         fork_dir: Path | None = None,
@@ -86,7 +87,7 @@ class VLMEngine:
         from mlx_vlm import load
 
         from sous.engine import int8prefill, verifyattn
-        from sous.engine.base import measure_cache_budget
+        from sous.engine.base import live_headroom, measure_cache_budget
 
         self.model_id = model_id
         self._model, self._processor = load(model_id)
@@ -142,6 +143,33 @@ class VLMEngine:
             drafter_kind=self._draft_kind if self._draft is not None else None,
             tile_status=self.attention_tile_status,
         )
+        # After the projection kernel has settled: the tile is reached only
+        # through the kernel's hooks and reads its status, and the kernel's
+        # warm-up and probe read gate, up and down in mlx's layout, which the
+        # conversion replaces with slab planes. Before the drafter route,
+        # which reads none of the target's modules and runs once the block
+        # has resolved.
+        # Before kv8, which reads none of its state, so kv8's probe drives
+        # the attention projections through those hooks as every call outside
+        # a decode window will meet them. Before the fork store, whose key
+        # reads the conversion back off the modules (a slab-only MLP sends a
+        # prefill chunk of 9-127 rows to int8, so stored KV depends on it),
+        # and before the budget: the headroom is read here, with the drafter
+        # loaded and before the copy, so the copy is weighed against the
+        # prompt-cache budget it would leave, and an automatic budget
+        # measured below then finds the copy inside `active`.
+        self.projection_tile_status = projtile.enable(
+            self._model,
+            config_value=projection_tile,
+            kernel_status=self.projection_kernel_status,
+            tile_status=self.attention_tile_status,
+            int8_status=self.int8_prefill_status,
+            drafter_kind=self._draft_kind if self._draft is not None else None,
+            cache_budget=cache_budget,
+            headroom_bytes=live_headroom(),
+            reserve_bytes=reserve_bytes,
+        )
+        self._ptile = projtile.fork_key_state(int8prefill._root(self._model))
         # An unset block resolves only now that the tile and the kernel have
         # settled: with the kernel a deeper verify round's projections cost
         # about what a 4-row round's do, so SPECULATIVE_BLOCK_KERNEL pays;
@@ -192,9 +220,10 @@ class VLMEngine:
         self._draft_context = draftctx.enable(self._model, self._draft, self._draft_kind)
         self._speculation = Speculation()
         # Forks on disk, when the factory handed us a directory: built after
-        # the drafter, int8, the attention tile and the projection kernel have
-        # settled, since the key reads them. Tests and sous tune never pass
-        # one, so nothing they build touches ~/.sous.
+        # the drafter, int8, the attention tile, the projection kernel and the
+        # projection tile's conversion have settled, since the key reads them.
+        # Tests and sous tune never pass one, so nothing they build touches
+        # ~/.sous.
         self.fork_store: ForkStore | None = None
         if fork_dir is not None and prompt_cache:
             try:
@@ -269,6 +298,8 @@ class VLMEngine:
             int8_status=self.int8_prefill_status,
             tile_status=self.attention_tile_status,
             proj_status=self.projection_kernel_status,
+            # An engine built around the constructor has converted nothing.
+            ptile=getattr(self, "_ptile", "off"),
         )
 
     def _loaded(self) -> tuple:
@@ -335,6 +366,12 @@ class VLMEngine:
         return make_prompt_cache(model.language_model)
 
     def prefill(self, cache: list, token_ids: list[int], capture: Any = None) -> Any:
+        # A window left open (a decode whose close never ran) would serve
+        # this prefill's 2-8-row calls on the tile, and KV with the tile's
+        # bits would reach a fork under a key that cannot tell. Refuse rather
+        # than serve.
+        if projtile._window is not None:
+            raise RuntimeError("projection tile window open across a prefill")
         import mlx.core as mx
         from mlx_vlm import generate
 
@@ -496,6 +533,13 @@ class VLMEngine:
             kv8_window = bool(kv8._active)
             if kv8_window:
                 kv8.open_window()
+            # The projection tile's window spans the same generation, its own
+            # generation-prompt chunk included, under the same rule: no
+            # prefill() KV ever carries the tile's bits. Opened after kv8's,
+            # so an open that raised there leaves no tile window behind.
+            tile_window = bool(projtile._active)
+            if tile_window:
+                projtile.open_window()
             try:
                 for r in stream_generate(
                     model,
@@ -517,13 +561,20 @@ class VLMEngine:
                     if on_delta is not None:
                         on_delta(Delta(r.text, r.generation_tokens, r.finish_reason))
             finally:
-                # Before PrefixCache restores or trims this cache, so no trim
-                # wrap is left on a layer when it does, and on this thread, so
-                # the mirrors' buffers leave mlx's cache before the publish
-                # that follows. An exception leaves _speculation as it was:
-                # a cold retry's decode supplies the next values.
-                if kv8_window:
-                    kv8_state, kv8_rows = kv8.close_window(cache)
+                # The tile's first, in a try of its own: whatever kv8's close
+                # does, the next turn's prefill finds the tile's window shut.
+                try:
+                    if tile_window:
+                        projtile.close_window()
+                finally:
+                    # Before PrefixCache restores or trims this cache, so no
+                    # trim wrap is left on a layer when it does, and on this
+                    # thread, so the mirrors' buffers leave mlx's cache before
+                    # the publish that follows. An exception leaves
+                    # _speculation as it was: a cold retry's decode supplies
+                    # the next values.
+                    if kv8_window:
+                        kv8_state, kv8_rows = kv8.close_window(cache)
         rounds, accepted, drafted = draftctx.rounds_since(self._draft, before)
         self._speculation = Speculation(
             rounds=rounds,
@@ -644,12 +695,14 @@ class VLMEngine:
         import mlx.core as mx
 
         # First, before anything below can raise: until the next load decides
-        # afresh, no call may reach the tile, the projection kernel or kv8 on
-        # the strength of this model's gates. The kernel's tags stay on this
-        # model's modules, inert while its flag is clear; kv8's mirrors live
-        # on caches that go with the engine.
+        # afresh, no call may reach the tile, the projection kernel, the
+        # projection tile or kv8 on the strength of this model's gates. The
+        # kernel's tags stay on this model's modules, inert while its flag is
+        # clear; the projection tile's planes live on the modules and go with
+        # them; kv8's mirrors live on caches that go with the engine.
         tileattn.clear()
         projkernel.clear()
+        projtile.clear()
         kv8.clear()
         self.reset_prompt_cache()
         self._model = None

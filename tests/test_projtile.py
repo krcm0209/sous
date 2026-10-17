@@ -1428,6 +1428,39 @@ def test_enable_serves_mlp_only_when_the_copy_is_skipped(monkeypatch, config, he
     ]
 
 
+def test_enable_reports_scope_mlp_when_no_stack_key_has_a_plan(monkeypatch):
+    """A copy decided but never built (every attention and GDN key outside the
+    plan table) serves exactly what scope "mlp" serves, so the status says so,
+    with the reason, rather than "all" with nothing copied."""
+    ready = ptfx.tile_ready(monkeypatch)
+    root = ptfx.ready_model()
+    untuned = {k: v for k, v in projtile.PLANS.items() if k not in ptfx.TINY_PLANS}
+    mlp_plans = {k: ptfx.TINY_PLAN for k in projtile.MLP_KEYS(root)}
+    monkeypatch.setattr(projtile, "PLANS", {**untuned, **mlp_plans})
+    groups = projtile.stack_groups(root)
+    assert groups and not any(_planned(projtile._key(group)) for group in groups)
+    status, messages, records = _gated(
+        root, ready, config_value="all", headroom_bytes=40 * G, reserve_bytes=8 * G
+    )
+    assert messages == []
+    why = "no stack key has a plan"
+    left = round((40 * G - 8 * G - 2 * G) / G, 2)
+    assert status == {
+        "state": "active",
+        "scope": "mlp",
+        "reason": why,
+        "copy_gb": None,
+        "probe_seconds": status["probe_seconds"],
+        "budget_left_gib": left,
+    }
+    assert (projtile._active, projtile._scope) == (1, "mlp")
+    assert _marked(root) == _MLP_ONLY
+    assert _infos(records) == [
+        f"projection tile: scope=mlp copy=0.0 GB budget left {left:.1f} GiB "
+        f"probe {status['probe_seconds']:.2f}s ({why})"
+    ]
+
+
 def _arrays_of(root) -> list[tuple[str, tuple]]:
     return [
         (path, (m.weight, m.scales, m.biases))

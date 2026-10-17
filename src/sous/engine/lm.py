@@ -66,6 +66,16 @@ class LMEngine:
             "floor": None,
             "ceiling": None,
         }
+        # The projection tile rides on the projection kernel's hooks, so
+        # mlx-lm's models never reach it either; reported off, with the keys
+        # the status document copies from projtile.enable's.
+        self.projection_tile_status = {
+            "state": "off",
+            "scope": None,
+            "reason": None,
+            "copy_gb": None,
+            "probe_seconds": None,
+        }
         # Forks on disk, when the factory handed us a directory: built after
         # int8 has settled, since the key reads it. Tests and sous tune never
         # pass one, so nothing they build touches ~/.sous.
@@ -105,6 +115,8 @@ class LMEngine:
             int8_status=self.int8_prefill_status,
             tile_status=self.attention_tile_status,
             proj_status=self.projection_kernel_status,
+            # Nothing converts an mlx-lm model's weights.
+            ptile="off",
         )
 
     def _loaded(self) -> tuple:

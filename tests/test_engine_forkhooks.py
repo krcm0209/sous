@@ -47,6 +47,28 @@ def test_vlm_key_fields_read_positions_and_the_realised_kernel_states(monkeypatc
     assert fields["gpu"]  # mx.device_info()["architecture"] on this Mac
 
 
+def test_vlm_key_fields_read_ptile_off_without_a_model(monkeypatch):
+    """An engine built around the constructor has no conversion to report: its
+    key reads the projection tile off, and the state the load recorded once it
+    is set."""
+    engine = vlm.VLMEngine.__new__(vlm.VLMEngine)
+    engine._positional = False
+    engine.int8_prefill_status = {"state": "active", "reason": None, "routed": 12}
+    engine.attention_tile_status = {"state": "off", "reason": None}
+    engine.projection_kernel_status = {"state": "off", "reason": None}
+    assert engine._fork_key_fields("sha")["ptile"] == "off"
+    engine._ptile = "active"
+    assert engine._fork_key_fields("sha")["ptile"] == "active"
+
+
+def test_lm_key_fields_carry_ptile_off(monkeypatch):
+    engine = lm.LMEngine.__new__(lm.LMEngine)
+    engine.int8_prefill_status = {"state": "active", "reason": None, "routed": 12}
+    engine.attention_tile_status = {"state": "off", "reason": None}
+    engine.projection_kernel_status = {"state": "off", "reason": None}
+    assert engine._fork_key_fields("sha")["ptile"] == "off"
+
+
 def test_lm_key_fields_name_the_lm_backend(monkeypatch):
     engine = lm.LMEngine.__new__(lm.LMEngine)
     engine.int8_prefill_status = {"state": "off", "reason": None, "routed": 0}

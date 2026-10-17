@@ -1600,7 +1600,9 @@ def enable(
                 if convert_mlp(root) == 0:
                     raise RuntimeError("the MLP conversion converted no linear")
                 if copy:
-                    built, scope = build_stacks(root, keys_with_plans=_has_plan), "all"
+                    built = build_stacks(root, keys_with_plans=_has_plan)
+                    # Nothing built serves exactly what scope "mlp" serves: say so.
+                    scope, why = ("all", why) if built else ("mlp", "no stack key has a plan")
                 warm_up(root, scope)
                 reason = probe(root, scope)
         finally:

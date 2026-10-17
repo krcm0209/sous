@@ -135,7 +135,7 @@ def test_engine_epoch_is_stable_and_16_hex(monkeypatch):
 def test_engine_epoch_changes_when_a_source_byte_changes(monkeypatch, tmp_path: Path):
     src = tmp_path / "engine"
     (src / "kernels").mkdir(parents=True)
-    for name in ("vlm.py", "lm.py", "int8prefill.py", "tileattn.py", "projkernel.py"):
+    for name in forkstore._EPOCH_FILES:
         (src / name).write_text(f"# {name}\n")
     (src / "kernels" / "a.metal").write_text("kernel\n")
     (src / "kernels" / "common.h").write_text("header\n")
@@ -203,9 +203,15 @@ def test_the_kv8_exclusions_name_kernels_in_the_tree_and_kv8_is_no_epoch_file():
     """An excluded name that no longer matches a file excludes nothing, and
     the renamed kernel would cold-start every store on each later edit, so
     each name must still be a kernel in the tree. kv8.py stays out of the
-    epoch files: nothing it serves is stored."""
+    epoch files: nothing it serves is stored. The projection tile's kernel
+    files are excluded on the same grounds."""
     kernels = forkstore._ENGINE_SOURCES.joinpath("kernels")
-    assert forkstore._EPOCH_EXCLUDED_KERNELS == ("attention_tile_kv8.metal", "kv8_quant.metal")
+    assert forkstore._EPOCH_EXCLUDED_KERNELS == (
+        "attention_tile_kv8.metal",
+        "kv8_quant.metal",
+        "projection_tile.metal",
+        "projection_tile.h",
+    )
     for name in forkstore._EPOCH_EXCLUDED_KERNELS:
         assert kernels.joinpath(name).is_file(), name
     assert "kv8.py" not in forkstore._EPOCH_FILES
@@ -1458,13 +1464,14 @@ def test_fork_key_fields_carry_everything_that_changes_the_kv(monkeypatch):
         int8_status={"state": "active", "reason": None, "routed": 336},
         tile_status={"state": "active", "reason": None, "splits": 20, "probe_seconds": 0.43},
         proj_status={"state": "active", "reason": None, "probe_seconds": 0.37},
+        ptile="active",
     )
     assert f["backend"] == "vlm" and f["backend_version"] == "0.7.1"
     assert f["mlx"] and f["weights"] == "sha" and f["gpu"] == "applegpu_g16s"
     assert f["epoch"] == engine_epoch() and f["layout"] == str(FORK_LAYOUT)
     assert f["positions"] == "engine" and f["int8"] == "active:336"
     assert f["tile"] == "active:20" and f["os"] == forkstore.os_release()
-    assert f["proj"] == "active"
+    assert f["proj"] == "active" and f["ptile"] == "active"
     assert f["env"] == "MLX_ENABLE_TF32=1"
     off = fork_key_fields(
         backend="lm",
@@ -1475,10 +1482,11 @@ def test_fork_key_fields_carry_everything_that_changes_the_kv(monkeypatch):
         int8_status={"state": "unavailable", "reason": "no tensor units", "routed": 0},
         tile_status={"state": "off", "reason": None},
         proj_status={"state": "off", "reason": None},
+        ptile="off",
     )
     assert off["int8"] == "off"  # off and unavailable ran the same numerics
     assert off["tile"] == "off" and off["os"] == forkstore.os_release()
-    assert off["proj"] == "off"
+    assert off["proj"] == "off" and off["ptile"] == "off"
     monkeypatch.delenv("MLX_ENABLE_TF32")
     assert "env" not in fork_key_fields(
         backend="lm",
@@ -1489,6 +1497,7 @@ def test_fork_key_fields_carry_everything_that_changes_the_kv(monkeypatch):
         int8_status={"state": "off", "reason": None, "routed": 0},
         tile_status={"state": "off", "reason": None},
         proj_status={"state": "off", "reason": None},
+        ptile="off",
     )
 
 
@@ -1499,7 +1508,7 @@ _PROJ_OFF = {"state": "off", "reason": None, "probe_seconds": None}
 _PROJ_ON = {"state": "active", "reason": None, "probe_seconds": 0.37}
 
 
-def _vlm_fields(*, tile=_TILE_OFF, int8=_INT8_OFF, proj=_PROJ_OFF) -> dict[str, str]:
+def _vlm_fields(*, tile=_TILE_OFF, int8=_INT8_OFF, proj=_PROJ_OFF, ptile="off") -> dict[str, str]:
     from sous.engine.forkstore import fork_key_fields
 
     return fork_key_fields(
@@ -1511,6 +1520,7 @@ def _vlm_fields(*, tile=_TILE_OFF, int8=_INT8_OFF, proj=_PROJ_OFF) -> dict[str, 
         int8_status=int8,
         tile_status=tile,
         proj_status=proj,
+        ptile=ptile,
     )
 
 
@@ -1546,6 +1556,47 @@ def test_the_key_moves_with_the_projection_kernel():
     assert key_name(_vlm_fields(proj=unavailable)) == key_name(_vlm_fields())
     later = {**_PROJ_ON, "reason": "noted", "probe_seconds": 1.2}
     assert key_name(_vlm_fields(proj=later)) == key_name(_vlm_fields(proj=_PROJ_ON))
+
+
+def test_the_key_changes_with_ptile_and_the_epoch_hashes_slab_and_projtile_but_not_the_tile_kernels(
+    monkeypatch, tmp_path: Path
+):
+    """A converted load sends a slab-only MLP's prefill chunks of 9 to 127 rows
+    to int8 where stock served them, so its stores never meet an unconverted
+    load's; slab.py and projtile.py decide every MLP read's path, so an edit to
+    either cold-starts the store. The tile's own kernel serves only inside a
+    decode window, whose KV no fork keeps, so editing it leaves every store
+    warm."""
+    int8 = {"state": "active", "reason": None, "routed": 336}
+    on = _vlm_fields(int8=int8, proj=_PROJ_ON, tile=_TILE_20, ptile="active")
+    off = _vlm_fields(int8=int8, proj=_PROJ_ON, tile=_TILE_20, ptile="off")
+    assert (on["ptile"], off["ptile"]) == ("active", "off")
+    assert key_name(on) != key_name(off)
+    assert {k: v for k, v in on.items() if k != "ptile"} == {
+        k: v for k, v in off.items() if k != "ptile"
+    }
+
+    assert {"slab.py", "projtile.py"} <= set(forkstore._EPOCH_FILES)
+    assert {"projection_tile.metal", "projection_tile.h"} <= set(forkstore._EPOCH_EXCLUDED_KERNELS)
+    src = tmp_path / "engine"
+    (src / "kernels").mkdir(parents=True)
+    for name in forkstore._EPOCH_FILES:
+        (src / name).write_text(f"# {name}\n")
+    (src / "kernels" / "projection_mma.metal").write_text("mma\n")
+    monkeypatch.setattr(forkstore, "_ENGINE_SOURCES", src)
+    forkstore.engine_epoch.cache_clear()
+    epoch = engine_epoch()
+    for name in ("projection_tile.metal", "projection_tile.h"):
+        (src / "kernels" / name).write_text(f"// {name}\n")
+        forkstore.engine_epoch.cache_clear()
+        assert engine_epoch() == epoch, name
+    for name in ("slab.py", "projtile.py"):
+        (src / name).write_text(f"# {name} changed\n")
+        forkstore.engine_epoch.cache_clear()
+        changed = engine_epoch()
+        assert changed != epoch, name
+        epoch = changed
+    forkstore.engine_epoch.cache_clear()
 
 
 def test_the_os_build_is_in_every_key(monkeypatch):
