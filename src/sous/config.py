@@ -31,6 +31,7 @@ _KNOWN = {
         "int8_prefill",
         "attention_tile",
         "projection_kernel",
+        "projection_tile",
         "kv_int8",
     },
 }
@@ -162,6 +163,16 @@ class SousConfig:
     # active, else 3. Active only where the attention tile is, `unavailable`
     # with the reason anywhere else. Read once, at daemon start.
     projection_kernel: bool = True
+    # The drafter's verify projections on the M5 Pro's tensor units, from
+    # weights held in the order those units read them. The MLP weights are
+    # held in that order and every path reads them from it; the attention and
+    # GDN weights get a tile-ordered copy beside the originals only when the
+    # prompt-cache budget left is at least 14 GiB. true decides by that rule,
+    # "mlp" never makes the copy and "all" always does; false runs the
+    # projection kernel's simdgroup-matrix paths. Refused, with the reason,
+    # wherever the projection kernel, the attention tile, a DFlash drafter or
+    # int8 prefill is missing. Read once, at daemon start.
+    projection_tile: bool | str = True
     # Decode's and the exact verifier's attention read an int8 copy of the
     # context's K/V (one symmetric scale per token and KV head) with int8
     # queries on the tensor units' int8 rows, instead of the bf16 cache, from
@@ -484,6 +495,22 @@ def _attention_tile(model: dict) -> bool:
     return False
 
 
+def _projection_tile(model: dict) -> bool | str:
+    """[model].projection_tile: true, false, "mlp" or "all"; anything else
+    warns and means false, the kernel's own paths, by _int8_prefill's rule that
+    a typo must not select changed numerics. The type is tested, not equality:
+    1 == True in Python, and a TOML integer is not a boolean."""
+    value = model.get("projection_tile", True)
+    if isinstance(value, bool) or (isinstance(value, str) and value in ("mlp", "all")):
+        return value
+    warnings.warn(
+        f'sous config: [model].projection_tile {value!r} must be true, false, "mlp" or "all"; '
+        "using false",
+        stacklevel=3,
+    )
+    return False
+
+
 def _projection_kernel(model: dict) -> bool:
     """[model].projection_kernel: true or false; anything else warns and means
     false, the stock projections, by _int8_prefill's rule that a typo must not
@@ -611,6 +638,7 @@ def load_config(config_path: Path | None = None) -> SousConfig:
         int8_prefill=_int8_prefill(model),
         attention_tile=_attention_tile(model),
         projection_kernel=_projection_kernel(model),
+        projection_tile=_projection_tile(model),
         kv_int8=_kv_int8(model),
         data_dir=(path.parent if path.parent != Path(".") else DEFAULT_DATA_DIR),
         config_path=path,
