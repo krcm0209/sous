@@ -253,6 +253,41 @@ def test_projection_kernel_rejects_non_booleans_with_a_warning(tmp_path: Path, b
     assert cfg.projection_kernel is False
 
 
+# ---- [model].projection_tile --------------------------------------------------
+
+
+def test_projection_tile_defaults_on(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text("[model]\nid = 'x/y'\n")
+    assert load_config(p).projection_tile is True
+    assert SousConfig().projection_tile is True
+
+
+@pytest.mark.parametrize(
+    "value, want", [("true", True), ("false", False), ('"mlp"', "mlp"), ('"all"', "all")]
+)
+def test_projection_tile_reads_its_four_values(tmp_path: Path, value: str, want: bool | str):
+    p = tmp_path / "config.toml"
+    p.write_text(f"[model]\nprojection_tile = {value}\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cfg = load_config(p)
+    assert cfg.projection_tile == want
+    assert type(cfg.projection_tile) is type(want)
+
+
+@pytest.mark.parametrize("bad", ["1", '"on"', '"ALL"', "[]"])
+def test_projection_tile_rejects_anything_else_with_a_warning(tmp_path: Path, bad: str):
+    p = tmp_path / "config.toml"
+    p.write_text(f"[model]\nprojection_tile = {bad}\n")
+    with pytest.warns(
+        UserWarning,
+        match=r'\[model\]\.projection_tile .* must be true, false, "mlp" or "all"; using false',
+    ):
+        cfg = load_config(p)
+    assert cfg.projection_tile is False
+
+
 # ---- [model].kv_int8 ----------------------------------------------------------
 
 
