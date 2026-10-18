@@ -21,7 +21,11 @@ one by one, then measures prefill and decode throughput of every arm — a
 model, a drafter or none, a block size — through sous's own engine
 (`--repeat` sets the attempts per measurement, default 2; the best wins and
 the spread is printed). It proposes only the settings that cannot change
-what the model says: the drafter, its block size, and a window that fits.
+what the model says beyond a near-tie: the drafter, its block size, and a
+window that fits — a block size, or one drafter for another, changes
+nothing, and a drafter against none moves a near-tie only where the
+projection tile is active (the 20-core M5 Pro; see `projection_tile` in
+[Configuration](configuration.md)).
 Other models are measured and reported with a "quality untested" label; a
 quick run never changes the model.
 
