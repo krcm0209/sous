@@ -827,8 +827,9 @@ goal.
   0.07 GiB above the rule, so the automatic scope is `active:all` there but
   sits on the rule's edge (a change to the weights, the drafter, mlx, the
   window or the reserve can flip it to `mlp`), and a maintainer who wants a
-  fixed scope pins `"all"` or `"mlp"`; at 131072 the copy leaves about 22 GiB
-  and the scope is `all`. `measure_cache_budget` runs after the copy and finds
+  fixed scope pins `"all"` or `"mlp"`. At 131072 the same arithmetic (the
+  reserve 8 GiB smaller) leaves about 22 GiB and the scope `all` — derived,
+  not measured. `measure_cache_budget` runs after the copy and finds
   it inside `active`. The probe takes the first
   full-attention layer's MLP (layer 3 of the 27B) and, at `all`, its
   attention and the first GDN layer's linears (layer 0), every call and each
