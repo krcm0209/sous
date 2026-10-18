@@ -236,6 +236,7 @@ def _run(
         attention_tile=arm.attention_tile,
         projection_kernel=arm.projection_kernel,
         kv_int8=arm.kv_int8,
+        projection_tile=arm.projection_tile,
         window=arm.window,
         state=state,
         outcome="completed" if state == "done" else None,
@@ -318,6 +319,18 @@ def test_summarize_reads_the_runs_and_the_bench_peak(tmp_path):
         peak_memory_bytes=20 * 2**30,
     )
     assert summarize(_arm(user, "27 @5", block=5), runs, []) is None
+
+
+def test_a_summary_is_keyed_by_the_projection_tile_its_runs_were_graded_under(tmp_path):
+    user = _user(tmp_path)
+    arm = _arm(user, "27 @3", current=True)
+    mlp = dataclasses.replace(
+        arm, projection_tile="mlp", config=dataclasses.replace(user, projection_tile="mlp")
+    )
+    s = summarize(mlp, _runs(mlp, [1.0]), [])
+    assert s is not None and s.key == (*arm.key, False, False, True, True, True, "mlp")
+    # Runs graded under another value of the flag belong to another arm.
+    assert summarize(arm, _runs(mlp, [1.0]), []) is None
 
 
 def test_summarize_takes_the_peak_from_the_row_at_the_arms_window(tmp_path):

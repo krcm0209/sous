@@ -155,7 +155,7 @@ def quick_decision(user: SousConfig, arms: list[Arm], rows: list[BenchRow]) -> Q
 @dataclass(frozen=True)
 class ArmSummary:
     label: str
-    key: tuple[str, str, int, bool, bool, bool, bool, bool]
+    key: tuple[str, str, int, bool, bool, bool, bool, bool, bool | str]
     model_id: str
     runs: int
     completed: int

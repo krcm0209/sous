@@ -134,6 +134,7 @@ def _suite(grades, seconds, seen):
                     attention_tile=arm.attention_tile,
                     projection_kernel=arm.projection_kernel,
                     kv_int8=arm.kv_int8,
+                    projection_tile=arm.projection_tile,
                     window=arm.window,
                     state="done",
                     outcome="completed",
@@ -524,6 +525,31 @@ def test_resume_grades_every_suite_arm_again_after_kv_int8_was_flipped(tmp_path,
     assert {r["kv_int8"] for r in suite_rows} == {True, False}
 
 
+def test_resume_grades_the_model_stage_again_after_projection_tile_changed(tmp_path, capsys):
+    """projection_tile changes verify numerics, so suite rows are keyed by it:
+    a resume after the change grades every model-stage arm from scratch. The
+    winner stage's int8 arm runs with the tile off whatever the user set, so
+    its rows still count and it is not graded again."""
+    seen = []
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N), seen=seen)
+    assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 0
+    first = list(seen)
+    assert len(first) == 3 and all(done == [] for _, done in first)
+    assert first[2][0].endswith(" + int8 prefill")
+    run_id = sorted(p.name for p in (tmp_path / "tune").iterdir())[-1]
+    seen.clear()
+    changed = _cfg(tmp_path, projection_tile="mlp")
+    assert main(_args(quick=False, resume=run_id), config=changed, **deps) == 0
+    assert seen == first[:2]
+    results = (tmp_path / "tune" / run_id / "results.jsonl").read_text().splitlines()
+    suite_rows = [r for r in map(json.loads, results) if r["kind"] == "suite"]
+    assert {(r["int8_prefill"], r["projection_tile"]) for r in suite_rows} == {
+        (False, True),
+        (False, "mlp"),
+        (True, False),
+    }
+
+
 def test_resume_retries_a_run_the_runner_recorded_as_an_error(tmp_path, capsys):
     """_error_run and the denier-failure relabel both leave a state="error"
     row in results.jsonl — a row is appended, never rewritten — so a stale
@@ -597,6 +623,7 @@ def test_a_stopped_suite_still_reports_the_runs_it_recorded(tmp_path, capsys):
             attention_tile=arm.attention_tile,
             projection_kernel=arm.projection_kernel,
             kv_int8=arm.kv_int8,
+            projection_tile=arm.projection_tile,
             window=arm.window,
             state="done",
             outcome="completed",
@@ -693,8 +720,14 @@ def test_progress_lines_are_flushed_as_they_are_printed(monkeypatch):
 def _static_check(monkeypatch, reason=None, tile_reason="same"):
     """Stand in for the projection kernel's static check and the attention
     tile's: the real ones read this machine's GPU, and these tests must not
-    move with it. The tile's answer is the kernel's unless given."""
-    from sous.engine import projkernel, tileattn
+    move with it. The tile's answer is the kernel's unless given. The
+    projection tile's check, which starts from the kernel's, refuses here, so
+    every call recorded is the block resolution's."""
+    from sous.engine import projkernel, projtile, tileattn
+
+    monkeypatch.setattr(
+        projtile, "static_reason", lambda config, model_config, drafter_kind: "stand-in"
+    )
 
     asked = []
     tile_answer = reason if tile_reason == "same" else tile_reason

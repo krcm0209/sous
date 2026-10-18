@@ -64,6 +64,7 @@ class SuiteRun:
     attention_tile: bool
     projection_kernel: bool
     kv_int8: bool
+    projection_tile: bool | str
     window: int
     state: str
     outcome: str | None
@@ -79,7 +80,7 @@ class SuiteRun:
     transcript_path: str | None
 
     @property
-    def key(self) -> tuple[str, str, int, bool, bool, bool, bool, bool]:
+    def key(self) -> tuple[str, str, int, bool, bool, bool, bool, bool, bool | str]:
         """The arm this run measured — `Arm.suite_key`, never the label."""
         return (
             self.model_id,
@@ -90,6 +91,7 @@ class SuiteRun:
             self.attention_tile,
             self.projection_kernel,
             self.kv_int8,
+            self.projection_tile,
         )
 
     @property
@@ -102,11 +104,17 @@ class SuiteRun:
     @classmethod
     def from_dict(cls, d: dict) -> SuiteRun:
         # A row written before a setting existed ran without what it switches
-        # on — stock attention, stock projections, bf16 K/V — on every
-        # machine, so it reads False, and a resume under an arm that has the
-        # setting runs the task again rather than pool the two. Without the
-        # fallback, resuming such a run would raise KeyError.
-        d = {"attention_tile": False, "projection_kernel": False, "kv_int8": False, **d}
+        # on — stock attention, stock projections, bf16 K/V, no projection
+        # tile — on every machine, so it reads False, and a resume under an
+        # arm that has the setting runs the task again rather than pool the
+        # two. Without the fallback, resuming such a run would raise KeyError.
+        d = {
+            "attention_tile": False,
+            "projection_kernel": False,
+            "kv_int8": False,
+            "projection_tile": False,
+            **d,
+        }
         return cls(**{f.name: d[f.name] for f in dataclasses.fields(cls)})
 
 
@@ -139,8 +147,8 @@ class CountingEngine:
         # drafter, draft_block, positions, int8_prefill_status,
         # verify_attention_status, draft_context_status, attention_tile_status,
         # projection_kernel_status, projection_kernel_drafter_status,
-        # kv_int8_status: whatever the backend has, read through
-        # getattr(..., None) by ManagedEngine.
+        # projection_tile_status, kv_int8_status: whatever the backend has,
+        # read through getattr(..., None) by ManagedEngine.
         return getattr(self._inner, name)
 
     def generate(
@@ -237,6 +245,7 @@ def _error_run(task: SuiteTask, index: int, arm: Arm, error: str) -> SuiteRun:
         attention_tile=arm.attention_tile,
         projection_kernel=arm.projection_kernel,
         kv_int8=arm.kv_int8,
+        projection_tile=arm.projection_tile,
         window=arm.window,
         state="error",
         outcome=None,
@@ -310,6 +319,7 @@ def run_one(
         attention_tile=arm.attention_tile,
         projection_kernel=arm.projection_kernel,
         kv_int8=arm.kv_int8,
+        projection_tile=arm.projection_tile,
         window=arm.window,
         state="failed" if failed else "done",
         outcome=None if failed else result.outcome,
@@ -401,6 +411,22 @@ def _check_proj(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> No
             out,
             runs="the drafter's own projections stock",
         )
+
+
+def _check_projtile(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> None:
+    """The projection tile is inherited and unmeasured like the kernel, so the
+    same holds: where the engine reports it unavailable, the daemon would
+    serve this checkpoint without it, and the arm runs the same way after a
+    notice. Except for `no drafter`: the tile loads only beside a drafter,
+    so every drafterless arm on a machine it runs on gets that refusal, and
+    a notice there would say nothing. `off`, or no status, is
+    the setting switched off or an engine without the tile: no notice."""
+    if not arm.projection_tile:
+        return
+    status = engine.projection_tile_status or {}
+    if (status.get("reason") or "").startswith("no drafter"):
+        return
+    _notice_unavailable(arm, "projection tile", status, out, runs="without it")
 
 
 def _check_kv8(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> None:
@@ -499,6 +525,7 @@ def _run_suite(
             _check_int8(arm, engine, out)
             _check_tile(arm, engine, out)
             _check_proj(arm, engine, out)
+            _check_projtile(arm, engine, out)
             _check_kv8(arm, engine, out)
         except RuntimeError as e:
             check_error = str(e)

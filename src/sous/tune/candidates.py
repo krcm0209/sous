@@ -199,6 +199,10 @@ class Fit:
     needed_bytes: int
     working_set_bytes: int
     detail: str
+    # The scope the projection tile's memory guard would pick at this window:
+    # "all" with its attention and GDN copies, "mlp" without them. None where
+    # the tile would not run, or the candidate does not fit.
+    tile_scope: str | None = None
 
 
 def _needed(target_bytes: int, drafter_bytes: int, kv: int, window: int) -> int:
@@ -212,12 +216,22 @@ def fit(
     window: int,
     floor: int,
     working_set_bytes: int,
+    tile_copy_bytes: int | None = None,
+    tile_config: bool | str = False,
+    cache_budget: int | None = None,
 ) -> Fit:
     """Weights, the quantized drafter, one window of KV and the slack against
     Metal's recommended working set. A window that does not fit is lowered
     to the largest step that does; below `floor` the candidate is refused,
     and the arithmetic goes into `detail` either way so a refusal explains
-    itself."""
+    itself.
+
+    `tile_copy_bytes` is the projection tile's copy where its static check
+    passes, else None; `tile_config` is [model].projection_tile and
+    `cache_budget` the configured prompt-cache budget in bytes (None when
+    automatic). The scope the tile's guard would pick goes into `tile_scope`
+    and `detail`, never into `needed` or the window: the copy is elective, and
+    the guard skips it rather than shrink the window."""
     kv = target.kv_bytes_per_token
     dbytes = 0 if drafter is None else drafter.bytes
     if target.bytes is None or kv is None or dbytes is None:
@@ -235,6 +249,19 @@ def fit(
             chosen = floor
         needed = _needed(target.bytes, dbytes, kv, chosen)
     fits = needed <= working_set_bytes
+    tile_scope, tile_note = None, ""
+    if fits and tile_config and tile_copy_bytes is not None:
+        from sous.engine import projtile
+
+        # What live_headroom() reads at load, when the tile decides: the
+        # working set less the weights and the quantized drafter.
+        headroom = int(working_set_bytes - target.bytes - dbytes / DRAFTER_QUANT_DIVISOR)
+        copy, why = projtile.copy_decision(
+            tile_config, cache_budget, headroom, tile_copy_bytes, kv * chosen
+        )
+        tile_scope = "all" if copy else "mlp"
+        copied = f" copy={tile_copy_bytes / _GB:.1f} GB" if copy else ""
+        tile_note = f"; projection tile scope={tile_scope}{copied} ({why})"
     drafter_note = f" + drafter {dbytes / _GB:.1f} GB/{DRAFTER_QUANT_DIVISOR}" if drafter else ""
     detail = (
         f"weights {target.bytes / _GB:.1f} GB ({target.bytes / _GIB:.1f} GiB){drafter_note}"
@@ -249,5 +276,6 @@ def fit(
             else f" (window lowered from {window}; little or nothing left for prompt-cache forks)"
         )
         + ("" if fits else f"; below the {floor}-token floor")
+        + tile_note
     )
-    return Fit(fits, chosen, needed, working_set_bytes, detail)
+    return Fit(fits, chosen, needed, working_set_bytes, detail, tile_scope)
