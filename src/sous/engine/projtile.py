@@ -91,16 +91,23 @@ def stack_of(module: Any) -> Stack | None:
     return vars(module).get(STACK_ATTR)
 
 
-def _mlp_linears(root: Any) -> Iterator[Any]:
-    """gate, up and down of every layer with a dense MLP; any other layout (a MoE
-    block, a model without layers) yields nothing, so the fork key can read any
-    model the engine loads."""
+def _mlp_trios(root: Any) -> Iterator[tuple[Any, ...]]:
+    """gate, up and down of each layer with a dense MLP, one tuple per layer; any
+    other layout (a MoE block, a model without layers) yields nothing, so the fork
+    key can read any model the engine loads."""
     for layer in getattr(getattr(root, "model", None), "layers", ()):
         mlp = getattr(layer, "mlp", None)
-        for name in _MLP_NAMES:
-            module = getattr(mlp, name, None)
-            if module is not None:
-                yield module
+        trio = tuple(
+            module for name in _MLP_NAMES if (module := getattr(mlp, name, None)) is not None
+        )
+        if trio:
+            yield trio
+
+
+def _mlp_linears(root: Any) -> Iterator[Any]:
+    """Every layer's gate, up and down, flat."""
+    for trio in _mlp_trios(root):
+        yield from trio
 
 
 def _convert(module: Any) -> None:
@@ -112,15 +119,23 @@ def _convert(module: Any) -> None:
     object.__setattr__(module, slab.SLAB_ATTR, info)
 
 
-def _revert(module: Any, info: SlabInfo) -> None:
-    """One slab-only linear back to mlx's arrays, bitwise. The marker goes last, so
-    a revert that raises leaves the module marked as what it still holds."""
+def _revert_group(modules: Sequence[Any]) -> int:
+    """Every slab-only linear of a layer's MLP back to mlx's arrays, bitwise, all or
+    none: the unpacking and its evaluation come first, the assignments after, so a
+    failure while unpacking leaves the whole group slab-only. A group that was left
+    half reverted would fuse gate and up in two forms, which the projection kernel's
+    fused call refuses on every drafted decode. Each module's marker goes after its
+    own planes, so a module is never marked as what it no longer holds. Returns how
+    many were reverted."""
     import mlx.core as mx
 
-    w, scales, biases = slab.unpack(module.weight, module.scales, module.biases, info)
-    mx.eval(w, scales, biases)
-    module.weight, module.scales, module.biases = w, scales, biases
-    object.__delattr__(module, slab.SLAB_ATTR)
+    marked = [(m, info) for m in modules if (info := slab.slab_info(m)) is not None]
+    unpacked = [slab.unpack(m.weight, m.scales, m.biases, info) for m, info in marked]
+    mx.eval(*(array for planes in unpacked for array in planes))
+    for (module, _), (w, scales, biases) in zip(marked, unpacked, strict=True):
+        module.weight, module.scales, module.biases = w, scales, biases
+        object.__delattr__(module, slab.SLAB_ATTR)
+    return len(marked)
 
 
 def convert_mlp(root: Any) -> int:
@@ -140,15 +155,14 @@ def convert_mlp(root: Any) -> int:
 
 def revert_mlp(root: Any) -> int:
     """convert_mlp's inverse: every marked MLP linear back to mlx's arrays,
-    bitwise, its marker deleted; returns how many."""
+    bitwise, its marker deleted; returns how many. One layer at a time and a
+    layer's three together (_revert_group), so an interrupted revert leaves whole
+    layers in one form each."""
     import mlx.core as mx
 
     reverted = 0
-    for module in _mlp_linears(root):
-        info = slab.slab_info(module)
-        if info is not None:
-            _revert(module, info)
-            reverted += 1
+    for trio in _mlp_trios(root):
+        reverted += _revert_group(trio)
     mx.clear_cache()
     return reverted
 
@@ -545,8 +559,9 @@ def _check(x8: Any, planes: Sequence[Any], info: SlabInfo) -> None:
 
 def run(x8: Any, codes: Any, scales: Any, biases: Any, info: SlabInfo, plan: Plan) -> Any:
     """x8 [8, K] bf16 through one slab-ordered projection or stack at ``plan``:
-    [8, n_pad] bf16, the columns past n_real zero. A split plan runs the split
-    kernel, then the reduce that adds its partials in order."""
+    [8, n_pad] bf16, the columns past n_real computing exactly 0 for finite
+    activations. A split plan runs the split kernel, then the reduce that adds its
+    partials in order."""
     if plan.splits > 1:
         return _reduce(_partials(x8, codes, scales, biases, info, plan))
     _check(x8, (codes, scales, biases), info)
@@ -1051,10 +1066,11 @@ def copy_decision(
     worth having beside them: TILE_COPY_MIN_BUDGET_GIB under the automatic
     budget, the configured budget itself under an explicit one. Never a warning:
     a skipped copy still serves the MLP, and a configured budget is the user's
-    choice. Shared with sous tune's fit(), which records in its Fit the scope a
-    load would take."""
+    choice. Shared with sous tune's fit(), which names the scope a load would take
+    in its detail."""
     left = budget_left(headroom_bytes, copy_bytes, reserve_bytes)
-    after = "unknown" if left is None else f"{left / _GIB:.1f} GiB"
+    # Two decimals: at one, 13.96 GiB would read "14.0 GiB (< 14)".
+    after = "unknown" if left is None else f"{left / _GIB:.2f} GiB"
     if config_value == "mlp":
         return False, "scope mlp by config"
     if config_value == "all":
@@ -1067,7 +1083,7 @@ def copy_decision(
         return False, (
             f"copy would leave {after} of prompt-cache budget (< {TILE_COPY_MIN_BUDGET_GIB})"
         )
-    configured = f"configured budget {cache_budget / _GIB:.1f} GiB"
+    configured = f"configured budget {cache_budget / _GIB:.2f} GiB"
     if left >= cache_budget:
         return True, f"{configured} fits beside the copy; budget left {after}"
     return False, f"{configured} does not fit beside the copy; budget left {after}"
@@ -1405,7 +1421,9 @@ def _check_routing(mlp: Any) -> str | None:
     import mlx.core as mx
 
     global _active
-    x = mx.random.normal((1, _PROBE_ROWS, projkernel._in_features(mlp.gate_proj)))
+    x = mx.random.normal(
+        (1, _PROBE_ROWS, projkernel._in_features(mlp.gate_proj)), key=mx.random.key(0)
+    )
     x = x.astype(mx.bfloat16)
     mx.eval(x)
     verifier = projkernel._verifier_class()()
@@ -1514,8 +1532,9 @@ def probe(root: Any, scope: str) -> str | None:
 
 def _undo(root: Any) -> None:
     """Take a refused load back to mlx's layout: the MLP reverted, then the copies
-    dropped. A revert that raises leaves the linears it did not reach slab-only and
-    marked; every reader is marker-driven, so they keep their slab paths and the
+    dropped. A revert that raises leaves the layers it did not reach slab-only and
+    marked, each layer whole (revert_mlp moves a layer's gate, up and down
+    together); every reader is marker-driven, so they keep their slab paths and the
     fork key reads them as converted."""
     try:
         revert_mlp(root)

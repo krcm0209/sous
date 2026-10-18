@@ -214,25 +214,32 @@ def _fit_27b(**tile):
 
 def test_fit_reports_the_projection_tiles_scope_without_counting_the_copy():
     base = _fit_27b()
-    assert base.tile_scope is None and "projection tile" not in base.detail
+    assert "projection tile" not in base.detail
     small = _fit_27b(tile_copy_bytes=_SMALL_COPY, tile_config=True)
     large = _fit_27b(tile_copy_bytes=_LARGE_COPY, tile_config=True)
-    assert (small.tile_scope, large.tile_scope) == ("all", "mlp")
     # The copy is elective: the guard skips it rather than shrink the window.
     for f in (small, large):
         assert (f.fits, f.window, f.needed_bytes) == (base.fits, base.window, base.needed_bytes)
-    assert "projection tile scope=all copy=4.1 GB (budget left 22.0 GiB)" in small.detail
-    assert "projection tile scope=mlp (copy would leave 11.9 GiB" in large.detail
+    assert "projection tile scope=all copy=4.1 GB (budget left 22.01 GiB)" in small.detail
+    assert "projection tile scope=mlp (copy would leave 11.85 GiB" in large.detail
 
 
 def test_fit_reports_the_scope_the_config_and_an_explicit_budget_decide():
-    assert _fit_27b(tile_copy_bytes=_SMALL_COPY).tile_scope is None  # the tile switched off
-    assert _fit_27b(tile_copy_bytes=_SMALL_COPY, tile_config="mlp").tile_scope == "mlp"
-    assert _fit_27b(tile_copy_bytes=_LARGE_COPY, tile_config="all").tile_scope == "all"
+    off = _fit_27b(tile_copy_bytes=_SMALL_COPY)  # the tile switched off
+    assert "projection tile" not in off.detail
+    assert (
+        "projection tile scope=mlp"
+        in _fit_27b(tile_copy_bytes=_SMALL_COPY, tile_config="mlp").detail
+    )
+    assert (
+        "projection tile scope=all"
+        in _fit_27b(tile_copy_bytes=_LARGE_COPY, tile_config="all").detail
+    )
     fits = _fit_27b(tile_copy_bytes=_SMALL_COPY, tile_config=True, cache_budget=20 * 2**30)
     tight = _fit_27b(tile_copy_bytes=_SMALL_COPY, tile_config=True, cache_budget=24 * 2**30)
-    assert (fits.tile_scope, tight.tile_scope) == ("all", "mlp")
-    assert "configured budget 24.0 GiB does not fit beside the copy" in tight.detail
+    assert "projection tile scope=all" in fits.detail
+    assert "projection tile scope=mlp" in tight.detail
+    assert "configured budget 24.00 GiB does not fit beside the copy" in tight.detail
 
 
 def test_fit_reports_no_scope_for_a_model_it_refuses():
@@ -245,7 +252,7 @@ def test_fit_reports_no_scope_for_a_model_it_refuses():
         tile_copy_bytes=_SMALL_COPY,
         tile_config=True,
     )
-    assert f.fits is False and f.tile_scope is None
+    assert f.fits is False
     assert "projection tile" not in f.detail
 
 
@@ -265,4 +272,4 @@ def test_a_lowered_window_stays_where_the_fit_put_it_beside_the_copy():
     tiled = _fit_lowered(tile_copy_bytes=_SMALL_COPY, tile_config=True)
     assert base.window < 131072
     assert (tiled.window, tiled.needed_bytes) == (base.window, base.needed_bytes)
-    assert tiled.tile_scope == "mlp"
+    assert "projection tile scope=mlp" in tiled.detail

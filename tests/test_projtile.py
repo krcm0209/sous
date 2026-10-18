@@ -178,6 +178,47 @@ def test_revert_mlp_restores_the_arrays_bitwise_and_clears_the_marker():
     assert projtile.revert_mlp(root) == 0
 
 
+def test_a_revert_that_fails_on_a_layers_last_linear_leaves_that_layer_slab_only(monkeypatch):
+    """A layer's gate, up and down revert together: unpacking all three comes
+    before any assignment, so a failure on the third leaves the first two still
+    slab-only, planes and markers untouched, never a gate in mlx's layout beside an
+    up in the slab one (the fused gate+up call refuses such a pair on every drafted
+    decode). The layers before it are reverted whole, and a second revert finishes."""
+    root = pfx.tiny_quantized_model(seed=0)
+    linears = _mlp_linears(root)
+    original = [_arrays(m) for m in linears]
+    projtile.convert_mlp(root)
+    slabbed = [_arrays(m) for m in linears]
+    infos = [slab.slab_info(m) for m in linears]
+    assert len(linears) >= 6
+    fail_on = slabbed[3 + 2][0]  # the second layer's down_proj planes
+    real = slab.unpack
+
+    def unpack(weight, scales, biases, info):
+        if weight is fail_on:
+            raise RuntimeError("out of memory")
+        return real(weight, scales, biases, info)
+
+    monkeypatch.setattr(slab, "unpack", unpack)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        projtile.revert_mlp(root)
+    for i, module in enumerate(linears):
+        if i < 3:
+            assert slab.slab_info(module) is None and slab.SLAB_ATTR not in vars(module)
+            for got, want in zip(_arrays(module), original[i], strict=True):
+                assert _same(got, want)
+        else:
+            assert slab.slab_info(module) == infos[i]
+            for got, want in zip(_arrays(module), slabbed[i], strict=True):
+                assert got is want
+    monkeypatch.undo()
+    assert projtile.revert_mlp(root) == len(linears) - 3
+    for module, arrays in zip(linears, original, strict=True):
+        assert slab.slab_info(module) is None
+        for got, want in zip(_arrays(module), arrays, strict=True):
+            assert _same(got, want)
+
+
 def test_a_padded_module_converts_and_reverts_bitwise():
     module = ptfx.padded_module(48, K, seed=5)
     before = _arrays(module)
@@ -187,7 +228,7 @@ def test_a_padded_module_converts_and_reverts_bitwise():
     projtile._convert(module)
     info = slab.slab_info(module)
     assert info == slab.SlabInfo(n_real=48, k=K, tiles=1)
-    projtile._revert(module, info)
+    assert projtile._revert_group([module]) == 1
     assert slab.slab_info(module) is None
     for got, original in zip(_arrays(module), before, strict=True):
         assert _same(got, original)
@@ -1334,25 +1375,38 @@ def test_enable_refuses_an_exception_in_a_guard_with_its_error_line(monkeypatch,
 # automatic rule keeps 2 GiB of slack beside the reserve.
 COPY_CASES = [
     (True, None, 35 * G, 4 * G, 16 * G, False,
-     "copy would leave 13.0 GiB of prompt-cache budget (< 14)"),
-    (True, None, 44 * G, 4 * G, 16 * G, True, "budget left 22.0 GiB"),
+     "copy would leave 13.00 GiB of prompt-cache budget (< 14)"),
+    (True, None, 44 * G, 4 * G, 16 * G, True, "budget left 22.00 GiB"),
+    # Exactly the rule's floor copies: the rule is "at least".
+    (True, None, 36 * G, 4 * G, 16 * G, True, "budget left 14.00 GiB"),
+    # 40 MiB short of it does not, and the text must not round up to the floor.
+    (True, None, 36 * G - 40 * 2**20, 4 * G, 16 * G, False,
+     "copy would leave 13.96 GiB of prompt-cache budget (< 14)"),
     (True, 12 * G, 35 * G, 4 * G, 16 * G, True,
-     "configured budget 12.0 GiB fits beside the copy; budget left 13.0 GiB"),
+     "configured budget 12.00 GiB fits beside the copy; budget left 13.00 GiB"),
+    # A configured budget that exactly equals what is left still fits beside it.
+    (True, 13 * G, 35 * G, 4 * G, 16 * G, True,
+     "configured budget 13.00 GiB fits beside the copy; budget left 13.00 GiB"),
     (True, 14 * G, 35 * G, 4 * G, 16 * G, False,
-     "configured budget 14.0 GiB does not fit beside the copy; budget left 13.0 GiB"),
+     "configured budget 14.00 GiB does not fit beside the copy; budget left 13.00 GiB"),
+    # 0 is a real budget (one slot): any headroom that leaves nothing negative copies.
+    (True, 0, 30 * G, 4 * G, 16 * G, True,
+     "configured budget 0.00 GiB fits beside the copy; budget left 8.00 GiB"),
+    (True, 0, 22 * G, 4 * G, 16 * G, True,
+     "configured budget 0.00 GiB fits beside the copy; budget left 0.00 GiB"),
     (True, 0, 20 * G, 4 * G, 16 * G, False,
-     "configured budget 0.0 GiB does not fit beside the copy; budget left -2.0 GiB"),
+     "configured budget 0.00 GiB does not fit beside the copy; budget left -2.00 GiB"),
     (True, None, None, 4 * G, 16 * G, False, "headroom unreadable"),
     (True, 12 * G, None, 4 * G, 16 * G, False, "headroom unreadable"),
     ("mlp", None, 44 * G, 4 * G, 16 * G, False, "scope mlp by config"),
-    ("all", None, 20 * G, 4 * G, 16 * G, True, "scope all by config; budget left -2.0 GiB"),
+    ("all", None, 20 * G, 4 * G, 16 * G, True, "scope all by config; budget left -2.00 GiB"),
     ("all", 12 * G, None, 4 * G, 16 * G, True, "scope all by config; budget left unknown"),
 ]  # fmt: skip
 
 
 def _copy_id(case) -> str:
     config, budget, headroom, *_ = case
-    gib = lambda v: "auto" if v is None else f"{v // G}G"  # noqa: E731
+    gib = lambda v: "auto" if v is None else f"{v / G:g}G"  # noqa: E731
     return f"{config}-budget-{gib(budget)}-headroom-{gib(headroom)}"
 
 
@@ -1400,7 +1454,7 @@ def test_enable_converts_the_mlp_and_builds_stacks_at_scope_all(monkeypatch):
 @pytest.mark.parametrize(
     ("config", "headroom", "why"),
     [
-        (True, 19 * G, "copy would leave 13.0 GiB of prompt-cache budget (< 14)"),
+        (True, 19 * G, "copy would leave 13.00 GiB of prompt-cache budget (< 14)"),
         ("mlp", 64 * G, "scope mlp by config"),
         (True, None, "headroom unreadable"),
     ],

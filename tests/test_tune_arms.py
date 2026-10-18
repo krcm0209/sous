@@ -710,9 +710,10 @@ def test_quick_arms_hand_fit_the_tiles_copy_only_where_its_static_check_passes(
         assert kw["tile_config"] is True and kw["cache_budget"] == 12 * 2**30
         if drafter is None:
             # "no drafter": the tile serves the drafter's verify only.
-            assert kw["tile_copy_bytes"] is None and f.tile_scope is None
+            assert kw["tile_copy_bytes"] is None and "projection tile" not in f.detail
         else:
-            assert kw["tile_copy_bytes"] == 4_090_000_000 and f.tile_scope == "all"
+            assert kw["tile_copy_bytes"] == 4_090_000_000
+            assert "projection tile scope=all" in f.detail
 
 
 def test_quick_arms_hand_fit_no_copy_where_the_tiles_static_check_refuses(tmp_path, monkeypatch):
@@ -727,4 +728,4 @@ def test_quick_arms_hand_fit_no_copy_where_the_tiles_static_check_refuses(tmp_pa
     assert sized == []
     for _, kw, f in fits:
         assert kw["tile_copy_bytes"] is None and kw["cache_budget"] is None
-        assert f.tile_scope is None
+        assert "projection tile" not in f.detail
