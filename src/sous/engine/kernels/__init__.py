@@ -22,17 +22,21 @@ multiply-accumulate helper and the presum and slab switches.
 same summation order with no MMA: two bodies, over mlx's layout and over
 slab-ordered weights, divided at its ``// SLAB`` line. None of those projection
 kernels uses tensor ops, so they compile on any Metal GPU and CI runs their
-tests. ``projection_tile.metal`` is the projection tile, which does: one MPP
-``matmul2d`` per quant group over slab-ordered weights. It holds the tile body
-and the split's fixed-order reduce, divided at its ``// REDUCE`` line, and
-``projection_tile.h`` the tile's helpers and its ``DUAL`` and ``SPLITOUT``
-switches.
+tests. ``projection_tile.metal`` is the projection tile, which runs one MPP
+``matmul2d`` per quant group over slab-ordered weights on the tensor units: it
+holds the tile body and the split's fixed-order reduce, divided at its
+``// REDUCE`` line. ``projection_tile.h`` holds the tile's helpers (the row sums,
+the traversal guard and the per-group matmul and epilogue) and is prepended to
+the tile body alone, after the ``DUAL`` and ``SPLITOUT`` defines projtile.py
+writes and ``nax.h``; the reduce body gets ``common.h`` only.
 
 The int8 prefill kernels are derived from oMLX (jundot/omlx#3548), the
 projection kernel in part from Splash (incoai/splash and its Apple7/8 port), and
 the projection tile from Splash's ``q4_mpp_tiles.h`` at 0d5a035, all under the
-Apache License 2.0; see THIRD_PARTY_NOTICES.md. ``attention_tile.metal``,
-``attention_tile_kv8.metal`` and ``kv8_quant.metal`` are sous's own, and so is
-``projection_row.metal`` apart from the nibble decode and epilogue it shares with
-the projection kernel.
+Apache License 2.0; see THIRD_PARTY_NOTICES.md. The slab weight layout read by
+``projection_mma.metal``'s ``SLAB`` bodies, ``projection_row.metal``'s slab body
+and ``q4_int8_gemm.metal``'s ``SLAB`` read is Splash's too.
+``attention_tile.metal``, ``attention_tile_kv8.metal`` and ``kv8_quant.metal`` are
+sous's own, and so is ``projection_row.metal`` apart from the nibble decode and
+epilogue it shares with the projection kernel and its slab body's layout.
 """

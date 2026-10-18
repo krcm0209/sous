@@ -1051,7 +1051,8 @@ def copy_decision(
     worth having beside them: TILE_COPY_MIN_BUDGET_GIB under the automatic
     budget, the configured budget itself under an explicit one. Never a warning:
     a skipped copy still serves the MLP, and a configured budget is the user's
-    choice. Shared with sous tune, which reports the scope a load would take."""
+    choice. Shared with sous tune's fit(), which records in its Fit the scope a
+    load would take."""
     left = budget_left(headroom_bytes, copy_bytes, reserve_bytes)
     after = "unknown" if left is None else f"{left / _GIB:.1f} GiB"
     if config_value == "mlp":

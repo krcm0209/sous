@@ -249,8 +249,12 @@ write per cold turn. A
 file is used only when its ids are exactly a prefix of the render, whole
 or not at all, and only by a daemon whose backend and its version
 (mlx-vlm or mlx-lm), mlx version, GPU, weights snapshot, engine sources,
-positions owner, int8 state, attention-tile state, projection-kernel state
-and macOS build match the ones that wrote it; anything else
+positions owner, int8 state, attention-tile state, projection-kernel state,
+projection-tile state (`ptile`: whether the MLP is held in the tile's order,
+which sends its prefill chunks of 9 to 127 rows to int8 prefill instead of
+stock; only a load with a drafter converts it, which is how the drafter, itself
+absent from the key, reaches the files) and macOS build match the ones that
+wrote it; anything else
 is a natural miss and ages out of the disk budget
 ([`prompt_cache_disk_gb`](configuration.md)). `sous claude` runs one
 subagent at a time, and the daemon serves one turn at a time whatever the

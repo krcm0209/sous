@@ -27,6 +27,7 @@ speculative_draft_id = "z-lab/Qwen3.8-27B-DFlash2"
 int8_prefill = true
 attention_tile = true
 projection_kernel = true
+projection_tile = true
 kv_int8 = true
 ```
 
@@ -110,7 +111,12 @@ for a while and would evict the forks a cold turn had just made. The
 conversation that just ran is never evicted by
 its own turn, and a cold turn's second fork copy never evicts its first, so
 `0` means exactly one slot and a 32 GB machine
-degrades to that on its own.
+degrades to that on its own. Where `projection_tile` copies the attention and
+linear-attention weights (4.1 GB), `"auto"` is that much smaller: on a 64 GB
+M5 Pro at the default window with the default drafter loaded, about 21 GiB
+where it would be about 25. At
+262144 the tile skips the copy rather than leave less than 14 GiB (see
+`projection_tile` below).
 
 `[model].prompt_cache_disk_gb` (default `"auto"` — a number sets the GiB,
 `0` keeps nothing on disk) bounds the tools forks kept under
@@ -144,7 +150,9 @@ against the checkpoint's packed 4-bit weights on the M5 GPU's neural accelerator
 on an M5 Pro with the default model on macOS 27: 374 → 602 tok/s at 4K tokens, 336 →
 503 tok/s at 32K, and 8–25% off warm prefills at 64–192K of context (MLP and
 linear-attention projections; attention projections are not routed, see #76). Decode
-and speculative verify are untouched. It changes prefill numerics (KL 0.033 vs the
+and speculative verify are untouched; where `projection_tile` is active it also
+takes the MLP's prefill chunks of 9 to 127 rows (see below). It changes prefill
+numerics (KL 0.033 vs the
 stock path on a code prompt; 4-bit weights alone are 0.052 vs 8-bit), but on `sous
 tune`'s tool-loop suite, with both arms given one prompt and one seed per run, its
 mean grade stayed within 0.05 of stock's (+0.013, 95% CI −0.020 to +0.054 over 64
@@ -168,9 +176,11 @@ the default model and drafter: the verify forward's attention at block 3 is
 2–2.6x faster than the grouped stock calls it replaces, and decode is 1.21x
 faster on 64 real subagent turns at 44–77K of context. It serves attention
 over 1,536 keys or more; below that, decode and verify take the stock paths,
-which are as fast there. Greedy output with the drafter stays identical to
-output without it — a verify row and the decode step at the same key count
-use the same partition — and the tile is as accurate as the stock kernels,
+which are as fast there. A verify row and the decode step at the same key
+count use the same partition, so greedy output with the drafter stays
+identical to output without it wherever `projection_tile` is not active, and
+the same at any block size where it is (see `projection_tile` below); and the
+tile is as accurate as the stock kernels,
 but not bit-identical to them: a near-tie can resolve the other way than
 with `false`, which runs the stock paths. It is active only where it has
 been measured: a 20-core M5 Pro GPU on macOS 26.2+, running a dense
@@ -214,9 +224,11 @@ ABBA over 290 pairs of the same 145 turns; 1.17x per round with the arm
 drawn per round). That is why an unset `speculative_block_size` is 8
 wherever the kernel is active. Each row's
 output is bitwise independent of how many rows a call carries and of which
-projections share it, so greedy output with the drafter stays identical to
-output without it — and that is also why plain decode goes through the
-kernel. Decode's projections are one-row calls, which the
+projections share it, so, wherever `projection_tile` is not active, greedy
+output with the drafter stays identical to output without it — and that is
+also why plain decode goes through the kernel (where it is active, its tile
+takes over the verify projections it holds weights for; see below). Decode's
+projections are one-row calls, which the
 simdgroup-matrix kernel serves on a fraction of its lanes, so they run on the
 one-row kernel instead, whose output is the same bit for bit. The DFlash
 drafter's own linears (quantized the same way at load) ride the kernel too,
@@ -259,6 +271,73 @@ should have run here and did not. The on-disk forks are keyed by it: where it
 is active, changing the setting starts the fork store cold once. The daemon
 reads it at startup, so a change takes effect on its next start.
 
+`[model].projection_tile` (default `true`; also `false`, `"mlp"` or `"all"`)
+runs speculative verify's projections, and the short chunk a generation
+prefills itself, on the M5 GPU's neural accelerators: one tensor-op tile per
+64-weight quant group, over weights held in the order those units read them
+(Splash's affine 4-bit tile and its 256-column slab layout, Apache-2.0 — see
+`THIRD_PARTY_NOTICES.md`; compiled at model load, no build step). It serves
+only inside a generation, so prefill, the prompt cache and the on-disk forks
+never hold its output. The MLP's gate, up and down weights are put in that
+order at load and held only in it, and every path reads them there: the
+projection kernel and its one-row kernel with the same bits as before, and
+int8 prefill's GEMM, which now also takes their prefill chunks of 9 to 127
+rows because stock `quantized_matmul`, which served those, cannot read the new
+order. That moves those chunks from stock's bits to int8's, and is why int8
+prefill must be active. The attention and linear-attention projections keep
+their weights and, memory allowing, gain a copy in that order — 4.1 GB on the
+default model — so that the tile serves them too; without it the tile serves
+the MLP alone. `true` decides by the rule below, `"mlp"` never makes the copy,
+`"all"` always does, and `false` leaves every projection where
+`projection_kernel` puts it. Any other value warns and means `false`.
+
+What it changes in the output: the tile computes a row the same way whatever
+else shares the call, but not bit for bit the way the projection kernel
+computes a single row. So with it active, greedy output with the drafter is
+the same at any `speculative_block_size` for a given load and scope, and
+differs from output without the drafter by bf16 rounding inside the
+projections: a near-tie can resolve the other way. Where it is not active
+(`false`, no DFlash drafter, int8 prefill off, another Mac), output with the
+drafter equals output without it, as above.
+
+The copy is decided in bytes when the model loads. With `prompt_cache_gb`
+automatic, it is made when Metal's headroom at that moment (the weights and
+the drafter loaded), less the copy, one window of KV and the 2 GiB slack —
+the automatic prompt-cache budget the copy would leave — is at least 14 GiB,
+the budget a fork kept beside a retaining conversation wants (see
+`prompt_cache_gb` above): a copy that evicts the forks costs more prefill than
+it saves decode. With `prompt_cache_gb` set, it is made when that budget still
+fits beside the copy. On a 64 GB M5 Pro with the default model and drafter,
+Metal's working set is about 51.8 GiB and the resident weights about 17 GiB;
+at `max_context_tokens = 131072` (8 GiB of KV reserve) the automatic budget is
+about 25 GiB, the copy (3.8 GiB) leaves about 21, and the load is `active:all`;
+at 262144 the reserve doubles to 16 GiB, the budget is about 17 GiB, the copy
+would leave about 13, and the load is `active:mlp`. `"all"` there leaves those
+13 GiB, below the ~14 GiB where cold turns start paying for forks they never
+reuse. A second stage, not built yet, would put every projection in this
+order and drop the copy and its rule.
+
+It is active only beside an active projection kernel and attention tile (so
+far a 20-core M5 Pro), a DFlash drafter and active int8 prefill, on a GPU
+whose core count its plans were measured on (20 so far). Anywhere else the
+model-load line reads `projection_tile=unavailable` (`off` with `false` and
+on the mlx-lm backend) and the status document's `projection_tile` block
+carries the reason; that is one INFO line, and a `WARNING` saying `sous:
+projection tile unavailable (…)` means it should have run here and did not —
+a pinned mlx or mlx-vlm source changed, its kernels failed to compile, or its
+load-time check failed, and a failure after the conversion puts the MLP back
+in mlx's order. Where it is active, the model-load line carries the scope —
+`projection_tile=active:all … projection_tile_copy_gb=4.1` or
+`projection_tile=active:mlp … projection_tile_copy=skipped` — beside
+`projection_tile_budget_gib=`, the automatic budget left beside what was
+copied, and the status document's `reason` and the log's `projection tile:`
+line say why a copy was skipped (see
+[Observability](observability.md)). The on-disk forks are keyed
+by whether the MLP was converted: where the tile is active, changing the
+setting to or from `false`, or loading without the drafter (which never
+converts), starts the fork store cold once. The daemon reads it at startup,
+so a change takes effect on its next start.
+
 `[model].kv_int8` (default `true`) runs decode's and speculative verify's
 attention over an int8 copy of the context's keys and values instead of the
 bf16 cache, on the attention tile's key partition (sous's own kernels,
@@ -270,9 +349,10 @@ keys and values from a real 35K-token prompt that costs about 1 % relative
 error on the keys and values themselves and 0.7 % median (1.8 % in the worst
 layer) on the attention output. So, unlike the tile and the projection
 kernel, it moves more than the last bits: a reply can differ from one with
-`false`, which reads the bf16 cache. Greedy output with the drafter still
-equals output without it, since a verify row reads the same int8 rows as the
-decode step at the same key count.
+`false`, which reads the bf16 cache. A verify row reads the same int8 rows as
+the decode step at the same key count, so greedy output with the drafter still
+equals output without it wherever `projection_tile` is not active, and stays
+the same at any block size where it is.
 
 Only a generation reads the copy. It is built from the bf16 cache on the
 first decode step at or past the floor and dropped when the generation ends,
@@ -336,7 +416,9 @@ drafter-off decode with `projection_kernel = false`, 13.6 tok/s on 64 real
 subagent turns at 44–77K tokens — against 2.0x at block 4 without the kernel
 (27.1 against 13.6 tok/s; 1.83x at block 3). Either way, output with the
 drafter was identical to plain decode under the same setting on every turn
-(#118, #148). Measured against the kernel's own drafter-off decode as it ran
+(#118, #148; measured before `projection_tile`, which relaxes that to block
+invariance where it is active). Measured against the kernel's own drafter-off
+decode as it ran
 before one-row calls had a kernel of their own (see `projection_kernel`
 above), the same runs are about 2.9x.
 The "~2.4x greedy" figure earlier versions quoted ran an argmax sampler
