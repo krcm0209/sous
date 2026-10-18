@@ -4,7 +4,8 @@ slab-only MLP paths, drafter on against drafter off, and the scope on the load l
 Every engine but one tile-off reference runs what a 64 GB M5 Pro serves: int8 prefill, the
 attention tile, the projection kernel, kv8 at the default 131072 window and the DFlash2
 drafter at its resolved block, with the tile forced to scope "all" or "mlp" and an explicit
-12 GiB prompt-cache budget. Acceptance bars (manual, on the M5 Pro):
+12 GiB prompt-cache budget. Acceptance bars (manual, on the M5 Pro; about 23 minutes, 1391 s
+measured, most of it ten decodes of the ~57,560-token prompt with the prompt cache off):
 - Each such engine reports the tile active at its scope and kv8 active; the test skips,
   naming the reason, where the tile cannot be.
 - Block invariance, the contract on the drafter's path: at each scope, greedy token ids at
@@ -197,8 +198,8 @@ def _tap(*, logits: bool = False) -> Iterator[list[_Trace]]:
     run. The drafter run's later tokens come from greedy verify, whose logits reach
     their sampler inside _dflash_verify_greedy, a module global _dflash_rounds looks up
     per round. Both wrappers hand back what they wrap returned, so the decode is
-    unchanged. Install after the engine loads: the kernels' load-time source pins read
-    _dflash_verify_greedy (through __wrapped__, which functools.wraps sets)."""
+    unchanged. Installed after the engine loads, so the kernels' load-time source pins
+    hash mlx-vlm's own _dflash_verify_greedy."""
     import mlx_vlm
     from mlx_vlm.speculative import dflash
 
@@ -293,13 +294,13 @@ def test_greedy_output_is_block_invariant_on_the_tile():
                         # What a load at block 0 leaves: _pin_block_size pins only a block
                         # above 0, so the drafter's own policy picks every round's depth.
                         drafter.prefer_requested_block_size = False
-                    before, cut = dict(projkernel.calls), len(seen)
+                    before, mark = dict(projkernel.calls), len(seen)
                     started = time.perf_counter()
                     for name, messages in prompts.items():
                         ids[(block, name)] = _decode(engine, messages, traces).ids
                         spec[(block, name)] = engine.speculation()
                     counts[block] = {k: v - before[k] for k, v in projkernel.calls.items()}
-                    splits[block] = seen[cut:]
+                    splits[block] = seen[mark:]
                     print(
                         f"scope {scope} block {block}: {time.perf_counter() - started:.1f} s,"
                         + "".join(
@@ -519,9 +520,10 @@ def test_the_tile_sits_at_the_bf16_floor_on_every_linear():
 
 def _mlp_inputs(root: Any) -> dict[tuple[int, int], Any]:
     """[1, t, K] rows per (K, t), uniform on [-1, 1]. Per-row int8 activation noise is
-    what separates int8 from stock: on normal rows, whose amax runs to 4 sigma over these
-    K, it is about 0.95e-2 relative, at the bound itself; on uniform rows about 0.4e-2,
-    so the bound still parts that noise from a wrong slab read (relative error near 1)."""
+    what separates int8 from stock: on normal rows, whose amax runs to about 4 sigma over
+    these K, it is 0.9-1.0e-2 relative (9.2e-3 measured at K = 5120), at the bound itself;
+    on uniform rows 4.6-4.8e-3 measured on the 27B, so the bound still parts that noise
+    from a wrong slab read (relative error near 1)."""
     ks = sorted({projkernel._in_features(getattr(root.model.layers[0].mlp, n)) for n in _MLP})
     out: dict[tuple[int, int], Any] = {}
     for i, k in enumerate(ks):
