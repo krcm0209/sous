@@ -143,8 +143,8 @@ class SousConfig:
     # units, through one GQA-packed tile whose key partition steps with the
     # context. On by default because it is as accurate as stock and a verify
     # row equals the decode step at its key count, so greedy output is the
-    # same with the drafter on or off while projection_tile is off (and the
-    # same at any block size while it is active); it is not bit-identical
+    # same with the drafter on or off while projection_tile is not active
+    # (and the same at any block size while it is); it is not bit-identical
     # to stock's kernels, hence the switch, and false runs the stock paths.
     # Active only on a measured split target (the M5 Pro's 20 GPU cores),
     # `unavailable` with the reason anywhere else. Read once, at daemon start.
@@ -152,8 +152,8 @@ class SousConfig:
     # The target's small-row quantized projections through one simdgroup-MMA
     # kernel whose rows do not depend on how many rows or linears share the
     # call: every verify forward's and, so that greedy output stays the same
-    # with the drafter on or off while projection_tile is off, every other
-    # target call of up to 8 rows, decode included (with projection_tile
+    # with the drafter on or off while projection_tile is not active, every
+    # other target call of up to 8 rows, decode included (with projection_tile
     # active, its tile takes the verify projections it holds weights for).
     # With it a deeper verify round's projections cost about
     # what 4 rows' do, which makes a deeper block pay: block 5 ran 1.10x
@@ -177,11 +177,14 @@ class SousConfig:
     # copy and "all" always does; false leaves every projection where
     # projection_kernel puts it. While it is active, greedy output with the
     # drafter is the same at any block size but differs from output without
-    # the drafter by bf16 rounding inside the projections, so a near-tie can
-    # resolve the other way; refused or off, the two are identical. Refused,
-    # with the reason, wherever the projection kernel, the attention tile, a
-    # DFlash drafter or int8 prefill is missing, or the GPU's core count is
-    # not one its plans were measured on. Read once, at daemon start.
+    # the drafter by bf16 rounding inside the projections and, on prefill
+    # chunks of 9-127 rows, by int8 prefill's activations on the MLP (a load
+    # without the drafter never converts it, so stock serves those chunks
+    # there), so a near-tie can resolve the other way; where it is not active,
+    # the two are identical. Refused, with the reason, wherever the
+    # projection kernel, the attention tile, a DFlash drafter or int8 prefill
+    # is missing, or the GPU's core count is not one its plans were measured
+    # on. Read once, at daemon start.
     projection_tile: bool | str = True
     # Decode's and the exact verifier's attention read an int8 copy of the
     # context's K/V (one symmetric scale per token and KV head) with int8
@@ -195,8 +198,8 @@ class SousConfig:
     # a ceiling (about 84.5K keys at the 131072 window, 170K at 262144) and
     # the rest of the generation runs on the tile. Which path a row takes
     # depends only on its own key count, so greedy output with the drafter
-    # equals greedy output without it while projection_tile is off, and is
-    # the same at any block size while it is active. Not bit-identical to
+    # equals greedy output without it while projection_tile is not active,
+    # and is the same at any block size while it is. Not bit-identical to
     # the tile, hence the switch; false runs the tile.
     # Active only where the attention tile is, `unavailable` with the
     # reason anywhere else. Read once, at daemon start.

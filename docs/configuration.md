@@ -296,9 +296,12 @@ else shares the call, but not bit for bit the way the projection kernel
 computes a single row. So with it active, greedy output with the drafter is
 the same at any `speculative_block_size` for a given load and scope, and
 differs from output without the drafter by bf16 rounding inside the
-projections: a near-tie can resolve the other way. Where it is not active
-(`false`, no DFlash drafter, int8 prefill off, another Mac), output with the
-drafter equals output without it, as above.
+projections and, on prefill chunks of 9 to 127 rows, by int8 prefill's
+activations on the MLP (a load without the drafter never converts the MLP, so
+stock `quantized_matmul` serves those chunks there): a near-tie can resolve the
+other way. Where it is not active (`false`, or `unavailable`: no DFlash
+drafter, int8 prefill off, another Mac), output with the drafter equals output
+without it, as above.
 
 The copy is decided in bytes when the model loads. With `prompt_cache_gb`
 automatic, it is made when Metal's headroom at that moment (the weights and

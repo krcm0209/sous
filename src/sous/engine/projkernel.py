@@ -1322,7 +1322,9 @@ def _probe_steps(root: Any) -> str | None:
     # Through both hooks, on the first full-attention layer (layer 3 of the
     # 27B): the exact verifier's feed-forward over _PROBE_ROWS rows (gate+up
     # fused, then down) against the plain MLP one row at a time, as decode
-    # calls it. Its rows must be identical, which is what greedy parity rests on.
+    # calls it. Its rows must be identical: drafter-on/off greedy parity rests
+    # on that while the projection tile is not active, and while it is, every
+    # path outside the tile's decode window keeps these bits.
     mlp = full.mlp
     verifier = _verifier_class()()
     x = mx.random.normal((1, _PROBE_ROWS, _in_features(mlp.gate_proj)), key=mx.random.key(0))

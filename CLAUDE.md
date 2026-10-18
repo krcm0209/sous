@@ -368,7 +368,7 @@ goal.
   units (`kernels/attention_tile.metal`: a split kernel and a fixed-order
   reduce, specialised to bf16, 24/4/256 heads and scale 1/16). A verify row
   equals its one-row decode call — what greedy parity with the drafter on
-  or off rests on while the projection tile is off, and what block
+  or off rests on while the projection tile is not active, and what block
   invariance on the drafter's path rests on while it is active
   (`engine/projtile.py` bullet) — only because a row's output
   depends on its chunk and nothing else about the call, and the chunk is
@@ -454,7 +454,7 @@ goal.
   sampled DFlash drafter's call of the target's shared `lm_head`. Inside
   a decode window the projection tile takes a verify run or a call of 2–8
   rows instead where it can (`engine/projtile.py` bullet). With the tile
-  off, greedy parity with the drafter on or off holds only because the
+  not active, greedy parity with the drafter on or off holds only because the
   kernel's rows are bitwise independent of the row count T and of which
   linears share a dispatch (with it active the verify projections it holds
   planes for run on the tile, whose rows are T-invariant but not the
@@ -633,8 +633,8 @@ goal.
   `speculative_verify_dflash_hidden`, pin drift, a compile or probe failure
   and any exception (logged with its traceback) say it should have run: one
   `warnings.warn`, `sous: projection kernel unavailable (…)`. Both are
-  `unavailable`; `off` is never a refusal. With the projection tile off,
-  parity still rests on one thing
+  `unavailable`; `off` is never a refusal. With the projection tile not
+  active, parity still rests on one thing
   the probe cannot cover: drafter-off greedy takes its argmax over bf16
   `logits − logsumexp(logits)` (`generate/ar.py`) and greedy verify over
   raw logits (`sampler(logits)` in `dflash.py`), so the two can differ only
@@ -714,10 +714,13 @@ goal.
   one-row bits, the GDN verifier is batch-invariant), so for a given load
   and scope greedy output with the drafter is the same at any block — and
   drafter-on output differs from drafter-off by bf16 rounding inside the
-  projections, so the two agree except at near-ties. Where it is refused or
-  off (`projection_tile = false`, no DFlash drafter, int8 prefill off,
-  another Mac) drafter on equals drafter off bit for bit, as before the
-  tile. It serves only while `serves(rows, hook=)` holds — `_active`, a
+  projections and, on prefill chunks of 9–127 rows, by int8 prefill's
+  activations on the MLP (a drafterless load is refused with `no drafter`
+  and never converts, so stock `quantized_matmul` serves those chunks
+  there), so the two agree except at near-ties. Where it is not active
+  (`projection_tile = false`, or `unavailable`: no DFlash drafter, int8
+  prefill off, another Mac) drafter on equals drafter off bit for bit, as
+  before the tile. It serves only while `serves(rows, hook=)` holds — `_active`, a
   decode window open, the round flag set — through projkernel's two hooks:
   hook 1 (`_serve_verify`) run by run after its cut into runs of ≤ 8, at any
   rows, a one-row remainder included, so a verify of more than 8 rows never
@@ -879,7 +882,7 @@ goal.
   verify row reads the same codes as the decode step at its key count, so
   a verify row equals its one-row call: as for the tile, what greedy
   parity with the drafter on or off rests on while the projection tile is
-  off and block invariance while it is active. kv8 itself differs from the
+  not active and block invariance while it is. kv8 itself differs from the
   bf16 tile by the quantisation, not in the
   last bits. The mirror exists only inside `VLMEngine.decode()`, which,
   when kv8 is active, calls `kv8.open_window()` inside the draft-context `seed` block

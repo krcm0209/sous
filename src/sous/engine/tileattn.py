@@ -14,8 +14,10 @@ in. So the chunk is fixed within each step of 32 * S keys (S the GPU's core
 count, one wave of threadgroups); a verify call is cut into runs that never
 cross N0, a step boundary or 8 rows; and below N0 decode and verify both take
 stock paths that are exact against each other. Every verify row then equals a
-one-row decode at its own length, so greedy output with a drafter equals greedy
-output without one, whatever the block size.
+one-row decode at its own length: while the projection tile is not active,
+greedy output with a drafter therefore equals greedy output without one at any
+block size; while it is, that equality is one of what block invariance on the
+drafter's path rests on.
 
 Two hooks reach it. One-row decode goes through a replacement of the
 ``scaled_dot_product_attention`` global in mlx-vlm's qwen3_5 language module,
@@ -799,8 +801,10 @@ def _drafter_reason(drafter_kind: str | None) -> str | None:
 
 def _verify_reason(drafter_kind: str | None, verify_status: Mapping[str, Any] | None) -> str | None:
     """With a drafter, the verifier must be on its exact grouped path too:
-    otherwise decode runs the tile while verify runs stock SDPA, and output
-    with the drafter no longer equals output without it."""
+    otherwise decode runs the tile while verify runs stock SDPA, and a verify
+    row no longer equals its one-row call, which drafter-on/off parity rests on
+    while the projection tile is not active and block invariance on the
+    drafter's path while it is."""
     if drafter_kind is None:
         return None
     state = (verify_status or {}).get("state")

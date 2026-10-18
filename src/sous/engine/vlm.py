@@ -123,9 +123,11 @@ class VLMEngine:
             self._model, enabled=self._draft is not None
         )
         # After the verifier, whose status it reads: with a drafter, decode may
-        # take the tile only if verify does too, or output with the drafter
-        # would differ from output without it. Before the budget is measured,
-        # so the probe's transient K/V is already released.
+        # take the tile only if verify does too, or a verify row would stop
+        # equalling its one-row call, which drafter-on/off parity rests on
+        # while the projection tile is not active and block invariance on the
+        # drafter's path while it is. Before the budget is measured, so the
+        # probe's transient K/V is already released.
         self.attention_tile_status = tileattn.enable(
             self._model,
             enabled=attention_tile,
