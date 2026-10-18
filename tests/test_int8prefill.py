@@ -661,6 +661,28 @@ def test_a_batch_of_short_calls_on_a_slab_only_linear_routes_as_its_total_rows(
     assert rel.item() < 3e-2
 
 
+def test_int8_small_counts_the_nine_to_127_row_calls_and_not_the_128_row_ones(
+    monkeypatch, wrappers
+):
+    """The projection tile's gate reads int8_small as the evidence that a slab-only
+    call went to int8 on its own floor: it moves from nine rows to 127, where stock
+    served the call before the conversion, and not from 128 rows up, which int8
+    takes with or without it. A linear and an MLP count the same."""
+    monkeypatch.setattr(i8, "qmm", _either_form_qmm)
+    monkeypatch.setitem(i8.calls, "int8_small", 0)
+    mlp = ptfx.tiny_slab_model(seed=0, scope="mlp").model.layers[0].mlp
+    _tag_all(mlp)
+    for caller in (mlp.gate_proj, mlp):
+        for rows in (9, 64, 127):
+            before = i8.calls["int8_small"]
+            caller(pfx.activations(rows, 256, seed=rows).reshape(1, rows, 256))
+            assert i8.calls["int8_small"] == before + 1, (caller, rows)
+        for rows in (128, 200):
+            before = i8.calls["int8_small"]
+            caller(pfx.activations(rows, 256, seed=rows).reshape(1, rows, 256))
+            assert i8.calls["int8_small"] == before, (caller, rows)
+
+
 def test_linear_int8_hands_qmm_a_slab_only_for_a_slab_only_module(monkeypatch):
     """Only a slab-only module's call names its form, so a six-argument qmm
     stand-in keeps serving an unconverted model, and the output is reshaped to

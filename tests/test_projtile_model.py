@@ -130,8 +130,9 @@ def _require_the_tile() -> None:
 
 def _check_tile(engine: VLMEngine, scope: str) -> None:
     status = engine.projection_tile_status
-    if status["state"] != "active":
-        pytest.skip(f"projection tile {status['state']}: {status['reason']}")
+    # Not a skip: _require_the_tile has already passed every static check, so a
+    # tile that did not load here is a probe failure or pin drift, which must fail.
+    assert status["state"] == "active", f"projection tile {status['state']}: {status['reason']}"
     assert status["scope"] == scope, status
     assert engine.kv_int8_status["state"] == "active", engine.kv_int8_status
     assert engine.projection_kernel_status["state"] == "active", engine.projection_kernel_status
@@ -326,11 +327,14 @@ def test_greedy_output_is_block_invariant_on_the_tile():
         for block in BLOCKS:
             assert counts[block]["verify_tile"] > 0, (scope, block, counts[block])
             assert counts[block]["declined"] == 0, (scope, block, counts[block])
-            assert (counts[block]["verify_split"] > 0) == (block == SPLIT_BLOCK), (
-                scope,
-                block,
-                counts[block],
-            )
+            # Block 0 leaves the depth to the drafter's own policy, which may verify
+            # up to 16 rows, so whether it cuts a call is left open.
+            if block != 0:
+                assert (counts[block]["verify_split"] > 0) == (block == SPLIT_BLOCK), (
+                    scope,
+                    block,
+                    counts[block],
+                )
         # Block 2 drafts one token a round, so its verify is two rows throughout.
         assert all(spec[(2, name)].drafted == spec[(2, name)].rounds for name in prompts)
         # The long prompt's generation sits between kv8's floor and its ceiling.
@@ -758,8 +762,9 @@ def test_the_status_and_load_line_name_the_scope(tmp_path, caplog):
             assert len(loads) == 1, loads
             line, status = loads[0], manager.status()
             print(line)
-            if engine.projection_tile_status["state"] != "active":
-                pytest.skip(f"projection tile: {engine.projection_tile_status}")
+            # Not a skip: the static checks passed, so a tile that did not load
+            # is a probe failure or pin drift.
+            assert engine.projection_tile_status["state"] == "active", engine.projection_tile_status
             tokens = line.split()
             block = status["projection_tile"]
             assert set(block) == {"state", "scope", "reason", "copy_gb", "probe_seconds"}, block
