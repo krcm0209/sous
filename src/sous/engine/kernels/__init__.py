@@ -32,10 +32,11 @@ writes and ``nax.h``; the reduce body gets ``common.h`` only.
 
 The int8 prefill kernels are derived from oMLX (jundot/omlx#3548), the
 projection kernel in part from Splash (incoai/splash and its Apple7/8 port), and
-the projection tile from Splash's ``q4_mpp_tiles.h`` at 0d5a035, all under the
-Apache License 2.0; see THIRD_PARTY_NOTICES.md. The slab weight layout read by
-``projection_mma.metal``'s ``SLAB`` bodies, ``projection_row.metal``'s slab body
-and ``q4_int8_gemm.metal``'s ``SLAB`` read is Splash's too.
+the projection tile from Splash's ``q4_mpp_tiles.h`` and ``linear_q4.metal`` at
+0d5a035, all under the Apache License 2.0; see THIRD_PARTY_NOTICES.md. The slab
+weight layout read by ``projection_mma.metal``'s ``SLAB`` bodies,
+``projection_row.metal``'s slab body and ``q4_int8_gemm.metal``'s ``SLAB`` read is
+Splash's too.
 ``attention_tile.metal``, ``attention_tile_kv8.metal`` and ``kv8_quant.metal`` are
 sous's own, and so is ``projection_row.metal`` apart from the nibble decode and
 epilogue it shares with the projection kernel and its slab body's layout.

@@ -275,14 +275,17 @@ since it rides on the tile, and a window too small to put the ceiling
 above the floor — the status document's engine block carries `kv_int8`
 with its state and reason, and the log splits INFO and `WARNING` the way
 it does for the tile). Beyond these fields, and kv8's on the turn line, none
-of these kernels logs anything per turn: in-process counters (`int8prefill.calls`, `tileattn.calls`, `projkernel.calls`,
-`kv8.calls`) count every path for the tests and for harnesses that wrap the
-daemon — the projection tile's verify runs as
-`projkernel.calls["verify_tile"]`, its module calls as
-`projkernel.calls["plain_tile"]`, and the prefill calls of 9 to 127 rows
-that int8 prefill took over from stock on the slab-only MLP as
-`int8prefill.calls["int8_small"]`. One
-more line names the Anthropic tool *types* a turn dropped, when any.
+of these kernels logs anything per turn: in-process counters count their paths
+for the tests and for harnesses that wrap the daemon. `tileattn.calls`,
+`projkernel.calls` and `kv8.calls` count every path they serve — the projection
+tile's verify runs as `projkernel.calls["verify_tile"]` and its module calls as
+`projkernel.calls["plain_tile"]`. `int8prefill.calls` has one key,
+`"int8_small"`: the calls on the slab-only MLP that only its own nine-row floor
+admits (under 128 rows in the last leading dimension, nine or more in all),
+which stock served before the conversion, counted once per MLP call and once per
+linear called on its own; the calls int8 prefill always took, from 128 rows, are
+not counted. One more line names the Anthropic tool *types* a turn dropped,
+when any.
 Each forwarded request logs one line too: `upstream`, method, path, the
 model id when the body named one, the upstream's status, and seconds to
 its headers — at `INFO` whatever the status, since that is the upstream's

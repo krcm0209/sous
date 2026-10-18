@@ -821,10 +821,15 @@ goal.
   conversation: a copy that evicts the forks costs more prefill than it
   saves decode), under a configured `prompt_cache_gb` iff that budget fits
   beside the copy, and keeps `mlp` when the headroom is unreadable; never a
-  warning. The copy is 4.09 GB on the 27B (b+a pads to one tile), so a 64 GB
-  M5 Pro loads `active:mlp` at 262144 (the copy would leave about 13 GiB)
-  and `active:all` at 131072 (about 21); `measure_cache_budget` runs after
-  the copy and finds it inside `active`. The probe takes the first
+  warning. The copy is 4.09 GB on the 27B (b+a pads to one tile). Measured on
+  the 64 GB M5 Pro with the automatic budget: at 262144 the budget is about
+  17.9 GiB without the copy and 14.07 GiB (15,102,367,760 bytes) with it,
+  0.07 GiB above the rule, so the automatic scope is `active:all` there but
+  sits on the rule's edge (a change to the weights, the drafter, mlx, the
+  window or the reserve can flip it to `mlp`), and a maintainer who wants a
+  fixed scope pins `"all"` or `"mlp"`; at 131072 the copy leaves about 22 GiB
+  and the scope is `all`. `measure_cache_budget` runs after the copy and finds
+  it inside `active`. The probe takes the first
   full-attention layer's MLP (layer 3 of the 27B) and, at `all`, its
   attention and the first GDN layer's linears (layer 0), every call and each
   of its linears alone: every row at T = 1..8 `array_equal` to the same row

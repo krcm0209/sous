@@ -113,10 +113,10 @@ its own turn, and a cold turn's second fork copy never evicts its first, so
 `0` means exactly one slot and a 32 GB machine
 degrades to that on its own. Where `projection_tile` copies the attention and
 linear-attention weights (4.1 GB), `"auto"` is that much smaller: on a 64 GB
-M5 Pro at the default window with the default drafter loaded, about 21 GiB
-where it would be about 25. At
-262144 the tile skips the copy rather than leave less than 14 GiB (see
-`projection_tile` below).
+M5 Pro at the default window with the default drafter loaded, about 22 GiB
+where it would be about 26. At 262144 it is 14.07 GiB where it would be 17.9,
+just above the 14 GiB floor the copy is made down to (see `projection_tile`
+below).
 
 `[model].prompt_cache_disk_gb` (default `"auto"` — a number sets the GiB,
 `0` keeps nothing on disk) bounds the tools forks kept under
@@ -313,11 +313,15 @@ it saves decode. With `prompt_cache_gb` set, it is made when that budget still
 fits beside the copy. On a 64 GB M5 Pro with the default model and drafter,
 Metal's working set is about 51.8 GiB and the resident weights about 17 GiB;
 at `max_context_tokens = 131072` (8 GiB of KV reserve) the automatic budget is
-about 25 GiB, the copy (3.8 GiB) leaves about 21, and the load is `active:all`;
-at 262144 the reserve doubles to 16 GiB, the budget is about 17 GiB, the copy
-would leave about 13, and the load is `active:mlp`. `"all"` there leaves those
-13 GiB, below the ~14 GiB where cold turns start paying for forks they never
-reuse. A second stage, not built yet, would put every projection in this
+about 26 GiB, the copy (3.8 GiB) leaves about 22, and the load is `active:all`;
+at 262144 the reserve doubles to 16 GiB and the budget is 17.9 GiB without the
+copy and 14.07 GiB with it (measured), 0.07 GiB above the rule, so the load is
+`active:all` there too — on the rule's edge: a change to the weights, the
+drafter, mlx, the window or the reserve can drop the budget under 14 GiB and
+make the same configuration load `active:mlp`. To keep one scope whatever the
+headroom, set `"all"` (always the copy; at 262144 that leaves about 14 GiB, the
+floor below which cold turns pay for forks they never reuse) or `"mlp"` (never).
+A second stage, not built yet, would put every projection in this
 order and drop the copy and its rule.
 
 It is active only beside an active projection kernel and attention tile (so
