@@ -48,13 +48,15 @@ model: deciding what to delegate and reviewing what comes back.
 - **Tuned for your machine.** `sous tune` (about 15 minutes quick, about
   three hours in full) measures and grades candidate models on your Mac and
   proposes the configuration.
-- **Speed never changes the answer.** Every speed feature shipped behind a
-  pre-registered gate on real Claude Code subagent turns: greedy output with
-  the drafter equals output without it (68 of 68 turns, to 229K tokens), the
+- **Speed is checked against the answer.** Every speed feature shipped behind
+  a pre-registered gate on real Claude Code subagent turns: greedy output is
+  the same at any verify block size (68 of 68 turns at three sizes, to 229K
+  tokens) and, on an M5 Pro, with the drafter against without it differs
+  only at near-ties (25 of 68 turns, each at a tie or one bf16 step); the
   int8 copy of the context that decode reads moved the next-token
-  distribution by a mean KL of 0.0001 against the bf16 model, and `sous tune`
-  proposes only settings that cannot change what the model says. The numbers
-  are in the pull requests that shipped them.
+  distribution by a mean KL of 0.0001 against the bf16 model; and
+  `sous tune` proposes only settings that cannot change what the model says.
+  The numbers are in the pull requests that shipped them.
 
 What it will not do for you:
 
@@ -417,7 +419,21 @@ Validated end to end on an M5 Pro / 64 GB with the default model
   output with the drafter equalled output without it on 68 of 68 turns to
   229K tokens; the next-token distribution moved by a mean KL of 0.0001
   over 7,061 scored tokens; the tool-loop suite read within 0.004 of the
-  bf16 arm.
+  bf16 arm. That parity is the contract from before the projection tile:
+  since the tile (2026-10-18), greedy output with the drafter is the same at
+  any block size and differs from output without it only at near-ties (see
+  [Why use it](#why-use-it)).
+- **Projection tile** (2026-10-18): on 64 real subagent turns of 44–77K
+  tokens, decode ran 1.115x [1.072, 1.160] with the tile on against off in
+  same-hour ABBA order (1.082x [1.028, 1.165] with the MLP alone on it),
+  and a verify round took 0.888x the time [0.884, 0.892] with the tile drawn
+  per round over 127 distinct turns of 44–88K; greedy output was identical
+  at blocks 2, 8 and the drafter's own on 68 of 68 turns to 229K tokens;
+  with the drafter against without it, 43 of 68 turns were identical and
+  the other 25 parted where one run had a tie or one bf16 step; the
+  tool-loop suite read +0.005 [0.000, +0.016] against the tile off; loading
+  it costs about 1 s (7 s with its kernels compiled cold) and a 4.1 GB copy
+  of the attention and linear-attention projections.
 
 ## Limitations
 
