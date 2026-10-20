@@ -158,6 +158,21 @@ class VLMEngine:
             else:
                 self._draft_block_size = SPECULATIVE_BLOCK_DEFAULT
         _pin_block_size(self._draft, self._draft_block_size)
+        # The drafter's own linears ride the same kernel from six rows up (its
+        # proposals only, so none of the target's contracts): decided once the
+        # kernel's state has settled and the block has resolved, since a block
+        # of 1-5 never feeds the drafter's calls six rows in steady state and
+        # leaves the route off. Before kv8 and the budget, so the probe's
+        # transient arrays are released when the budget is measured.
+        self.projection_kernel_drafter_status = (
+            projkernel.enable_drafter(
+                self._draft,
+                kernel_status=self.projection_kernel_status,
+                block_size=self._draft_block_size,
+            )
+            if self._draft is not None and self._draft_kind == "dflash"
+            else projkernel.drafter_off()
+        )
         # After the projection kernel, once the tile's and the verifier's
         # states are settled: kv8 serves only where the tile does and rides
         # on its step schedule, its verify plan and, with a drafter, exact

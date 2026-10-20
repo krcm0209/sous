@@ -224,7 +224,21 @@ decode and short prefill tails — run on the small-row projection kernel, with
 a load the kernel cannot serve, every load whose attention tile is not
 `active` included, since the kernel rides on the tile — the status document's
 `projection_kernel` block carries the reason, and the log splits INFO and
-`WARNING` the way it does for the tile), and, whenever a drafter loaded,
+`WARNING` the way it does for the tile), and on the mlx-vlm backend
+`projection_kernel_drafter=active|unavailable|off` (whether the DFlash
+drafter's own linears ride the kernel at six rows and more, with
+`projection_kernel_drafter_probe_s=` when they do; `off` means no DFlash
+drafter, the kernel switched off, or a `draft_block` of 1 to 5, whose draft
+calls stay below six rows in steady state, and `unavailable` a route this
+load cannot serve, which the log splits into INFO — the kernel not active, a
+drafter linear it cannot take, a drafter class it was not validated with —
+and `WARNING` — a validated drafter whose forward differs from the mlx-vlm
+code it was validated on, a failed warm-up or probe — the same way; the
+status document's `projection_kernel` block carries it as `drafter`, with
+its reason; at `draft_block=0` with the default DFlash2 drafter, whose own
+policy stays at five rows, an `active` route serves nothing in steady
+state), and, whenever
+a drafter loaded,
 `draft_block=` (the verify block the engine pinned: the configured
 `speculative_block_size`, or for an unset one 8 where the projection kernel
 is active, 4 where only the attention tile is and 3 elsewhere, 0 being the

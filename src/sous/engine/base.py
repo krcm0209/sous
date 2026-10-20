@@ -439,6 +439,13 @@ class ManagedEngine:
         return getattr(self._inner, "projection_kernel_status", None)
 
     @property
+    def projection_kernel_drafter_status(self) -> dict | None:
+        # Optional like the kernel's own: VLMEngine.__init__ always sets it
+        # (`off` without a DFlash drafter); the LM backend and fakes have
+        # none, and the load line and the status document then leave it out.
+        return getattr(self._inner, "projection_kernel_drafter_status", None)
+
+    @property
     def kv_int8_status(self) -> dict | None:
         # Optional on purpose, like attention_tile_status: the VLM backend
         # reports whether kv8 serves this load, the LM backend reports it
@@ -760,8 +767,15 @@ class EngineManager:
             line += f" projection_kernel={proj['state']}"
             if proj["state"] == "active":
                 line += f" projection_kernel_probe_s={proj['probe_seconds']}"
+            # The drafter's own linears ride on the kernel, so their route's
+            # state sits beside the kernel's.
+            drafter = engine.projection_kernel_drafter_status
+            if drafter is not None:
+                line += f" projection_kernel_drafter={drafter['state']}"
+                if drafter["state"] == "active":
+                    line += f" projection_kernel_drafter_probe_s={drafter['probe_seconds']}"
         # Resolved at load, so the config alone cannot say which block runs:
-        # an unset one is 5 where the kernel is active, 4 where only the
+        # an unset one is 8 where the kernel is active, 4 where only the
         # attention tile is and 3 elsewhere.
         if engine.draft_block is not None:
             line += f" draft_block={engine.draft_block}"
@@ -1099,6 +1113,16 @@ class EngineManager:
                 proj = self._engine.projection_kernel_status
                 if proj is not None:
                     out["projection_kernel"] = {"state": proj["state"], "reason": proj["reason"]}
+                    # The drafter's own route rides on the kernel: once the
+                    # load line has scrolled away, this is what says whether
+                    # the drafter's linears are served, and why not.
+                    drafter = self._engine.projection_kernel_drafter_status
+                    if drafter is not None:
+                        out["projection_kernel"]["drafter"] = {
+                            "state": drafter["state"],
+                            "reason": drafter["reason"],
+                            "linears": drafter["linears"],
+                        }
                 # The block the drafter runs, as resolved at load: present
                 # whenever the backend knows drafters, None while it runs
                 # without one.

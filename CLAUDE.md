@@ -491,7 +491,8 @@ goal.
   wrapped on top): hook 1 wraps `Qwen3_5BatchInvariantForward._linear` and
   `_linears` on the class and routes when the flag is set, every linear in
   the call is tagged and x is bf16 with ndim 3, cutting a call of more than
-  8 rows (block 0, the drafter's own policy, verifies up to 16) along T
+  8 rows (block 0, the drafter's own policy, verifies up to the checkpoint's
+  runtime block: 16 for a v1 DFlash, 5 for the default DFlash2) along T
   into runs of ≤ 8, exact because the kernel is T-invariant; hook 2 wraps
   `nn.QuantizedLinear.__call__` and routes when the flag is set, the module
   is tagged, x is bf16 and its rows (the product of the leading
@@ -501,9 +502,65 @@ goal.
   `Qwen3_5BatchInvariantForward` and inherit hook 1, so only the tag keeps
   them stock. Tags (`_TAG`, set with `object.__setattr__` so they stay out
   of mlx's parameter tree) go on every `QuantizedLinear` of the loaded
-  target's language model, `lm_head` included (497 on the default 27B);
-  the drafter's own linears are never tagged, and the greedy drafter's
-  head argmax (`quantized_argmax`) stays stock, since it shapes proposals
+  target's language model, `lm_head` included (497 on the default 27B).
+  The drafter's own linears carry a tag of their own (`_DRAFT_TAG`) under a
+  flag of their own (`_draft_active`, set by `enable_drafter()`, which
+  `VLMEngine.__init__` calls with the resolved block after `enable()`, the
+  block resolution and `_pin_block_size` and before kv8; `enable()` clears
+  both flags, as `clear()` does), which hook 2 serves
+  only from `_DRAFT_MIN_ROWS` = 6
+  rows to 8: stock `quantized_matmul` serves the drafter's shapes at
+  135–197 GB/s up to five rows and falls to about 100 at eight, where the
+  kernel reads at 126–177 (M5 Pro, 2026-10-16), so at block 8 the draft's
+  eight-row calls go to the kernel, and so do the context calls (`fc` at
+  K = 25600, every layer's `k_proj` and `v_proj` on `x_ctx`) of a round
+  that committed six to eight tokens, since mlx-vlm's `_dflash_rounds` cuts
+  the context to `accepted + 1` rows, and an unseeded first draft's
+  seven-row generation prompt (a floor moved off six must bench both
+  shapes); at blocks 1–5 no steady-state call reaches six rows and the
+  route is `off` (below). They shape proposals only, so no bitwise or
+  T-invariance contract is owed to
+  them, their probe is relrms against stock at 6, 7 and 8 rows on every
+  (K, N) the drafter holds (the warm-up compiles the same), and the drafter
+  stays out of the fork key. Whether the drafter's calls reach hook 2 is
+  guarded on two sides, since the warm-up and the relrms step call `mma`
+  directly. The probe ends by tagging the drafter and calling one of its
+  linears at 8 rows as a module with the flag raised: `draft_kernel` must
+  move, or the route is `unavailable` and untagged. That proves only that a
+  drafter linear's own `__call__` is the hooked one (a `QuantizedLinear`
+  subclass with a `__call__` of its own fails it); it never runs the
+  drafter's forward. The forward is pinned instead: `VALIDATED_DRAFT_SOURCES`
+  hashes, as `VALIDATED_PROJ_SOURCES` does, every mlx-vlm function from
+  `draft_block` and `draft_block_greedy` to the linears (`_hidden`;
+  `_project_context_kv`, which already fuses every layer's k/v into one
+  matmul when they are `nn.Linear`; the decoder layer, the attention and its
+  `_project_kv`, the MLP; DFlash2's convolutions' `prepare` and its
+  selector's `select`), for the drafter classes in `VALIDATED_DRAFTERS`
+  (v1 DFlash and DFlash2, by `module:qualname`). `_draft_pins_reason`, just
+  before the warm-up, gives two kinds of refusal. A drafter of any other
+  class (Laguna, the DSpark variants, a subclass of either) is one the route
+  does not apply to: `unavailable`, one INFO line, `drafter <class> not
+  validated`. In a validated class it reads each pinned function through the
+  loaded drafter's own classes, so a forward that fused the quantized k/v or
+  called `quantized_matmul` directly, or a component overriding a pinned
+  function, reads as mlx-vlm drift: `unavailable`, one warning, `mlx-vlm
+  <qualname> changed`. `enable_drafter()` reports through the
+  kernel's `_refuse` (subject `projection kernel drafter`) in its
+  vocabulary: `off` with the kernel switched off or a verify block of 1–5
+  (whose draft calls stay below the floor in steady state), checked in that
+  order before anything else. Block 0, the drafter's own policy, proceeds
+  because a drafter's own policy may exceed five rows (a v1 DFlash
+  checkpoint's 16); under the default DFlash2's runtime block of 5 an
+  `active` route there serves nothing in steady state, and `draft_kernel`
+  stays 0. `unavailable` with one INFO line where the route does
+  not apply (the kernel not active, no quantized linear, a linear `eligible()`
+  rejects, named with the K and N its packed weight holds and the
+  requirement it misses, a drafter class not validated) and with one
+  `warnings.warn` where it should have run (a validated drafter's forward
+  off its pins, a warm-up or probe that failed or
+  raised, each under its own name, any exception — an exception's
+  traceback logged beside it, as the kernel's). The greedy drafter's head
+  argmax (`quantized_argmax`) stays stock, since it too shapes proposals
   only. int8 prefill wraps the same `__call__` for its own tags at ≥ 128
   rows on `shape[-2]`: the row ranges are disjoint and each wrapper falls
   through to what it wrapped, so install order does not matter — keep the
@@ -584,11 +641,15 @@ goal.
   (`VLMEngine(projection_kernel=False, draft_block_explicit=True)`); only
   `default_engine_factory` hands them the config. Nothing is logged per
   turn; `projkernel.calls` (`verify_kernel`, `verify_split`,
-  `plain_kernel`, `declined`, and `one_row`, one per one-row dispatch
-  `linears()` serves; warm-up and probe leave them all as found) counts
+  `plain_kernel`, `draft_kernel`, `declined`, and `one_row`, one per one-row
+  dispatch `linears()` serves; warm-up and probe leave them all as found) counts
   every path for the tests and for
-  harnesses, and the load line carries `projection_kernel=` and, with a
-  drafter, `draft_block=`. The fork key records `proj` (`active`, else
+  harnesses, and the load line carries `projection_kernel=`, then on the
+  VLM backend the drafter route's `projection_kernel_drafter=active|unavailable|off` (with
+  `projection_kernel_drafter_probe_s=` when active; the status document
+  carries it as `projection_kernel.drafter`, and `sous tune`'s `_check_proj`
+  gives an `unavailable` one a notice of its own),
+  and, with a drafter, `draft_block=`. The fork key records `proj` (`active`, else
   `off`) and `projkernel.py` is in `_EPOCH_FILES`: the one-row forward that
   ends every prefill segment, and any tail of ≤ 8 rows, runs on the
   kernel, so stored KV and GDN state depend on it, while routing never

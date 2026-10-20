@@ -170,6 +170,7 @@ def guard_proj_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(verifier, "_linear", verifier._linear)
     monkeypatch.setattr(verifier, "_linears", verifier._linears)
     monkeypatch.setattr(projkernel, "_active", projkernel._active)
+    monkeypatch.setattr(projkernel, "_draft_active", projkernel._draft_active)
     monkeypatch.setattr(
         int8prefill, "_QUANTIZED_LINEAR_WRAPPED", int8prefill._QUANTIZED_LINEAR_WRAPPED
     )
@@ -211,9 +212,10 @@ ACTIVE_TILE: dict[str, Any] = {
 def proj_ready(monkeypatch: pytest.MonkeyPatch, *, real_pins: bool = False) -> dict[str, Any]:
     """Every enable() and static_reason() guard that reads the machine passes
     on any GPU: the platform rule, and a core count of 20 under this GPU's own
-    name. The stand-ins are the kernels, and the pins pass unless `real_pins`
-    (for the tests about the pins themselves). Registers guard_proj_state's restores
-    and returns the attention tile's status to hand enable()."""
+    name. The stand-ins are the kernels, and the pins, the drafter's included,
+    pass unless `real_pins` (for the tests about the pins themselves). Registers
+    guard_proj_state's restores and returns the attention tile's status to hand
+    enable()."""
     import mlx.core as mx
 
     from sous.engine import gpucores, nax
@@ -225,4 +227,5 @@ def proj_ready(monkeypatch: pytest.MonkeyPatch, *, real_pins: bool = False) -> d
     stand_ins(monkeypatch)
     if not real_pins:
         monkeypatch.setattr(projkernel, "_pins_reason", lambda: None)
+        monkeypatch.setattr(projkernel, "_draft_pins_reason", lambda drafter: None)
     return dict(ACTIVE_TILE)

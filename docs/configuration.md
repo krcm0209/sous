@@ -218,7 +218,29 @@ projections share it, so greedy output with the drafter stays identical to
 output without it — and that is also why plain decode goes through the
 kernel. Decode's projections are one-row calls, which the
 simdgroup-matrix kernel serves on a fraction of its lanes, so they run on the
-one-row kernel instead, whose output is the same bit for bit. That took
+one-row kernel instead, whose output is the same bit for bit. The DFlash
+drafter's own linears (quantized the same way at load) ride the kernel too,
+but only from six rows up, where stock `quantized_matmul` drops to about 100
+GB/s on their shapes against the kernel's 126–177 and below which stock is as
+fast or faster: at block 8 the draft's eight-row calls, and the calls on the
+context a round that committed six to eight tokens leaves behind (mlx-vlm
+hands the drafter one context row per committed token, the accepted drafts
+plus one), plus the first draft of a turn whose drafter was not seeded with
+the prompt (the seven-row generation prompt). At a `speculative_block_size`
+of 1 to 5 the route is `off`, since there its calls stay below six rows in
+steady state (only that unseeded first draft reaches seven, and it runs
+stock); at 0 the drafter's own policy sets the depth, which may exceed five
+rows, so the route stays armed there (the default DFlash2 policy stops at
+five, and serves nothing in steady state). The drafter's linears shape proposals only, so its probe is a
+distance check against stock, not a bitwise one, and the load line says
+`projection_kernel_drafter=active` beside the kernel's own state, or `off`,
+or `unavailable` with the reason in the status document's
+`projection_kernel.drafter` and in the log the way the kernel's own is: one
+INFO line where the route does not apply (the kernel not active, a drafter
+linear it cannot take, a drafter of a class other than the DFlash and DFlash2
+ones it was validated with), a `WARNING` where it should have run and did not
+(a validated drafter whose forward differs from the mlx-vlm code it was
+validated on, a failed warm-up or probe). The one-row kernel took
 decode with no drafter from 10.2 to 13.4 tok/s on the first 16 of those turns
 (1.32x), about the 13.5 tok/s it decodes with `false` there (measured in
 separate runs); before it, decode with no drafter ran about 0.78x. The kernel is

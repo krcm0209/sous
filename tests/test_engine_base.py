@@ -1675,17 +1675,18 @@ def test_lm_engine_reports_kv_int8_off(monkeypatch):
     }
 
 
-def _drafted_vlm(monkeypatch, proj_state: str, tile_state: str = "off", **kwargs):
-    """A VLMEngine over stubs whose drafter loads, whose attention tile reports
-    `tile_state` and whose projection kernel reports `proj_state`; returned
-    with its drafter and the blocks pinned."""
+def _drafted_vlm(monkeypatch, proj_state: str, tile_state: str = "off", *, drafter=None, **kwargs):
+    """A VLMEngine over stubs whose drafter (`drafter`, else a bare stub) loads,
+    whose attention tile reports `tile_state` and whose projection kernel
+    reports `proj_state`; returned with its drafter and the blocks pinned."""
     from sous.engine import draftctx, projkernel, tileattn, verifyattn, vlm
 
     model = _positionless_model()
     processor = types.SimpleNamespace(tokenizer=_RecordingTokenizer())
     _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
     _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
-    drafter = types.SimpleNamespace(prefer_requested_block_size=False)
+    if drafter is None:
+        drafter = types.SimpleNamespace(prefer_requested_block_size=False)
     monkeypatch.setattr(vlm, "_load_quantized_drafter", lambda m, draft_id: (drafter, "dflash"))
     monkeypatch.setattr(
         verifyattn,
@@ -1752,6 +1753,88 @@ def test_vlm_engine_resolves_an_unset_draft_block_by_what_is_active(
     assert engine._draft_block_size == expected and engine.draft_block == expected
     assert pinned == [expected], "the pin must see the resolved block"
     assert drafter.prefer_requested_block_size is (expected > 0)
+
+
+@pytest.mark.parametrize(
+    ("proj_state", "state", "reason"),
+    [
+        # The stub drafter is no module tree, so even an active kernel finds nothing to serve.
+        ("active", "unavailable", "the drafter owns no quantized linear"),
+        ("unavailable", "unavailable", "projection kernel unavailable"),
+        ("off", "off", "projection kernel off"),
+    ],
+)
+def test_vlm_engine_decides_the_drafters_kernel_route_after_the_kernels_own(
+    monkeypatch, proj_state, state, reason
+):
+    """The drafter's own linears ride the kernel only where the kernel serves the
+    target; the engine asks after the kernel's state is settled, with the loaded
+    drafter and that state, and keeps the answer beside the kernel's."""
+    from sous.engine import projkernel
+
+    asked = []
+    real = projkernel.enable_drafter
+
+    def enable_drafter(drafter, *, kernel_status, block_size):
+        # The pin marks a drafter it has seen: the block must be resolved first.
+        asked.append((drafter, kernel_status, block_size, drafter.prefer_requested_block_size))
+        return real(drafter, kernel_status=kernel_status, block_size=block_size)
+
+    monkeypatch.setattr(projkernel, "enable_drafter", enable_drafter)
+    engine, drafter, pinned = _drafted_vlm(
+        monkeypatch, proj_state, "active", draft_block_size=8, draft_block_explicit=True
+    )
+    assert asked == [(drafter, engine.projection_kernel_status, 8, True)]
+    assert pinned == [8]
+    status = engine.projection_kernel_drafter_status
+    assert (status["state"], status["reason"]) == (state, reason)
+    assert projkernel._draft_active == 0
+
+
+@pytest.mark.parametrize(
+    ("block", "explicit", "state"),
+    [
+        (5, True, "off"),
+        (8, True, "active"),
+        (0, True, "active"),
+        # Unset, it resolves to the kernel's 8 before the route is decided.
+        (3, False, "active"),
+    ],
+)
+def test_vlm_engine_decides_the_drafter_route_at_the_block_it_resolved(
+    monkeypatch, block, explicit, state
+):
+    """A block of 1-5 never feeds the drafter's calls six rows in steady state,
+    so the route is `off` there and nothing on the drafter is tagged; block 0
+    (the drafter's own policy, which may exceed five rows) and blocks from six
+    up arm it."""
+    pytest.importorskip("mlx.core")
+    from sous.engine import projkernel
+    from tests import proj_fixtures as pfx
+
+    # Before the stubs replace mlx_vlm: the hooks wrap the real verifier.
+    pfx.hooked(monkeypatch)
+    # The stub drafter has no forward for the drafter pins to read.
+    monkeypatch.setattr(projkernel, "_draft_pins_reason", lambda drafter: None)
+    linear = pfx.rand_module(256, 256, 0)
+    drafter = types.SimpleNamespace(
+        prefer_requested_block_size=False, named_modules=lambda: [("fc", linear)]
+    )
+    engine, _, pinned = _drafted_vlm(
+        monkeypatch,
+        "active",
+        "active",
+        drafter=drafter,
+        draft_block_size=block,
+        draft_block_explicit=explicit,
+    )
+    status = engine.projection_kernel_drafter_status
+    assert status["state"] == state, status
+    if state == "off":
+        assert status["reason"] == f"verify block {block} below the route's floor 6"
+    assert projkernel._draft_tagged(linear) is (state == "active")
+    assert projkernel._draft_active == (state == "active")
+    assert pinned == [engine.draft_block]
 
 
 def test_vlm_engine_built_directly_keeps_the_draft_block_it_was_given(monkeypatch):
@@ -2991,6 +3074,65 @@ def test_get_logs_the_projection_kernel_state(caplog, tmp_path, status, tail):
 
 
 @pytest.mark.parametrize(
+    ("drafter", "tail"),
+    [
+        (
+            {"state": "active", "reason": None, "linears": 47, "probe_seconds": 0.12},
+            " projection_kernel=active projection_kernel_probe_s=0.37"
+            " projection_kernel_drafter=active projection_kernel_drafter_probe_s=0.12"
+            " draft_block=8",
+        ),
+        (
+            {
+                "state": "unavailable",
+                "reason": "drafter linear fc (K=25600 N=5120) has group size 32 (64 only)",
+                "linears": 47,
+                "probe_seconds": None,
+            },
+            " projection_kernel=active projection_kernel_probe_s=0.37"
+            " projection_kernel_drafter=unavailable draft_block=8",
+        ),
+        (
+            # A failed probe has a cost, but like the kernel's own only an
+            # active route prints one.
+            {
+                "state": "unavailable",
+                "reason": "correctness: K=25600 N=5120 at T=8 is 0.2 from stock (bound 0.01)",
+                "linears": 47,
+                "probe_seconds": 0.41,
+            },
+            " projection_kernel=active projection_kernel_probe_s=0.37"
+            " projection_kernel_drafter=unavailable draft_block=8",
+        ),
+        (
+            {"state": "off", "reason": None, "linears": 0, "probe_seconds": None},
+            " projection_kernel=active projection_kernel_probe_s=0.37"
+            " projection_kernel_drafter=off draft_block=8",
+        ),
+        (None, " projection_kernel=active projection_kernel_probe_s=0.37 draft_block=8"),
+    ],
+)
+def test_get_logs_the_drafter_route_beside_the_kernel(caplog, tmp_path, drafter, tail):
+    """The route's fields follow the kernel's and come before draft_block=, so a
+    reader takes them as the kernel's and a field added later has a fixed place."""
+    import logging
+
+    def factory(model_id):
+        engine = _positional_factory(model_id)
+        engine.projection_kernel_status = {"state": "active", "reason": None, "probe_seconds": 0.37}  # ty: ignore[unresolved-attribute]
+        if drafter is not None:
+            engine.projection_kernel_drafter_status = drafter  # ty: ignore[unresolved-attribute]
+        engine.draft_block = 8  # ty: ignore[unresolved-attribute]
+        return engine
+
+    mgr = EngineManager(_cfg(tmp_path), engine_factory=factory)
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert len(lines) == 1 and lines[0].endswith(tail), lines
+
+
+@pytest.mark.parametrize(
     ("block", "tail"),
     [
         (5, " projection_kernel=active projection_kernel_probe_s=0.37 draft_block=5"),
@@ -3048,6 +3190,36 @@ def test_status_carries_the_projection_kernel_and_the_draft_block(tmp_path):
     inner.drafter = "z-lab/drafter"  # ty: ignore[unresolved-attribute]
     inner.draft_block = 5  # ty: ignore[unresolved-attribute]
     assert manager.status()["draft_block"] == 5
+
+
+def test_status_carries_the_drafter_route_inside_the_projection_kernel_block(tmp_path):
+    """The load line scrolls out of daemon.log; the status document is what says,
+    for as long as the model is resident, whether the drafter's own linears ride
+    the kernel and why not."""
+    inner = FakeEngine([])
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    inner.projection_kernel_status = {  # ty: ignore[unresolved-attribute]
+        "state": "active",
+        "reason": None,
+        "probe_seconds": 0.37,
+    }
+    assert manager.status()["projection_kernel"] == {"state": "active", "reason": None}
+    inner.projection_kernel_drafter_status = {  # ty: ignore[unresolved-attribute]
+        "state": "unavailable",
+        "reason": "correctness: K=25600 N=5120 at T=8 is 0.2 from stock (bound 0.01)",
+        "linears": 47,
+        "probe_seconds": 0.41,
+    }
+    assert manager.status()["projection_kernel"] == {
+        "state": "active",
+        "reason": None,
+        "drafter": {
+            "state": "unavailable",
+            "reason": "correctness: K=25600 N=5120 at T=8 is 0.2 from stock (bound 0.01)",
+            "linears": 47,
+        },
+    }
 
 
 _KV8_ACTIVE = {

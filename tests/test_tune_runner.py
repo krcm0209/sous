@@ -886,14 +886,62 @@ def test_an_arm_that_inherits_the_kernel_runs_stock_where_the_engine_cannot_serv
     ) in lines
 
 
+class _DrafterRouteUnavailable(FakeEngine):
+    drafter = ""
+    projection_kernel_status = {"state": "active", "reason": None, "probe_seconds": 0.3}
+    projection_kernel_drafter_status = {
+        "state": "unavailable",
+        "reason": "probe: program_source:3:1: error: boom",
+        "linears": 47,
+        "probe_seconds": 0.4,
+    }
+
+
+def test_an_arm_whose_drafter_route_is_unavailable_gets_a_notice_of_its_own(tmp_path):
+    """The drafter's own linears ride the kernel under a status of their own: an
+    arm whose kernel serves the target but not the drafter measures stock
+    drafter projections under a kernel-on key, and says so."""
+    lines = []
+    outcome = run_suite(
+        _arm(tmp_path),
+        [_task()],
+        runs=1,
+        done=set(),
+        record=lambda r: None,
+        scratch=tmp_path / "s",
+        out=lines.append,
+        factory=lambda mid: _DrafterRouteUnavailable([FINISH]),
+        python=PYTHON,
+        active_memory=lambda: 0,
+    )
+    assert len(outcome.runs) == 1 and outcome.error is None
+    assert [line for line in lines if "projection kernel" in line] == [
+        "  m: projection kernel drafter unavailable here "
+        "(probe: program_source:3:1: error: boom); "
+        "the engine runs the drafter's own projections stock, as the daemon would"
+    ]
+
+
 def test_no_kernel_notice_when_it_is_active_off_unreported_or_not_inherited(tmp_path):
     class Active(FakeEngine):
         drafter = ""
         projection_kernel_status = {"state": "active", "reason": None, "probe_seconds": 0.3}
+        projection_kernel_drafter_status = {
+            "state": "active",
+            "reason": None,
+            "linears": 47,
+            "probe_seconds": 0.2,
+        }
 
     class Off(FakeEngine):
         drafter = ""
         projection_kernel_status = {"state": "off", "reason": None}
+        projection_kernel_drafter_status = {
+            "state": "off",
+            "reason": "projection kernel off",
+            "linears": 0,
+            "probe_seconds": None,
+        }
 
     class Silent(FakeEngine):
         drafter = ""
@@ -909,6 +957,7 @@ def test_no_kernel_notice_when_it_is_active_off_unreported_or_not_inherited(tmp_
         ("off", arm, Off),
         ("silent", arm, Silent),
         ("stock", stock, _ProjUnavailable),
+        ("drafter stock", stock, _DrafterRouteUnavailable),
     ):
         lines = []
         outcome = run_suite(

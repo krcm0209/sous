@@ -9,7 +9,11 @@ drafter-off decode on the kernel):
   block), at block 12 set on the engine directly (config caps the block at 8), and at block 0,
   the drafter's own policy. DFlash2's own policy verifies at most 5 rows (its runtime block is
   min(5, 8)), so block 12 is the one whose verify rows exceed 8 and are split into runs.
-- Over the kernel runs both hooks are reached, nothing is declined, and only block 12 splits.
+- Over the kernel runs both hooks are reached, nothing is declined (the drafter's own calls
+  included), and only block 12 splits.
+- The drafter's own linears ride the kernel: the route is active on every drafted engine (at
+  block 0 too, where DFlash2's runtime block of 5 leaves it nothing to serve in steady state),
+  and at block 8 the drafter's calls reach the kernel.
 - An engine with the kernel off, built after the kernel engines unloaded, reproduces the output
   of one built before any of them, and makes no kernel call.
 """
@@ -123,6 +127,8 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_the_kernel()
     with _engine(kernel=True, drafter=True) as engine:
         assert engine.projection_kernel_status["state"] == "active", engine.projection_kernel_status
         assert engine._draft_block_size == 8
+        drafter = engine.projection_kernel_drafter_status
+        assert drafter["state"] == "active", drafter
         for block in (8, SPLIT_BLOCK):
             engine._draft_block_size = block
             drafted[block], drafted_counts[block] = _generate(engine, prompts)
@@ -131,6 +137,11 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_the_kernel()
         assert policy.projection_kernel_status["state"] == "active", policy.projection_kernel_status
         assert policy._draft_block_size == 0
         assert not getattr(policy._draft, "prefer_requested_block_size", False)
+        # Block 0 arms the route as 8 does (a drafter's own policy may run deeper than five
+        # rows), but DFlash2's own runtime block is 5, so here it serves nothing in steady state:
+        # draft_kernel is held above 0 at block 8 only.
+        drafter = policy.projection_kernel_drafter_status
+        assert drafter["state"] == "active", drafter
         drafted[0], drafted_counts[0] = _generate(policy, prompts)
 
     with _engine(kernel=False, drafter=True) as off:
@@ -150,5 +161,9 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_the_kernel()
         assert counts["verify_kernel"] > 0, (block, counts)
         assert counts["plain_kernel"] > 0, (block, counts)
         assert (counts["verify_split"] > 0) == (block == SPLIT_BLOCK), (block, counts)
+    # The drafter's eight-row block calls at 8, through hook 2 under its own tag and flag: the
+    # load-time probe proves one call gets there, this proves the drafter's own forward does.
+    assert drafted_counts[8]["draft_kernel"] > 0, drafted_counts[8]
+    # `declined` counts both routes' refusals, so this bar covers the drafter's calls too.
     assert all(c["declined"] == 0 for c in (plain_counts, *drafted_counts.values()))
     assert not any(off_counts.values()), off_counts

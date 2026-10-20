@@ -13,6 +13,7 @@ import os
 import types
 import warnings
 from importlib.resources import files
+from typing import Any
 
 import pytest
 
@@ -816,8 +817,9 @@ def fresh_target(tiny_target):
     projkernel.untag(tiny_target)
 
 
-def test_the_counters_name_the_five_paths():
+def test_the_counters_name_the_six_paths():
     assert set(projkernel.calls) == {
+        "draft_kernel",
         "verify_kernel",
         "verify_split",
         "plain_kernel",
@@ -842,10 +844,12 @@ def test_a_one_row_call_through_hook_two_is_a_one_row_dispatch(monkeypatch):
     assert _proj_counts_since(before) == {"plain_kernel": 1}
 
 
-def test_clear_drops_the_flag(monkeypatch):
+def test_clear_drops_both_flags(monkeypatch):
     monkeypatch.setattr(projkernel, "_active", 1)
+    monkeypatch.setattr(projkernel, "_draft_active", 1)
     projkernel.clear()
     assert projkernel._active == 0
+    assert projkernel._draft_active == 0
 
 
 def test_tag_marks_every_quantized_linear_of_the_language_model_and_nothing_else(fresh_target):
@@ -861,9 +865,10 @@ def test_tag_marks_every_quantized_linear_of_the_language_model_and_nothing_else
     assert not any(projkernel._tagged(module) for _, module in fresh_target.named_modules())
 
 
-def test_the_drafters_own_linears_are_never_tagged(fresh_target):
+def test_the_drafters_own_linears_are_never_target_tagged(fresh_target):
     """DFlash binds the target's lm_head into the drafter: that head is the target's
-    object and is tagged; every linear the drafter owns is not."""
+    object and carries the target's tag; no linear the drafter owns does (they
+    carry the drafter's own tag, which tag_drafter() sets)."""
     from mlx_vlm.speculative.drafters.qwen3_dflash.config import DFlashConfig
     from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import DFlashDraftModel
 
@@ -1258,6 +1263,7 @@ def _enabling_failures(caplog) -> list[logging.LogRecord]:
 def test_enable_off_returns_before_any_guard(monkeypatch):
     pfx.proj_ready(monkeypatch)
     monkeypatch.setattr(projkernel, "_active", 1)
+    monkeypatch.setattr(projkernel, "_draft_active", 1)
 
     def untouchable(*args, **kwargs):
         raise AssertionError("a guard ran while the kernel is off")
@@ -1280,6 +1286,7 @@ def test_enable_off_returns_before_any_guard(monkeypatch):
     assert [w for w in caught if issubclass(w.category, UserWarning)] == []
     assert records == []
     assert projkernel._active == 0
+    assert projkernel._draft_active == 0
 
 
 _GUARD_REASONS = [
@@ -2084,3 +2091,706 @@ def test_static_reason_keeps_the_kernels_own_model_types(monkeypatch):
     assert projkernel.static_reason(config, moe, "dflash") == (
         "unsupported model type 'qwen3_5_moe' (qwen3_5 only)"
     )
+
+
+# --------------------------------------------------------------------------------
+# The drafter's own linears: tagged apart, served from six rows
+# --------------------------------------------------------------------------------
+
+
+def _tiny_drafter(target):
+    """A quantized DFlash drafter bound to `target`, as the engine loads one: eight
+    linears of its own plus the target's lm_head."""
+    from mlx_vlm.speculative.drafters.qwen3_dflash.config import DFlashConfig
+    from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import DFlashDraftModel
+
+    vocab = target.args.vocab_size
+    drafter = DFlashDraftModel(
+        DFlashConfig(
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=128,
+            vocab_size=vocab,
+            mask_token_id=vocab - 1,
+            target_layer_ids=[1],
+            num_target_layers=4,
+        )
+    )
+    drafter.set_dtype(mx.bfloat16)
+    nn.quantize(drafter, group_size=64, bits=4)
+    drafter.bind(types.SimpleNamespace(language_model=target))
+    return drafter
+
+
+def test_the_drafter_tag_marks_its_own_linears_and_not_the_targets_head(fresh_target):
+    drafter = _tiny_drafter(fresh_target)
+    model = types.SimpleNamespace(language_model=fresh_target)
+    projkernel.tag(model)
+    assert projkernel.tag_drafter(drafter) == 8
+    owned = [
+        m
+        for _, m in drafter.named_modules()
+        if isinstance(m, nn.QuantizedLinear) and m is not fresh_target.lm_head
+    ]
+    assert all(projkernel._draft_tagged(m) and not projkernel._tagged(m) for m in owned)
+    # The head DFlash binds in is the target's object: the target's tag, never the drafter's.
+    assert projkernel._tagged(drafter.lm_head) and not projkernel._draft_tagged(drafter.lm_head)
+    projkernel.untag_drafter(drafter)
+    assert not any(projkernel._draft_tagged(m) for m in owned)
+    projkernel.untag(model)
+
+
+@pytest.mark.parametrize("rows", [6, 7, 8])
+def test_the_module_hook_serves_a_drafter_tagged_module_from_six_rows(monkeypatch, rows):
+    """Stock quantized_matmul falls off a cliff at eight rows (about 100 GB/s against
+    the kernel's 175 on the drafter's shapes) and is as fast or faster below six, so
+    the drafter's calls go to the kernel only from six rows up."""
+    pfx.hooked(monkeypatch)
+    monkeypatch.setattr(projkernel, "_draft_active", 1)
+    linear = pfx.rand_module(256, 256, 0)
+    object.__setattr__(linear, projkernel._DRAFT_TAG, True)
+    x = _acts(1, rows, 256)
+    before = dict(projkernel.calls)
+    got = linear(x)
+    assert _proj_counts_since(before) == {"draft_kernel": 1}
+    assert _bitwise(got, pfx.stand_in_mma(x, _triples(linear))[0])
+
+
+# case -> (draft flag, x, the counter it moves)
+_DRAFT_HANDED_ON = {
+    "flag clear": (0, lambda: _acts(1, 8, 256), None),
+    "five rows": (1, lambda: _acts(1, 5, 256), None),
+    "one row": (1, lambda: _acts(1, 1, 256), None),
+    "nine rows": (1, lambda: _acts(1, 9, 256), None),
+    "the context tail": (1, lambda: _acts(1, 2047, 256), None),
+    "float16": (1, lambda: _acts(1, 8, 256, dtype=mx.float16), "declined"),
+    # Only tagged modules route: with the drafter's flag set, any other
+    # QuantizedLinear call of 6-8 bf16 rows in the process would otherwise
+    # reach the kernel.
+    "untagged module": (1, lambda: _acts(1, 8, 256), None),
+}
+
+
+@pytest.mark.parametrize("case", list(_DRAFT_HANDED_ON))
+def test_the_module_hook_hands_the_drafters_other_calls_on(monkeypatch, case):
+    flag, build, counter = _DRAFT_HANDED_ON[case]
+    seen = []
+
+    def original(self, x):
+        seen.append((self, x))
+        return "the wrapped method's answer"
+
+    hook = projkernel._wrap_call(original)
+    monkeypatch.setattr(projkernel, "_active", 1)
+    monkeypatch.setattr(projkernel, "_draft_active", flag)
+    monkeypatch.setattr(projkernel, "mma", _no_kernel)
+    linear = pfx.rand_module(256, 256, 0)
+    if case != "untagged module":
+        object.__setattr__(linear, projkernel._DRAFT_TAG, True)
+    x = build()
+    before = dict(projkernel.calls)
+    assert hook(linear, x) == "the wrapped method's answer"
+    ((got_self, got_x),) = seen
+    assert got_self is linear and got_x is x
+    assert _proj_counts_since(before) == ({} if counter is None else {counter: 1})
+
+
+def test_enable_drafter_tags_warms_probes_and_raises_its_own_flag(
+    monkeypatch, caplog, fresh_target
+):
+    tile = pfx.proj_ready(monkeypatch)
+    status = projkernel.enable(fresh_target, enabled=True, drafter_kind="dflash", tile_status=tile)
+    assert status["state"] == "active", status
+    drafter = _tiny_drafter(fresh_target)
+    served = []
+    serve_draft = projkernel._serve_draft
+
+    def spy(module, x):
+        out = serve_draft(module, x)
+        served.append((module, x.shape, out is not None))
+        return out
+
+    monkeypatch.setattr(projkernel, "_serve_draft", spy)
+    before = dict(projkernel.calls)
+    with caplog.at_level(logging.INFO, logger="sous.engine.projkernel"):
+        got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=8)
+    assert got == {
+        "state": "active",
+        "reason": None,
+        "linears": 8,
+        "probe_seconds": got["probe_seconds"],
+    }
+    assert isinstance(got["probe_seconds"], float)
+    assert projkernel._draft_active == 1 and projkernel._active == 1
+    # The probe's last step is one call of a tagged drafter linear through the
+    # hook, which the kernel served and counted, and which it then put back.
+    ((module, shape, hit),) = served
+    assert projkernel._draft_tagged(module) and hit
+    assert shape == (1, projkernel.MAX_ROWS, module.weight.shape[1] * 8)
+    assert projkernel.calls == before, "the warm-up and the probe leave the counters as found"
+    assert [r.getMessage() for r in caplog.records if "drafter" in r.getMessage()] == [
+        f"projection kernel drafter: 8 linears from {projkernel._DRAFT_MIN_ROWS} rows, "
+        f"probe {got['probe_seconds']:.2f}s"
+    ]
+    # Served through the real hook at eight rows; handed on at five.
+    linear = drafter.layers[0].mlp.gate_proj
+    x8, x5 = _acts(1, 8, 256), _acts(1, 5, 256)
+    before = dict(projkernel.calls)
+    linear(x8)
+    assert _proj_counts_since(before) == {"draft_kernel": 1}
+    before = dict(projkernel.calls)
+    linear(x5)
+    assert _proj_counts_since(before) == {}
+    projkernel.clear()
+    assert projkernel._draft_active == 0 and projkernel._active == 0
+    projkernel.untag_drafter(drafter)
+
+
+def _drafter_untagged(drafter) -> bool:
+    return not any(
+        projkernel._draft_tagged(m)
+        for _, m in drafter.named_modules()
+        if isinstance(m, nn.QuantizedLinear)
+    )
+
+
+def _drafter_refusal(drafter, kernel_status, *, warned: bool, raised: str | None = None) -> dict:
+    """enable_drafter() expected to refuse `unavailable`, reporting as the kernel's
+    own refusals do: one where the route does not apply is one INFO line in the
+    route's words and no warning; one where it should have run is exactly one
+    warning, on one line, and no WARNING log line beside it but the traceback of
+    whatever raised, which `raised` names. In the daemon a warning is itself a
+    WARNING line, so a second one carrying the reason would print it twice. The
+    flag is left clear and nothing on the drafter tagged."""
+    with warnings.catch_warnings(record=True) as caught, _gate_log() as records:
+        warnings.simplefilter("always")
+        status = projkernel.enable_drafter(drafter, kernel_status=kernel_status, block_size=8)
+    messages = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    infos = [r.getMessage() for r in records if r.levelno == logging.INFO]
+    louder = [r for r in records if r.levelno >= logging.WARNING]
+    assert status["state"] == "unavailable", status
+    assert set(status) == {"state", "reason", "linears", "probe_seconds"}
+    if warned:
+        assert messages == [
+            f"sous: projection kernel drafter unavailable ({status['reason']}); "
+            "the drafter's own projections run stock"
+        ]
+        assert "\n" not in messages[0]
+        assert infos == []
+    else:
+        assert messages == []
+        assert infos == [f"projection kernel drafter unavailable: {status['reason']}"]
+    assert [r.getMessage() for r in louder] == ([] if raised is None else [raised])
+    assert all(r.exc_info is not None for r in louder), "only a traceback rides beside it"
+    assert projkernel._draft_active == 0
+    if hasattr(drafter, "layers"):
+        assert _drafter_untagged(drafter)
+    return status
+
+
+@pytest.fixture
+def drafted(monkeypatch, fresh_target):
+    """(the tiny drafter bound to the tiny target, the kernel's active status):
+    enable() has served the target, so the drafter route has a kernel to ride on."""
+    tile = pfx.proj_ready(monkeypatch)
+    status = projkernel.enable(fresh_target, enabled=True, drafter_kind="dflash", tile_status=tile)
+    assert status["state"] == "active", status
+    drafter = _tiny_drafter(fresh_target)
+    yield drafter, status
+    projkernel.untag_drafter(drafter)
+
+
+def test_enable_drafter_is_off_while_the_kernel_is_switched_off(drafted):
+    """The kernel's switch is the route's: switched off, it is `off`, which is
+    never a refusal, and nothing is logged."""
+    drafter, _ = drafted
+    with warnings.catch_warnings(record=True) as caught, _gate_log() as records:
+        warnings.simplefilter("always")
+        got = projkernel.enable_drafter(
+            drafter,
+            kernel_status={"state": "off", "reason": None, "probe_seconds": None},
+            block_size=8,
+        )
+    assert got == projkernel.drafter_off("projection kernel off")
+    assert got == {
+        "state": "off",
+        "reason": "projection kernel off",
+        "linears": 0,
+        "probe_seconds": None,
+    }
+    assert [w for w in caught if issubclass(w.category, UserWarning)] == []
+    assert records == []
+    assert projkernel._draft_active == 0 and _drafter_untagged(drafter)
+
+
+@pytest.mark.parametrize(
+    ("block", "kernel"),
+    [(1, "active"), (3, "active"), (5, "active"), (3, "unavailable")],
+)
+def test_enable_drafter_is_off_below_its_floor(monkeypatch, drafted, block, kernel):
+    """A verify block of 1-5 never feeds the drafter's calls six rows in steady
+    state, so the route is `off` there, like a switch: nothing is warmed,
+    probed, tagged or logged, so `active` means the route can serve. The block is
+    the config's, so it answers before whether the kernel is active."""
+    drafter, status = drafted
+    if kernel != "active":
+        status = {"state": kernel, "reason": "attention tile off", "probe_seconds": None}
+    for step in ("_warm_up_drafter", "_probe_drafter", "_probe_drafter_hook", "tag_drafter"):
+        ran = AssertionError(f"{step} ran below the floor")
+        monkeypatch.setattr(projkernel, step, _raises(ran))
+    with warnings.catch_warnings(record=True) as caught, _gate_log() as records:
+        warnings.simplefilter("always")
+        got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=block)
+    assert got == projkernel.drafter_off(f"verify block {block} below the route's floor 6")
+    assert [w for w in caught if issubclass(w.category, UserWarning)] == []
+    assert records == []
+    assert projkernel._draft_active == 0 and _drafter_untagged(drafter)
+
+
+@pytest.mark.parametrize("block", [0, 6, 7, 8, 12])
+def test_enable_drafter_serves_from_its_floor_and_at_the_drafters_own_policy(drafted, block):
+    """Block 0 lets the drafter's own policy pick the depth, which may exceed
+    five rows (a v1 DFlash checkpoint's block of 16), so it proceeds like any
+    block from six up; under the default DFlash2's runtime block of 5 it then
+    serves nothing in steady state."""
+    drafter, status = drafted
+    got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=block)
+    assert got["state"] == "active", got
+    assert projkernel._draft_active == 1 and not _drafter_untagged(drafter)
+
+
+def _requantized(drafter, path: str, **kwargs) -> None:
+    """Swap the drafter's linear at `path` for a fresh one of the same shape,
+    quantized as `kwargs` say: a checkpoint quantized otherwise survives
+    nn.quantize, which leaves an existing QuantizedLinear alone."""
+    parent, name = path.rsplit(".", 1)
+    old = dict(drafter.named_modules())[path]
+    n, k = old.weight.shape[0], old.weight.shape[1] * 8
+    module = nn.QuantizedLinear(k, n, **{"bias": False, "group_size": 64, "bits": 4, **kwargs})
+    setattr(dict(drafter.named_modules())[parent], name, module)
+
+
+# case -> (how the drafter or the kernel's status is made to refuse, the reason)
+_DRAFTER_DOES_NOT_APPLY: dict[str, tuple[Any, str]] = {
+    "kernel unavailable": ("attention tile off", "attention tile off"),
+    "kernel unavailable, no reason": (None, "projection kernel unavailable"),
+    "no linears": ("no linears", "the drafter owns no quantized linear"),
+    "group size 32": (
+        {"group_size": 32},
+        "drafter linear layers.0.mlp.gate_proj (K=256 N=512) has group size 32 (64 only)",
+    ),
+    "group size 128": (
+        {"group_size": 128},
+        "drafter linear layers.0.mlp.gate_proj (K=256 N=512) has group size 128 (64 only)",
+    ),
+    "8-bit": (
+        {"bits": 8},
+        "drafter linear layers.0.mlp.gate_proj (K=256 N=512) is 8-bit (4-bit only)",
+    ),
+    "a bias": (
+        {"bias": True},
+        "drafter linear layers.0.mlp.gate_proj (K=256 N=512) has a bias term",
+    ),
+    "float32 scales": (
+        {},
+        "drafter linear layers.0.mlp.gate_proj (K=256 N=512) has mlx.core.float32 scales "
+        "and mlx.core.float32 biases (bfloat16 only)",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_DRAFTER_DOES_NOT_APPLY))
+def test_enable_drafter_refuses_a_load_it_does_not_apply_to_in_one_info_line(drafted, case):
+    """Where the kernel is not active, or the drafter holds no linear the kernel
+    takes, the route says so the way the kernel says it of a tile that is not
+    active: `unavailable`, one INFO line, no warning. An ineligible linear is
+    named with the K and N its packed weight holds and the requirement it
+    misses; K off the scales would read 512 at group size 32 and 128 at 128."""
+    drafter, status = drafted
+    how, reason = _DRAFTER_DOES_NOT_APPLY[case]
+    if case.startswith("kernel unavailable"):
+        status = {"state": "unavailable", "reason": how, "probe_seconds": None}
+    elif how == "no linears":
+        drafter = types.SimpleNamespace(named_modules=lambda: [])
+    else:
+        _requantized(drafter, "layers.0.mlp.gate_proj", **how)
+    got = _drafter_refusal(drafter, status, warned=False)
+    assert got["reason"] == reason
+    assert got["probe_seconds"] is None
+    if case.startswith("kernel unavailable"):
+        assert projkernel._active == 1, "the target's own route is untouched"
+
+
+def test_enable_drafter_warns_once_for_a_failed_probe(monkeypatch, drafted):
+    drafter, status = drafted
+    monkeypatch.setattr(
+        projkernel, "_probe_drafter", lambda linears: "correctness: K=256 N=512 at T=8 is off"
+    )
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert got["reason"] == "correctness: K=256 N=512 at T=8 is off"
+    assert got["linears"] == 8 and isinstance(got["probe_seconds"], float)
+    assert projkernel._active == 1, "the target's own route is untouched"
+
+
+def _raises(error):
+    def raising(*args, **kwargs):
+        raise error
+
+    return raising
+
+
+# case -> (the step that raises, the reason, the traceback line beside the warning)
+_DRAFTER_RAISES = {
+    "warm-up": (
+        "_warm_up_drafter",
+        "warm-up: program_source:3:1: error: boom",
+        "projection kernel: the drafter's warm-up failed",
+    ),
+    "probe": (
+        "_probe_drafter",
+        "probe: program_source:3:1: error: boom",
+        "projection kernel: the drafter's probe failed",
+    ),
+    "a guard": (
+        "_drafter_reason",
+        "program_source:3:1: error: boom",
+        "projection kernel: enabling the drafter route failed",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_DRAFTER_RAISES))
+def test_enable_drafter_warns_once_for_a_step_that_raises_and_logs_its_traceback(
+    monkeypatch, drafted, case
+):
+    """A raise in the warm-up or the probe is reported as that step's, never the
+    other's, and every reason is the error's one line; the traceback goes to the
+    log as the kernel's own does."""
+    drafter, status = drafted
+    step, reason, line = _DRAFTER_RAISES[case]
+    error = RuntimeError(_BUILD_ERROR)
+    monkeypatch.setattr(projkernel, step, _raises(error))
+    with warnings.catch_warnings(record=True), _gate_log() as records:
+        warnings.simplefilter("always")
+        got = _drafter_refusal(drafter, status, warned=True, raised=line)
+    assert got["reason"] == reason
+    (record,) = [r for r in records if r.levelno >= logging.WARNING]
+    assert record.exc_info is not None and record.exc_info[1] is error
+    if case != "a guard":
+        assert isinstance(got["probe_seconds"], float)
+
+
+def _recording(seen: set):
+    """The stand-in kernel, recording (K, N, rows) for every linear it is asked for."""
+
+    def record(x, weights):
+        seen.update((x.shape[-1], w.shape[0], _rows(x)) for w, _, _ in weights)
+        return pfx.stand_in_mma(x, weights)
+
+    return record
+
+
+def test_the_drafters_warm_up_and_probe_cover_every_row_count_the_hook_serves(monkeypatch, drafted):
+    """Six, seven and eight rows on every (K, N) the drafter holds, in both: a
+    shape that fails to compile, or that the kernel computes wrongly, at seven
+    rows would otherwise go live."""
+    drafter, _ = drafted
+    linears = projkernel._drafter_linears(drafter)
+    shapes = {(m.weight.shape[1] * 8, m.weight.shape[0]) for m in linears}
+    want = {(k, n, t) for k, n in shapes for t in range(projkernel._DRAFT_MIN_ROWS, 9)}
+    assert {t for *_, t in want} == {6, 7, 8}
+    warmed: set = set()
+    monkeypatch.setattr(projkernel, "mma", _recording(warmed))
+    projkernel._warm_up_drafter(linears)
+    assert warmed == want
+    probed: set = set()
+    monkeypatch.setattr(projkernel, "mma", _recording(probed))
+    assert projkernel._probe_drafter(linears) is None
+    assert probed == want
+
+
+@pytest.mark.parametrize("rows", [6, 7, 8])
+def test_enable_drafter_refuses_a_kernel_wrong_at_one_row_count(monkeypatch, drafted, rows):
+    """The probe's negative control: a kernel wrong in one place, at one row
+    count the hook serves, refuses the route with a warning and untags it."""
+    drafter, status = drafted
+
+    def wrong_at(x, weights):
+        outs = pfx.stand_in_mma(x, weights)
+        return _scaled(outs, 1.1) if _rows(x) == rows else outs
+
+    monkeypatch.setattr(projkernel, "mma", wrong_at)
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert got["reason"].startswith("correctness: K="), got
+    assert f" at T={rows} is " in got["reason"], got
+    assert projkernel._active == 1, "the target's own route is untouched"
+
+
+def test_enable_drafter_refuses_a_kernel_that_writes_a_nan(monkeypatch, drafted):
+    drafter, status = drafted
+    nan = mx.array(float("nan"), dtype=mx.bfloat16)
+
+    def nan_at_eight(x, weights):
+        outs = pfx.stand_in_mma(x, weights)
+        if _rows(x) != projkernel.MAX_ROWS:
+            return outs
+        return tuple(mx.where(mx.arange(o.shape[-1]) == 3, nan, o) for o in outs)
+
+    monkeypatch.setattr(projkernel, "mma", nan_at_eight)
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert got["reason"].startswith("correctness: K="), got
+    assert got["reason"].endswith(f" at T=8 is inf from stock (bound {projkernel.REL_RMS_BOUND})")
+
+
+def test_enable_drafter_refuses_a_distance_that_is_nan(monkeypatch, drafted):
+    """A NaN distance fails `<=` against any bound; `>` would wave it through."""
+    drafter, status = drafted
+    monkeypatch.setattr(projkernel, "_stock_distance", lambda got, want: float("nan"))
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert " is nan from stock " in got["reason"], got
+
+
+class _Bypassing(nn.QuantizedLinear):
+    """A QuantizedLinear subclass whose own __call__ goes straight to
+    quantized_matmul, past nn.QuantizedLinear.__call__: the case the hook step
+    covers. A forward that reads the weights without calling the module at all
+    (a fused k/v) is the drafter pins' to catch, not this step's."""
+
+    def __call__(self, x):
+        return mx.quantized_matmul(
+            x,
+            self.weight,
+            scales=self.scales,
+            biases=self.biases,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+        )
+
+
+def test_enable_drafter_refuses_a_drafter_whose_calls_bypass_the_hook(drafted):
+    """The warm-up and the probe call the kernel directly; only the probe's last
+    step proves that a drafter linear's own __call__ reaches the hook."""
+    drafter, status = drafted
+    for module in projkernel._drafter_linears(drafter):
+        module.__class__ = _Bypassing
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert got["reason"] == "the drafter's linears do not reach the hook"
+    assert isinstance(got["probe_seconds"], float)
+    assert projkernel._active == 1, "the target's own route is untouched"
+
+
+def test_the_drafters_hook_step_leaves_the_flag_clear_and_the_counters_as_found(
+    monkeypatch, drafted
+):
+    drafter, _ = drafted
+    linears = projkernel._drafter_linears(drafter)
+    projkernel.tag_drafter(drafter)
+    flags = []
+    real = projkernel._serve_draft
+
+    def spy(module, x):
+        flags.append(projkernel._draft_active)
+        return real(module, x)
+
+    monkeypatch.setattr(projkernel, "_serve_draft", spy)
+    before = dict(projkernel.calls)
+    assert projkernel._probe_drafter_hook(linears) is None
+    assert flags == [1], "the flag is raised around the one call"
+    assert projkernel._draft_active == 0
+    assert projkernel.calls == before
+
+
+def test_enable_clears_a_drafter_route_left_from_an_earlier_load(monkeypatch, drafted):
+    """A load with no DFlash drafter after one with it never reaches
+    enable_drafter(), so only enable() itself can clear the drafter's flag: else
+    the earlier drafter's tagged linears would keep riding a kernel that this
+    load's checks never approved for them."""
+    drafter, status = drafted
+    got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=8)
+    assert got["state"] == "active" and projkernel._draft_active == 1
+    later = pfx.tiny_quantized_model(seed=1)
+    tile = dict(pfx.ACTIVE_TILE)
+    again = projkernel.enable(later, enabled=True, drafter_kind=None, tile_status=tile)
+    assert again["state"] == "active", again
+    assert projkernel._draft_active == 0
+    # The earlier drafter's linears are still tagged, and now handed on.
+    linear = drafter.layers[0].mlp.gate_proj
+    assert projkernel._draft_tagged(linear)
+    before = dict(projkernel.calls)
+    linear(_acts(1, 8, 256))
+    assert _proj_counts_since(before) == {}
+    projkernel.untag(later)
+
+
+@pytest.mark.parametrize("ending", ["kernel unavailable", "block below the floor"])
+def test_enable_drafter_clears_its_flag_before_it_decides(drafted, ending):
+    """A second decision that refuses, or is off, leaves the flag clear whatever
+    the first one set."""
+    drafter, status = drafted
+    assert projkernel.enable_drafter(drafter, kernel_status=status, block_size=8)["state"] == (
+        "active"
+    )
+    assert projkernel._draft_active == 1
+    if ending == "kernel unavailable":
+        unavailable = {"state": "unavailable", "reason": "attention tile off"}
+        got = projkernel.enable_drafter(drafter, kernel_status=unavailable, block_size=8)
+    else:
+        got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=5)
+    assert got["state"] in ("unavailable", "off"), got
+    assert projkernel._draft_active == 0
+
+
+_REAL_DRAFT_PINS = projkernel._draft_pins_reason
+
+
+def _tiny_dflash2_drafter(cls=None):
+    """An unbound DFlash2 drafter (or one of `cls`, a subclass), the default
+    drafter's class, quantized as the engine quantizes one: its own linears are
+    the kernel's to take, and its forward's classes are there to read."""
+    from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
+
+    drafter = (cls or DFlash2DraftModel)(
+        DFlash2Config(
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=128,
+            vocab_size=512,
+            mask_token_id=511,
+            target_layer_ids=[1],
+            num_target_layers=4,
+            block_size=8,
+            conv_kernel_size=3,
+            conv_group_size=64,
+            selector_rank=64,
+            selector_top_k=4,
+        )
+    )
+    drafter.set_dtype(mx.bfloat16)
+    nn.quantize(drafter, group_size=64, bits=4)
+    return drafter
+
+
+def test_the_drafter_pins_hold_on_the_locked_mlx_vlm(fresh_target):
+    """Every function between the round loop's draft call and the drafter's
+    linears, for the v1 DFlash and the DFlash2 drafters, read through each
+    loaded drafter's own classes."""
+    dflash = "mlx_vlm.speculative.drafters.qwen3_dflash.dflash"
+    dflash2 = "mlx_vlm.speculative.drafters.dflash2.dflash2"
+    assert set(projkernel.VALIDATED_DRAFTERS) == {
+        f"{dflash}:DFlashDraftModel",
+        f"{dflash2}:DFlash2DraftModel",
+    }
+    assert set(projkernel.VALIDATED_DRAFT_SOURCES) == {
+        f"{dflash}:DFlashDraftModel.draft_block",
+        f"{dflash}:DFlashDraftModel.draft_block_greedy",
+        f"{dflash}:DFlashDraftModel._hidden",
+        f"{dflash}:DFlashDraftModel._project_context_kv",
+        f"{dflash}:DFlashDecoderLayer.__call__",
+        f"{dflash}:DFlashAttention.__call__",
+        f"{dflash}:DFlashAttention._project_kv",
+        f"{dflash}:Qwen3MLP.__call__",
+        f"{dflash2}:DFlash2DraftModel.draft_block",
+        f"{dflash2}:DFlash2DecoderLayer.__call__",
+        f"{dflash2}:GroupedDynamicCausalConv.prepare",
+        f"{dflash2}:CandidateSelector.select",
+    }
+    from sous.engine import verifyattn
+
+    for key, digest in projkernel.VALIDATED_DRAFT_SOURCES.items():
+        module, qualname = key.split(":")
+        assert verifyattn._source_digest(module, qualname) == digest, key
+    assert _REAL_DRAFT_PINS(_tiny_drafter(fresh_target)) is None
+    assert _REAL_DRAFT_PINS(_tiny_dflash2_drafter()) is None
+
+
+@pytest.mark.parametrize(
+    ("key", "reason"),
+    [
+        (
+            "mlx_vlm.speculative.drafters.qwen3_dflash.dflash:DFlashDraftModel._project_context_kv",
+            "mlx-vlm DFlashDraftModel._project_context_kv changed",
+        ),
+        (
+            "mlx_vlm.speculative.drafters.qwen3_dflash.dflash:DFlashAttention._project_kv",
+            "mlx-vlm DFlashAttention._project_kv changed",
+        ),
+        (
+            "mlx_vlm.speculative.drafters.qwen3_dflash.dflash:Qwen3MLP.__call__",
+            "mlx-vlm Qwen3MLP.__call__ changed",
+        ),
+    ],
+)
+def test_enable_drafter_refuses_a_changed_drafter_forward(monkeypatch, drafted, key, reason):
+    """A drafter forward that might no longer call its linears as modules, a
+    fused k/v or a direct quantized_matmul, is a route that should have run:
+    one warning, before anything is warmed."""
+    drafter, status = drafted
+    monkeypatch.setattr(projkernel, "_draft_pins_reason", _REAL_DRAFT_PINS)
+    monkeypatch.setitem(projkernel.VALIDATED_DRAFT_SOURCES, key, "0" * 64)
+    monkeypatch.setattr(
+        projkernel, "_warm_up_drafter", _raises(AssertionError("warmed past drifted pins"))
+    )
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert got["reason"] == reason
+    assert got["probe_seconds"] is None
+
+
+def test_enable_drafter_warns_for_a_validated_drafter_whose_component_overrides_a_pin(
+    monkeypatch, drafted
+):
+    """The pins are read through the loaded drafter's own classes: inside a
+    validated drafter class, an attention that fuses its k and v reads as
+    mlx-vlm drift, not as the pinned DFlashAttention."""
+    from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import DFlashAttention
+
+    class _FusedKV(DFlashAttention):
+        def _project_kv(self, x):
+            return super()._project_kv(x)
+
+    drafter, status = drafted
+    monkeypatch.setattr(projkernel, "_draft_pins_reason", _REAL_DRAFT_PINS)
+    drafter.layers[0].self_attn.__class__ = _FusedKV
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert got["reason"] == f"mlx-vlm {_FusedKV._project_kv.__qualname__} changed"
+
+
+def test_enable_drafter_serves_the_default_drafters_class(monkeypatch, drafted):
+    """DFlash2, the default drafter's class, through the real pins, eligibility,
+    warm-up, probe and hook step."""
+    _, status = drafted
+    monkeypatch.setattr(projkernel, "_draft_pins_reason", _REAL_DRAFT_PINS)
+    drafter = _tiny_dflash2_drafter()
+    got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=8)
+    assert got["state"] == "active", got
+    assert got["linears"] == len(projkernel._drafter_linears(drafter))
+    projkernel.untag_drafter(drafter)
+
+
+def test_enable_drafter_does_not_apply_to_a_drafter_class_it_was_not_validated_with(
+    monkeypatch, drafted
+):
+    """A drafter of another class (here a DFlash2 subclass with its own _hidden)
+    runs a forward nobody read against the hook: the route does not apply, one
+    INFO line, no warning, before anything is warmed."""
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
+
+    class _OwnHidden(DFlash2DraftModel):
+        def _hidden(self, inputs, target_hidden, cache):
+            return super()._hidden(inputs, target_hidden, cache)
+
+    _, status = drafted
+    monkeypatch.setattr(projkernel, "_draft_pins_reason", _REAL_DRAFT_PINS)
+    monkeypatch.setattr(
+        projkernel, "_warm_up_drafter", _raises(AssertionError("warmed an unvalidated drafter"))
+    )
+    got = _drafter_refusal(_tiny_dflash2_drafter(_OwnHidden), status, warned=False)
+    assert got["reason"] == f"drafter {_OwnHidden.__qualname__} not validated"
+    assert got["probe_seconds"] is None
