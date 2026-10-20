@@ -224,16 +224,20 @@ but only from six rows up, where stock `quantized_matmul` drops to about 100
 GB/s on their shapes against the kernel's 126–177 and below which stock is as
 fast or faster: at block 8 the draft's eight-row calls, and the calls on the
 context a round that committed six to eight tokens leaves behind (mlx-vlm
-hands the drafter the committed tokens plus one). At a
-`speculative_block_size` of 1 to 5 the route is `off`, since its calls stay
-below six rows there. The drafter's linears shape proposals only, so its
-probe is a distance check against stock, not a bitwise one, and the load line
-says `projection_kernel_drafter=active` beside the kernel's own state, or
-`off`, or `unavailable` with the reason in
-the status document's `projection_kernel.drafter` and in the log the way the
-kernel's own is: one INFO line where the route does not apply (the kernel not
-active, a drafter linear it cannot take), a `WARNING` where it should have run
-and did not (a failed warm-up or probe). The one-row kernel took
+hands the drafter one context row per committed token, the accepted drafts
+plus one), plus the first draft of a turn whose drafter was not seeded with
+the prompt (the seven-row generation prompt). At a `speculative_block_size`
+of 1 to 5 the route is `off`, since there its calls stay below six rows in
+steady state (only that unseeded first draft reaches seven, and it runs
+stock). The drafter's linears shape proposals only, so its probe is a
+distance check against stock, not a bitwise one, and the load line says
+`projection_kernel_drafter=active` beside the kernel's own state, or `off`,
+or `unavailable` with the reason in the status document's
+`projection_kernel.drafter` and in the log the way the kernel's own is: one
+INFO line where the route does not apply (the kernel not active, a drafter
+linear it cannot take), a `WARNING` where it should have run and did not (a
+drafter forward that differs from the mlx-vlm code it was validated on, a
+failed warm-up or probe). The one-row kernel took
 decode with no drafter from 10.2 to 13.4 tok/s on the first 16 of those turns
 (1.32x), about the 13.5 tok/s it decodes with `false` there (measured in
 separate runs); before it, decode with no drafter ran about 0.78x. The kernel is

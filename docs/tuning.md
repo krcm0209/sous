@@ -70,14 +70,18 @@ existed reads as `false` for it), and where the engine reports one
 the daemon would: stock attention or projections, or attention over the bf16
 cache for `kv_int8` (an `off` engine, such as the mlx-lm backend's, gets no
 notice). The projection kernel's route for the drafter's own linears reports
-apart from the kernel, so an arm whose kernel serves the target but not the
-drafter gets a notice of its own and drafts on stock projections. `kv_int8` matters most here of the three: attention past its floor
-reads keys and values quantised to int8, which moves more than the last bits,
-and the suite's grades are where that would show. Bench rows are keyed only by
-model, drafter, block and window, so a `--resume` across a sous upgrade or a
-flip of `attention_tile`, `projection_kernel` or `kv_int8` reuses decode and
-prefill timings measured before it, which can rank the blocks the other way:
-start a fresh tune after any of them.
+apart from the kernel and gets a notice of its own only when it is
+`unavailable`, the arm then drafting on stock projections: where the kernel
+serves the target but the drafter's probe failed, say, and also wherever the
+kernel itself is `unavailable` and the arm's block is 0 or 6 and up, which
+prints both notices with the same reason. A block of 1 to 5 leaves the route
+`off`, with no notice. `kv_int8` matters most here of the three: attention
+past its floor reads keys and values quantised to int8, which moves more
+than the last bits, and the suite's grades are where that would show. Bench
+rows are keyed only by model, drafter, block and window, so a `--resume`
+across a sous upgrade or a flip of `attention_tile`, `projection_kernel` or
+`kv_int8` reuses decode and prefill timings measured before it, which can
+rank the blocks the other way: start a fresh tune after any of them.
 
 Every drafter arm runs exactly the block its label names. Your configured arm
 is the block the daemon would run: with `speculative_block_size` unset, that

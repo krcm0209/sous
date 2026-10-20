@@ -491,7 +491,8 @@ goal.
   wrapped on top): hook 1 wraps `Qwen3_5BatchInvariantForward._linear` and
   `_linears` on the class and routes when the flag is set, every linear in
   the call is tagged and x is bf16 with ndim 3, cutting a call of more than
-  8 rows (block 0, the drafter's own policy, verifies up to 16) along T
+  8 rows (block 0, the drafter's own policy, verifies up to the checkpoint's
+  runtime block: 16 for a v1 DFlash, 5 for the default DFlash2) along T
   into runs of ≤ 8, exact because the kernel is T-invariant; hook 2 wraps
   `nn.QuantizedLinear.__call__` and routes when the flag is set, the module
   is tagged, x is bf16 and its rows (the product of the leading
@@ -521,24 +522,40 @@ goal.
   T-invariance contract is owed to
   them, their probe is relrms against stock at 6, 7 and 8 rows on every
   (K, N) the drafter holds (the warm-up compiles the same), and the drafter
-  stays out of the fork key. The probe ends by tagging the drafter and
-  calling one of its linears at 8 rows as a module with the flag raised:
-  `draft_kernel` must move, or the route is `unavailable` and untagged,
-  since the warm-up and the relrms step call `mma` directly and a drafter
-  reaching its weights past `nn.QuantizedLinear.__call__` would otherwise
-  load `active` and never be served. `enable_drafter()` reports through the
+  stays out of the fork key. Whether the drafter's calls reach hook 2 is
+  guarded on two sides, since the warm-up and the relrms step call `mma`
+  directly. The probe ends by tagging the drafter and calling one of its
+  linears at 8 rows as a module with the flag raised: `draft_kernel` must
+  move, or the route is `unavailable` and untagged. That proves only that a
+  drafter linear's own `__call__` is the hooked one (a `QuantizedLinear`
+  subclass with a `__call__` of its own fails it); it never runs the
+  drafter's forward. The forward is pinned instead: `VALIDATED_DRAFT_SOURCES`
+  hashes, as `VALIDATED_PROJ_SOURCES` does, every mlx-vlm function from
+  `draft_block` and `draft_block_greedy` to the linears (`_hidden`;
+  `_project_context_kv`, which already fuses every layer's k/v into one
+  matmul when they are `nn.Linear`; the decoder layer, the attention and its
+  `_project_kv`, the MLP; DFlash2's convolutions' `prepare` and its
+  selector's `select`), and `_draft_pins_reason` reads each through the
+  loaded drafter's own classes, so a forward that fused the quantized k/v
+  or called `quantized_matmul` directly reads as drift, and a subclass
+  override as unvalidated. Either makes the route `unavailable` with one
+  warning, before the warm-up. `enable_drafter()` reports through the
   kernel's `_refuse` (subject `projection kernel drafter`) in its
   vocabulary: `off` with the kernel switched off or a verify block of 1–5
-  (whose draft calls stay below the floor in steady state; block 0, the
-  drafter's own policy, proceeds), checked in that order before anything
-  else; `unavailable` with one INFO line where the route does
+  (whose draft calls stay below the floor in steady state), checked in that
+  order before anything else. Block 0, the drafter's own policy, proceeds
+  because a drafter's own policy may exceed five rows (a v1 DFlash
+  checkpoint's 16); under the default DFlash2's runtime block of 5 an
+  `active` route there serves nothing in steady state, and `draft_kernel`
+  stays 0. `unavailable` with one INFO line where the route does
   not apply (the kernel not active, no quantized linear, a linear `eligible()`
   rejects, named with the K and N its packed weight holds and the
   requirement it misses) and with one `warnings.warn` where it should have
-  run (a warm-up or probe that failed or raised, each under its own name,
-  any exception — an exception's traceback logged beside it, as the
-  kernel's). The greedy drafter's head argmax (`quantized_argmax`) stays
-  stock, since it too shapes proposals only. int8 prefill wraps the same `__call__` for its own tags at ≥ 128
+  run (a drafter forward off its pins, a warm-up or probe that failed or
+  raised, each under its own name, any exception — an exception's
+  traceback logged beside it, as the kernel's). The greedy drafter's head
+  argmax (`quantized_argmax`) stays stock, since it too shapes proposals
+  only. int8 prefill wraps the same `__call__` for its own tags at ≥ 128
   rows on `shape[-2]`: the row ranges are disjoint and each wrapper falls
   through to what it wrapped, so install order does not matter — keep the
   two gates disjoint if either moves. The flag `_active` is a plain int, 1
