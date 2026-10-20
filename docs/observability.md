@@ -236,7 +236,8 @@ and `WARNING` — a validated drafter whose forward differs from the mlx-vlm
 code it was validated on, a failed warm-up or probe — the same way; the
 status document's `projection_kernel` block carries it as `drafter`, with
 its reason; at `draft_block=0` with the default DFlash2 drafter, whose own
-policy stays at five rows, an `active` route serves nothing), and, whenever
+policy stays at five rows, an `active` route serves nothing in steady
+state), and, whenever
 a drafter loaded,
 `draft_block=` (the verify block the engine pinned: the configured
 `speculative_block_size`, or for an unset one 8 where the projection kernel

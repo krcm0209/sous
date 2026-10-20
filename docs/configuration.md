@@ -229,7 +229,9 @@ plus one), plus the first draft of a turn whose drafter was not seeded with
 the prompt (the seven-row generation prompt). At a `speculative_block_size`
 of 1 to 5 the route is `off`, since there its calls stay below six rows in
 steady state (only that unseeded first draft reaches seven, and it runs
-stock). The drafter's linears shape proposals only, so its probe is a
+stock); at 0 the drafter's own policy sets the depth, which may exceed five
+rows, so the route stays armed there (the default DFlash2 policy stops at
+five, and serves nothing in steady state). The drafter's linears shape proposals only, so its probe is a
 distance check against stock, not a bitwise one, and the load line says
 `projection_kernel_drafter=active` beside the kernel's own state, or `off`,
 or `unavailable` with the reason in the status document's

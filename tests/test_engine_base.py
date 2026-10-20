@@ -1806,7 +1806,8 @@ def test_vlm_engine_decides_the_drafter_route_at_the_block_it_resolved(
 ):
     """A block of 1-5 never feeds the drafter's calls six rows in steady state,
     so the route is `off` there and nothing on the drafter is tagged; block 0
-    (the drafter's own policy) and blocks from six up serve it."""
+    (the drafter's own policy, which may exceed five rows) and blocks from six
+    up arm it."""
     pytest.importorskip("mlx.core")
     from sous.engine import projkernel
     from tests import proj_fixtures as pfx

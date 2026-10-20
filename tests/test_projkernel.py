@@ -2333,7 +2333,7 @@ def test_enable_drafter_is_off_while_the_kernel_is_switched_off(drafted):
 def test_enable_drafter_is_off_below_its_floor(monkeypatch, drafted, block, kernel):
     """A verify block of 1-5 never feeds the drafter's calls six rows in steady
     state, so the route is `off` there, like a switch: nothing is warmed,
-    probed, tagged or logged, and `active` keeps meaning served. The block is
+    probed, tagged or logged, so `active` means the route can serve. The block is
     the config's, so it answers before whether the kernel is active."""
     drafter, status = drafted
     if kernel != "active":
