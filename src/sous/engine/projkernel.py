@@ -201,30 +201,62 @@ def eligible(module: Any) -> bool:
     weights, bf16 scales and biases, no bias term, K / 64 at least the kernel's
     four-way K split, and scales of at least _MIN_DEVICE_SIZE values. Any N past
     that: partial tiles are clamped on read and guarded on write."""
+    return _ineligibility(module) is None
+
+
+def _ineligibility(module: Any) -> str | None:
+    """Why the kernel cannot decode `module`, naming the first requirement it
+    misses in eligible()'s order, or None when it can."""
     import mlx.core as mx
     import mlx.nn as nn
 
-    if not isinstance(module, nn.QuantizedLinear) or "bias" in module:
-        return False
-    if getattr(module, "mode", None) != "affine":
-        return False
-    if getattr(module, "bits", None) != 4 or getattr(module, "group_size", None) != _GROUP:
-        return False
+    if not isinstance(module, nn.QuantizedLinear):
+        return "is not a QuantizedLinear"
+    if "bias" in module:
+        return "has a bias term"
+    mode = getattr(module, "mode", None)
+    if mode != "affine":
+        return f"is {mode} (affine only)"
+    bits = getattr(module, "bits", None)
+    if bits != 4:
+        return f"is {bits}-bit (4-bit only)"
+    group = getattr(module, "group_size", None)
+    if group != _GROUP:
+        return f"has group size {group} ({_GROUP} only)"
     weight = getattr(module, "weight", None)
     scales = getattr(module, "scales", None)
     biases = getattr(module, "biases", None)
     if weight is None or scales is None or biases is None:
-        return False
+        return "lacks its weight, scales or biases"
     if weight.dtype != mx.uint32 or weight.ndim != 2 or scales.ndim != 2:
-        return False
+        return "has no packed uint32 weight with 2-D scales"
     if scales.dtype != mx.bfloat16 or biases.dtype != mx.bfloat16:
-        return False
+        return f"has {scales.dtype} scales and {biases.dtype} biases (bfloat16 only)"
     if scales.shape != biases.shape or scales.shape[0] != weight.shape[0]:
-        return False
+        return "has scales and biases that do not match its weight"
     if scales.size < _MIN_DEVICE_SIZE:
-        return False
+        return f"has {scales.size} scale values (at least {_MIN_DEVICE_SIZE})"
     k = scales.shape[1] * _GROUP
-    return weight.shape[1] * 8 == k and k // _GROUP >= _KS
+    if weight.shape[1] * 8 != k:
+        return "has scales that do not cover its weight"
+    if k // _GROUP < _KS:
+        return f"has K={k} (at least {_KS * _GROUP})"
+    return None
+
+
+def _packed_shape(module: Any) -> tuple[int | None, int | None]:
+    """(K, N) read off a quantized linear's packed weight, 32 // bits codes to a
+    uint32 word, so they hold at any group size; None where the module does not
+    say. _in_features reads K off the scales, which only an eligible linear's
+    group size makes right."""
+    weight = getattr(module, "weight", None)
+    if weight is None or getattr(weight, "ndim", None) != 2:
+        return None, None
+    n = weight.shape[0]
+    bits = getattr(module, "bits", None)
+    if not isinstance(bits, int) or bits <= 0:
+        return None, n
+    return weight.shape[1] * 32 // bits, n
 
 
 # --------------------------------------------------------------------------------
@@ -1165,25 +1197,28 @@ def probe(model: Any) -> str | None:
 
 
 def _refuse(
-    reason: str, probe_seconds: float | None = None, *, expected: bool = False
+    reason: str,
+    probe_seconds: float | None = None,
+    *,
+    expected: bool = False,
+    subject: str = "projection kernel",
+    runs: str = "verify and decode run the stock projections",
+    stacklevel: int = 3,
 ) -> dict[str, Any]:
-    """This load cannot use the kernel: report why. An `expected` refusal says
-    only that the kernel does not apply here (the tile, the model, the
-    drafter), which is how most Macs load a default-on kernel: one INFO line,
-    and the reason in the status. Any other refusal means it should have run
-    and did not (a pinned dependency that drifted, a kernel this OS rejects, a
-    failed probe): one warning, since a switch that is silently inert there
-    hides a fault."""
+    """This load cannot use the kernel, or the route `subject` names: report
+    why. An `expected` refusal says only that it does not apply here (the
+    tile, the model, the drafter), which is how most Macs load a default-on
+    kernel: one INFO line, and the reason in the status. Any other refusal
+    means it should have run and did not (a pinned dependency that drifted, a
+    kernel this OS rejects, a failed probe): one warning, since a switch that
+    is silently inert there hides a fault. `runs` says what serves instead;
+    `stacklevel` points the warning at the engine that asked."""
     # A compiler error runs to dozens of lines; the status needs the one naming it.
     reason = _error_line(reason)
     if expected:
-        logger.info("projection kernel unavailable: %s", reason)
+        logger.info("%s unavailable: %s", subject, reason)
     else:
-        warnings.warn(
-            f"sous: projection kernel unavailable ({reason}); "
-            "verify and decode run the stock projections",
-            stacklevel=3,
-        )
+        warnings.warn(f"sous: {subject} unavailable ({reason}); {runs}", stacklevel=stacklevel)
     return {"state": "unavailable", "reason": reason, "probe_seconds": probe_seconds}
 
 
@@ -1389,70 +1424,101 @@ def _probe_drafter(linears: list[Any]) -> str | None:
         mx.clear_cache()
 
 
+# The drafter route's name in its INFO line and its warning.
+_DRAFT_SUBJECT = "projection kernel drafter"
+
+
+def drafter_off(reason: str | None = None) -> dict[str, Any]:
+    """The drafter route's status where nothing asks for it: no DFlash drafter,
+    or the kernel switched off. `off` is never a refusal: nothing is logged."""
+    return {"state": "off", "reason": reason, "linears": 0, "probe_seconds": None}
+
+
+def _refuse_drafter(
+    reason: str, probe_seconds: float | None = None, *, linears: int = 0, expected: bool = False
+) -> dict[str, Any]:
+    """_refuse() for the drafter route, in the kernel's vocabulary and with its
+    one-line rule; the target's own route is untouched either way."""
+    status = _refuse(
+        reason,
+        probe_seconds,
+        expected=expected,
+        subject=_DRAFT_SUBJECT,
+        runs="the drafter's own projections run stock",
+        stacklevel=4,
+    )
+    return {**status, "linears": linears}
+
+
+def _kernel_reason(kernel_status: dict[str, Any]) -> str:
+    """Why the drafter route cannot ride on a kernel that is not active: the
+    kernel's own reason, as the kernel gives the tile's."""
+    state = kernel_status.get("state")
+    return kernel_status.get("reason") or f"projection kernel {state or 'unknown'}"
+
+
+def _drafter_reason(drafter: Any, linears: list[Any]) -> str | None:
+    """Why the kernel cannot take one of the drafter's own linears, naming the
+    linear, its real K and N and the requirement it misses; or None."""
+    named = getattr(drafter, "named_modules", None)
+    names = {id(m): path for path, m in named()} if callable(named) else {}
+    for module in linears:
+        cause = _ineligibility(module)
+        if cause is not None:
+            k, n = _packed_shape(module)
+            path = names.get(id(module), "?")
+            return f"drafter linear {path} (K={k} N={n}) {cause}"
+    return None
+
+
 def enable_drafter(drafter: Any, *, kernel_status: dict[str, Any]) -> dict[str, Any]:
     """Decide whether the DFlash drafter's own linears run on the kernel from
     _DRAFT_MIN_ROWS rows up; after enable(), on the loading thread. Returns the
-    status the engine exposes and never raises. `off` says the route does not
-    apply (the kernel itself is not active, or the drafter owns no quantized
-    linear); `stock` says a drafter the kernel cannot take (an ineligible
-    linear: one INFO line) or a warm-up or probe that failed (one warning);
-    either way the target's own route is untouched."""
+    status the engine exposes, `off`, `unavailable` or `active` as the kernel's
+    own is, and never raises. `off`: the kernel is switched off. `unavailable`,
+    as _refuse() reports it: an expected refusal (the kernel not active, a
+    drafter that owns no quantized linear, a linear the kernel cannot take) is
+    one INFO line; a failed warm-up or probe, or any exception, is one warning,
+    and an exception's traceback goes to the log as the kernel's does. Either
+    way the target's own route is untouched."""
     global _draft_active
     _draft_active = 0
     seconds: float | None = None
+    linears: list[Any] = []
     try:
+        if kernel_status.get("state") == "off":
+            return drafter_off("projection kernel off")
         if kernel_status.get("state") != "active":
-            return {
-                "state": "off",
-                "reason": "projection kernel not active",
-                "linears": 0,
-                "probe_seconds": None,
-            }
+            return _refuse_drafter(_kernel_reason(kernel_status), expected=True)
         linears = _drafter_linears(drafter)
         if not linears:
-            return {
-                "state": "off",
-                "reason": "the drafter owns no quantized linear",
-                "linears": 0,
-                "probe_seconds": None,
-            }
-        for m in linears:
-            if not eligible(m):
-                reason = (
-                    f"a drafter linear the kernel cannot take "
-                    f"(K={_in_features(m)} N={m.weight.shape[0]})"
-                )
-                logger.info("projection kernel: drafter linears stay stock: %s", reason)
-                return {
-                    "state": "stock",
-                    "reason": reason,
-                    "linears": len(linears),
-                    "probe_seconds": None,
-                }
+            return _refuse_drafter("the drafter owns no quantized linear", expected=True)
+        reason = _drafter_reason(drafter, linears)
+        if reason is not None:
+            return _refuse_drafter(reason, linears=len(linears), expected=True)
         start = time.perf_counter()
         try:
-            _warm_up_drafter(linears)
-            reason = _probe_drafter(linears)
-        except Exception as e:  # noqa: BLE001 — a shape this toolchain rejects stays stock
-            logger.warning("projection kernel: the drafter's warm-up failed", exc_info=True)
-            reason = f"warm-up: {_error_line(str(e) or type(e).__name__)}"
+            try:
+                _warm_up_drafter(linears)
+            except Exception as e:  # noqa: BLE001 — a shape this toolchain rejects refuses the route
+                # The one-line reason cannot carry a compiler's full report; the log can.
+                logger.warning("projection kernel: the drafter's warm-up failed", exc_info=True)
+                reason = f"warm-up: {_error_line(str(e) or type(e).__name__)}"
+            else:
+                try:
+                    reason = _probe_drafter(linears)
+                except Exception as e:  # noqa: BLE001 — a probe that raises refuses the route
+                    logger.warning("projection kernel: the drafter's probe failed", exc_info=True)
+                    reason = f"probe: {_error_line(str(e) or type(e).__name__)}"
         finally:
             seconds = round(time.perf_counter() - start, 2)
         if reason is not None:
-            warnings.warn(
-                f"sous: projection kernel: drafter linears stay stock ({reason})", stacklevel=2
-            )
-            logger.warning("projection kernel: drafter linears stay stock: %s", reason)
-            return {
-                "state": "stock",
-                "reason": reason,
-                "linears": len(linears),
-                "probe_seconds": seconds,
-            }
+            return _refuse_drafter(reason, seconds, linears=len(linears))
         tagged = tag_drafter(drafter)
         _draft_active = 1
         logger.info(
-            "projection kernel: drafter: %d linears from %d rows, probe %.2fs",
+            "%s: %d linears from %d rows, probe %.2fs",
+            _DRAFT_SUBJECT,
             tagged,
             _DRAFT_MIN_ROWS,
             seconds,
@@ -1462,13 +1528,9 @@ def enable_drafter(drafter: Any, *, kernel_status: dict[str, Any]) -> dict[str, 
         _draft_active = 0
         with contextlib.suppress(Exception):
             untag_drafter(drafter)
+        # The warning carries one line; the traceback goes to the log.
         logger.warning("projection kernel: enabling the drafter route failed", exc_info=True)
-        return {
-            "state": "stock",
-            "reason": str(e) or type(e).__name__,
-            "linears": 0,
-            "probe_seconds": seconds,
-        }
+        return _refuse_drafter(str(e) or type(e).__name__, seconds, linears=len(linears))
 
 
 def static_reason(config: Any, model_config: dict, drafter_kind: str | None) -> str | None:

@@ -225,8 +225,10 @@ GB/s on their shapes against the kernel's 126–177 and below which stock is as
 fast or faster: a block-8 draft's eight-row calls, never a block-5 draft's.
 They shape proposals only, so the drafter's probe is a distance check against
 stock, not a bitwise one, and the load line says `projection_kernel_drafter=`
-`active` (or `stock` with the reason in the log) beside the kernel's own
-state. That took
+`active` beside the kernel's own state, or `unavailable` with the reason in
+the log the way the kernel's own is: one INFO line where the route does not
+apply (the kernel not active, a drafter linear it cannot take), a `WARNING`
+where it should have run and did not (a failed warm-up or probe). That took
 decode with no drafter from 10.2 to 13.4 tok/s on the first 16 of those turns
 (1.32x), about the 13.5 tok/s it decodes with `false` there (measured in
 separate runs); before it, decode with no drafter ran about 0.78x. The kernel is

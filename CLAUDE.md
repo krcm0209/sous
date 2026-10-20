@@ -512,7 +512,15 @@ goal.
   eight-row calls go to the kernel and a block-5 draft's never do; they
   shape proposals only, so no bitwise or T-invariance contract is owed to
   them, their probe is relrms against stock, and the drafter stays out of
-  the fork key. The greedy drafter's head argmax (`quantized_argmax`) stays
+  the fork key. `enable_drafter()` reports through the kernel's `_refuse`
+  (subject `projection kernel drafter`) in its vocabulary: `off` with the
+  kernel switched off; `unavailable` with one INFO line where the route does
+  not apply (the kernel not active, no quantized linear, a linear `eligible()`
+  rejects, named with the K and N its packed weight holds and the
+  requirement it misses) and with one `warnings.warn` where it should have
+  run (a warm-up or probe that failed or raised, each under its own name,
+  any exception — an exception's traceback logged beside it, as the
+  kernel's). The greedy drafter's head argmax (`quantized_argmax`) stays
   stock, since it too shapes proposals only. int8 prefill wraps the same `__call__` for its own tags at ≥ 128
   rows on `shape[-2]`: the row ranges are disjoint and each wrapper falls
   through to what it wrapped, so install order does not matter — keep the
@@ -597,7 +605,7 @@ goal.
   dispatch `linears()` serves; warm-up and probe leave them all as found) counts
   every path for the tests and for
   harnesses, and the load line carries `projection_kernel=`, with a DFlash
-  drafter beside an active kernel `projection_kernel_drafter=active|stock`,
+  drafter `projection_kernel_drafter=active|unavailable` (absent when `off`),
   and, with a drafter, `draft_block=`. The fork key records `proj` (`active`, else
   `off`) and `projkernel.py` is in `_EPOCH_FILES`: the one-row forward that
   ends every prefill segment, and any tail of ≤ 8 rows, runs on the

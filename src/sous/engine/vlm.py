@@ -148,7 +148,7 @@ class VLMEngine:
         self.projection_kernel_drafter_status = (
             projkernel.enable_drafter(self._draft, kernel_status=self.projection_kernel_status)
             if self._draft is not None and self._draft_kind == "dflash"
-            else {"state": "off", "reason": None, "linears": 0, "probe_seconds": None}
+            else projkernel.drafter_off()
         )
         # An unset block resolves only now that the tile and the kernel have
         # settled: with the kernel a deeper verify round's projections cost

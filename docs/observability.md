@@ -224,11 +224,13 @@ decode and short prefill tails — run on the small-row projection kernel, with
 a load the kernel cannot serve, every load whose attention tile is not
 `active` included, since the kernel rides on the tile — the status document's
 `projection_kernel` block carries the reason, and the log splits INFO and
-`WARNING` the way it does for the tile; with a DFlash drafter beside an active
-kernel, `projection_kernel_drafter=active|stock` says whether the drafter's
-own linears ride the kernel at six rows and more — `stock` names, in the log, a
-drafter linear the kernel cannot take or a failed probe — and the field is
-absent where the route does not apply), and, whenever a drafter loaded,
+`WARNING` the way it does for the tile; with a DFlash drafter,
+`projection_kernel_drafter=active|unavailable` says whether the drafter's
+own linears ride the kernel at six rows and more — `unavailable` is a route
+this load cannot serve, which the log splits into INFO (the kernel not
+active, a drafter linear it cannot take) and `WARNING` (a failed warm-up or
+probe) the same way — and the field is absent where it is `off`, as with the
+kernel switched off), and, whenever a drafter loaded,
 `draft_block=` (the verify block the engine pinned: the configured
 `speculative_block_size`, or for an unset one 8 where the projection kernel
 is active, 4 where only the attention tile is and 3 elsewhere, 0 being the

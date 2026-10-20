@@ -1754,9 +1754,17 @@ def test_vlm_engine_resolves_an_unset_draft_block_by_what_is_active(
     assert drafter.prefer_requested_block_size is (expected > 0)
 
 
-@pytest.mark.parametrize("proj_state", ["active", "unavailable"])
+@pytest.mark.parametrize(
+    ("proj_state", "state", "reason"),
+    [
+        # The stub drafter is no module tree, so even an active kernel finds nothing to serve.
+        ("active", "unavailable", "the drafter owns no quantized linear"),
+        ("unavailable", "unavailable", "projection kernel unavailable"),
+        ("off", "off", "projection kernel off"),
+    ],
+)
 def test_vlm_engine_decides_the_drafters_kernel_route_after_the_kernels_own(
-    monkeypatch, proj_state
+    monkeypatch, proj_state, state, reason
 ):
     """The drafter's own linears ride the kernel only where the kernel serves the
     target; the engine asks after the kernel's state is settled, with the loaded
@@ -1774,13 +1782,8 @@ def test_vlm_engine_decides_the_drafters_kernel_route_after_the_kernels_own(
     engine, drafter, _ = _drafted_vlm(monkeypatch, proj_state, "active")
     assert asked == [(drafter, engine.projection_kernel_status)]
     status = engine.projection_kernel_drafter_status
-    # The stub drafter is no module tree, so even an active kernel finds nothing to serve.
-    assert status["state"] == "off" and projkernel._draft_active == 0
-    assert status["reason"] == (
-        "the drafter owns no quantized linear"
-        if proj_state == "active"
-        else "projection kernel not active"
-    )
+    assert (status["state"], status["reason"]) == (state, reason)
+    assert projkernel._draft_active == 0
 
 
 def test_vlm_engine_built_directly_keeps_the_draft_block_it_was_given(monkeypatch):
@@ -3029,13 +3032,13 @@ def test_get_logs_the_projection_kernel_state(caplog, tmp_path, status, tail):
         ),
         (
             {
-                "state": "stock",
-                "reason": "a drafter linear the kernel cannot take",
+                "state": "unavailable",
+                "reason": "drafter linear fc (K=25600 N=5120) has group size 32 (64 only)",
                 "linears": 47,
                 "probe_seconds": None,
             },
             " projection_kernel=active projection_kernel_probe_s=0.37"
-            " projection_kernel_drafter=stock",
+            " projection_kernel_drafter=unavailable",
         ),
         (
             {"state": "off", "reason": None, "linears": 0, "probe_seconds": None},

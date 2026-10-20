@@ -13,6 +13,7 @@ import os
 import types
 import warnings
 from importlib.resources import files
+from typing import Any
 
 import pytest
 
@@ -2207,7 +2208,7 @@ def test_enable_drafter_tags_warms_probes_and_raises_its_own_flag(
     assert projkernel._draft_active == 1 and projkernel._active == 1
     assert projkernel.calls == before, "the warm-up and the probe leave the counters as found"
     assert [r.getMessage() for r in caplog.records if "drafter" in r.getMessage()] == [
-        f"projection kernel: drafter: 8 linears from {projkernel._DRAFT_MIN_ROWS} rows, "
+        f"projection kernel drafter: 8 linears from {projkernel._DRAFT_MIN_ROWS} rows, "
         f"probe {got['probe_seconds']:.2f}s"
     ]
     # Served through the real hook at eight rows; handed on at five.
@@ -2224,46 +2225,197 @@ def test_enable_drafter_tags_warms_probes_and_raises_its_own_flag(
     projkernel.untag_drafter(drafter)
 
 
-@pytest.mark.parametrize("ending", ["kernel off", "no linears", "ineligible", "probe fails"])
-def test_enable_drafter_stays_stock_without_a_served_kernel_or_a_servable_drafter(
-    monkeypatch, caplog, fresh_target, ending
-):
+def _drafter_untagged(drafter) -> bool:
+    return not any(
+        projkernel._draft_tagged(m)
+        for _, m in drafter.named_modules()
+        if isinstance(m, nn.QuantizedLinear)
+    )
+
+
+def _drafter_refusal(drafter, kernel_status, *, warned: bool, raised: str | None = None) -> dict:
+    """enable_drafter() expected to refuse `unavailable`, reporting as the kernel's
+    own refusals do: one where the route does not apply is one INFO line in the
+    route's words and no warning; one where it should have run is exactly one
+    warning, on one line, and no WARNING log line beside it but the traceback of
+    whatever raised, which `raised` names. In the daemon a warning is itself a
+    WARNING line, so a second one carrying the reason would print it twice. The
+    flag is left clear and nothing on the drafter tagged."""
+    with warnings.catch_warnings(record=True) as caught, _gate_log() as records:
+        warnings.simplefilter("always")
+        status = projkernel.enable_drafter(drafter, kernel_status=kernel_status)
+    messages = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    infos = [r.getMessage() for r in records if r.levelno == logging.INFO]
+    louder = [r for r in records if r.levelno >= logging.WARNING]
+    assert status["state"] == "unavailable", status
+    assert set(status) == {"state", "reason", "linears", "probe_seconds"}
+    if warned:
+        assert messages == [
+            f"sous: projection kernel drafter unavailable ({status['reason']}); "
+            "the drafter's own projections run stock"
+        ]
+        assert "\n" not in messages[0]
+        assert infos == []
+    else:
+        assert messages == []
+        assert infos == [f"projection kernel drafter unavailable: {status['reason']}"]
+    assert [r.getMessage() for r in louder] == ([] if raised is None else [raised])
+    assert all(r.exc_info is not None for r in louder), "only a traceback rides beside it"
+    assert projkernel._draft_active == 0
+    if hasattr(drafter, "layers"):
+        assert _drafter_untagged(drafter)
+    return status
+
+
+@pytest.fixture
+def drafted(monkeypatch, fresh_target):
+    """(the tiny drafter bound to the tiny target, the kernel's active status):
+    enable() has served the target, so the drafter route has a kernel to ride on."""
     tile = pfx.proj_ready(monkeypatch)
     status = projkernel.enable(fresh_target, enabled=True, drafter_kind="dflash", tile_status=tile)
+    assert status["state"] == "active", status
     drafter = _tiny_drafter(fresh_target)
-    if ending == "kernel off":
-        status = {"state": "unavailable", "reason": "attention tile off", "probe_seconds": None}
-    elif ending == "no linears":
-        drafter = types.SimpleNamespace(named_modules=lambda: [])
-    elif ending == "ineligible":
-        object.__setattr__(drafter.layers[0].mlp.gate_proj, "bits", 8)
-    elif ending == "probe fails":
-        monkeypatch.setattr(
-            projkernel, "_probe_drafter", lambda linears: "correctness: gate_proj is off"
+    yield drafter, status
+    projkernel.untag_drafter(drafter)
+
+
+def test_enable_drafter_is_off_while_the_kernel_is_switched_off(drafted):
+    """The kernel's switch is the route's: switched off, it is `off`, which is
+    never a refusal, and nothing is logged."""
+    drafter, _ = drafted
+    with warnings.catch_warnings(record=True) as caught, _gate_log() as records:
+        warnings.simplefilter("always")
+        got = projkernel.enable_drafter(
+            drafter, kernel_status={"state": "off", "reason": None, "probe_seconds": None}
         )
-    with (
-        caplog.at_level(logging.INFO, logger="sous.engine.projkernel"),
-        pytest.warns(UserWarning, match="drafter linears stay stock")
-        if ending == "probe fails"
-        else contextlib.nullcontext(),
-    ):
-        got = projkernel.enable_drafter(drafter, kernel_status=status)
-    assert got["state"] == ("off" if ending in ("kernel off", "no linears") else "stock"), got
-    assert got["reason"]
-    assert projkernel._draft_active == 0
-    if ending != "kernel off":
-        assert projkernel._active == 1, "the target's own route is untouched"
-    if hasattr(drafter, "layers"):
-        assert not any(
-            projkernel._draft_tagged(m)
-            for _, m in drafter.named_modules()
-            if isinstance(m, nn.QuantizedLinear)
-        )
-    levels = {r.levelno for r in caplog.records if "drafter" in r.getMessage()}
-    want = {
-        "kernel off": set(),
-        "no linears": set(),
-        "ineligible": {logging.INFO},
-        "probe fails": {logging.WARNING},
+    assert got == projkernel.drafter_off("projection kernel off")
+    assert got == {
+        "state": "off",
+        "reason": "projection kernel off",
+        "linears": 0,
+        "probe_seconds": None,
     }
-    assert levels == want[ending]
+    assert [w for w in caught if issubclass(w.category, UserWarning)] == []
+    assert records == []
+    assert projkernel._draft_active == 0 and _drafter_untagged(drafter)
+
+
+def _requantized(drafter, path: str, **kwargs) -> None:
+    """Swap the drafter's linear at `path` for a fresh one of the same shape,
+    quantized as `kwargs` say: a checkpoint quantized otherwise survives
+    nn.quantize, which leaves an existing QuantizedLinear alone."""
+    parent, name = path.rsplit(".", 1)
+    old = dict(drafter.named_modules())[path]
+    n, k = old.weight.shape[0], old.weight.shape[1] * 8
+    module = nn.QuantizedLinear(k, n, **{"bias": False, "group_size": 64, "bits": 4, **kwargs})
+    setattr(dict(drafter.named_modules())[parent], name, module)
+
+
+# case -> (how the drafter or the kernel's status is made to refuse, the reason)
+_DRAFTER_DOES_NOT_APPLY: dict[str, tuple[Any, str]] = {
+    "kernel unavailable": ("attention tile off", "attention tile off"),
+    "kernel unavailable, no reason": (None, "projection kernel unavailable"),
+    "no linears": ("no linears", "the drafter owns no quantized linear"),
+    "group size 32": (
+        {"group_size": 32},
+        "drafter linear layers.0.mlp.gate_proj (K=256 N=512) has group size 32 (64 only)",
+    ),
+    "group size 128": (
+        {"group_size": 128},
+        "drafter linear layers.0.mlp.gate_proj (K=256 N=512) has group size 128 (64 only)",
+    ),
+    "8-bit": (
+        {"bits": 8},
+        "drafter linear layers.0.mlp.gate_proj (K=256 N=512) is 8-bit (4-bit only)",
+    ),
+    "a bias": (
+        {"bias": True},
+        "drafter linear layers.0.mlp.gate_proj (K=256 N=512) has a bias term",
+    ),
+    "float32 scales": (
+        {},
+        "drafter linear layers.0.mlp.gate_proj (K=256 N=512) has mlx.core.float32 scales "
+        "and mlx.core.float32 biases (bfloat16 only)",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_DRAFTER_DOES_NOT_APPLY))
+def test_enable_drafter_refuses_a_load_it_does_not_apply_to_in_one_info_line(drafted, case):
+    """Where the kernel is not active, or the drafter holds no linear the kernel
+    takes, the route says so the way the kernel says it of a tile that is not
+    active: `unavailable`, one INFO line, no warning. An ineligible linear is
+    named with the K and N its packed weight holds and the requirement it
+    misses; K off the scales would read 512 at group size 32 and 128 at 128."""
+    drafter, status = drafted
+    how, reason = _DRAFTER_DOES_NOT_APPLY[case]
+    if case.startswith("kernel unavailable"):
+        status = {"state": "unavailable", "reason": how, "probe_seconds": None}
+    elif how == "no linears":
+        drafter = types.SimpleNamespace(named_modules=lambda: [])
+    else:
+        _requantized(drafter, "layers.0.mlp.gate_proj", **how)
+    got = _drafter_refusal(drafter, status, warned=False)
+    assert got["reason"] == reason
+    assert got["probe_seconds"] is None
+    if case.startswith("kernel unavailable"):
+        assert projkernel._active == 1, "the target's own route is untouched"
+
+
+def test_enable_drafter_warns_once_for_a_failed_probe(monkeypatch, drafted):
+    drafter, status = drafted
+    monkeypatch.setattr(
+        projkernel, "_probe_drafter", lambda linears: "correctness: K=256 N=512 at T=8 is off"
+    )
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert got["reason"] == "correctness: K=256 N=512 at T=8 is off"
+    assert got["linears"] == 8 and isinstance(got["probe_seconds"], float)
+    assert projkernel._active == 1, "the target's own route is untouched"
+
+
+def _raises(error):
+    def raising(*args, **kwargs):
+        raise error
+
+    return raising
+
+
+# case -> (the step that raises, the reason, the traceback line beside the warning)
+_DRAFTER_RAISES = {
+    "warm-up": (
+        "_warm_up_drafter",
+        "warm-up: program_source:3:1: error: boom",
+        "projection kernel: the drafter's warm-up failed",
+    ),
+    "probe": (
+        "_probe_drafter",
+        "probe: program_source:3:1: error: boom",
+        "projection kernel: the drafter's probe failed",
+    ),
+    "a guard": (
+        "_drafter_reason",
+        "program_source:3:1: error: boom",
+        "projection kernel: enabling the drafter route failed",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_DRAFTER_RAISES))
+def test_enable_drafter_warns_once_for_a_step_that_raises_and_logs_its_traceback(
+    monkeypatch, drafted, case
+):
+    """A raise in the warm-up or the probe is reported as that step's, never the
+    other's, and every reason is the error's one line; the traceback goes to the
+    log as the kernel's own does."""
+    drafter, status = drafted
+    step, reason, line = _DRAFTER_RAISES[case]
+    error = RuntimeError(_BUILD_ERROR)
+    monkeypatch.setattr(projkernel, step, _raises(error))
+    with warnings.catch_warnings(record=True), _gate_log() as records:
+        warnings.simplefilter("always")
+        got = _drafter_refusal(drafter, status, warned=True, raised=line)
+    assert got["reason"] == reason
+    (record,) = [r for r in records if r.levelno >= logging.WARNING]
+    assert record.exc_info is not None and record.exc_info[1] is error
+    if case != "a guard":
+        assert isinstance(got["probe_seconds"], float)
