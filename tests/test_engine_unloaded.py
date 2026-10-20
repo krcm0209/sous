@@ -110,8 +110,10 @@ def test_vlm_unload_turns_the_projection_kernel_off(monkeypatch):
     from sous.engine import projkernel
 
     monkeypatch.setattr(projkernel, "_active", 1)
+    monkeypatch.setattr(projkernel, "_draft_active", 1)
     _unloaded_vlm().unload()
     assert projkernel._active == 0
+    assert projkernel._draft_active == 0
 
 
 def test_vlm_unload_turns_kv8_off(monkeypatch):
@@ -140,6 +142,7 @@ def test_vlm_unload_clears_the_tile_projection_kernel_and_kv8_before_anything_ca
 
     monkeypatch.setattr(tileattn, "_active_splits", 20)
     monkeypatch.setattr(projkernel, "_active", 1)
+    monkeypatch.setattr(projkernel, "_draft_active", 1)
     monkeypatch.setattr(kv8, "_active", 1)
     engine = _unloaded_vlm()
     if failing == "prompt cache":
@@ -150,6 +153,7 @@ def test_vlm_unload_clears_the_tile_projection_kernel_and_kv8_before_anything_ca
         engine.unload()
     assert tileattn._active_splits == 0
     assert projkernel._active == 0
+    assert projkernel._draft_active == 0
     assert kv8._active == 0
 
 

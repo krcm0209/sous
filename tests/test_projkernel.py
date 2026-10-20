@@ -844,10 +844,12 @@ def test_a_one_row_call_through_hook_two_is_a_one_row_dispatch(monkeypatch):
     assert _proj_counts_since(before) == {"plain_kernel": 1}
 
 
-def test_clear_drops_the_flag(monkeypatch):
+def test_clear_drops_both_flags(monkeypatch):
     monkeypatch.setattr(projkernel, "_active", 1)
+    monkeypatch.setattr(projkernel, "_draft_active", 1)
     projkernel.clear()
     assert projkernel._active == 0
+    assert projkernel._draft_active == 0
 
 
 def test_tag_marks_every_quantized_linear_of_the_language_model_and_nothing_else(fresh_target):
@@ -1260,6 +1262,7 @@ def _enabling_failures(caplog) -> list[logging.LogRecord]:
 def test_enable_off_returns_before_any_guard(monkeypatch):
     pfx.proj_ready(monkeypatch)
     monkeypatch.setattr(projkernel, "_active", 1)
+    monkeypatch.setattr(projkernel, "_draft_active", 1)
 
     def untouchable(*args, **kwargs):
         raise AssertionError("a guard ran while the kernel is off")
@@ -1282,6 +1285,7 @@ def test_enable_off_returns_before_any_guard(monkeypatch):
     assert [w for w in caught if issubclass(w.category, UserWarning)] == []
     assert records == []
     assert projkernel._active == 0
+    assert projkernel._draft_active == 0
 
 
 _GUARD_REASONS = [
@@ -2162,6 +2166,10 @@ _DRAFT_HANDED_ON = {
     "nine rows": (1, lambda: _acts(1, 9, 256), None),
     "the context tail": (1, lambda: _acts(1, 2047, 256), None),
     "float16": (1, lambda: _acts(1, 8, 256, dtype=mx.float16), "declined"),
+    # Only tagged modules route: with the drafter's flag set, any other
+    # QuantizedLinear call of 6-8 bf16 rows in the process would otherwise
+    # reach the kernel.
+    "untagged module": (1, lambda: _acts(1, 8, 256), None),
 }
 
 
@@ -2179,7 +2187,8 @@ def test_the_module_hook_hands_the_drafters_other_calls_on(monkeypatch, case):
     monkeypatch.setattr(projkernel, "_draft_active", flag)
     monkeypatch.setattr(projkernel, "mma", _no_kernel)
     linear = pfx.rand_module(256, 256, 0)
-    object.__setattr__(linear, projkernel._DRAFT_TAG, True)
+    if case != "untagged module":
+        object.__setattr__(linear, projkernel._DRAFT_TAG, True)
     x = build()
     before = dict(projkernel.calls)
     assert hook(linear, x) == "the wrapped method's answer"
@@ -2589,3 +2598,43 @@ def test_the_drafters_hook_step_leaves_the_flag_clear_and_the_counters_as_found(
     assert flags == [1], "the flag is raised around the one call"
     assert projkernel._draft_active == 0
     assert projkernel.calls == before
+
+
+def test_enable_clears_a_drafter_route_left_from_an_earlier_load(monkeypatch, drafted):
+    """A load with no DFlash drafter after one with it never reaches
+    enable_drafter(), so only enable() itself can clear the drafter's flag: else
+    the earlier drafter's tagged linears would keep riding a kernel that this
+    load's checks never approved for them."""
+    drafter, status = drafted
+    got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=8)
+    assert got["state"] == "active" and projkernel._draft_active == 1
+    later = pfx.tiny_quantized_model(seed=1)
+    tile = dict(pfx.ACTIVE_TILE)
+    again = projkernel.enable(later, enabled=True, drafter_kind=None, tile_status=tile)
+    assert again["state"] == "active", again
+    assert projkernel._draft_active == 0
+    # The earlier drafter's linears are still tagged, and now handed on.
+    linear = drafter.layers[0].mlp.gate_proj
+    assert projkernel._draft_tagged(linear)
+    before = dict(projkernel.calls)
+    linear(_acts(1, 8, 256))
+    assert _proj_counts_since(before) == {}
+    projkernel.untag(later)
+
+
+@pytest.mark.parametrize("ending", ["kernel unavailable", "block below the floor"])
+def test_enable_drafter_clears_its_flag_before_it_decides(drafted, ending):
+    """A second decision that refuses, or is off, leaves the flag clear whatever
+    the first one set."""
+    drafter, status = drafted
+    assert projkernel.enable_drafter(drafter, kernel_status=status, block_size=8)["state"] == (
+        "active"
+    )
+    assert projkernel._draft_active == 1
+    if ending == "kernel unavailable":
+        unavailable = {"state": "unavailable", "reason": "attention tile off"}
+        got = projkernel.enable_drafter(drafter, kernel_status=unavailable, block_size=8)
+    else:
+        got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=5)
+    assert got["state"] in ("unavailable", "off"), got
+    assert projkernel._draft_active == 0

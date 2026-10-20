@@ -1313,11 +1313,12 @@ def enable(
     the warm-up and the probe, the kernel's whole cost to a load."""
     global _active, _draft_active
     # First, on every call: a flag left from an earlier load must never serve
-    # this one, whatever happens below; the drafter's flag goes with it, since
-    # enable_drafter() runs only after an active enable(). Tags left on an
-    # earlier model are inert while the flags are clear, and a reference kept
-    # to untag them would keep that model's weights alive past its unload, so
-    # they stay.
+    # this one, whatever happens below. The drafter's flag goes with it: a load
+    # with no DFlash drafter after one with it never reaches enable_drafter(),
+    # whose own first statement clears it, so this is the only clear that load
+    # gets. Tags left on an earlier model are inert while the flags are clear,
+    # and a reference kept to untag them would keep that model's weights alive
+    # past its unload, so they stay.
     _active = 0
     _draft_active = 0
     if not enabled:
