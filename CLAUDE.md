@@ -511,8 +511,14 @@ goal.
   kernel reads at 126–177 (M5 Pro, 2026-10-16), so a block-8 draft's
   eight-row calls go to the kernel and a block-5 draft's never do; they
   shape proposals only, so no bitwise or T-invariance contract is owed to
-  them, their probe is relrms against stock, and the drafter stays out of
-  the fork key. `enable_drafter()` reports through the kernel's `_refuse`
+  them, their probe is relrms against stock at 6, 7 and 8 rows on every
+  (K, N) the drafter holds (the warm-up compiles the same), and the drafter
+  stays out of the fork key. The probe ends by tagging the drafter and
+  calling one of its linears at 8 rows as a module with the flag raised:
+  `draft_kernel` must move, or the route is `unavailable` and untagged,
+  since the warm-up and the relrms step call `mma` directly and a drafter
+  reaching its weights past `nn.QuantizedLinear.__call__` would otherwise
+  load `active` and never be served. `enable_drafter()` reports through the kernel's `_refuse`
   (subject `projection kernel drafter`) in its vocabulary: `off` with the
   kernel switched off; `unavailable` with one INFO line where the route does
   not apply (the kernel not active, no quantized linear, a linear `eligible()`

@@ -1424,6 +1424,34 @@ def _probe_drafter(linears: list[Any]) -> str | None:
         mx.clear_cache()
 
 
+def _probe_drafter_hook(linears: list[Any]) -> str | None:
+    """None when one of the drafter's tagged linears, called as a module the way
+    the drafter calls it, reaches hook 2 and the kernel at MAX_ROWS rows; else
+    why not. The warm-up and the probe call `mma` directly, so without this a
+    drafter that reached its linears some other way (a QuantizedLinear subclass
+    with a __call__ of its own, a fused projection) would load `active` and
+    never be served. Raises the drafter's flag only around the one call, and
+    leaves it clear and the counters as found."""
+    import mlx.core as mx
+
+    global _draft_active
+    module = linears[0]
+    # Evaluated before the launch, for the deadlock warm_up() describes.
+    x = mx.zeros((1, MAX_ROWS, _in_features(module)), dtype=mx.bfloat16)
+    mx.eval(x)
+    counted = dict(calls)
+    try:
+        _draft_active = 1
+        mx.eval(module(x))
+        served = calls["draft_kernel"] - counted["draft_kernel"]
+    finally:
+        _draft_active = 0
+        calls.update(counted)
+    if served != 1:
+        return "the drafter's linears do not reach the hook"
+    return None
+
+
 # The drafter route's name in its INFO line and its warning.
 _DRAFT_SUBJECT = "projection kernel drafter"
 
@@ -1480,11 +1508,14 @@ def enable_drafter(drafter: Any, *, kernel_status: dict[str, Any]) -> dict[str, 
     drafter that owns no quantized linear, a linear the kernel cannot take) is
     one INFO line; a failed warm-up or probe, or any exception, is one warning,
     and an exception's traceback goes to the log as the kernel's does. Either
-    way the target's own route is untouched."""
+    way the target's own route is untouched. The probe ends by tagging the
+    drafter and proving one of its calls reaches the hook; a refusal from
+    there on untags it."""
     global _draft_active
     _draft_active = 0
     seconds: float | None = None
     linears: list[Any] = []
+    tagged = 0
     try:
         if kernel_status.get("state") == "off":
             return drafter_off("projection kernel off")
@@ -1507,14 +1538,17 @@ def enable_drafter(drafter: Any, *, kernel_status: dict[str, Any]) -> dict[str, 
             else:
                 try:
                     reason = _probe_drafter(linears)
+                    if reason is None:
+                        tagged = tag_drafter(drafter)
+                        reason = _probe_drafter_hook(linears)
                 except Exception as e:  # noqa: BLE001 — a probe that raises refuses the route
                     logger.warning("projection kernel: the drafter's probe failed", exc_info=True)
                     reason = f"probe: {_error_line(str(e) or type(e).__name__)}"
         finally:
             seconds = round(time.perf_counter() - start, 2)
         if reason is not None:
+            untag_drafter(drafter)
             return _refuse_drafter(reason, seconds, linears=len(linears))
-        tagged = tag_drafter(drafter)
         _draft_active = 1
         logger.info(
             "%s: %d linears from %d rows, probe %.2fs",

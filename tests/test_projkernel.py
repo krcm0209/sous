@@ -2195,6 +2195,15 @@ def test_enable_drafter_tags_warms_probes_and_raises_its_own_flag(
     status = projkernel.enable(fresh_target, enabled=True, drafter_kind="dflash", tile_status=tile)
     assert status["state"] == "active", status
     drafter = _tiny_drafter(fresh_target)
+    served = []
+    serve_draft = projkernel._serve_draft
+
+    def spy(module, x):
+        out = serve_draft(module, x)
+        served.append((module, x.shape, out is not None))
+        return out
+
+    monkeypatch.setattr(projkernel, "_serve_draft", spy)
     before = dict(projkernel.calls)
     with caplog.at_level(logging.INFO, logger="sous.engine.projkernel"):
         got = projkernel.enable_drafter(drafter, kernel_status=status)
@@ -2206,6 +2215,11 @@ def test_enable_drafter_tags_warms_probes_and_raises_its_own_flag(
     }
     assert isinstance(got["probe_seconds"], float)
     assert projkernel._draft_active == 1 and projkernel._active == 1
+    # The probe's last step is one call of a tagged drafter linear through the
+    # hook, which the kernel served and counted, and which it then put back.
+    ((module, shape, hit),) = served
+    assert projkernel._draft_tagged(module) and hit
+    assert shape == (1, projkernel.MAX_ROWS, module.weight.shape[1] * 8)
     assert projkernel.calls == before, "the warm-up and the probe leave the counters as found"
     assert [r.getMessage() for r in caplog.records if "drafter" in r.getMessage()] == [
         f"projection kernel drafter: 8 linears from {projkernel._DRAFT_MIN_ROWS} rows, "
@@ -2419,3 +2433,123 @@ def test_enable_drafter_warns_once_for_a_step_that_raises_and_logs_its_traceback
     assert record.exc_info is not None and record.exc_info[1] is error
     if case != "a guard":
         assert isinstance(got["probe_seconds"], float)
+
+
+def _recording(seen: set):
+    """The stand-in kernel, recording (K, N, rows) for every linear it is asked for."""
+
+    def record(x, weights):
+        seen.update((x.shape[-1], w.shape[0], _rows(x)) for w, _, _ in weights)
+        return pfx.stand_in_mma(x, weights)
+
+    return record
+
+
+def test_the_drafters_warm_up_and_probe_cover_every_row_count_the_hook_serves(monkeypatch, drafted):
+    """Six, seven and eight rows on every (K, N) the drafter holds, in both: a
+    shape that fails to compile, or that the kernel computes wrongly, at seven
+    rows would otherwise go live."""
+    drafter, _ = drafted
+    linears = projkernel._drafter_linears(drafter)
+    shapes = {(m.weight.shape[1] * 8, m.weight.shape[0]) for m in linears}
+    want = {(k, n, t) for k, n in shapes for t in range(projkernel._DRAFT_MIN_ROWS, 9)}
+    assert {t for *_, t in want} == {6, 7, 8}
+    warmed: set = set()
+    monkeypatch.setattr(projkernel, "mma", _recording(warmed))
+    projkernel._warm_up_drafter(linears)
+    assert warmed == want
+    probed: set = set()
+    monkeypatch.setattr(projkernel, "mma", _recording(probed))
+    assert projkernel._probe_drafter(linears) is None
+    assert probed == want
+
+
+@pytest.mark.parametrize("rows", [6, 7, 8])
+def test_enable_drafter_refuses_a_kernel_wrong_at_one_row_count(monkeypatch, drafted, rows):
+    """The probe's negative control: a kernel wrong in one place, at one row
+    count the hook serves, refuses the route with a warning and untags it."""
+    drafter, status = drafted
+
+    def wrong_at(x, weights):
+        outs = pfx.stand_in_mma(x, weights)
+        return _scaled(outs, 1.1) if _rows(x) == rows else outs
+
+    monkeypatch.setattr(projkernel, "mma", wrong_at)
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert got["reason"].startswith("correctness: K="), got
+    assert f" at T={rows} is " in got["reason"], got
+    assert projkernel._active == 1, "the target's own route is untouched"
+
+
+def test_enable_drafter_refuses_a_kernel_that_writes_a_nan(monkeypatch, drafted):
+    drafter, status = drafted
+    nan = mx.array(float("nan"), dtype=mx.bfloat16)
+
+    def nan_at_eight(x, weights):
+        outs = pfx.stand_in_mma(x, weights)
+        if _rows(x) != projkernel.MAX_ROWS:
+            return outs
+        return tuple(mx.where(mx.arange(o.shape[-1]) == 3, nan, o) for o in outs)
+
+    monkeypatch.setattr(projkernel, "mma", nan_at_eight)
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert got["reason"].startswith("correctness: K="), got
+    assert got["reason"].endswith(f" at T=8 is inf from stock (bound {projkernel.REL_RMS_BOUND})")
+
+
+def test_enable_drafter_refuses_a_distance_that_is_nan(monkeypatch, drafted):
+    """A NaN distance fails `<=` against any bound; `>` would wave it through."""
+    drafter, status = drafted
+    monkeypatch.setattr(projkernel, "_stock_distance", lambda got, want: float("nan"))
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert " is nan from stock " in got["reason"], got
+
+
+class _Bypassing(nn.QuantizedLinear):
+    """A QuantizedLinear whose own __call__ goes straight to quantized_matmul, the
+    way a subclass or a fused projection would reach the drafter's weights
+    without passing nn.QuantizedLinear.__call__."""
+
+    def __call__(self, x):
+        return mx.quantized_matmul(
+            x,
+            self.weight,
+            scales=self.scales,
+            biases=self.biases,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+        )
+
+
+def test_enable_drafter_refuses_a_drafter_whose_calls_bypass_the_hook(drafted):
+    """The warm-up and the probe call the kernel directly; only the probe's last
+    step proves the drafter's own calls reach it."""
+    drafter, status = drafted
+    for module in projkernel._drafter_linears(drafter):
+        module.__class__ = _Bypassing
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert got["reason"] == "the drafter's linears do not reach the hook"
+    assert isinstance(got["probe_seconds"], float)
+    assert projkernel._active == 1, "the target's own route is untouched"
+
+
+def test_the_drafters_hook_step_leaves_the_flag_clear_and_the_counters_as_found(
+    monkeypatch, drafted
+):
+    drafter, _ = drafted
+    linears = projkernel._drafter_linears(drafter)
+    projkernel.tag_drafter(drafter)
+    flags = []
+    real = projkernel._serve_draft
+
+    def spy(module, x):
+        flags.append(projkernel._draft_active)
+        return real(module, x)
+
+    monkeypatch.setattr(projkernel, "_serve_draft", spy)
+    before = dict(projkernel.calls)
+    assert projkernel._probe_drafter_hook(linears) is None
+    assert flags == [1], "the flag is raised around the one call"
+    assert projkernel._draft_active == 0
+    assert projkernel.calls == before
