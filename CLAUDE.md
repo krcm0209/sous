@@ -604,8 +604,11 @@ goal.
   `plain_kernel`, `draft_kernel`, `declined`, and `one_row`, one per one-row
   dispatch `linears()` serves; warm-up and probe leave them all as found) counts
   every path for the tests and for
-  harnesses, and the load line carries `projection_kernel=`, with a DFlash
-  drafter `projection_kernel_drafter=active|unavailable` (absent when `off`),
+  harnesses, and the load line carries `projection_kernel=`, then on the
+  VLM backend the drafter route's `projection_kernel_drafter=active|unavailable|off` (with
+  `projection_kernel_drafter_probe_s=` when active; the status document
+  carries it as `projection_kernel.drafter`, and `sous tune`'s `_check_proj`
+  gives an `unavailable` one a notice of its own),
   and, with a drafter, `draft_block=`. The fork key records `proj` (`active`, else
   `off`) and `projkernel.py` is in `_EPOCH_FILES`: the one-row forward that
   ends every prefill segment, and any tail of ≤ 8 rows, runs on the

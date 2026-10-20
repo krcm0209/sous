@@ -69,7 +69,9 @@ existed reads as `false` for it), and where the engine reports one
 `unavailable`, the arm prints a notice with the reason and runs without it, as
 the daemon would: stock attention or projections, or attention over the bf16
 cache for `kv_int8` (an `off` engine, such as the mlx-lm backend's, gets no
-notice). `kv_int8` matters most here of the three: attention past its floor
+notice). The projection kernel's route for the drafter's own linears reports
+apart from the kernel, so an arm whose kernel serves the target but not the
+drafter gets a notice of its own and drafts on stock projections. `kv_int8` matters most here of the three: attention past its floor
 reads keys and values quantised to int8, which moves more than the last bits,
 and the suite's grades are where that would show. Bench rows are keyed only by
 model, drafter, block and window, so a `--resume` across a sous upgrade or a

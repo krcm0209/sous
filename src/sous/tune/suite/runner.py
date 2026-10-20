@@ -138,8 +138,9 @@ class CountingEngine:
     def __getattr__(self, name: str):
         # drafter, draft_block, positions, int8_prefill_status,
         # verify_attention_status, draft_context_status, attention_tile_status,
-        # projection_kernel_status, kv_int8_status: whatever the backend has,
-        # read through getattr(..., None) by ManagedEngine.
+        # projection_kernel_status, projection_kernel_drafter_status,
+        # kv_int8_status: whatever the backend has, read through
+        # getattr(..., None) by ManagedEngine.
         return getattr(self._inner, name)
 
     def generate(
@@ -387,10 +388,19 @@ def _check_proj(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> No
     the same holds: where the engine reports it unavailable, the daemon would
     serve this checkpoint with stock projections, and the arm runs the same
     way after a notice. Its block is unaffected — every drafter arm pins the
-    one its label names. `off`, or no status, is the setting switched off or
-    an engine without the kernel: no notice."""
+    one its label names. The drafter's own linears ride on the kernel under a
+    status of their own, so an arm whose drafter route is unavailable gets a
+    notice of its own and drafts on stock projections. `off`, or no status,
+    is the setting switched off or an engine without the kernel: no notice."""
     if arm.projection_kernel:
         _notice_unavailable(arm, "projection kernel", engine.projection_kernel_status, out)
+        _notice_unavailable(
+            arm,
+            "projection kernel drafter",
+            engine.projection_kernel_drafter_status,
+            out,
+            runs="the drafter's own projections stock",
+        )
 
 
 def _check_kv8(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> None:

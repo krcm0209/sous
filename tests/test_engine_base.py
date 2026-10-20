@@ -3028,7 +3028,7 @@ def test_get_logs_the_projection_kernel_state(caplog, tmp_path, status, tail):
         (
             {"state": "active", "reason": None, "linears": 47, "probe_seconds": 0.12},
             " projection_kernel=active projection_kernel_probe_s=0.37"
-            " projection_kernel_drafter=active",
+            " projection_kernel_drafter=active projection_kernel_drafter_probe_s=0.12",
         ),
         (
             {
@@ -3041,20 +3041,33 @@ def test_get_logs_the_projection_kernel_state(caplog, tmp_path, status, tail):
             " projection_kernel_drafter=unavailable",
         ),
         (
-            {"state": "off", "reason": None, "linears": 0, "probe_seconds": None},
-            " projection_kernel=active projection_kernel_probe_s=0.37",
+            # A failed probe has a cost, but like the kernel's own only an
+            # active route prints one.
+            {
+                "state": "unavailable",
+                "reason": "correctness: K=25600 N=5120 at T=8 is 0.2 from stock (bound 0.01)",
+                "linears": 47,
+                "probe_seconds": 0.41,
+            },
+            " projection_kernel=active projection_kernel_probe_s=0.37"
+            " projection_kernel_drafter=unavailable",
         ),
+        (
+            {"state": "off", "reason": None, "linears": 0, "probe_seconds": None},
+            " projection_kernel=active projection_kernel_probe_s=0.37"
+            " projection_kernel_drafter=off",
+        ),
+        (None, " projection_kernel=active projection_kernel_probe_s=0.37"),
     ],
 )
-def test_get_logs_the_drafter_route_beside_the_kernel_unless_it_is_off(
-    caplog, tmp_path, drafter, tail
-):
+def test_get_logs_the_drafter_route_beside_the_kernel(caplog, tmp_path, drafter, tail):
     import logging
 
     def factory(model_id):
         engine = _positional_factory(model_id)
         engine.projection_kernel_status = {"state": "active", "reason": None, "probe_seconds": 0.37}  # ty: ignore[unresolved-attribute]
-        engine.projection_kernel_drafter_status = drafter  # ty: ignore[unresolved-attribute]
+        if drafter is not None:
+            engine.projection_kernel_drafter_status = drafter  # ty: ignore[unresolved-attribute]
         return engine
 
     mgr = EngineManager(_cfg(tmp_path), engine_factory=factory)
@@ -3122,6 +3135,36 @@ def test_status_carries_the_projection_kernel_and_the_draft_block(tmp_path):
     inner.drafter = "z-lab/drafter"  # ty: ignore[unresolved-attribute]
     inner.draft_block = 5  # ty: ignore[unresolved-attribute]
     assert manager.status()["draft_block"] == 5
+
+
+def test_status_carries_the_drafter_route_inside_the_projection_kernel_block(tmp_path):
+    """The load line scrolls out of daemon.log; the status document is what says,
+    for as long as the model is resident, whether the drafter's own linears ride
+    the kernel and why not."""
+    inner = FakeEngine([])
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    inner.projection_kernel_status = {  # ty: ignore[unresolved-attribute]
+        "state": "active",
+        "reason": None,
+        "probe_seconds": 0.37,
+    }
+    assert manager.status()["projection_kernel"] == {"state": "active", "reason": None}
+    inner.projection_kernel_drafter_status = {  # ty: ignore[unresolved-attribute]
+        "state": "unavailable",
+        "reason": "correctness: K=25600 N=5120 at T=8 is 0.2 from stock (bound 0.01)",
+        "linears": 47,
+        "probe_seconds": 0.41,
+    }
+    assert manager.status()["projection_kernel"] == {
+        "state": "active",
+        "reason": None,
+        "drafter": {
+            "state": "unavailable",
+            "reason": "correctness: K=25600 N=5120 at T=8 is 0.2 from stock (bound 0.01)",
+            "linears": 47,
+        },
+    }
 
 
 _KV8_ACTIVE = {
