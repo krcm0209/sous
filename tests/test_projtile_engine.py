@@ -253,14 +253,14 @@ class _Tokenizer:
     [(True, None, 40 * _GIB), (False, 12 * _GIB, None)],
     ids=["automatic-budget", "explicit-budget"],
 )
-def test_vlm_engine_enables_the_tile_after_the_drafter_route_and_before_kv8(
+def test_vlm_engine_enables_the_tile_after_the_kernel_and_before_the_drafter_route(
     monkeypatch, tmp_path, drafter_loads, cache_budget, headroom
 ):
-    """After the kernel and the drafter's route, whose statuses it reads, with
-    int8's status and the drafter's kind; the headroom read just before it, the
-    budget as configured (None when automatic) and the turn's reserve; the
-    conversion read for the fork key right after; then kv8, the store and the
-    budget."""
+    """After the kernel, whose status it reads, with int8's status and the
+    drafter's kind; the headroom read just before it, the budget as configured
+    (None when automatic) and the turn's reserve; the conversion read for the
+    fork key right after; then the block pin, the drafter's route (decided once
+    the block has resolved), kv8, the store and the budget."""
     from sous.engine import base, int8prefill, projkernel, tileattn, verifyattn, vlm
 
     model = types.SimpleNamespace(
@@ -301,8 +301,9 @@ def test_vlm_engine_enables_the_tile_after_the_drafter_route_and_before_kv8(
         "budget_left_gib": 13.1,
     }
 
-    def enable_drafter(d, *, kernel_status):
+    def enable_drafter(d, *, kernel_status, block_size):
         order.append("drafter_route")
+        seen["drafter_block"] = block_size
         return {"state": "active", "reason": None, "linears": 47, "probe_seconds": 0.12}
 
     def live_headroom():
@@ -377,13 +378,15 @@ def test_vlm_engine_enables_the_tile_after_the_drafter_route_and_before_kv8(
     route = ["drafter_route"] if drafter_loads else []
     tail = ["kv_int8", "fork_store"] + (["budget"] if cache_budget is None else [])
     assert order == [
-        *route,
         "headroom",
         "projection_tile",
         "fork_key_state",
         "pin",
+        *route,
         *tail,
     ]
+    if drafter_loads:
+        assert seen["drafter_block"] == engine.draft_block
     assert seen["model"] is model
     assert seen["config_value"] == "all"
     assert seen["kernel_status"] is proj_status

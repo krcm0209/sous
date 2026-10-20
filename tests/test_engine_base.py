@@ -3385,13 +3385,14 @@ def _load_line(caplog, tmp_path, ptile: dict | None) -> str:
 
 
 def test_the_load_line_carries_the_projection_tile_after_the_drafter_route(caplog, tmp_path):
-    """The tile enables after the drafter route and before the block is read, so
-    its tokens sit between them: the scope, the load's cost, the prompt-cache
-    budget the copy leaves, and the copy itself in GB."""
+    """The tile's tokens follow the kernel's and its drafter route's and precede
+    the block: the scope, the load's cost, the prompt-cache budget the copy
+    leaves, and the copy itself in GB."""
     line = _load_line(caplog, tmp_path, _PTILE_ALL)
     assert line.endswith(
         " projection_kernel=active projection_kernel_probe_s=0.37"
-        " projection_kernel_drafter=active projection_tile=active:all"
+        " projection_kernel_drafter=active projection_kernel_drafter_probe_s=0.12"
+        " projection_tile=active:all"
         " projection_tile_probe_s=1.2 projection_tile_budget_gib=13.1"
         " projection_tile_copy_gb=4.1 draft_block=8"
     ), line
@@ -3465,7 +3466,11 @@ def test_the_load_line_prints_the_mlp_scope_and_unavailable(caplog, tmp_path, st
     whatever its status still holds from a probe that ran; an engine without
     the attribute prints nothing."""
     line = _load_line(caplog, tmp_path, status)
-    assert line.endswith(" projection_kernel_drafter=active" + tokens + " draft_block=8"), line
+    assert line.endswith(
+        " projection_kernel_drafter=active projection_kernel_drafter_probe_s=0.12"
+        + tokens
+        + " draft_block=8"
+    ), line
 
 
 def test_the_status_document_reports_the_projection_tile_with_get(tmp_path):

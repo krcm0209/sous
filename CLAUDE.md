@@ -787,9 +787,10 @@ goal.
   = {20}). A key outside the table stays on the MMA kernel, never on a
   default plan (one GROUPS step off cost 15–20 %), and split counts are
   frozen per key, since another count adds in another order. `enable()` runs
-  on the `sous-model-load` thread after `projkernel.enable_drafter` and
-  before block resolution, kv8, the fork store and `measure_cache_budget`,
-  never raises and starts with `clear()`. It checks, in order: the config
+  on the `sous-model-load` thread after `projkernel.enable` and before block
+  resolution, the drafter's route (which reads none of the target's modules
+  and runs once the block has resolved), kv8, the fork store and
+  `measure_cache_budget`, never raises and starts with `clear()`. It checks, in order: the config
   (`false` is `off`); the projection kernel `active`; the attention tile
   `active`; a DFlash drafter (else `no drafter`); int8 prefill `active`; the
   GPU core count in `MEASURED_CORES`; the model (`_model_reason`: a dense
