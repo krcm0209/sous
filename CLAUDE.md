@@ -510,9 +510,15 @@ goal.
   only from `_DRAFT_MIN_ROWS` = 6
   rows to 8: stock `quantized_matmul` serves the drafter's shapes at
   135–197 GB/s up to five rows and falls to about 100 at eight, where the
-  kernel reads at 126–177 (M5 Pro, 2026-10-16), so a block-8 draft's
-  eight-row calls go to the kernel and a block-5 draft's never do; they
-  shape proposals only, so no bitwise or T-invariance contract is owed to
+  kernel reads at 126–177 (M5 Pro, 2026-10-16), so at block 8 the draft's
+  eight-row calls go to the kernel, and so do the context calls (`fc` at
+  K = 25600, every layer's `k_proj` and `v_proj` on `x_ctx`) of a round
+  that committed six to eight tokens, since mlx-vlm's `_dflash_rounds` cuts
+  the context to `accepted + 1` rows, and an unseeded first draft's
+  seven-row generation prompt (a floor moved off six must bench both
+  shapes); at blocks 1–5 no steady-state call reaches six rows and the
+  route is `off` (below). They shape proposals only, so no bitwise or
+  T-invariance contract is owed to
   them, their probe is relrms against stock at 6, 7 and 8 rows on every
   (K, N) the drafter holds (the warm-up compiles the same), and the drafter
   stays out of the fork key. The probe ends by tagging the drafter and

@@ -865,9 +865,10 @@ def test_tag_marks_every_quantized_linear_of_the_language_model_and_nothing_else
     assert not any(projkernel._tagged(module) for _, module in fresh_target.named_modules())
 
 
-def test_the_drafters_own_linears_are_never_tagged(fresh_target):
+def test_the_drafters_own_linears_are_never_target_tagged(fresh_target):
     """DFlash binds the target's lm_head into the drafter: that head is the target's
-    object and is tagged; every linear the drafter owns is not."""
+    object and carries the target's tag; no linear the drafter owns does (they
+    carry the drafter's own tag, which tag_drafter() sets)."""
     from mlx_vlm.speculative.drafters.qwen3_dflash.config import DFlashConfig
     from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import DFlashDraftModel
 

@@ -613,8 +613,12 @@ _draft_active = 0
 # rows and falls to about 100 GB/s at eight, where the kernel reads at 126-177
 # (measured on the M5 Pro, 2026-10-16); below six rows the kernel also loses on
 # the drafter's narrow linears (N 256-1280). So the drafter's calls go to the
-# kernel from six rows up and stay stock below: a block-8 draft's eight-row
-# calls, never a block-5 draft's.
+# kernel from six rows up and stay stock below. At block 8 that is the block's
+# eight-row calls and, since mlx-vlm's _dflash_rounds cuts the drafter's
+# context to accepted + 1 rows, the context calls (fc at K = 25600, every
+# layer's k_proj and v_proj) of a round that committed six to eight tokens; a
+# floor moved off six must bench both. At blocks 1-5 no steady-state call
+# reaches six rows, and enable_drafter() leaves the route off.
 _DRAFT_MIN_ROWS = 6
 # Per projection call, not per turn: the tests read deltas, and so can a harness
 # that wraps the daemon. Nothing is logged per turn.
@@ -623,7 +627,7 @@ calls: dict[str, int] = {
     "verify_split": 0,  # of those, calls over MAX_ROWS rows cut into runs
     "plain_kernel": 0,  # QuantizedLinear calls the kernel served
     "draft_kernel": 0,  # the drafter's own QuantizedLinear calls the kernel served
-    "declined": 0,  # flag set and every linear tagged, refused for dtype or shape
+    "declined": 0,  # a route's flag set and every linear tagged, refused for dtype or shape
     "one_row": 0,  # one-row kernel dispatches linears() served, one per linear
 }
 _VERIFIER_MODULE = "mlx_vlm.models.qwen3_5.speculative_verifier"
@@ -640,7 +644,8 @@ def _tagged(module: Any) -> bool:
 def tag(model: Any) -> int:
     """Tag every QuantizedLinear of the loaded target's language model, lm_head
     included, and return how many; enable() has checked each one eligible. The
-    drafter's own linears live in its own tree and are never reached. The
+    drafter's own linears live in its own tree and are never reached here
+    (tag_drafter() gives them a tag of their own). The
     lm_head DFlash binds into the drafter is the target's own object, so the
     drafter's sampled head goes through the kernel too, which changes proposals
     only."""
@@ -775,9 +780,13 @@ def _serve_plain(module: Any, x: Any) -> Any | None:
 def _serve_draft(module: Any, x: Any) -> Any | None:
     """The kernel's output for one call of a drafter-tagged module while the
     drafter's flag is set and the call has _DRAFT_MIN_ROWS..MAX_ROWS rows, else
-    None. The drafter's context rows (one to a block's worth each round, the
-    whole seeded tail on a decode's first draft) fall below or above that and
-    stay stock; so does everything at block 5 and under."""
+    None. Each round the drafter runs its linears on the block's rows and, in
+    fc and every layer's k_proj and v_proj, on the context the last round left:
+    accepted + 1 rows, so at block 8 a round that committed six to eight tokens
+    feeds six to eight context rows and those calls are served too. A decode's
+    first draft takes the seeded tail, which runs past MAX_ROWS and stays
+    stock, or, unseeded, the rows the decode call prefilled itself: on the
+    prompt-cache path the seven-token generation prompt, which is served."""
     if not _draft_tagged(module):
         return None
     import mlx.core as mx
@@ -826,7 +835,9 @@ def _wrap_linears(original: Callable[..., Any]) -> Callable[..., Any]:
 
 def _wrap_call(original: Callable[..., Any]) -> Callable[..., Any]:
     """The module hook: nn.QuantizedLinear.__call__, for every call on the target
-    outside the verifier."""
+    outside the verifier, and for the drafter's own linears under their tag and
+    flag, from _DRAFT_MIN_ROWS rows: a row gate moved for int8 or the target
+    must keep clear of that range too."""
 
     @functools.wraps(original)
     def call(self: Any, x: Any) -> Any:
@@ -848,7 +859,8 @@ def install_hooks() -> None:
     """Wrap the exact verifier's _linear and _linears and nn.QuantizedLinear's
     __call__, once per process: a method already carrying the mark is left alone.
     enable() calls this on the first activation only, and the wrappers are never
-    removed; while the flag is 0 each costs one int read per call.
+    removed; while the flags are 0 each costs an int read per call, the module
+    hook two (the target's flag and the drafter's).
 
     The verifier is wrapped on the class because its projections reach mlx-vlm's
     ops through names imported into its own module, and verifyattn's _attention
@@ -876,8 +888,10 @@ def install_hooks() -> None:
 # class and the dense MLP for its shared expert, beside routed experts the kernel
 # never serves, so it is refused by model type rather than by class.
 SUPPORTED_MODEL_TYPES = frozenset({"qwen3_5"})
-# DFlash drafts with modules of its own, which are never tagged, and verifies
-# through the exact verifier's _linear and _linears. Other drafters are unmeasured.
+# DFlash drafts with modules of its own, which the target's tag never reaches
+# (enable_drafter() gives them a tag and a flag of their own, served by the
+# module hook from _DRAFT_MIN_ROWS rows), and verifies through the exact
+# verifier's _linear and _linears. Other drafters are unmeasured.
 SUPPORTED_DRAFTER_KINDS = frozenset({"dflash"})
 # What decides that every target projection of at most MAX_ROWS rows reaches one
 # of the two hooks, and that greedy verify takes its tokens from the hooked head:
