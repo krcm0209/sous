@@ -2206,7 +2206,7 @@ def test_enable_drafter_tags_warms_probes_and_raises_its_own_flag(
     monkeypatch.setattr(projkernel, "_serve_draft", spy)
     before = dict(projkernel.calls)
     with caplog.at_level(logging.INFO, logger="sous.engine.projkernel"):
-        got = projkernel.enable_drafter(drafter, kernel_status=status)
+        got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=8)
     assert got == {
         "state": "active",
         "reason": None,
@@ -2257,7 +2257,7 @@ def _drafter_refusal(drafter, kernel_status, *, warned: bool, raised: str | None
     flag is left clear and nothing on the drafter tagged."""
     with warnings.catch_warnings(record=True) as caught, _gate_log() as records:
         warnings.simplefilter("always")
-        status = projkernel.enable_drafter(drafter, kernel_status=kernel_status)
+        status = projkernel.enable_drafter(drafter, kernel_status=kernel_status, block_size=8)
     messages = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
     infos = [r.getMessage() for r in records if r.levelno == logging.INFO]
     louder = [r for r in records if r.levelno >= logging.WARNING]
@@ -2300,7 +2300,9 @@ def test_enable_drafter_is_off_while_the_kernel_is_switched_off(drafted):
     with warnings.catch_warnings(record=True) as caught, _gate_log() as records:
         warnings.simplefilter("always")
         got = projkernel.enable_drafter(
-            drafter, kernel_status={"state": "off", "reason": None, "probe_seconds": None}
+            drafter,
+            kernel_status={"state": "off", "reason": None, "probe_seconds": None},
+            block_size=8,
         )
     assert got == projkernel.drafter_off("projection kernel off")
     assert got == {
@@ -2312,6 +2314,40 @@ def test_enable_drafter_is_off_while_the_kernel_is_switched_off(drafted):
     assert [w for w in caught if issubclass(w.category, UserWarning)] == []
     assert records == []
     assert projkernel._draft_active == 0 and _drafter_untagged(drafter)
+
+
+@pytest.mark.parametrize(
+    ("block", "kernel"),
+    [(1, "active"), (3, "active"), (5, "active"), (3, "unavailable")],
+)
+def test_enable_drafter_is_off_below_its_floor(monkeypatch, drafted, block, kernel):
+    """A verify block of 1-5 never feeds the drafter's calls six rows in steady
+    state, so the route is `off` there, like a switch: nothing is warmed,
+    probed, tagged or logged, and `active` keeps meaning served. The block is
+    the config's, so it answers before whether the kernel is active."""
+    drafter, status = drafted
+    if kernel != "active":
+        status = {"state": kernel, "reason": "attention tile off", "probe_seconds": None}
+    for step in ("_warm_up_drafter", "_probe_drafter", "_probe_drafter_hook", "tag_drafter"):
+        ran = AssertionError(f"{step} ran below the floor")
+        monkeypatch.setattr(projkernel, step, _raises(ran))
+    with warnings.catch_warnings(record=True) as caught, _gate_log() as records:
+        warnings.simplefilter("always")
+        got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=block)
+    assert got == projkernel.drafter_off(f"verify block {block} below the route's floor 6")
+    assert [w for w in caught if issubclass(w.category, UserWarning)] == []
+    assert records == []
+    assert projkernel._draft_active == 0 and _drafter_untagged(drafter)
+
+
+@pytest.mark.parametrize("block", [0, 6, 7, 8, 12])
+def test_enable_drafter_serves_from_its_floor_and_at_the_drafters_own_policy(drafted, block):
+    """Block 0 lets the drafter's own policy pick the depth, which can exceed
+    five rows, so it proceeds like any block from six up."""
+    drafter, status = drafted
+    got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=block)
+    assert got["state"] == "active", got
+    assert projkernel._draft_active == 1 and not _drafter_untagged(drafter)
 
 
 def _requantized(drafter, path: str, **kwargs) -> None:

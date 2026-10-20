@@ -228,7 +228,8 @@ a load the kernel cannot serve, every load whose attention tile is not
 `projection_kernel_drafter=active|unavailable|off` (whether the DFlash
 drafter's own linears ride the kernel at six rows and more, with
 `projection_kernel_drafter_probe_s=` when they do; `off` means no DFlash
-drafter or the kernel switched off, and `unavailable` a route this load
+drafter, the kernel switched off, or a `draft_block` of 1 to 5, whose draft
+calls stay below six rows, and `unavailable` a route this load
 cannot serve, which the log splits into INFO — the kernel not active, a
 drafter linear it cannot take — and `WARNING` — a failed warm-up or probe —
 the same way; the status document's `projection_kernel` block carries it as

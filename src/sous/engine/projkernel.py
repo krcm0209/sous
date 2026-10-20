@@ -1458,7 +1458,8 @@ _DRAFT_SUBJECT = "projection kernel drafter"
 
 def drafter_off(reason: str | None = None) -> dict[str, Any]:
     """The drafter route's status where nothing asks for it: no DFlash drafter,
-    or the kernel switched off. `off` is never a refusal: nothing is logged."""
+    the kernel switched off, or a verify block below the route's floor. `off`
+    is never a refusal: nothing is logged."""
     return {"state": "off", "reason": reason, "linears": 0, "probe_seconds": None}
 
 
@@ -1499,11 +1500,16 @@ def _drafter_reason(drafter: Any, linears: list[Any]) -> str | None:
     return None
 
 
-def enable_drafter(drafter: Any, *, kernel_status: dict[str, Any]) -> dict[str, Any]:
+def enable_drafter(
+    drafter: Any, *, kernel_status: dict[str, Any], block_size: int
+) -> dict[str, Any]:
     """Decide whether the DFlash drafter's own linears run on the kernel from
-    _DRAFT_MIN_ROWS rows up; after enable(), on the loading thread. Returns the
-    status the engine exposes, `off`, `unavailable` or `active` as the kernel's
-    own is, and never raises. `off`: the kernel is switched off. `unavailable`,
+    _DRAFT_MIN_ROWS rows up; after enable() and after the verify block has
+    resolved to `block_size`, on the loading thread. Returns the status the
+    engine exposes, `off`, `unavailable` or `active` as the kernel's own is,
+    and never raises. `off`: the kernel is switched off, or a verify block of
+    1 to _DRAFT_MIN_ROWS - 1, whose draft calls stay below the floor (block 0,
+    the drafter's own policy, can run deeper, so it proceeds). `unavailable`,
     as _refuse() reports it: an expected refusal (the kernel not active, a
     drafter that owns no quantized linear, a linear the kernel cannot take) is
     one INFO line; a failed warm-up or probe, or any exception, is one warning,
@@ -1519,6 +1525,12 @@ def enable_drafter(drafter: Any, *, kernel_status: dict[str, Any]) -> dict[str, 
     try:
         if kernel_status.get("state") == "off":
             return drafter_off("projection kernel off")
+        if 1 <= block_size < _DRAFT_MIN_ROWS:
+            # Warming, probing and tagging a route no steady-state call reaches
+            # costs a load seconds, and `active` would then mean eligible.
+            return drafter_off(
+                f"verify block {block_size} below the route's floor {_DRAFT_MIN_ROWS}"
+            )
         if kernel_status.get("state") != "active":
             return _refuse_drafter(_kernel_reason(kernel_status), expected=True)
         linears = _drafter_linears(drafter)

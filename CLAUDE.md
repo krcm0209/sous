@@ -503,8 +503,10 @@ goal.
   of mlx's parameter tree) go on every `QuantizedLinear` of the loaded
   target's language model, `lm_head` included (497 on the default 27B).
   The drafter's own linears carry a tag of their own (`_DRAFT_TAG`) under a
-  flag of their own (`_draft_active`, set by `enable_drafter()` after
-  `enable()`, which clears both, as `clear()` does), which hook 2 serves
+  flag of their own (`_draft_active`, set by `enable_drafter()`, which
+  `VLMEngine.__init__` calls with the resolved block after `enable()`, the
+  block resolution and `_pin_block_size` and before kv8; `enable()` clears
+  both flags, as `clear()` does), which hook 2 serves
   only from `_DRAFT_MIN_ROWS` = 6
   rows to 8: stock `quantized_matmul` serves the drafter's shapes at
   135–197 GB/s up to five rows and falls to about 100 at eight, where the
@@ -518,9 +520,12 @@ goal.
   `draft_kernel` must move, or the route is `unavailable` and untagged,
   since the warm-up and the relrms step call `mma` directly and a drafter
   reaching its weights past `nn.QuantizedLinear.__call__` would otherwise
-  load `active` and never be served. `enable_drafter()` reports through the kernel's `_refuse`
-  (subject `projection kernel drafter`) in its vocabulary: `off` with the
-  kernel switched off; `unavailable` with one INFO line where the route does
+  load `active` and never be served. `enable_drafter()` reports through the
+  kernel's `_refuse` (subject `projection kernel drafter`) in its
+  vocabulary: `off` with the kernel switched off or a verify block of 1–5
+  (whose draft calls stay below the floor in steady state; block 0, the
+  drafter's own policy, proceeds), checked in that order before anything
+  else; `unavailable` with one INFO line where the route does
   not apply (the kernel not active, no quantized linear, a linear `eligible()`
   rejects, named with the K and N its packed weight holds and the
   requirement it misses) and with one `warnings.warn` where it should have

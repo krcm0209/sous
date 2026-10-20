@@ -223,9 +223,11 @@ drafter's own linears (quantized the same way at load) ride the kernel too,
 but only from six rows up, where stock `quantized_matmul` drops to about 100
 GB/s on their shapes against the kernel's 126–177 and below which stock is as
 fast or faster: a block-8 draft's eight-row calls, never a block-5 draft's.
-They shape proposals only, so the drafter's probe is a distance check against
-stock, not a bitwise one, and the load line says `projection_kernel_drafter=`
-`active` beside the kernel's own state, or `unavailable` with the reason in
+At a `speculative_block_size` of 1 to 5 the route is `off`, since its calls
+stay below six rows there. The drafter's linears shape proposals only, so its
+probe is a distance check against stock, not a bitwise one, and the load line
+says `projection_kernel_drafter=active` beside the kernel's own state, or
+`off`, or `unavailable` with the reason in
 the status document's `projection_kernel.drafter` and in the log the way the
 kernel's own is: one INFO line where the route does not apply (the kernel not
 active, a drafter linear it cannot take), a `WARNING` where it should have run

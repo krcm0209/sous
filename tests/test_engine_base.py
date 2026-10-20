@@ -1675,17 +1675,18 @@ def test_lm_engine_reports_kv_int8_off(monkeypatch):
     }
 
 
-def _drafted_vlm(monkeypatch, proj_state: str, tile_state: str = "off", **kwargs):
-    """A VLMEngine over stubs whose drafter loads, whose attention tile reports
-    `tile_state` and whose projection kernel reports `proj_state`; returned
-    with its drafter and the blocks pinned."""
+def _drafted_vlm(monkeypatch, proj_state: str, tile_state: str = "off", *, drafter=None, **kwargs):
+    """A VLMEngine over stubs whose drafter (`drafter`, else a bare stub) loads,
+    whose attention tile reports `tile_state` and whose projection kernel
+    reports `proj_state`; returned with its drafter and the blocks pinned."""
     from sous.engine import draftctx, projkernel, tileattn, verifyattn, vlm
 
     model = _positionless_model()
     processor = types.SimpleNamespace(tokenizer=_RecordingTokenizer())
     _stub(monkeypatch, "mlx_vlm", load=lambda model_id: (model, processor))
     _stub(monkeypatch, "mlx_vlm.sample_utils", make_sampler=lambda **kw: None)
-    drafter = types.SimpleNamespace(prefer_requested_block_size=False)
+    if drafter is None:
+        drafter = types.SimpleNamespace(prefer_requested_block_size=False)
     monkeypatch.setattr(vlm, "_load_quantized_drafter", lambda m, draft_id: (drafter, "dflash"))
     monkeypatch.setattr(
         verifyattn,
@@ -1774,16 +1775,63 @@ def test_vlm_engine_decides_the_drafters_kernel_route_after_the_kernels_own(
     asked = []
     real = projkernel.enable_drafter
 
-    def enable_drafter(drafter, *, kernel_status):
-        asked.append((drafter, kernel_status))
-        return real(drafter, kernel_status=kernel_status)
+    def enable_drafter(drafter, *, kernel_status, block_size):
+        # The pin marks a drafter it has seen: the block must be resolved first.
+        asked.append((drafter, kernel_status, block_size, drafter.prefer_requested_block_size))
+        return real(drafter, kernel_status=kernel_status, block_size=block_size)
 
     monkeypatch.setattr(projkernel, "enable_drafter", enable_drafter)
-    engine, drafter, _ = _drafted_vlm(monkeypatch, proj_state, "active")
-    assert asked == [(drafter, engine.projection_kernel_status)]
+    engine, drafter, pinned = _drafted_vlm(
+        monkeypatch, proj_state, "active", draft_block_size=8, draft_block_explicit=True
+    )
+    assert asked == [(drafter, engine.projection_kernel_status, 8, True)]
+    assert pinned == [8]
     status = engine.projection_kernel_drafter_status
     assert (status["state"], status["reason"]) == (state, reason)
     assert projkernel._draft_active == 0
+
+
+@pytest.mark.parametrize(
+    ("block", "explicit", "state"),
+    [
+        (5, True, "off"),
+        (8, True, "active"),
+        (0, True, "active"),
+        # Unset, it resolves to the kernel's 8 before the route is decided.
+        (3, False, "active"),
+    ],
+)
+def test_vlm_engine_decides_the_drafter_route_at_the_block_it_resolved(
+    monkeypatch, block, explicit, state
+):
+    """A block of 1-5 never feeds the drafter's calls six rows in steady state,
+    so the route is `off` there and nothing on the drafter is tagged; block 0
+    (the drafter's own policy) and blocks from six up serve it."""
+    pytest.importorskip("mlx.core")
+    from sous.engine import projkernel
+    from tests import proj_fixtures as pfx
+
+    # Before the stubs replace mlx_vlm: the hooks wrap the real verifier.
+    pfx.hooked(monkeypatch)
+    linear = pfx.rand_module(256, 256, 0)
+    drafter = types.SimpleNamespace(
+        prefer_requested_block_size=False, named_modules=lambda: [("fc", linear)]
+    )
+    engine, _, pinned = _drafted_vlm(
+        monkeypatch,
+        "active",
+        "active",
+        drafter=drafter,
+        draft_block_size=block,
+        draft_block_explicit=explicit,
+    )
+    status = engine.projection_kernel_drafter_status
+    assert status["state"] == state, status
+    if state == "off":
+        assert status["reason"] == f"verify block {block} below the route's floor 6"
+    assert projkernel._draft_tagged(linear) is (state == "active")
+    assert projkernel._draft_active == (state == "active")
+    assert pinned == [engine.draft_block]
 
 
 def test_vlm_engine_built_directly_keeps_the_draft_block_it_was_given(monkeypatch):
