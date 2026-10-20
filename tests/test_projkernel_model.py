@@ -11,8 +11,9 @@ drafter-off decode on the kernel):
   min(5, 8)), so block 12 is the one whose verify rows exceed 8 and are split into runs.
 - Over the kernel runs both hooks are reached, nothing is declined (the drafter's own calls
   included), and only block 12 splits.
-- The drafter's own linears ride the kernel: the route is active on every drafted engine, and at
-  block 8 the drafter's calls reach the kernel.
+- The drafter's own linears ride the kernel: the route is active on every drafted engine (at
+  block 0 too, where DFlash2's runtime block of 5 leaves it nothing to serve in steady state),
+  and at block 8 the drafter's calls reach the kernel.
 - An engine with the kernel off, built after the kernel engines unloaded, reproduces the output
   of one built before any of them, and makes no kernel call.
 """
@@ -136,7 +137,9 @@ def test_greedy_output_with_the_drafter_equals_output_without_it_on_the_kernel()
         assert policy.projection_kernel_status["state"] == "active", policy.projection_kernel_status
         assert policy._draft_block_size == 0
         assert not getattr(policy._draft, "prefer_requested_block_size", False)
-        # Block 0 lets the drafter's own policy pick the depth: the route is decided as at 8.
+        # Block 0 arms the route as 8 does (a drafter's own policy may run deeper than five
+        # rows), but DFlash2's own runtime block is 5, so here it serves nothing in steady state:
+        # draft_kernel is held above 0 at block 8 only.
         drafter = policy.projection_kernel_drafter_status
         assert drafter["state"] == "active", drafter
         drafted[0], drafted_counts[0] = _generate(policy, prompts)

@@ -1813,6 +1813,8 @@ def test_vlm_engine_decides_the_drafter_route_at_the_block_it_resolved(
 
     # Before the stubs replace mlx_vlm: the hooks wrap the real verifier.
     pfx.hooked(monkeypatch)
+    # The stub drafter has no forward for the drafter pins to read.
+    monkeypatch.setattr(projkernel, "_draft_pins_reason", lambda drafter: None)
     linear = pfx.rand_module(256, 256, 0)
     drafter = types.SimpleNamespace(
         prefer_requested_block_size=False, named_modules=lambda: [("fc", linear)]
@@ -3076,7 +3078,8 @@ def test_get_logs_the_projection_kernel_state(caplog, tmp_path, status, tail):
         (
             {"state": "active", "reason": None, "linears": 47, "probe_seconds": 0.12},
             " projection_kernel=active projection_kernel_probe_s=0.37"
-            " projection_kernel_drafter=active projection_kernel_drafter_probe_s=0.12",
+            " projection_kernel_drafter=active projection_kernel_drafter_probe_s=0.12"
+            " draft_block=8",
         ),
         (
             {
@@ -3086,7 +3089,7 @@ def test_get_logs_the_projection_kernel_state(caplog, tmp_path, status, tail):
                 "probe_seconds": None,
             },
             " projection_kernel=active projection_kernel_probe_s=0.37"
-            " projection_kernel_drafter=unavailable",
+            " projection_kernel_drafter=unavailable draft_block=8",
         ),
         (
             # A failed probe has a cost, but like the kernel's own only an
@@ -3098,17 +3101,19 @@ def test_get_logs_the_projection_kernel_state(caplog, tmp_path, status, tail):
                 "probe_seconds": 0.41,
             },
             " projection_kernel=active projection_kernel_probe_s=0.37"
-            " projection_kernel_drafter=unavailable",
+            " projection_kernel_drafter=unavailable draft_block=8",
         ),
         (
             {"state": "off", "reason": None, "linears": 0, "probe_seconds": None},
             " projection_kernel=active projection_kernel_probe_s=0.37"
-            " projection_kernel_drafter=off",
+            " projection_kernel_drafter=off draft_block=8",
         ),
-        (None, " projection_kernel=active projection_kernel_probe_s=0.37"),
+        (None, " projection_kernel=active projection_kernel_probe_s=0.37 draft_block=8"),
     ],
 )
 def test_get_logs_the_drafter_route_beside_the_kernel(caplog, tmp_path, drafter, tail):
+    """The route's fields follow the kernel's and come before draft_block=, so a
+    reader takes them as the kernel's and a field added later has a fixed place."""
     import logging
 
     def factory(model_id):
@@ -3116,6 +3121,7 @@ def test_get_logs_the_drafter_route_beside_the_kernel(caplog, tmp_path, drafter,
         engine.projection_kernel_status = {"state": "active", "reason": None, "probe_seconds": 0.37}  # ty: ignore[unresolved-attribute]
         if drafter is not None:
             engine.projection_kernel_drafter_status = drafter  # ty: ignore[unresolved-attribute]
+        engine.draft_block = 8  # ty: ignore[unresolved-attribute]
         return engine
 
     mgr = EngineManager(_cfg(tmp_path), engine_factory=factory)

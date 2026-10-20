@@ -603,11 +603,15 @@ _HOOK_MARK = "_sous_projection_kernel_hook"
 # the two routes apart.
 _DRAFT_TAG = "_sous_projection_kernel_draft"
 # 1 while the kernel serves, else 0: set only by an enable() that reached active,
-# cleared first by every enable(), by clear() and by the probe on its way out. A
-# plain int, so nothing it holds outlives an unload.
+# raised by the probe only around its calls through the hooks, and cleared first
+# by every enable(), by clear() and by the probe on its way out. A plain int, so
+# nothing it holds outlives an unload.
 _active = 0
-# The drafter's flag, with the same discipline: enable_drafter() clears it first
-# and sets it last, clear() clears it.
+# The drafter's flag, with the same discipline. Its writers: enable_drafter(),
+# which clears it first and sets it last, on `active` only; the probe's hook step
+# (_probe_drafter_hook), which raises it around its one call and clears it on the
+# way out; enable(), whose clear is the only one a load with no DFlash drafter
+# gets, since that load never reaches enable_drafter(); and clear().
 _draft_active = 0
 # Stock quantized_matmul serves the drafter's shapes at 135-197 GB/s up to five
 # rows and falls to about 100 GB/s at eight, where the kernel reads at 126-177
@@ -791,10 +795,11 @@ def _serve_draft(module: Any, x: Any) -> Any | None:
         return None
     import mlx.core as mx
 
-    shape = x.shape
-    if not _DRAFT_MIN_ROWS <= math.prod(shape[:-1]) <= MAX_ROWS:
+    # A 1-D x counts one row and has already returned here, so unlike
+    # _serve_plain only the dtype can decline.
+    if not _DRAFT_MIN_ROWS <= math.prod(x.shape[:-1]) <= MAX_ROWS:
         return None
-    if len(shape) < 2 or x.dtype != mx.bfloat16:
+    if x.dtype != mx.bfloat16:
         calls["declined"] += 1
         return None
     calls["draft_kernel"] += 1
@@ -954,6 +959,73 @@ VALIDATED_PROJ_SOURCES: dict[str, str] = {
         "eee8dc9ab95a74ed87c74064607736003b7d0dafbdafc32c9fba91dc190d2b32"
     ),
 }
+# What decides how the DFlash drafter's own linears are called, keyed and hashed
+# as above. _dflash_rounds (pinned above) calls draft_block or draft_block_greedy,
+# which run _hidden: fc, then _project_context_kv, which fuses every layer's
+# k_proj and v_proj into one matmul when they are nn.Linear (so past hook 2,
+# were it ever to take QuantizedLinear too), then each layer: its attention's
+# q_proj, _project_kv's k_proj and v_proj and o_proj, its MLP's three, and in
+# DFlash2 its convolutions' kernel projections and the candidate selector's
+# projection. The hook step proves a drafter linear's own __call__ reaches hook
+# 2; these prove the forward still reaches each linear by calling it. Read
+# through the loaded drafter's own classes (_draft_pins_reason), so a subclass
+# that overrides one of them is refused rather than taken for the pinned code.
+# Validated on mlx-vlm 0.7.2 with the v1 DFlash and the DFlash2 drafters.
+_DFLASH = "mlx_vlm.speculative.drafters.qwen3_dflash.dflash"
+_DFLASH2 = "mlx_vlm.speculative.drafters.dflash2.dflash2"
+VALIDATED_DRAFT_SOURCES: dict[str, str] = {
+    f"{_DFLASH}:DFlashDraftModel.draft_block": (
+        "020d608979bfcea742b7bda0a1abc312a8383d1cc9f653e9dc9d763e106d9b6e"
+    ),
+    f"{_DFLASH}:DFlashDraftModel.draft_block_greedy": (
+        "c367cf45513db12de61a0c5201d2943d1fbda5d024d03e7fe9cca1e794cccbc1"
+    ),
+    f"{_DFLASH}:DFlashDraftModel._hidden": (
+        "e01ca795d8183f747210f41ee0e30810c99eb447c7b268186898ac14f289caa0"
+    ),
+    f"{_DFLASH}:DFlashDraftModel._project_context_kv": (
+        "e1961cbdf5902336ae9ca4e7a4b755943b69af942401cf9c38fc3fcf752c0058"
+    ),
+    f"{_DFLASH}:DFlashDecoderLayer.__call__": (
+        "cd7509aa4612f2b58fafc145a91c24e119c3dbfe4d47347e892fffd8a12fbdc1"
+    ),
+    f"{_DFLASH}:DFlashAttention.__call__": (
+        "7eaabc86f5be71f93d2c7ae79cfd3baaaa2f812885119a737c5619d9602c073d"
+    ),
+    f"{_DFLASH}:DFlashAttention._project_kv": (
+        "923038316bcdf38aa85eb07ae17e1bd8959e5a47ede5928c9ae1eabda50c77ff"
+    ),
+    f"{_DFLASH}:Qwen3MLP.__call__": (
+        "dc08d40bfdf18cf60619caad43c76a1094f3de1b14d2c53b9e2228fa698bc40a"
+    ),
+    f"{_DFLASH2}:DFlash2DraftModel.draft_block": (
+        "5af196cd5861a4891a8773334693db20d64c25265a64406d1e5ee171da48a24c"
+    ),
+    f"{_DFLASH2}:DFlash2DecoderLayer.__call__": (
+        "48f36f5619649b1bc0c3241d8ac1fcfdff85e2e730123c6546250f2bc775b747"
+    ),
+    f"{_DFLASH2}:GroupedDynamicCausalConv.prepare": (
+        "2bb0b2e8a6061f0d8bfa6d72a36a789c17c0953d93e47bbdc194df53b26b0173"
+    ),
+    f"{_DFLASH2}:CandidateSelector.select": (
+        "ea7dc90d4b8a590d8e29ac86e832e90a4f492d59ac716b6a8356bcb28c58308d"
+    ),
+}
+# Where _draft_pins_reason() reads the drafter's path to its linears: (attribute,
+# methods) on the drafter, then on each of its layers; an attribute the drafter
+# or a layer lacks is skipped (DFlash2's convolutions and selector), a method a
+# present one lacks is drift.
+_DRAFT_PATH = (
+    ("", ("draft_block", "draft_block_greedy", "_hidden", "_project_context_kv")),
+    ("candidate_selector", ("select",)),
+)
+_DRAFT_LAYER_PATH = (
+    ("", ("__call__",)),
+    ("self_attn", ("__call__", "_project_kv")),
+    ("mlp", ("__call__",)),
+    ("attention_conv", ("prepare",)),
+    ("mlp_conv", ("prepare",)),
+)
 # The probe's through-the-hooks rows: a verify depth above today's block of 4.
 _PROBE_ROWS = 5
 # The row the probe plants a NaN in: inside every T = MAX_ROWS call, at neither end.
@@ -1299,6 +1371,36 @@ def _greedy_verify_reason(model: Any) -> str | None:
     return None
 
 
+def _draft_pins_reason(drafter: Any) -> str | None:
+    """Which function on the loaded drafter's path to its linears is not the one
+    VALIDATED_DRAFT_SOURCES pins, or None. Each is looked up on the class of the
+    object that runs it, the way a call resolves it (an instance attribute,
+    such as draftctx's wraps, would be installed later and delegates to it)."""
+    owners: list[tuple[Any, tuple[str, ...]]] = []
+    for path, layer_level in ((_DRAFT_PATH, False), (_DRAFT_LAYER_PATH, True)):
+        roots = list(getattr(drafter, "layers", ())) if layer_level else [drafter]
+        for root in roots:
+            for attribute, methods in path:
+                owner = getattr(root, attribute, None) if attribute else root
+                if owner is not None:
+                    owners.append((owner, methods))
+    for owner, methods in owners:
+        for name in methods:
+            # Through the class's own MRO: getattr on a class without __call__
+            # would hand back the metaclass's.
+            fn = next((vars(c)[name] for c in type(owner).__mro__ if name in vars(c)), None)
+            module = getattr(fn, "__module__", None)
+            qualname = getattr(fn, "__qualname__", None)
+            if module is None or qualname is None:
+                return f"mlx-vlm {type(owner).__qualname__}.{name} changed"
+            digest = VALIDATED_DRAFT_SOURCES.get(f"{module}:{qualname}")
+            if digest is None:
+                return f"drafter {qualname} not validated"
+            if verifyattn._source_digest(module, qualname) != digest:
+                return f"mlx-vlm {qualname} changed"
+    return None
+
+
 def _pins_reason() -> str | None:
     """Which pinned dependency drifted, or None."""
     import mlx.core as mx
@@ -1440,13 +1542,15 @@ def _probe_drafter(linears: list[Any]) -> str | None:
 
 
 def _probe_drafter_hook(linears: list[Any]) -> str | None:
-    """None when one of the drafter's tagged linears, called as a module the way
-    the drafter calls it, reaches hook 2 and the kernel at MAX_ROWS rows; else
-    why not. The warm-up and the probe call `mma` directly, so without this a
-    drafter that reached its linears some other way (a QuantizedLinear subclass
-    with a __call__ of its own, a fused projection) would load `active` and
-    never be served. Raises the drafter's flag only around the one call, and
-    leaves it clear and the counters as found."""
+    """None when one of the drafter's tagged linears, called as a module, reaches
+    hook 2 and the kernel at MAX_ROWS rows; else why not. It proves that a
+    drafter linear's __call__ is the hooked nn.QuantizedLinear.__call__, which
+    the warm-up and the probe, calling `mma` directly, cannot: a QuantizedLinear
+    subclass with a __call__ of its own fails it. It never runs the drafter's
+    forward, so a forward that reaches the weights without calling the module
+    (a fused k/v, a direct quantized_matmul) passes it; the pins in
+    VALIDATED_DRAFT_SOURCES guard that side. Raises the drafter's flag only
+    around the one call, and leaves it clear and the counters as found."""
     import mlx.core as mx
 
     global _draft_active
@@ -1523,11 +1627,15 @@ def enable_drafter(
     resolved to `block_size`, on the loading thread. Returns the status the
     engine exposes, `off`, `unavailable` or `active` as the kernel's own is,
     and never raises. `off`: the kernel is switched off, or a verify block of
-    1 to _DRAFT_MIN_ROWS - 1, whose draft calls stay below the floor (block 0,
-    the drafter's own policy, can run deeper, so it proceeds). `unavailable`,
+    1 to _DRAFT_MIN_ROWS - 1, whose draft calls stay below the floor in steady
+    state. Block 0, the drafter's own policy, proceeds: a drafter's own policy
+    may exceed five rows (a v1 DFlash checkpoint's block of 16), though the
+    default DFlash2's runtime block of 5 never does, and there an `active`
+    route serves nothing in steady state (`draft_kernel` stays 0). `unavailable`,
     as _refuse() reports it: an expected refusal (the kernel not active, a
     drafter that owns no quantized linear, a linear the kernel cannot take) is
-    one INFO line; a failed warm-up or probe, or any exception, is one warning,
+    one INFO line; a drafter forward that drifted from VALIDATED_DRAFT_SOURCES,
+    a failed warm-up or probe, or any exception, is one warning,
     and an exception's traceback goes to the log as the kernel's does. Either
     way the target's own route is untouched. The probe ends by tagging the
     drafter and proving one of its calls reaches the hook; a refusal from
@@ -1554,6 +1662,9 @@ def enable_drafter(
         reason = _drafter_reason(drafter, linears)
         if reason is not None:
             return _refuse_drafter(reason, linears=len(linears), expected=True)
+        reason = _draft_pins_reason(drafter)
+        if reason is not None:
+            return _refuse_drafter(reason, linears=len(linears))
         start = time.perf_counter()
         try:
             try:

@@ -2352,8 +2352,10 @@ def test_enable_drafter_is_off_below_its_floor(monkeypatch, drafted, block, kern
 
 @pytest.mark.parametrize("block", [0, 6, 7, 8, 12])
 def test_enable_drafter_serves_from_its_floor_and_at_the_drafters_own_policy(drafted, block):
-    """Block 0 lets the drafter's own policy pick the depth, which can exceed
-    five rows, so it proceeds like any block from six up."""
+    """Block 0 lets the drafter's own policy pick the depth, which may exceed
+    five rows (a v1 DFlash checkpoint's block of 16), so it proceeds like any
+    block from six up; under the default DFlash2's runtime block of 5 it then
+    serves nothing in steady state."""
     drafter, status = drafted
     got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=block)
     assert got["state"] == "active", got
@@ -2552,9 +2554,10 @@ def test_enable_drafter_refuses_a_distance_that_is_nan(monkeypatch, drafted):
 
 
 class _Bypassing(nn.QuantizedLinear):
-    """A QuantizedLinear whose own __call__ goes straight to quantized_matmul, the
-    way a subclass or a fused projection would reach the drafter's weights
-    without passing nn.QuantizedLinear.__call__."""
+    """A QuantizedLinear subclass whose own __call__ goes straight to
+    quantized_matmul, past nn.QuantizedLinear.__call__: the case the hook step
+    covers. A forward that reads the weights without calling the module at all
+    (a fused k/v) is the drafter pins' to catch, not this step's."""
 
     def __call__(self, x):
         return mx.quantized_matmul(
@@ -2570,7 +2573,7 @@ class _Bypassing(nn.QuantizedLinear):
 
 def test_enable_drafter_refuses_a_drafter_whose_calls_bypass_the_hook(drafted):
     """The warm-up and the probe call the kernel directly; only the probe's last
-    step proves the drafter's own calls reach it."""
+    step proves that a drafter linear's own __call__ reaches the hook."""
     drafter, status = drafted
     for module in projkernel._drafter_linears(drafter):
         module.__class__ = _Bypassing
@@ -2639,3 +2642,117 @@ def test_enable_drafter_clears_its_flag_before_it_decides(drafted, ending):
         got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=5)
     assert got["state"] in ("unavailable", "off"), got
     assert projkernel._draft_active == 0
+
+
+_REAL_DRAFT_PINS = projkernel._draft_pins_reason
+
+
+def _tiny_dflash2_drafter():
+    """An unbound DFlash2 drafter, the default drafter's class, quantized as the
+    engine quantizes one: enough to read its forward's classes."""
+    from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
+
+    drafter = DFlash2DraftModel(
+        DFlash2Config(
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=128,
+            vocab_size=512,
+            mask_token_id=511,
+            target_layer_ids=[1],
+            num_target_layers=4,
+            block_size=8,
+            conv_kernel_size=3,
+            conv_group_size=64,
+            selector_rank=64,
+            selector_top_k=4,
+        )
+    )
+    nn.quantize(drafter, group_size=64, bits=4)
+    return drafter
+
+
+def test_the_drafter_pins_hold_on_the_locked_mlx_vlm(fresh_target):
+    """Every function between the round loop's draft call and the drafter's
+    linears, for the v1 DFlash and the DFlash2 drafters, read through each
+    loaded drafter's own classes."""
+    dflash = "mlx_vlm.speculative.drafters.qwen3_dflash.dflash"
+    dflash2 = "mlx_vlm.speculative.drafters.dflash2.dflash2"
+    assert set(projkernel.VALIDATED_DRAFT_SOURCES) == {
+        f"{dflash}:DFlashDraftModel.draft_block",
+        f"{dflash}:DFlashDraftModel.draft_block_greedy",
+        f"{dflash}:DFlashDraftModel._hidden",
+        f"{dflash}:DFlashDraftModel._project_context_kv",
+        f"{dflash}:DFlashDecoderLayer.__call__",
+        f"{dflash}:DFlashAttention.__call__",
+        f"{dflash}:DFlashAttention._project_kv",
+        f"{dflash}:Qwen3MLP.__call__",
+        f"{dflash2}:DFlash2DraftModel.draft_block",
+        f"{dflash2}:DFlash2DecoderLayer.__call__",
+        f"{dflash2}:GroupedDynamicCausalConv.prepare",
+        f"{dflash2}:CandidateSelector.select",
+    }
+    from sous.engine import verifyattn
+
+    for key, digest in projkernel.VALIDATED_DRAFT_SOURCES.items():
+        module, qualname = key.split(":")
+        assert verifyattn._source_digest(module, qualname) == digest, key
+    assert _REAL_DRAFT_PINS(_tiny_drafter(fresh_target)) is None
+    assert _REAL_DRAFT_PINS(_tiny_dflash2_drafter()) is None
+
+
+@pytest.mark.parametrize(
+    ("key", "reason"),
+    [
+        (
+            "mlx_vlm.speculative.drafters.qwen3_dflash.dflash:DFlashDraftModel._project_context_kv",
+            "mlx-vlm DFlashDraftModel._project_context_kv changed",
+        ),
+        (
+            "mlx_vlm.speculative.drafters.qwen3_dflash.dflash:DFlashAttention._project_kv",
+            "mlx-vlm DFlashAttention._project_kv changed",
+        ),
+        (
+            "mlx_vlm.speculative.drafters.qwen3_dflash.dflash:Qwen3MLP.__call__",
+            "mlx-vlm Qwen3MLP.__call__ changed",
+        ),
+    ],
+)
+def test_enable_drafter_refuses_a_changed_drafter_forward(monkeypatch, drafted, key, reason):
+    """A drafter forward that might no longer call its linears as modules, a
+    fused k/v or a direct quantized_matmul, is a route that should have run:
+    one warning, before anything is warmed."""
+    drafter, status = drafted
+    monkeypatch.setattr(projkernel, "_draft_pins_reason", _REAL_DRAFT_PINS)
+    monkeypatch.setitem(projkernel.VALIDATED_DRAFT_SOURCES, key, "0" * 64)
+    monkeypatch.setattr(
+        projkernel, "_warm_up_drafter", _raises(AssertionError("warmed past drifted pins"))
+    )
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert got["reason"] == reason
+    assert got["probe_seconds"] is None
+
+
+def test_enable_drafter_refuses_a_drafter_class_that_overrides_a_pinned_function(
+    monkeypatch, drafted
+):
+    """The pins are read through the loaded drafter's own classes: a subclass that
+    fuses its k and v reads as itself, not as the pinned DFlashAttention."""
+    from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import DFlashAttention
+
+    class _FusedKV(DFlashAttention):
+        def _project_kv(self, x):
+            return super()._project_kv(x)
+
+    drafter, status = drafted
+    monkeypatch.setattr(projkernel, "_draft_pins_reason", _REAL_DRAFT_PINS)
+    drafter.layers[0].self_attn.__class__ = _FusedKV
+    got = _drafter_refusal(drafter, status, warned=True)
+    assert got["reason"] == (
+        "drafter test_enable_drafter_refuses_a_drafter_class_that_overrides_a_pinned_function"
+        ".<locals>._FusedKV._project_kv not validated"
+    )
