@@ -968,11 +968,15 @@ VALIDATED_PROJ_SOURCES: dict[str, str] = {
 # DFlash2 its convolutions' kernel projections and the candidate selector's
 # projection. The hook step proves a drafter linear's own __call__ reaches hook
 # 2; these prove the forward still reaches each linear by calling it. Read
-# through the loaded drafter's own classes (_draft_pins_reason), so a subclass
-# that overrides one of them is refused rather than taken for the pinned code.
+# through the loaded drafter's own classes (_draft_pins_reason), so a component
+# that overrides one of them reads as drift rather than as the pinned code.
 # Validated on mlx-vlm 0.7.2 with the v1 DFlash and the DFlash2 drafters.
 _DFLASH = "mlx_vlm.speculative.drafters.qwen3_dflash.dflash"
 _DFLASH2 = "mlx_vlm.speculative.drafters.dflash2.dflash2"
+# The drafter classes those pins were read for, by module:qualname. Any other
+# dflash-kind drafter (Laguna, the DSpark variants, a subclass of these) runs a
+# forward nobody has read against the hook: the route does not apply to it.
+VALIDATED_DRAFTERS = frozenset({f"{_DFLASH}:DFlashDraftModel", f"{_DFLASH2}:DFlash2DraftModel"})
 VALIDATED_DRAFT_SOURCES: dict[str, str] = {
     f"{_DFLASH}:DFlashDraftModel.draft_block": (
         "020d608979bfcea742b7bda0a1abc312a8383d1cc9f653e9dc9d763e106d9b6e"
@@ -1371,11 +1375,18 @@ def _greedy_verify_reason(model: Any) -> str | None:
     return None
 
 
-def _draft_pins_reason(drafter: Any) -> str | None:
-    """Which function on the loaded drafter's path to its linears is not the one
-    VALIDATED_DRAFT_SOURCES pins, or None. Each is looked up on the class of the
-    object that runs it, the way a call resolves it (an instance attribute,
-    such as draftctx's wraps, would be installed later and delegates to it)."""
+def _draft_pins_reason(drafter: Any) -> tuple[str, bool] | None:
+    """(why, expected) when the loaded drafter's forward is not the one
+    VALIDATED_DRAFT_SOURCES pins, or None. A drafter whose class is not one of
+    VALIDATED_DRAFTERS, by its module:qualname, is one the route does not apply
+    to: expected. Within a validated class, a pinned function that drifted, or
+    one the drafter's own components override, means mlx-vlm moved: not
+    expected. Each function is looked up on the class of the object that runs
+    it, the way a call resolves it (an instance attribute, such as draftctx's
+    wraps, would be installed later and delegates to it)."""
+    cls = type(drafter)
+    if f"{cls.__module__}:{cls.__qualname__}" not in VALIDATED_DRAFTERS:
+        return f"drafter {cls.__qualname__} not validated", True
     owners: list[tuple[Any, tuple[str, ...]]] = []
     for path, layer_level in ((_DRAFT_PATH, False), (_DRAFT_LAYER_PATH, True)):
         roots = list(getattr(drafter, "layers", ())) if layer_level else [drafter]
@@ -1392,12 +1403,10 @@ def _draft_pins_reason(drafter: Any) -> str | None:
             module = getattr(fn, "__module__", None)
             qualname = getattr(fn, "__qualname__", None)
             if module is None or qualname is None:
-                return f"mlx-vlm {type(owner).__qualname__}.{name} changed"
+                return f"mlx-vlm {type(owner).__qualname__}.{name} changed", False
             digest = VALIDATED_DRAFT_SOURCES.get(f"{module}:{qualname}")
-            if digest is None:
-                return f"drafter {qualname} not validated"
-            if verifyattn._source_digest(module, qualname) != digest:
-                return f"mlx-vlm {qualname} changed"
+            if digest is None or verifyattn._source_digest(module, qualname) != digest:
+                return f"mlx-vlm {qualname} changed", False
     return None
 
 
@@ -1633,9 +1642,10 @@ def enable_drafter(
     default DFlash2's runtime block of 5 never does, and there an `active`
     route serves nothing in steady state (`draft_kernel` stays 0). `unavailable`,
     as _refuse() reports it: an expected refusal (the kernel not active, a
-    drafter that owns no quantized linear, a linear the kernel cannot take) is
-    one INFO line; a drafter forward that drifted from VALIDATED_DRAFT_SOURCES,
-    a failed warm-up or probe, or any exception, is one warning,
+    drafter that owns no quantized linear, a linear the kernel cannot take, a
+    drafter class not in VALIDATED_DRAFTERS) is one INFO line; a validated
+    drafter whose forward drifted from VALIDATED_DRAFT_SOURCES, a failed
+    warm-up or probe, or any exception, is one warning,
     and an exception's traceback goes to the log as the kernel's does. Either
     way the target's own route is untouched. The probe ends by tagging the
     drafter and proving one of its calls reaches the hook; a refusal from
@@ -1662,9 +1672,10 @@ def enable_drafter(
         reason = _drafter_reason(drafter, linears)
         if reason is not None:
             return _refuse_drafter(reason, linears=len(linears), expected=True)
-        reason = _draft_pins_reason(drafter)
-        if reason is not None:
-            return _refuse_drafter(reason, linears=len(linears))
+        drift = _draft_pins_reason(drafter)
+        if drift is not None:
+            reason, expected = drift
+            return _refuse_drafter(reason, linears=len(linears), expected=expected)
         start = time.perf_counter()
         try:
             try:

@@ -235,9 +235,10 @@ distance check against stock, not a bitwise one, and the load line says
 or `unavailable` with the reason in the status document's
 `projection_kernel.drafter` and in the log the way the kernel's own is: one
 INFO line where the route does not apply (the kernel not active, a drafter
-linear it cannot take), a `WARNING` where it should have run and did not (a
-drafter forward that differs from the mlx-vlm code it was validated on, a
-failed warm-up or probe). The one-row kernel took
+linear it cannot take, a drafter of a class other than the DFlash and DFlash2
+ones it was validated with), a `WARNING` where it should have run and did not
+(a validated drafter whose forward differs from the mlx-vlm code it was
+validated on, a failed warm-up or probe). The one-row kernel took
 decode with no drafter from 10.2 to 13.4 tok/s on the first 16 of those turns
 (1.32x), about the 13.5 tok/s it decodes with `false` there (measured in
 separate runs); before it, decode with no drafter ran about 0.78x. The kernel is

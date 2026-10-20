@@ -2647,13 +2647,14 @@ def test_enable_drafter_clears_its_flag_before_it_decides(drafted, ending):
 _REAL_DRAFT_PINS = projkernel._draft_pins_reason
 
 
-def _tiny_dflash2_drafter():
-    """An unbound DFlash2 drafter, the default drafter's class, quantized as the
-    engine quantizes one: enough to read its forward's classes."""
+def _tiny_dflash2_drafter(cls=None):
+    """An unbound DFlash2 drafter (or one of `cls`, a subclass), the default
+    drafter's class, quantized as the engine quantizes one: its own linears are
+    the kernel's to take, and its forward's classes are there to read."""
     from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
     from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
 
-    drafter = DFlash2DraftModel(
+    drafter = (cls or DFlash2DraftModel)(
         DFlash2Config(
             hidden_size=256,
             intermediate_size=512,
@@ -2672,6 +2673,7 @@ def _tiny_dflash2_drafter():
             selector_top_k=4,
         )
     )
+    drafter.set_dtype(mx.bfloat16)
     nn.quantize(drafter, group_size=64, bits=4)
     return drafter
 
@@ -2682,6 +2684,10 @@ def test_the_drafter_pins_hold_on_the_locked_mlx_vlm(fresh_target):
     loaded drafter's own classes."""
     dflash = "mlx_vlm.speculative.drafters.qwen3_dflash.dflash"
     dflash2 = "mlx_vlm.speculative.drafters.dflash2.dflash2"
+    assert set(projkernel.VALIDATED_DRAFTERS) == {
+        f"{dflash}:DFlashDraftModel",
+        f"{dflash2}:DFlash2DraftModel",
+    }
     assert set(projkernel.VALIDATED_DRAFT_SOURCES) == {
         f"{dflash}:DFlashDraftModel.draft_block",
         f"{dflash}:DFlashDraftModel.draft_block_greedy",
@@ -2737,11 +2743,12 @@ def test_enable_drafter_refuses_a_changed_drafter_forward(monkeypatch, drafted, 
     assert got["probe_seconds"] is None
 
 
-def test_enable_drafter_refuses_a_drafter_class_that_overrides_a_pinned_function(
+def test_enable_drafter_warns_for_a_validated_drafter_whose_component_overrides_a_pin(
     monkeypatch, drafted
 ):
-    """The pins are read through the loaded drafter's own classes: a subclass that
-    fuses its k and v reads as itself, not as the pinned DFlashAttention."""
+    """The pins are read through the loaded drafter's own classes: inside a
+    validated drafter class, an attention that fuses its k and v reads as
+    mlx-vlm drift, not as the pinned DFlashAttention."""
     from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import DFlashAttention
 
     class _FusedKV(DFlashAttention):
@@ -2752,7 +2759,38 @@ def test_enable_drafter_refuses_a_drafter_class_that_overrides_a_pinned_function
     monkeypatch.setattr(projkernel, "_draft_pins_reason", _REAL_DRAFT_PINS)
     drafter.layers[0].self_attn.__class__ = _FusedKV
     got = _drafter_refusal(drafter, status, warned=True)
-    assert got["reason"] == (
-        "drafter test_enable_drafter_refuses_a_drafter_class_that_overrides_a_pinned_function"
-        ".<locals>._FusedKV._project_kv not validated"
+    assert got["reason"] == f"mlx-vlm {_FusedKV._project_kv.__qualname__} changed"
+
+
+def test_enable_drafter_serves_the_default_drafters_class(monkeypatch, drafted):
+    """DFlash2, the default drafter's class, through the real pins, eligibility,
+    warm-up, probe and hook step."""
+    _, status = drafted
+    monkeypatch.setattr(projkernel, "_draft_pins_reason", _REAL_DRAFT_PINS)
+    drafter = _tiny_dflash2_drafter()
+    got = projkernel.enable_drafter(drafter, kernel_status=status, block_size=8)
+    assert got["state"] == "active", got
+    assert got["linears"] == len(projkernel._drafter_linears(drafter))
+    projkernel.untag_drafter(drafter)
+
+
+def test_enable_drafter_does_not_apply_to_a_drafter_class_it_was_not_validated_with(
+    monkeypatch, drafted
+):
+    """A drafter of another class (here a DFlash2 subclass with its own _hidden)
+    runs a forward nobody read against the hook: the route does not apply, one
+    INFO line, no warning, before anything is warmed."""
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
+
+    class _OwnHidden(DFlash2DraftModel):
+        def _hidden(self, inputs, target_hidden, cache):
+            return super()._hidden(inputs, target_hidden, cache)
+
+    _, status = drafted
+    monkeypatch.setattr(projkernel, "_draft_pins_reason", _REAL_DRAFT_PINS)
+    monkeypatch.setattr(
+        projkernel, "_warm_up_drafter", _raises(AssertionError("warmed an unvalidated drafter"))
     )
+    got = _drafter_refusal(_tiny_dflash2_drafter(_OwnHidden), status, warned=False)
+    assert got["reason"] == f"drafter {_OwnHidden.__qualname__} not validated"
+    assert got["probe_seconds"] is None

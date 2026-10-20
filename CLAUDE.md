@@ -535,11 +535,16 @@ goal.
   `_project_context_kv`, which already fuses every layer's k/v into one
   matmul when they are `nn.Linear`; the decoder layer, the attention and its
   `_project_kv`, the MLP; DFlash2's convolutions' `prepare` and its
-  selector's `select`), and `_draft_pins_reason` reads each through the
-  loaded drafter's own classes, so a forward that fused the quantized k/v
-  or called `quantized_matmul` directly reads as drift, and a subclass
-  override as unvalidated. Either makes the route `unavailable` with one
-  warning, before the warm-up. `enable_drafter()` reports through the
+  selector's `select`), for the drafter classes in `VALIDATED_DRAFTERS`
+  (v1 DFlash and DFlash2, by `module:qualname`). `_draft_pins_reason`, just
+  before the warm-up, gives two kinds of refusal. A drafter of any other
+  class (Laguna, the DSpark variants, a subclass of either) is one the route
+  does not apply to: `unavailable`, one INFO line, `drafter <class> not
+  validated`. In a validated class it reads each pinned function through the
+  loaded drafter's own classes, so a forward that fused the quantized k/v or
+  called `quantized_matmul` directly, or a component overriding a pinned
+  function, reads as mlx-vlm drift: `unavailable`, one warning, `mlx-vlm
+  <qualname> changed`. `enable_drafter()` reports through the
   kernel's `_refuse` (subject `projection kernel drafter`) in its
   vocabulary: `off` with the kernel switched off or a verify block of 1–5
   (whose draft calls stay below the floor in steady state), checked in that
@@ -550,8 +555,9 @@ goal.
   stays 0. `unavailable` with one INFO line where the route does
   not apply (the kernel not active, no quantized linear, a linear `eligible()`
   rejects, named with the K and N its packed weight holds and the
-  requirement it misses) and with one `warnings.warn` where it should have
-  run (a drafter forward off its pins, a warm-up or probe that failed or
+  requirement it misses, a drafter class not validated) and with one
+  `warnings.warn` where it should have run (a validated drafter's forward
+  off its pins, a warm-up or probe that failed or
   raised, each under its own name, any exception — an exception's
   traceback logged beside it, as the kernel's). The greedy drafter's head
   argmax (`quantized_argmax`) stays stock, since it too shapes proposals
