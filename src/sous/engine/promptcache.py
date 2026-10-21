@@ -219,9 +219,13 @@ def probe_boundaries(
 
 def slot_bytes(cache: Sequence[Any]) -> int:
     """Bytes a cache holds resident: every layer's `nbytes`. For a KVCache that
-    is the whole allocated buffer, 256-step padding and the trimmed-off
-    generation region included — the truth about residency, and an upper
-    bound."""
+    is the whole allocated buffer, its padding and the trimmed-off generation
+    region included — the truth about residency, and an upper bound. A turn
+    slot published after a decode holds up to 4,096 padded rows, about 256 MiB
+    on the default model, since a decode grows its KV by
+    `window.DECODE_KV_STEP`; a cache a prefill grew, the one a fork file is
+    written from included, carries mlx-vlm's 256-step padding, and a fork copy
+    holds only its offset's rows."""
     return sum(int(getattr(c, "nbytes", 0) or 0) for c in cache)
 
 

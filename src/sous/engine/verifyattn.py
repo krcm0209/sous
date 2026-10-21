@@ -258,7 +258,9 @@ def probe(arch: str, q_heads: int, kv_heads: int, dtype: Any) -> str | None:
     """Prove grouped_attention bit-identical to the per-row loop on this GPU at
     every plan transition. Returns why not, or None. Inputs are laid out as
     serving lays them out: queries are a transposed [1, T, Hq, D] slice, K/V
-    slices of a buffer grown in KVCache's 256-token steps."""
+    slices of a padded buffer, which serving grows by the cache's growth step
+    (256 in prefill, 4096 inside a decode). The probe pads to a multiple of
+    256: a slice's strides follow the capacity, not the step."""
     import mlx.core as mx
 
     # Serving always hands _row_loop a real KVCache, and mlx-vlm's own

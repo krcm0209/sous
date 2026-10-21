@@ -100,13 +100,14 @@ goal.
   holds its current and previous lengths and a chain a cold retry breaks
   heals on the next take. A slot is priced at `slot_bytes`, every layer's
   `nbytes`, so the whole padded buffers: `VLMEngine.decode()`, and nothing
-  else, grows the full-attention `KVCache`s by `window.DECODE_KV_STEP` = 4096
-  rows (mlx-vlm's step is 256; a prefill keeps it, and the decode's `finally`
-  puts it back, with the instance's `prefix_cache_reserve`, which skips
-  mlx-vlm's DFlash reserve while the rows fit: rounded to 4096 it would copy
-  nearly every decode's whole cache before the first round), so a published
-  turn slot carries up to 4,096 rows past its decode's last token, 256 MiB
-  on the default model, while a `fork_copy` holds only the offset's rows. Inline `role:"system"` messages after the first user message
+  else, grows the full-attention `KVCache`s by `window.DECODE_KV_STEP` =
+  4096 rows (mlx-vlm's step is 256; a prefill keeps it, and the decode's
+  `finally` puts it back, with the instance's `prefix_cache_reserve`, which
+  skips mlx-vlm's DFlash reserve while the rows fit: rounded to 4096 it
+  would copy nearly every decode's whole cache before the first round), so a
+  published turn slot carries up to 4,096 rows past its decode's last token,
+  256 MiB on the default model, while a `fork_copy` holds only the offset's
+  rows. Inline `role:"system"` messages after the first user message
   render as `<system-reminder>` blocks in the preceding user turn (after its
   tool results), or as a user turn of their own after an assistant turn
   (`api/convert._place_inline_system`), never hoisted into the system
@@ -761,9 +762,12 @@ goal.
   path every projection of every round takes. `VLMEngine.decode()` opens the
   window (`open_window()`, which also sets the round flag to 1) after kv8's,
   inside the draft-context `seed` block just before `stream_generate`, when
-  `projtile._active`, and closes it first in that loop's `finally`, in a
-  `try` of its own, so kv8's close runs whatever happens (`close_window()`
-  never raises). `prefill()` finding a window open closes it and warns,
+  `projtile._active`, and closes it in that loop's `finally`, in a `try` of
+  its own, so kv8's close runs whatever happens (`close_window()` never
+  raises). The KV step widens (`_widen_kv_step`) after both windows open,
+  just before the `try`, and its restore (`_restore_kv_step`, which never
+  raises) is the `finally`'s first statement: the tile's close follows it,
+  then kv8's. `prefill()` finding a window open closes it and warns,
   naming the window's serial, before the forward: KV with the tile's bits
   would reach a fork under a key that cannot tell, and a refusal would fail
   every prompt-cache turn (each prefills before the decode that replaces
@@ -939,7 +943,7 @@ goal.
   last bits. The mirror exists only inside `VLMEngine.decode()`, which,
   when kv8 is active, calls `kv8.open_window()` inside the draft-context `seed` block
   just before `stream_generate`, only the projection tile's window opening
-  between them (so the one-row forward that ends
+  and the KV step's widening between them (so the one-row forward that ends
   the decode call's own prefill segment is covered), and
   `kv8.close_window(cache)` in that loop's `finally`, after the projection
   tile's close: it drops every

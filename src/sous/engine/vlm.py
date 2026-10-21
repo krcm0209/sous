@@ -80,13 +80,20 @@ def _widen_kv_step(layers: list) -> None:
         # mlx-vlm's DFlash round loop reserves offset + block rows on every
         # layer before its first round, rounded up to a multiple of the step,
         # and copies the whole cache whenever the rounded figure passes the
-        # capacity, whether the rows fit or not. At 256 the prefill's last
-        # growth nearly always leaves the room; at 4096 nearly every decode
-        # would pay that copy, the cost of a growth, before its first round,
-        # a loss on every reply shorter than ~250 tokens. The step cannot wait
-        # until after the reserve: generate_step appends the decode's own
-        # prompt rows before the round loop starts. So this decode's reserve
-        # copies only when the rows do not fit, and then grows a full step.
+        # capacity, whether the rows fit or not. At 256 a cold turn rarely
+        # pays it, since a prefill from empty leaves a multiple of 256. A
+        # copy (a fork, a retained turn slot) holds exactly its offset's rows
+        # and a prefill extends a cache by whole steps from what it holds, so
+        # a warm turn's capacity is mostly not one, and its reserve copies
+        # whenever offset + block passes that capacity rounded down to 256:
+        # on about half of warm turns. At 4096 nearly every decode would pay
+        # it, the cost of a growth, before its first round, a loss on every
+        # reply shorter than ~250 tokens. The step cannot wait until after
+        # the reserve: generate_step appends the decode's own prompt rows
+        # before the round loop starts. So this decode's reserve copies only
+        # when the rows do not fit, which spares warm turns the copy they
+        # paid at 256 as well, and then pads to the next multiple of the
+        # step, which can leave far fewer than 4096 rows past the block.
         c.prefix_cache_reserve = functools.partial(_reserve_when_short, c)
 
 
