@@ -1808,6 +1808,25 @@ def test_the_probe_passes_the_stand_ins_and_leaves_its_state(monkeypatch):
         assert state == (0, None, 0)
 
 
+@pytest.mark.parametrize(("scope", "linears"), [("all", 12), ("mlp", 3)])
+def test_the_probe_takes_each_linears_fp32_reference_once(monkeypatch, scope, linears):
+    """Every fused call's linears are probed alone too, over the same rows, so
+    the reference, the probe's costly step, is taken once per linear: the
+    tiny model's MLP, and at scope all a full-attention layer's four and a GDN
+    layer's five, never twice."""
+    root = _probe_ready(monkeypatch, scope)
+    seen: list[int] = []
+    real = projtile._reference
+
+    def reference(x, w, scales, biases):
+        seen.append(w.shape[0])
+        return real(x, w, scales, biases)
+
+    monkeypatch.setattr(projtile, "_reference", reference)
+    assert projtile.probe(root, scope) is None
+    assert len(seen) == linears
+
+
 def _nonzero_rows(x8) -> int:
     return int(mx.sum(mx.any(x8 != 0, axis=1)).item())
 

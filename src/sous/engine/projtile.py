@@ -1361,21 +1361,26 @@ def _reference(x: Any, w: Any, scales: Any, biases: Any) -> Any:
 
 
 def _check_tile_call(
-    call: tuple[Any, ...], launches: tuple[Launch, ...], names: list[str], key: Any
+    call: tuple[Any, ...],
+    launches: tuple[Launch, ...],
+    names: list[str],
+    x: Any,
+    refs: dict[int, tuple[Any, float]],
 ) -> str | None:
-    """One call on the tile, at its plans, on its real planes: every row at T =
-    1..MAX_ROWS equals the same row at T = 1; each linear's rows sit within
-    TILE_FLOOR_FACTOR of the bf16 floor against an fp32 reference (block
-    invariance compares the tile with itself; this catches a kernel that lost
-    precision); and a NaN in one row leaves the others bitwise alone."""
+    """One call on the tile, at its plans, on its real planes, over ``x``
+    [MAX_ROWS, K] bf16, evaluated: every row at T = 1..MAX_ROWS equals the same
+    row at T = 1; each linear's rows sit within TILE_FLOOR_FACTOR of the bf16
+    floor against an fp32 reference (block invariance compares the tile with
+    itself; this catches a kernel that lost precision); and a NaN in one row
+    leaves the others bitwise alone. ``refs`` holds each linear's reference and
+    floor by id, computed on first use: the probe calls a fused group's linears
+    alone too, over the same ``x``, and the reference is the costly step."""
     import mlx.core as mx
 
     label = "+".join(names)
-    k = projkernel._in_features(call[0])
-    x = mx.random.normal((MAX_ROWS, k), key=key).astype(mx.bfloat16)
     nan = mx.array(float("nan"), dtype=mx.bfloat16)
     x_nan = mx.where(mx.arange(MAX_ROWS)[:, None] == _NAN_ROW, nan, x)
-    mx.eval(x, x_nan)
+    mx.eval(x_nan)
     alone = [verify(call, x[r : r + 1], launches) for r in range(MAX_ROWS)]
     rows = [mx.concatenate([outs[i] for outs in alone]) for i in range(len(call))]
     mx.eval(rows)
@@ -1387,15 +1392,16 @@ def _check_tile_call(
         if not mx.all(same).item():
             return f"T-invariance: {label} at T={t} differs from its rows alone"
     for module, got, name in zip(call, full, names, strict=True):
-        ref = _reference(x, *_as_mlx(module))
-        floor = tileattn._rel_rms(ref.astype(mx.bfloat16), ref)
+        if id(module) not in refs:
+            ref = _reference(x, *_as_mlx(module))
+            refs[id(module)] = ref, tileattn._rel_rms(ref.astype(mx.bfloat16), ref)
+        ref, floor = refs[id(module)]
         error = projkernel._stock_distance(got, ref)
         if not error <= TILE_FLOOR_FACTOR * floor:
             return (
                 f"floor: {name} is {error:.4g} from its fp32 reference, above "
                 f"{TILE_FLOOR_FACTOR}x the bf16 floor {floor:.4g}"
             )
-        del ref
     keep = mx.array([r for r in range(MAX_ROWS) if r != _NAN_ROW])
     for got, clean, name in zip(verify(call, x_nan, launches), full, names, strict=True):
         if not mx.array_equal(mx.take(got, keep, axis=0), mx.take(clean, keep, axis=0)).item():
@@ -1552,16 +1558,27 @@ def _probe_steps(root: Any, scope: str) -> str | None:
     # The guards gave every MLP key a plan; a copied group without one was not
     # copied, and the projection kernel keeps its calls.
     converted = {id(mlp.gate_proj), id(mlp.up_proj), id(mlp.down_proj)}
-    for seed, call in enumerate(calls_, start=1):
+    # One x per K, so a linear's fp32 reference serves its fused call and its
+    # call alone; at most a few MB of [MAX_ROWS, N] fp32 rows, dropped before
+    # the steps below.
+    xs: dict[int, Any] = {}
+    refs: dict[int, tuple[Any, float]] = {}
+    for call in calls_:
         launches = plan_for_call(call)
         call_names = [names.get(id(m), "?") for m in call]
         if launches is None:
             if id(call[0]) in converted:
                 return f"no launch on the tile for {'+'.join(call_names)}"
             continue
-        reason = _check_tile_call(call, launches, call_names, mx.random.key(seed))
+        k = projkernel._in_features(call[0])
+        if k not in xs:
+            x = mx.random.normal((MAX_ROWS, k), key=mx.random.key(len(xs) + 1))
+            xs[k] = x.astype(mx.bfloat16)
+            mx.eval(xs[k])
+        reason = _check_tile_call(call, launches, call_names, xs[k], refs)
         if reason is not None:
             return reason
+    del xs, refs
 
     # Off the tile: the slab-only MLP's other paths, bitwise against mlx's layout.
     for case in _slab_cases(mlp, names):
