@@ -23,8 +23,9 @@ projection kernel's two hooks: the verifier's runs (``verify``) and a module's
 calls of two to eight rows (``plain``), each when ``serves()`` and
 ``plan_for_call()`` say so; every other call keeps the projection kernel's path.
 
-``enable()`` decides it per load, after the projection kernel, the drafter's route
-and int8 prefill: guards that say whether the tile applies here, a compile of the
+``enable()`` decides it per load, after int8 prefill and the projection kernel and
+before the drafter's route, which VLMEngine settles only once the block has
+resolved: guards that say whether the tile applies here, a compile of the
 slab paths at the model's own shapes, the memory rule that picks the scope
 (``copy_decision``: the MLP alone, or the attention and GDN copies too), the
 conversion, a warm-up and a probe. A failure after the conversion reverts it.
@@ -1666,11 +1667,13 @@ def enable(
     reserve_bytes: int,
 ) -> dict[str, Any]:
     """Decide whether this load's verify projections run on the tile, and at which
-    scope; on the loading thread, after the projection kernel, the drafter's
-    route and int8 prefill. ``cache_enabled`` is whether the prompt cache is on,
-    ``cache_budget`` the configured prompt-cache budget in bytes (None when
-    automatic), ``headroom_bytes`` live_headroom() read now, ``reserve_bytes``
-    the turn's own reserve. Returns the status the engine
+    scope; on the loading thread, after int8 prefill and the projection kernel
+    and before the drafter's route, so neither the drafter's tags nor its flag
+    are set while the guards, the warm-up and the probe run (the probe drives
+    the target's MLP through both hooks). ``cache_enabled`` is whether the
+    prompt cache is on, ``cache_budget`` the configured prompt-cache budget in
+    bytes (None when automatic), ``headroom_bytes`` live_headroom() read now,
+    ``reserve_bytes`` the turn's own reserve. Returns the status the engine
     exposes and never raises: a model load must not fail because an accelerator
     is missing. probe_seconds covers the real-shape compile, the conversion, the
     copy, the warm-up and the probe, the tile's whole cost to a load."""
