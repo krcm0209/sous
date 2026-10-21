@@ -2074,14 +2074,14 @@ _GDN = "model.layers.0.linear_attn"
         (_mixes_rows, "isolation: a NaN in row 3 changed the other rows of "),
         (
             _mixes_columns,
-            "isolation: a NaN in the columns of model.layers.1.self_attn.q_proj changed "
+            "isolation: a NaN in the scales of model.layers.1.self_attn.q_proj changed "
             "model.layers.1.self_attn.k_proj",
         ),
         # q, k and v hold tiles of their own, so only the GDN stack's last tile,
         # b's and a's, shows a leak inside one tile.
         (
             _mixes_a_tile,
-            f"isolation: a NaN in the columns of {_GDN}.in_proj_b changed {_GDN}.in_proj_a",
+            f"isolation: a NaN in the scales of {_GDN}.in_proj_b changed {_GDN}.in_proj_a",
         ),
         (
             _drops_nans,
@@ -2098,6 +2098,52 @@ def test_probe_fails_t_invariance_floor_and_isolation_for_broken_stand_ins(
     monkeypatch.setattr(projtile, "tile", broken)
     got = projtile.probe(root, "all")
     assert got is not None and got.startswith(reason), got
+    assert projtile._active == 0
+
+
+@pytest.mark.parametrize("fault", ["unread", "leaks"])
+@pytest.mark.parametrize("plane", ["codes", "biases"])
+def test_the_probe_plants_each_plane_under_a_member_of_a_stack(monkeypatch, plane, fault):
+    """A kernel that read another member's codes or biases would pass a NaN planted
+    in the scales alone, so the probe plants in each plane in turn. A kernel that
+    never reads the planted plane under the member's columns (``unread``: it reads
+    the stack's own) fails as a plant that did not arrive, and one whose every
+    column reads it (``leaks``) as one that changed the next member."""
+    root = _probe_ready(monkeypatch)
+    index = ("codes", "scales", "biases").index(plane)
+    planted: dict[int, Any] = {}
+    kept: list[tuple[Any, ...]] = []
+    real = projtile._poisoned
+
+    def recording(stack, which, start, stop):
+        planes = real(stack, which, start, stop)
+        kept.append(planes)  # held, so no id below is reused while the probe runs
+        if which == plane:
+            planted[id(planes[index])] = (stack.codes, stack.scales, stack.biases)[index]
+        return planes
+
+    def broken(x8, codes, scales, biases, info, plan):
+        planes = [codes, scales, biases]
+        own = planted.get(id(planes[index]))
+        if own is None:
+            return ptfx.stand_in_tile(x8, codes, scales, biases, info, plan)
+        if fault == "unread":
+            planes[index] = own
+            return ptfx.stand_in_tile(x8, planes[0], planes[1], planes[2], info, plan)
+        y = ptfx.stand_in_tile(x8, codes, scales, biases, info, plan)
+        return y + mx.array(1, dtype=y.dtype)
+
+    monkeypatch.setattr(projtile, "_poisoned", recording)
+    monkeypatch.setattr(projtile, "tile", broken)
+    plant = "flipped codes" if plane == "codes" else "a NaN in the biases"
+    q = "model.layers.1.self_attn.q_proj"
+    outcome = (
+        "did not reach its columns"
+        if fault == "unread"
+        else "changed model.layers.1.self_attn.k_proj"
+    )
+    assert projtile.probe(root, "all") == f"isolation: {plant} of {q} {outcome}"
+    assert planted
     assert projtile._active == 0
 
 

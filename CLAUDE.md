@@ -876,9 +876,10 @@ goal.
   within `TILE_FLOOR_FACTOR` = 1.05x the bf16 floor (that reference rounded
   to bf16 — T-invariance compares the tile with itself, this catches one
   that lost precision); a NaN in one row leaving the others bitwise alone;
-  on a stack's launch (q+k+v, the GDN four) a NaN planted in each member's
-  scales in turn reaching all of that member's columns and leaving every
-  other member's bitwise alone, b's and a's inside their shared tile too.
+  on a stack's launch (q+k+v, the GDN four) flipped codes, a NaN in the
+  scales and one in the biases, each planted under one member's columns in
+  turn, changing that member's columns and leaving every other member's
+  bitwise alone, b's and a's inside their shared tile too.
   Then the slab-only MLP's other paths, bitwise against mlx's layout (the
   MMA kernel at T = 1..8 and, for a lone linear, the one-row kernel and
   int8's GEMM at 9, 64 and 128 rows) on its real linears, gate+up and a

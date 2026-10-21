@@ -1391,8 +1391,9 @@ def _check_tile_call(
     row at T = 1; each linear's rows sit within TILE_FLOOR_FACTOR of the bf16
     floor against an fp32 reference (block invariance compares the tile with
     itself; this catches a kernel that lost precision); a NaN in one row leaves
-    the others bitwise alone; and on a stack's launch a NaN in one member's
-    scales leaves every other member's columns bitwise alone (_check_columns).
+    the others bitwise alone; and on a stack's launch a poisoned plane under one
+    member's columns, its codes, scales or biases, leaves every other member's
+    columns bitwise alone (_check_columns).
     ``refs`` holds each linear's reference and floor by id, computed on first
     use: the probe calls a fused group's linears alone too, over the same ``x``,
     and the reference is the costly step."""
@@ -1440,46 +1441,73 @@ def _check_tile_call(
     return None
 
 
-def _poisoned_scales(stack: Stack, start: int, stop: int) -> Any:
-    """The stack's scales with a NaN in every unit of columns [start, stop):
-    unit i of the [T][G][256] plane is column (i // (G * 256)) * 256 + i % 256.
-    Evaluated."""
+# A stack's planes in the order tile() takes them, each with what _check_columns
+# plants under one member's columns: a NaN in a scale or a bias turns its group's
+# term NaN, and a flipped code (c to 15 - c) moves its weight by an odd multiple of
+# the group's scale.
+_PLANTS = {
+    "codes": "flipped codes",
+    "scales": "a NaN in the scales",
+    "biases": "a NaN in the biases",
+}
+
+
+def _poisoned(stack: Stack, plane: str, start: int, stop: int) -> tuple[Any, Any, Any]:
+    """The stack's codes, scales and biases with ``plane`` poisoned in every unit
+    of columns [start, stop) as _PLANTS says: unit i of a [T][G][256] plane is
+    column (i // (G * 256)) * 256 + i % 256, and a unit of the codes is its eight
+    words. Evaluated."""
     import mlx.core as mx
 
     info = stack.info
     unit = mx.arange(info.units)
     column = (unit // (info.groups * slab.TILE)) * slab.TILE + unit % slab.TILE
-    nan = mx.array(float("nan"), dtype=mx.bfloat16)
-    scales = mx.where((column >= start) & (column < stop), nan, stack.scales)
-    mx.eval(scales)
-    return scales
+    inside = (column >= start) & (column < stop)
+    planes = {"codes": stack.codes, "scales": stack.scales, "biases": stack.biases}
+    if plane == "codes":
+        words = stack.codes.reshape(info.units, -1)
+        flipped = mx.bitwise_xor(words, mx.array(0xFFFFFFFF, dtype=mx.uint32))
+        planes["codes"] = mx.where(inside[:, None], flipped, words).reshape(-1)
+    else:
+        nan = mx.array(float("nan"), dtype=mx.bfloat16)
+        planes[plane] = mx.where(inside, nan, planes[plane])
+    out = (planes["codes"], planes["scales"], planes["biases"])
+    mx.eval(out)
+    return out
 
 
 def _check_columns(
     stack: Stack, plan: Plan, x: Any, clean: Sequence[Any], names: Sequence[str]
 ) -> str | None:
-    """One stack's launch with a NaN planted in each member's scales in turn: the
-    member's own columns turn NaN, so the plant reached the kernel, and every other
-    member's columns stay bitwise ``clean`` (the launch's evaluated output over
-    ``x`` [MAX_ROWS, K], cut per member). That proves each column reads its own
-    planes and nothing else, between members sharing a tile (b and a in the GDN
-    stack) as between members in tiles of their own."""
+    """One stack's launch with each member's columns poisoned in each plane in
+    turn (_poisoned): the member's own columns change (not bitwise ``clean``
+    under flipped codes, every value NaN under a NaN scale or bias), so the plant
+    reached the kernel, and every other member's columns stay bitwise ``clean``
+    (the launch's evaluated output over ``x`` [MAX_ROWS, K], cut per member).
+    That proves each column reads its own codes, scales and biases and nothing
+    else, between members sharing a tile (b and a in the GDN stack) as between
+    members in tiles of their own."""
     import mlx.core as mx
 
     for i, (start, stop) in enumerate(stack.slices):
-        y = tile(
-            x, stack.codes, _poisoned_scales(stack, start, stop), stack.biases, stack.info, plan
-        )
-        checks = [mx.all(mx.isnan(y[:, start:stop]))]
         others = [j for j in range(len(stack.slices)) if j != i]
-        checks += [mx.array_equal(y[:, slice(*stack.slices[j])], clean[j]) for j in others]
-        same = mx.stack(checks)
-        mx.eval(same)
-        if not same[0].item():
-            return f"isolation: a NaN in the scales of {names[i]} did not reach its columns"
-        for n, j in enumerate(others, start=1):
-            if not same[n].item():
-                return f"isolation: a NaN in the columns of {names[i]} changed {names[j]}"
+        for plane, plant in _PLANTS.items():
+            y = tile(x, *_poisoned(stack, plane, start, stop), stack.info, plan)
+            own = y[:, start:stop]
+            reached = (
+                mx.logical_not(mx.array_equal(own, clean[i]))
+                if plane == "codes"
+                else mx.all(mx.isnan(own))
+            )
+            checks = [reached]
+            checks += [mx.array_equal(y[:, slice(*stack.slices[j])], clean[j]) for j in others]
+            same = mx.stack(checks)
+            mx.eval(same)
+            if not same[0].item():
+                return f"isolation: {plant} of {names[i]} did not reach its columns"
+            for n, j in enumerate(others, start=1):
+                if not same[n].item():
+                    return f"isolation: {plant} of {names[i]} changed {names[j]}"
     return None
 
 
