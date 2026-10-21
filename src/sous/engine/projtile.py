@@ -272,13 +272,20 @@ def copy_bytes(root: Any, *, keys_with_plans: Callable[[Key], bool]) -> int:
 
 
 def fork_key_state(root: Any) -> str:
-    """The fork key's ``ptile``: "active" while any MLP linear is slab-only, else
-    "off". Any, not all: a revert that raised part-way leaves linears that still
-    take the slab paths, and their 9-to-127-row calls int8's bits rather than
-    stock's, so the model must key as converted. The stacks are not read: they
-    serve only inside a decode, and no stored KV comes from one."""
-    converted = any(slab.slab_info(m) is not None for m in _mlp_linears(root))
-    return "active" if converted else "off"
+    """The fork key's ``ptile``: "active" when every MLP linear is slab-only, "off"
+    when none is, and "partial:<slab-only>/<MLP linears>" otherwise. A revert
+    that raised part-way leaves some layers slab-only, whose 9-to-127-row prefill
+    calls carry int8's bits, beside layers back on stock: KV that matches neither
+    a converted load's nor an unconverted one's, so it keys apart from both. The
+    stacks are not read: they serve only inside a decode, and no stored KV comes
+    from one."""
+    linears = list(_mlp_linears(root))
+    converted = sum(slab.slab_info(m) is not None for m in linears)
+    if not converted:
+        return "off"
+    if converted == len(linears):
+        return "active"
+    return f"partial:{converted}/{len(linears)}"
 
 
 # --------------------------------------------------------------------------------
@@ -1550,15 +1557,19 @@ def probe(root: Any, scope: str) -> str | None:
         mx.clear_cache()
 
 
-def _undo(root: Any) -> None:
+def _undo(root: Any) -> str | None:
     """Take a refused load back to mlx's layout: the MLP reverted, then the copies
     dropped. A revert that raises leaves the layers it did not reach slab-only and
     marked, each layer whole (revert_mlp moves a layer's gate, up and down
-    together); every reader is marker-driven, so they keep their slab paths and the
-    fork key reads them as converted."""
+    together); every reader is marker-driven, so they keep their slab paths, and
+    the fork key reads the model as converted or partly so. Returns None when the
+    MLP is back in mlx's layout, else what the refusal's reason adds: how many
+    linears stay slab-only."""
+    failed = False
     try:
         revert_mlp(root)
     except Exception:  # noqa: BLE001 — the markers stay authoritative
+        failed = True
         logger.warning(
             "projection tile: the revert failed; the linears it did not reach keep "
             "their slab paths",
@@ -1568,6 +1579,19 @@ def _undo(root: Any) -> None:
         drop_stacks(root)
     except Exception:  # noqa: BLE001 — a copy left behind is served by nothing
         logger.warning("projection tile: dropping the copies failed", exc_info=True)
+    if not failed:
+        return None
+    linears = list(_mlp_linears(root))
+    left = sum(slab.slab_info(m) is not None for m in linears)
+    return f"the revert failed with {left} of {len(linears)} MLP linears slab-only"
+
+
+def _with_undo(reason: str, root: Any) -> str:
+    """A refusal's one-line reason once the conversion is undone, with what a
+    failed revert left behind."""
+    note = _undo(root)
+    line = _error_line(reason)
+    return line if note is None else f"{line}; {note}"
 
 
 def enable(
@@ -1648,9 +1672,7 @@ def enable(
         finally:
             seconds = round(time.perf_counter() - start, 2)
         if reason is not None:
-            if touched:
-                _undo(root)
-            return _refuse(reason, seconds)
+            return _refuse(_with_undo(reason, root) if touched else reason, seconds)
         left = budget_left(headroom_bytes, built, reserve_bytes)
         left_gib = None if left is None else round(left / _GIB, 2)
         _active, _scope = 1, scope
@@ -1676,9 +1698,8 @@ def enable(
         traceback.clear_frames(e.__traceback__)
         # The warning carries one line; the traceback goes to the log.
         logger.warning("projection tile: enabling failed", exc_info=True)
-        if touched:
-            _undo(root)
-        return _refuse(str(e) or type(e).__name__, seconds)
+        reason = str(e) or type(e).__name__
+        return _refuse(_with_undo(reason, root) if touched else reason, seconds)
 
 
 def static_reason(config: Any, model_config: dict, drafter_kind: str | None) -> str | None:

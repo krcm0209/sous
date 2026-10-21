@@ -207,6 +207,11 @@ def test_a_revert_that_fails_on_a_layers_last_linear_leaves_that_layer_slab_only
     monkeypatch.setattr(slab, "unpack", unpack)
     with pytest.raises(RuntimeError, match="out of memory"):
         projtile.revert_mlp(root)
+    # Layer 0's MLP is back on stock and layers 1-3 still slab-only: a 9-to-127-row
+    # prefill chunk computes KV neither form computes, so it keys apart from both.
+    assert projtile.fork_key_state(root) == "partial:9/12"
+    keys = [_fork_key(ptile) for ptile in ("partial:9/12", "active", "off")]
+    assert len({tuple(sorted(k.items())) for k in keys}) == 3
     for i, module in enumerate(linears):
         if i < 3:
             assert slab.slab_info(module) is None and slab.SLAB_ATTR not in vars(module)
@@ -238,6 +243,24 @@ def test_a_padded_module_converts_and_reverts_bitwise():
     for got, original in zip(_arrays(module), before, strict=True):
         assert _same(got, original)
     assert _same(module(x), want)
+
+
+def _fork_key(ptile: str) -> dict[str, str]:
+    """The fork store's key for an otherwise fixed load, with ``ptile`` as given."""
+    from sous.engine.forkstore import fork_key_fields
+
+    active = {"state": "active", "routed": 24, "splits": 20}
+    return fork_key_fields(
+        backend="vlm",
+        backend_version="0",
+        weights="w",
+        gpu="g",
+        positions="engine",
+        int8_status=active,
+        tile_status=active,
+        proj_status=active,
+        ptile=ptile,
+    )
 
 
 # ---- the stacks ------------------------------------------------------------------
@@ -398,10 +421,10 @@ def test_fork_key_state_follows_the_markers():
     assert projtile.fork_key_state(root) == "off"
 
 
-def test_a_half_converted_model_keys_active():
+def test_a_part_converted_model_keys_as_neither_form():
     root = pfx.tiny_quantized_model(seed=0)
     projtile._convert(root.model.layers[0].mlp.gate_proj)
-    assert projtile.fork_key_state(root) == "active"
+    assert projtile.fork_key_state(root) == "partial:1/12"
 
 
 def test_fork_key_state_is_off_for_a_model_without_dense_mlps():
@@ -1572,11 +1595,34 @@ def test_a_revert_that_raises_leaves_the_markers_authoritative(monkeypatch, capl
 
     monkeypatch.setattr(projtile, "revert_mlp", revert_fails)
     status, messages, _ = _gated(root, ready)
-    assert status["state"] == "unavailable" and status["reason"] == "floor: boom"
+    assert status["state"] == "unavailable"
+    assert status["reason"] == "floor: boom; the revert failed with 12 of 12 MLP linears slab-only"
     assert len(messages) == 1
     assert _marked(root) == _MLP_ONLY
     assert projtile.fork_key_state(root) == "active"
     assert any("revert" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
+
+def test_a_revert_that_raises_part_way_is_named_and_keyed_partial(monkeypatch):
+    """Layer 0 reverts and layer 1's down_proj fails to unpack: the refusal says
+    how many linears stay slab-only, and the fork key reads the model as neither
+    converted nor stock."""
+    ready = ptfx.tile_ready(monkeypatch)
+    root = ptfx.ready_model()
+    monkeypatch.setattr(projtile, "probe", lambda root, scope: "floor: boom")
+    real = slab.unpack
+
+    def unpack(weight, scales, biases, info):
+        if weight is root.model.layers[1].mlp.down_proj.weight:
+            raise RuntimeError("out of memory")
+        return real(weight, scales, biases, info)
+
+    monkeypatch.setattr(slab, "unpack", unpack)
+    status, messages, _ = _gated(root, ready)
+    assert status["state"] == "unavailable"
+    assert status["reason"] == "floor: boom; the revert failed with 9 of 12 MLP linears slab-only"
+    assert len(messages) == 1
+    assert projtile.fork_key_state(root) == "partial:9/12"
 
 
 def test_a_conversion_that_converts_nothing_refuses_the_load(monkeypatch):

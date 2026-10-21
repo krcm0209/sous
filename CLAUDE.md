@@ -826,7 +826,8 @@ goal.
   (`revert_mlp`, bitwise, then `drop_stacks`), an exception's frames cleared
   first so its arrays go before the revert; a revert that raises leaves the
   markers authoritative, since every reader and the fork key are
-  marker-driven. The memory rule (`copy_decision`) decides in bytes: the
+  marker-driven, and the refusal's reason adds how many MLP linears stay
+  slab-only. The memory rule (`copy_decision`) decides in bytes: the
   conversion is size-neutral; `"mlp"` never copies and `"all"` always does;
   `true` under the automatic budget copies iff `budget_left` —
   `live_headroom()` read before the copy with the drafter loaded, less
@@ -869,9 +870,11 @@ goal.
   `projection_tile_copy_gb=` or `projection_tile_copy=skipped`. Nothing is
   logged per turn; `projkernel.calls["verify_tile"]` (runs) and
   `["plain_tile"]` and `int8prefill.calls["int8_small"]` count its paths.
-  The fork key's `ptile` (`fork_key_state`: `active` while any MLP linear
-  carries the marker — any, for a revert that raised part-way — else `off`)
-  keys the moved 9–127-row chunks; `slab.py` and `projtile.py` are in
+  The fork key's `ptile` (`fork_key_state`: `active` when every MLP linear
+  carries the marker, `off` when none does, `partial:<marked>/<total>` after
+  a revert that raised part-way, whose layers split between int8's bits and
+  stock's on a 9–127-row chunk, KV neither other load computes) keys the
+  moved 9–127-row chunks; `slab.py` and `projtile.py` are in
   `_EPOCH_FILES` (the repack decides the path every MLP read takes) and
   `projection_tile.metal` and `.h` in `_EPOCH_EXCLUDED_KERNELS`: they serve
   only inside the window and no stored KV carries their bits, while the

@@ -177,7 +177,8 @@ def fork_key_fields(
     rotary positions, whether int8 prefill actually ran, whether the
     attention tile served the load and at which split target, whether the
     projection kernel served it, whether the projection tile left the MLP
-    slab-only (`ptile`, read off the modules: "active" or "off"), the macOS
+    slab-only (`ptile`, read off the modules: "active", "off", or
+    "partial:<slab-only>/<total>" after a revert that raised part-way), the macOS
     build, and the two mlx-core environment switches that change matmul
     precision and attention accumulation.
 
