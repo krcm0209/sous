@@ -110,13 +110,33 @@ def _mlp_linears(root: Any) -> Iterator[Any]:
         yield from trio
 
 
-def _convert(module: Any) -> None:
+def _mlp_named(root: Any) -> Iterator[tuple[str, Any]]:
+    """_mlp_linears() with each linear's path, as named_modules() spells it."""
+    for index, layer in enumerate(getattr(getattr(root, "model", None), "layers", ())):
+        mlp = getattr(layer, "mlp", None)
+        for name in _MLP_NAMES:
+            module = getattr(mlp, name, None)
+            if module is not None:
+                yield f"model.layers.{index}.mlp.{name}", module
+
+
+def _convert(module: Any, path: str | None = None) -> None:
     """One linear slab-only. The planes go through the module's own __setattr__, so
     mlx's parameter tree holds them and mlx's arrays are dropped here; repack has
-    evaluated the planes, so no graph keeps the old arrays alive."""
+    evaluated the planes, so no graph keeps the old arrays alive. ``path`` names
+    the module in the error a call no slab path serves raises."""
     codes, scales, biases, info = slab.repack(module.weight, module.scales, module.biases)
     module.weight, module.scales, module.biases = codes, scales, biases
+    if path is not None:
+        object.__setattr__(module, slab.PATH_ATTR, path)
     object.__setattr__(module, slab.SLAB_ATTR, info)
+
+
+def _unmark(module: Any) -> None:
+    """Take off what _convert() set beside the planes: the marker and the path."""
+    object.__delattr__(module, slab.SLAB_ATTR)
+    if slab.PATH_ATTR in vars(module):
+        object.__delattr__(module, slab.PATH_ATTR)
 
 
 def _revert_group(modules: Sequence[Any]) -> int:
@@ -134,7 +154,7 @@ def _revert_group(modules: Sequence[Any]) -> int:
     mx.eval(*(array for planes in unpacked for array in planes))
     for (module, _), (w, scales, biases) in zip(marked, unpacked, strict=True):
         module.weight, module.scales, module.biases = w, scales, biases
-        object.__delattr__(module, slab.SLAB_ATTR)
+        _unmark(module)
     return len(marked)
 
 
@@ -145,9 +165,9 @@ def convert_mlp(root: Any) -> int:
     import mlx.core as mx
 
     converted = 0
-    for module in _mlp_linears(root):
+    for path, module in _mlp_named(root):
         if slab.slab_info(module) is None:
-            _convert(module)
+            _convert(module, path)
             converted += 1
     mx.clear_cache()
     return converted

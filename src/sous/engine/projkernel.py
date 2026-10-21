@@ -44,7 +44,7 @@ import warnings
 from collections.abc import Callable, Sequence
 from typing import Any, NamedTuple
 
-from sous.engine import nax, slab, tileattn, verifyattn
+from sous.engine import int8prefill, nax, slab, tileattn, verifyattn
 from sous.engine.int8prefill import _error_line, _kernel, _kernel_text, _model_type, _root
 from sous.engine.slab import SlabInfo
 
@@ -700,7 +700,12 @@ _DRAFT_TAG = "_sous_projection_kernel_draft"
 # 1 while the kernel serves, else 0: set only by an enable() that reached active,
 # raised by the probe only around its calls through the hooks, and cleared first
 # by every enable(), by clear() and by the probe on its way out. A plain int, so
-# nothing it holds outlives an unload.
+# nothing it holds outlives an unload. It switches the kernel off for modules in
+# mlx's layout only: a slab-only module (a converted load's MLP) has no reader but
+# its slab paths, so both hooks serve it whatever this says, and at 0 a converted
+# load runs its MLP there beside stock attention and GDN projections. A harness
+# that wants a round off the projection tile on a converted load clears the tile's
+# round flag (projtile.set_round_flag), which keeps the window's calls here.
 _active = 0
 # The drafter's flag, with the same discipline. Its writers: enable_drafter(),
 # which clears it first and sets it last, on `active` only; the probe's hook step
@@ -817,10 +822,37 @@ def clear() -> None:
 def _weights(module: Any) -> Entry:
     """A module's linears() entry: the bare arrays while it holds mlx's layout, a
     Weights with its SlabInfo once it is slab-only."""
-    info = slab.slab_info(module)
+    return _entry(module, slab.slab_info(module))
+
+
+def _entry(module: Any, info: SlabInfo | None) -> Entry:
+    """_weights() for a module whose marker the caller has read already."""
     if info is None:
         return module.weight, module.scales, module.biases
     return Weights(module.weight, module.scales, module.biases, info)
+
+
+def _any_slab(linears: Sequence[Any]) -> bool:
+    return any(slab.slab_info(m) is not None for m in linears)
+
+
+def _no_slab_path(module: Any, info: SlabInfo, x: Any, why: str) -> RuntimeError:
+    """The error for a call on a slab-only module that none of its slab paths
+    takes: mlx's own kernels would misread its flat planes or fail inside mlx on
+    their shape, so the call fails here, naming the module, its shape and why."""
+    path = vars(module).get(slab.PATH_ATTR, "a slab-only linear")
+    return RuntimeError(
+        f"{path} (slab-only, N={info.n_real} K={info.k}) has no path for x "
+        f"{tuple(x.shape)} {x.dtype}: {why}; its planes are served only by the "
+        f"projection kernel (bf16 rows, 1..{MAX_ROWS}) and int8 prefill (bf16 or fp16 "
+        f"rows, {int8prefill.SLAB_MIN_ROWS} and more), never by mlx's own kernels"
+    )
+
+
+def _int8_takes(module: Any, x: Any, info: SlabInfo) -> bool:
+    """Whether int8's wrapper serves this call on a slab-only module: then this hook
+    hands it on, and int8's wrapper takes it wherever it sits in the chain."""
+    return int8prefill._tagged(module) and int8prefill._rows_ok(x, info)
 
 
 def _run_mma(x: Any, weights: list[Entry]) -> tuple[Any, ...]:
@@ -835,27 +867,33 @@ def _run_mma(x: Any, weights: list[Entry]) -> tuple[Any, ...]:
 
 
 def _serve_verify(linears: Any, x: Any) -> tuple[Any, ...] | None:
-    """The kernel's outputs for one verifier call while the flag is set, else
-    None, and the wrapper calls mlx-vlm's method with the call's own arguments.
-    A call of more than MAX_ROWS rows (block 0 lets the drafter's own policy
-    verify 16) is cut along T into runs of at most MAX_ROWS: a row's bits do not
-    depend on the rows beside it, so every run equals its rows computed one at a
-    time, as decode computes them. Inside the projection tile's decode window a
-    run goes to the tile instead when every linear of the call has a launch
-    there at a tuned plan; else the whole call stays here, so no call mixes the
-    two."""
-    if not linears or not all(_tagged(m) for m in linears):
+    """The kernel's outputs for one verifier call while the flag is set or the
+    call holds a slab-only linear, else None, and the wrapper calls mlx-vlm's
+    method with the call's own arguments. A call of more than MAX_ROWS rows
+    (block 0 lets the drafter's own policy verify 16) is cut along T into runs
+    of at most MAX_ROWS: a row's bits do not depend on the rows beside it, so
+    every run equals its rows computed one at a time, as decode computes them.
+    Inside the projection tile's decode window a run goes to the tile instead
+    when every linear of the call has a launch there at a tuned plan; else the
+    whole call stays here, so no call mixes the two. A call holding a slab-only
+    linear that this declines raises: mlx-vlm's method would read its planes as
+    mlx's layout."""
+    # The slab test only where the tags do not settle it: every linear of a
+    # default load is tagged, and every verifier projection of every round
+    # passes through here.
+    if not linears or not (all(_tagged(m) for m in linears) or _any_slab(linears)):
         return None
     import mlx.core as mx
 
-    if getattr(x, "ndim", 0) != 3 or x.dtype != mx.bfloat16:
-        calls["declined"] += 1
-        return None
+    if (
+        getattr(x, "ndim", 0) != 3
+        or x.dtype != mx.bfloat16
+        or not 0 < x.shape[0] <= MAX_ROWS
+        or not x.shape[1]
+    ):
+        return _decline_verify(linears, x)
     batch, rows = x.shape[0], x.shape[1]
-    step = MAX_ROWS // batch if batch else 0
-    if not step or not rows:
-        calls["declined"] += 1
-        return None
+    step = MAX_ROWS // batch
     calls["verify_kernel"] += 1
     # Function-local: projtile imports this module.
     from sous.engine import projtile
@@ -879,6 +917,27 @@ def _serve_verify(linears: Any, x: Any) -> tuple[Any, ...] | None:
     return tuple(mx.concatenate(list(parts), axis=1) for parts in zip(*runs, strict=True))
 
 
+def _decline_verify(linears: Sequence[Any], x: Any) -> None:
+    """A verifier call hook 1 cannot serve: handed on, unless it holds a slab-only
+    linear, which mlx-vlm's method would read as mlx's layout."""
+    import mlx.core as mx
+
+    slabbed = next(((m, i) for m in linears if (i := slab.slab_info(m)) is not None), None)
+    if slabbed is None:
+        calls["declined"] += 1
+        return None
+    ndim = getattr(x, "ndim", 0)
+    if ndim != 3:
+        why = f"the verifier's rows are [batch, T, K], not {ndim}-D"
+    elif x.dtype != mx.bfloat16:
+        why = f"the kernel takes bf16 rows, not {x.dtype}"
+    elif x.shape[0] > MAX_ROWS:
+        why = f"a batch of {x.shape[0]} is wider than {MAX_ROWS} rows"
+    else:
+        why = "no rows"
+    raise _no_slab_path(*slabbed, x, why)
+
+
 def _serve_plain(module: Any, x: Any) -> Any | None:
     """The kernel's output for one call of a tagged module while the flag is set,
     else None, and the wrapper calls the method it wrapped: mlx's, or int8's,
@@ -888,16 +947,26 @@ def _serve_plain(module: Any, x: Any) -> Any | None:
     one-row forward that ends every prefill segment, and nothing longer. Inside
     the projection tile's decode window a call of two rows and more on a module
     with planes there (the decode's own generation-prompt chunk) goes to the
-    tile; one row stays on the one-row kernel."""
-    if not _tagged(module):
+    tile; one row stays on the one-row kernel. A slab-only module is served
+    whatever its tag, and a call on one that neither this nor int8 takes raises:
+    the wrapped method would reach mlx's own kernels, which cannot read its
+    planes."""
+    info = slab.slab_info(module)
+    if info is None and not _tagged(module):
         return None
     import mlx.core as mx
 
     shape = x.shape
     rows = math.prod(shape[:-1])
     if not 1 <= rows <= MAX_ROWS:
+        if info is not None and not _int8_takes(module, x, info):
+            why = "no rows" if not rows else f"int8 prefill does not take these {rows} rows"
+            raise _no_slab_path(module, info, x, why)
         return None
     if len(shape) < 2 or x.dtype != mx.bfloat16:
+        if info is not None:
+            why = "a 1-D x" if len(shape) < 2 else f"the kernel takes bf16 rows, not {x.dtype}"
+            raise _no_slab_path(module, info, x, why)
         calls["declined"] += 1
         return None
     # Never for one row: one-row decode calls every projection of the model per
@@ -912,7 +981,7 @@ def _serve_plain(module: Any, x: Any) -> Any | None:
                 calls["plain_tile"] += 1
                 return projtile.plain(module, x, launches)
     calls["plain_kernel"] += 1
-    return _run_mma(x, [_weights(module)])[0]
+    return _run_mma(x, [_entry(module, info)])[0]
 
 
 def _serve_draft(module: Any, x: Any) -> Any | None:
@@ -947,7 +1016,7 @@ def _wrap_linear(original: Callable[..., Any]) -> Callable[..., Any]:
     # functools.wraps: the source pins follow __wrapped__ back to mlx-vlm's body.
     @functools.wraps(original)
     def _linear(self: Any, linear: Any, x: Any) -> Any:
-        if _active:
+        if _active or slab.slab_info(linear) is not None:
             out = _serve_verify((linear,), x)
             if out is not None:
                 return out[0]
@@ -962,7 +1031,7 @@ def _wrap_linears(original: Callable[..., Any]) -> Callable[..., Any]:
 
     @functools.wraps(original)
     def _linears(self: Any, linears: Any, x: Any) -> Any:
-        if _active:
+        if _active or _any_slab(linears):
             out = _serve_verify(linears, x)
             if out is not None:
                 return out
@@ -980,7 +1049,7 @@ def _wrap_call(original: Callable[..., Any]) -> Callable[..., Any]:
 
     @functools.wraps(original)
     def call(self: Any, x: Any) -> Any:
-        if _active:
+        if _active or slab.slab_info(self) is not None:
             out = _serve_plain(self, x)
             if out is not None:
                 return out
@@ -998,8 +1067,9 @@ def install_hooks() -> None:
     """Wrap the exact verifier's _linear and _linears and nn.QuantizedLinear's
     __call__, once per process: a method already carrying the mark is left alone.
     enable() calls this on the first activation only, and the wrappers are never
-    removed; while the flags are 0 each costs an int read per call, the module
-    hook two (the target's flag and the drafter's).
+    removed; while the flags are 0 each costs an int read and a marker read per
+    call (a slab-only module is served whatever the flag says), the module hook
+    also the drafter's flag.
 
     The verifier is wrapped on the class because its projections reach mlx-vlm's
     ops through names imported into its own module, and verifyattn's _attention
@@ -1007,7 +1077,9 @@ def install_hooks() -> None:
     hook. gemma4's, nemotron_h's and qwen4_exp's verifiers inherit the wrap: only
     the tags keep them stock. Each wrapper falls through to what it wrapped, so
     int8's wrapper of nn.QuantizedLinear.__call__ may sit above or below this
-    one: int8 takes 128 rows and more, this one 8 and fewer."""
+    one: int8 takes 128 rows and more, and 9 and more on a slab-only module, this
+    one 8 and fewer; on a slab-only module this one raises for any call int8
+    would not take either, wherever int8's wrapper sits."""
     import mlx.nn as nn
 
     verifier = _verifier_class()

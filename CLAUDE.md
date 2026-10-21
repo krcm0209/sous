@@ -514,7 +514,15 @@ goal.
   `nn.QuantizedLinear.__call__` and routes when the flag is set, the module
   is tagged, x is bf16 and its rows (the product of the leading
   dimensions) are 1–8. Anything else falls through to what was wrapped,
-  and both reach the kernel through `projkernel.mma`, looked up per call.
+  and both reach the kernel through `projkernel.mma`, looked up per call —
+  except on a slab-only module (`engine/projtile.py` bullet), which has no
+  reader but its slab paths: both hooks serve it whatever the flag or its
+  tag says, and a call on one that neither they nor int8 take (not bf16,
+  1-D, zero rows, a verifier batch past 8 rows) raises a `RuntimeError`
+  naming the module (`slab.PATH_ATTR`, set by `convert_mlp`), its shape and
+  why, rather than reach mlx's kernels on the flat planes; past 8 rows hook 2
+  hands a call on only when int8 will take it, so the wrapper order still
+  does not matter.
   The Gemma4, NemotronH and Qwen4Exp verifiers subclass
   `Qwen3_5BatchInvariantForward` and inherit hook 1, so only the tag keeps
   them stock. Tags (`_TAG`, set with `object.__setattr__` so they stay out
@@ -588,7 +596,12 @@ goal.
   or 0, never a model reference: the first statement of every `enable()`
   clears it, only an `active` result sets it, the probe raises it only
   while it runs, and `VLMEngine.unload()` clears it through
-  `projkernel.clear()` beside `tileattn.clear()`. A failed probe untags the
+  `projkernel.clear()` beside `tileattn.clear()`. It switches the kernel off
+  for modules in mlx's layout only: a converted load's MLP is served from
+  its slab paths regardless, so at 0 that load runs its MLP there beside
+  stock attention and GDN projections, and a harness that wants a round off
+  the tile on a converted load clears the tile's round flag
+  (`projtile.set_round_flag`), not `_active`. A failed probe untags the
   model it was given; tags left on an unloaded model are inert while the
   flag is 0, and holding a reference to untag it would keep its weights
   alive. `enable()` checks, in order: the config (`off`); the attention

@@ -26,6 +26,10 @@ GROUP = 64
 # Set with object.__setattr__ so it lives in the module's __dict__, out of mlx's
 # parameter tree; every reader of a module's arrays tests it first.
 SLAB_ATTR = "_sous_slab"
+# Where a slab-only module sits in its model, set beside the marker the same way:
+# a call no slab path can serve fails naming it, since mlx's own kernels cannot
+# read the planes either.
+PATH_ATTR = "_sous_slab_path"
 
 _UNIT_WORDS = UNIT_BYTES // 4
 

@@ -10,6 +10,7 @@ import importlib
 import inspect
 import logging
 import os
+import re
 import types
 import warnings
 from importlib.resources import files
@@ -1679,6 +1680,162 @@ def test_the_drafters_own_linears_never_reach_the_tile(monkeypatch):
         before = dict(projkernel.calls)
         member(_acts(1, 7, 256))
     assert _proj_counts_since(before) == {"draft_kernel": 1}
+
+
+# ---- a slab-only module whatever the flag says ------------------------------------
+
+
+@pytest.mark.parametrize("rows", [1, 5, 8])
+def test_the_module_hook_serves_a_slab_only_module_with_the_flag_clear(monkeypatch, rows):
+    """Nothing but its slab paths can read a converted MLP's planes, so the flag
+    switches the kernel off for mlx's layout only: with it clear the module is
+    still served, to the same bits."""
+    root = _tile_target(monkeypatch)
+    gate = root.model.layers[0].mlp.gate_proj
+    x = _acts(1, rows, 256)
+    want = gate(x)
+    monkeypatch.setattr(projkernel, "_active", 0)
+    before = dict(projkernel.calls)
+    got = gate(x)
+    assert _proj_counts_since(before) == {"plain_kernel": 1}
+    assert _bitwise(got, want)
+
+
+def test_the_verifier_hook_serves_slab_only_linears_with_the_flag_clear(monkeypatch):
+    """The verifier's MLP calls on a converted load, gate+up fused and down alone,
+    run on the kernel (and inside a window on the tile) with the flag clear, to
+    the bits they have with it set."""
+    root = _tile_target(monkeypatch)
+    mlp = root.model.layers[0].mlp
+    verifier = projkernel._verifier_class()()
+    x = _acts(1, 12, 256)
+    want = verifier._feed_forward(mlp, x)
+    monkeypatch.setattr(projkernel, "_active", 0)
+    before = dict(projkernel.calls)
+    got = verifier._feed_forward(mlp, x)
+    assert _proj_counts_since(before) == {"verify_kernel": 2, "verify_split": 2}
+    assert _bitwise(got, want)
+    with ptfx.window():
+        before = dict(projkernel.calls)
+        verifier._feed_forward(mlp, x[:, :5])
+    assert _proj_counts_since(before) == {"verify_kernel": 2, "verify_tile": 2}
+
+
+def test_with_the_flag_clear_a_module_in_mlx_layout_is_handed_on(monkeypatch):
+    """The harness's lever still works where it was meant to: q_proj holds mlx's
+    arrays beside its stack copy, so with the flag clear its calls, through
+    either hook and inside a window too, reach mlx and mlx-vlm untouched."""
+    from mlx_vlm.speculative.ops.linear import _target_verify_linears
+
+    root = _tile_target(monkeypatch)
+    monkeypatch.setattr(projkernel, "_active", 0)
+    monkeypatch.setattr(projkernel, "mma", _no_kernel)
+    stock = inspect.unwrap(nn.QuantizedLinear.__call__)
+    attention = root.model.layers[1].self_attn
+    qkv = (attention.q_proj, attention.k_proj, attention.v_proj)
+    verifier = projkernel._verifier_class()()
+    x = _acts(1, 5, 256)
+    with ptfx.window():
+        before = dict(projkernel.calls)
+        plain = attention.q_proj(x)
+        group = verifier._linears(qkv, x)
+    assert _proj_counts_since(before) == {}
+    assert _bitwise(plain, stock(attention.q_proj, x))
+    want = _target_verify_linears(qkv, x)
+    assert all(_bitwise(g, w) for g, w in zip(group, want, strict=True))
+
+
+_GATE = re.escape("model.layers.0.mlp.gate_proj (slab-only, N=512 K=256) has no path")
+# case -> (x, what the error says)
+_PLAIN_UNSERVABLE = {
+    "float32": (lambda: _acts(1, 3, 256, dtype=mx.float32), "bf16 rows, not mlx.core.float32"),
+    "float16": (lambda: _acts(1, 1, 256, dtype=mx.float16), "bf16 rows, not mlx.core.float16"),
+    "one dimension": (lambda: _acts(256), "a 1-D x"),
+    "no rows": (lambda: _acts(1, 0, 256), "no rows"),
+    "nine rows int8 does not take": (
+        lambda: _acts(1, 9, 256),
+        "int8 prefill does not take these 9 rows",
+    ),
+}
+
+
+@pytest.mark.parametrize("flag", [0, 1])
+@pytest.mark.parametrize("case", list(_PLAIN_UNSERVABLE))
+def test_a_module_call_no_slab_path_takes_fails_naming_the_module(monkeypatch, flag, case):
+    """Handed on, the call would reach stock quantized_matmul, which fails on the
+    flat planes with an error that names neither the module nor the reason."""
+    build, why = _PLAIN_UNSERVABLE[case]
+    root = _tile_target(monkeypatch)
+    monkeypatch.setattr(projkernel, "_active", flag)
+    gate = root.model.layers[0].mlp.gate_proj
+    x = build()
+    with pytest.raises(RuntimeError, match=_GATE) as raised:
+        gate(x)
+    assert why in str(raised.value) and str(tuple(x.shape)) in str(raised.value)
+
+
+# case -> (x, what the error says)
+_VERIFY_UNSERVABLE = {
+    "float32": (lambda: _acts(1, 3, 256, dtype=mx.float32), "bf16 rows, not mlx.core.float32"),
+    "two dimensions": (lambda: _acts(3, 256), "[batch, T, K], not 2-D"),
+    "a batch wider than eight rows": (
+        lambda: _acts(9, 1, 256),
+        "a batch of 9 is wider than 8 rows",
+    ),
+    "no rows": (lambda: _acts(1, 0, 256), "no rows"),
+}
+
+
+@pytest.mark.parametrize("flag", [0, 1])
+@pytest.mark.parametrize("case", list(_VERIFY_UNSERVABLE))
+def test_a_verifier_call_no_slab_path_takes_fails_naming_the_module(monkeypatch, flag, case):
+    """Handed on, the call would reach mlx-vlm's optimized_affine_linears, which
+    reads a 1-D plane's shape out of range."""
+    build, why = _VERIFY_UNSERVABLE[case]
+    root = _tile_target(monkeypatch)
+    monkeypatch.setattr(projkernel, "_active", flag)
+    mlp = root.model.layers[0].mlp
+    verifier = projkernel._verifier_class()()
+    with pytest.raises(RuntimeError, match=_GATE) as raised:
+        verifier._linears((mlp.gate_proj, mlp.up_proj), build())
+    assert why in str(raised.value)
+    down = "model.layers.0.mlp.down_proj (slab-only, N=256 K=512)"
+    with pytest.raises(RuntimeError, match=re.escape(down)):
+        verifier._linear(mlp.down_proj, _acts(1, 3, 512, dtype=mx.float32))
+
+
+@pytest.mark.parametrize("order", ["int8 first", "kernel first"])
+def test_a_slab_only_call_int8_declines_fails_whichever_wrapper_sits_on_top(monkeypatch, order):
+    """int8 takes a slab-only module's bf16 calls from nine rows; past eight rows
+    the kernel hands a call on only when int8 will take it, so a call int8
+    declines fails the same way with int8's wrapper above the kernel's or below
+    it, and never reaches stock."""
+    root = _tile_target(monkeypatch)
+    stock = inspect.unwrap(nn.QuantizedLinear.__call__)
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", stock)
+    monkeypatch.setattr(int8prefill, "_QUANTIZED_LINEAR_WRAPPED", False)
+    installs = [lambda: int8prefill.install_wrappers([]), projkernel.install_hooks]
+    for install in installs if order == "int8 first" else installs[::-1]:
+        install()
+    served = []
+
+    def qmm(qa, sa, ra, w, scales, biases, *, slab=None):
+        assert slab is not None, "the module is slab-only"
+        served.append(qa.shape[0])
+        return mx.zeros((qa.shape[0], slab.n_real), dtype=mx.bfloat16)
+
+    monkeypatch.setattr(int8prefill, "qmm", qmm)
+    gate = root.model.layers[0].mlp.gate_proj
+    object.__setattr__(gate, int8prefill._TAG, True)
+    monkeypatch.setattr(projkernel, "_active", 0)
+    before = dict(projkernel.calls)
+    assert gate(_acts(1, 9, 256)).shape == (1, 9, 512)
+    assert gate(_acts(1, 5, 256)).shape == (1, 5, 512)
+    assert served == [9]
+    assert _proj_counts_since(before) == {"plain_kernel": 1}
+    with pytest.raises(RuntimeError, match=_GATE):
+        gate(_acts(1, 9, 256, dtype=mx.float32))
+    assert served == [9]
 
 
 # ---- the gates, the pins, the warm-up, the probe and enable() -----------------------

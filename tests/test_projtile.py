@@ -147,6 +147,10 @@ def test_convert_mlp_replaces_the_arrays_and_marks_the_module():
         for name in ("weight", "scales", "biases"):
             assert _same(params[name], getattr(module, name))
         assert slab.SLAB_ATTR not in params and slab.SLAB_ATTR in vars(module)
+    # Each named as named_modules() names it, for the error a call no slab path
+    # serves raises.
+    paths = {id(m): p for p, m in root.named_modules()}
+    assert all(vars(m)[slab.PATH_ATTR] == paths[id(m)] for m in linears)
     assert projtile.convert_mlp(root) == 0
 
 
@@ -172,6 +176,7 @@ def test_revert_mlp_restores_the_arrays_bitwise_and_clears_the_marker():
     assert projtile.revert_mlp(root) == 12
     for module, arrays, x, want in zip(linears, before, xs, stock, strict=True):
         assert slab.slab_info(module) is None and slab.SLAB_ATTR not in vars(module)
+        assert slab.PATH_ATTR not in vars(module)
         for got, original in zip(_arrays(module), arrays, strict=True):
             assert _same(got, original)
         assert _same(module(x), want)
@@ -1590,9 +1595,9 @@ def test_enable_compiles_the_real_shapes_before_converting(monkeypatch):
     order: list = []
     convert = projtile._convert
 
-    def recording_convert(module):
+    def recording_convert(module, path=None):
         order.append("convert")
-        convert(module)
+        convert(module, path)
 
     monkeypatch.setattr(projtile, "_convert", recording_convert)
     monkeypatch.setattr(
