@@ -198,6 +198,80 @@ def test_a_decode_starts_without_a_copy_its_256_row_reserve_would_not_have_made(
         assert set(vars(c)) == {"keys", "values", "offset"}
 
 
+# ---- prefill ----------------------------------------------------------------------
+
+
+def _kv_layers_of(layers: list) -> list:
+    return [c for c in layers if type(c) is KVCache]
+
+
+def _shadow(c) -> set[str]:
+    """What decode() sets on a KVCache instance and must take off again."""
+    return set(vars(c)) & {"step", "prefix_cache_reserve"}
+
+
+def test_every_prefill_grows_at_the_default_step_and_only_the_decode_widens(monkeypatch):
+    """A cold turn on a hybrid cache prefills to its fork stop, copies the fork,
+    prefills to the anchor and decodes; a warm turn then extends the turn slot it
+    left. Every prefill, the fork stop's included, runs with mlx-vlm's own step and
+    nothing on the instance, since the fork store saves the padded buffers a
+    prefill grew. Only the decode sets the step and the reserve, and no slot it
+    leaves carries either."""
+    boundary, prompt, generated = 4_100, 4_300, 60
+    prefills: list[list[tuple[int, set[str]]]] = []
+    decodes: list[list[tuple[int, set[str]]]] = []
+    grown: list[list[int]] = []
+
+    def append(layers, rows: int, seed: int) -> None:
+        for c in _kv_layers_of(layers):
+            c.update_and_fetch(*_rows(rows, seed=seed))
+            mx.eval(c.keys, c.values)
+
+    def generate(model, processor, prompt_text, **kwargs):
+        layers = kwargs["prompt_cache"]
+        assert kwargs["max_tokens"] == 0
+        prefills.append([(c.step, _shadow(c)) for c in _kv_layers_of(layers)])
+        append(layers, kwargs["input_ids"].shape[1], seed=20)
+        grown.append([c.keys.shape[2] for c in _kv_layers_of(layers)])
+
+    def stream_generate(model, processor, prompt_text, **kwargs):
+        layers = kwargs["prompt_cache"]
+        decodes.append([(c.step, _shadow(c)) for c in _kv_layers_of(layers)])
+        append(layers, kwargs["input_ids"].shape[1], seed=21)
+        for i in range(generated):
+            append(layers, 1, seed=30 + i)
+            yield _result("x")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm",
+        types.SimpleNamespace(generate=generate, stream_generate=stream_generate),
+    )
+    engine = _engine()
+    engine.new_cache = lambda: [KVCache(), ArraysCache(2), KVCache()]  # ty: ignore[invalid-assignment]
+    pc = PrefixCache(engine, enabled=True, max_bytes=1 << 30)
+    stable = list(range(1, prompt + 1))
+    assert pc.generate(stable, [*stable, 9001, 9002, 9003], generated, fork_at=[boundary]) == (
+        "x" * generated
+    )
+    # The fork stop's prefill, then the anchor's, then the decode; 4,100 rows on an
+    # empty cache grow it by 17 steps of 256, where 4096 would leave 8,192.
+    assert len(prefills) == 2 and len(decodes) == 1
+    assert [s.kind for s in pc.slots()].count("fork") == 1
+    assert grown[0] == [17 * DEFAULT_STEP] * 2
+
+    later = [*stable, 9001, 9002, 9003, *range(10_001, 10_301)]
+    assert pc.generate(later, [*later, 9004, 9005, 9006], generated) == "x" * generated
+    assert len(prefills) == 3 and len(decodes) == 2
+    for seen in prefills:
+        assert seen == [(DEFAULT_STEP, set()), (DEFAULT_STEP, set())]
+    for seen in decodes:
+        assert seen == [(DECODE_KV_STEP, {"step", "prefix_cache_reserve"})] * 2
+    for slot in pc.slots():
+        for c in _kv_layers_of(slot.cache):
+            assert _shadow(c) == set() and c.step == DEFAULT_STEP
+
+
 # ---- growth on mlx-vlm's KVCache ---------------------------------------------------
 
 
