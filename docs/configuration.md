@@ -378,7 +378,7 @@ ceiling set by `max_context_tokens` (`kv_int8_ceiling=`). The copy is half
 the size of the bf16 cache it mirrors and lives inside the memory the daemon
 already reserves for a turn's KV, so it serves only below the context length
 at which the turn's bf16 cache and the copy still fit there together: about
-84K keys at 131072, about 170K at 262144. Neither the reserve nor the
+82K keys at 131072, about 168K at 262144. Neither the reserve nor the
 prompt-cache budget grows for it. A generation whose context reaches the
 ceiling drops its copy and runs on over the bf16 cache, so one request takes
 the same path whatever else the daemon holds; below the floor attention is
