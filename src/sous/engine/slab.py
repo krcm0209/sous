@@ -50,6 +50,18 @@ class SlabInfo:
     def groups(self) -> int:
         return self.k // GROUP
 
+    @property
+    def units(self) -> int:
+        """(column, group) units the planes hold, padding included: the scales'
+        and the biases' size, each a unit's one value."""
+        return self.n_pad * self.groups
+
+    @property
+    def code_words(self) -> int:
+        """The codes plane's size in uint32 words: one 32-byte unit per (column,
+        group)."""
+        return self.units * UNIT_BYTES // 4
+
 
 def repack(w: Any, scales: Any, biases: Any) -> tuple[Any, Any, Any, SlabInfo]:
     """mlx's ``weight`` [N, K/8] uint32 and ``scales``/``biases`` [N, K/64] as the

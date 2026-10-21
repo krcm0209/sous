@@ -68,6 +68,8 @@ def test_repack_round_trip_is_bitwise(n):
     assert (info.n_pad, info.groups) == (tiles * 256, K // 64)
     assert codes.dtype == mx.uint32 and codes.shape == (tiles * (K // 64) * 256 * 8,)
     assert scales.shape == biases.shape == (tiles * (K // 64) * 256,)
+    # What every reader checks the planes against.
+    assert (info.code_words, info.units) == (codes.size, scales.size)
     assert scales.dtype == biases.dtype == mx.bfloat16
     for got, want in zip(slab.unpack(codes, scales, biases, info), (w, s, b), strict=True):
         assert _same(got, want)

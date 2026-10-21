@@ -1003,9 +1003,13 @@ def test_linears_refuses_slab_planes_off_their_descriptor(no_launch):
     entry = _slab_entry(*pfx.rand_linear(256, 512, 110))
     with pytest.raises(ValueError, match="K=256"):
         projkernel.linears(mx.zeros((3, 256), dtype=mx.bfloat16), [entry])
-    short = entry._replace(w=entry.w[: entry.w.size // 2])
-    with pytest.raises(ValueError, match="planes"):
-        projkernel.linears(mx.zeros((3, 512), dtype=mx.bfloat16), [short])
+    x = mx.zeros((3, 512), dtype=mx.bfloat16)
+    # Every plane is checked: a short one would be read past its end.
+    for plane in ("w", "scales", "biases"):
+        array = getattr(entry, plane)
+        short = entry._replace(**{plane: array[: array.size * 15 // 16]})
+        with pytest.raises(ValueError, match="planes"):
+            projkernel.linears(x, [short])
 
 
 def test_the_descriptor_gives_k_and_n_for_a_converted_module():

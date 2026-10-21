@@ -451,7 +451,11 @@ def linears(x: Any, weights: Sequence[Entry]) -> tuple[Any, ...]:
                 raise ValueError(f"projection kernel: a linear's K is not the activations' K={k}")
         elif e.slab.k != k:
             raise ValueError(f"projection kernel: a linear's K is not the activations' K={k}")
-        elif e.w.size * 8 != e.slab.n_pad * k or e.scales.size != e.slab.n_pad * e.slab.groups:
+        elif (
+            e.w.size != e.slab.code_words
+            or e.scales.size != e.slab.units
+            or e.biases.size != e.slab.units
+        ):
             raise ValueError(f"projection kernel: a linear's planes do not hold its {e.slab}")
         if e.scales.size < _MIN_DEVICE_SIZE:
             raise ValueError(

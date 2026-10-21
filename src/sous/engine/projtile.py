@@ -607,11 +607,10 @@ def _check(x8: Any, planes: Sequence[Any], info: SlabInfo) -> None:
             f"got {tuple(x8.shape)} {x8.dtype}"
         )
     codes, scales, biases = planes
-    units = info.n_pad * info.groups
     if (
         codes.dtype != mx.uint32
-        or codes.size * 4 != units * slab.UNIT_BYTES
-        or any(p.dtype != mx.bfloat16 or p.size != units for p in (scales, biases))
+        or codes.size != info.code_words
+        or any(p.dtype != mx.bfloat16 or p.size != info.units for p in (scales, biases))
     ):
         raise ValueError(f"projection tile: the planes do not hold {info}")
 
@@ -878,8 +877,9 @@ def _alone(module: Any, x8: Any, rows: int, x: Any, plan: Plan) -> Any:
     t0, t1 = start // slab.TILE, -(-stop // slab.TILE)
     planes = (stack.codes, stack.scales, stack.biases)
     if (t0, t1) != (0, whole.tiles):
-        units = whole.groups * slab.TILE
-        words = units * slab.UNIT_BYTES // 4
+        # Per tile: the planes are [T][G][256] units, whole tiles end to end.
+        units = whole.units // whole.tiles
+        words = whole.code_words // whole.tiles
         planes = (
             stack.codes[t0 * words : t1 * words],
             stack.scales[t0 * units : t1 * units],
@@ -1163,10 +1163,9 @@ def _zero_weights(n: int, k: int) -> projkernel.Weights:
     import mlx.core as mx
 
     info = SlabInfo(n_real=n, k=k, tiles=-(-n // slab.TILE))
-    units = info.n_pad * info.groups
-    codes = mx.zeros((units * slab.UNIT_BYTES // 4,), dtype=mx.uint32)
-    scales = mx.zeros((units,), dtype=mx.bfloat16)
-    biases = mx.zeros((units,), dtype=mx.bfloat16)
+    codes = mx.zeros((info.code_words,), dtype=mx.uint32)
+    scales = mx.zeros((info.units,), dtype=mx.bfloat16)
+    biases = mx.zeros((info.units,), dtype=mx.bfloat16)
     return projkernel.Weights(codes, scales, biases, info)
 
 
