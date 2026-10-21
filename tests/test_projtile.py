@@ -503,6 +503,16 @@ def test_the_six_fused_plans_match_the_spike_and_the_alone_forms_the_spec():
     assert {P(*shape) for shape in projtile.DISTINCT_SHAPES} == set(_TABLE.values())
 
 
+def test_the_slab_paths_row_ranges_meet_with_no_gap():
+    """A slab-only module's calls have no stock path, so the row ranges of the
+    paths that read its planes must meet: the projection kernel's hooks take 1
+    to its MAX_ROWS, the tile serves the same runs, and int8's slab GEMM takes
+    from SLAB_MIN_ROWS. Lowered, the kernel's ceiling would leave rows that reach
+    stock quantized_matmul on flat planes; raised, a verify run past the tile's
+    eight would reach pad8, which raises mid-decode."""
+    assert int8prefill.SLAB_MIN_ROWS == projkernel.MAX_ROWS + 1 == projtile.MAX_ROWS + 1
+
+
 def test_measured_cores_is_the_m5_pro():
     assert frozenset({20}) == projtile.MEASURED_CORES
 
