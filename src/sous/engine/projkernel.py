@@ -817,8 +817,10 @@ def untag_drafter(drafter: Any) -> None:
 
 
 def clear() -> None:
-    """Stop serving: both hooks hand every call on from here on, the drafter's
-    included. Tags left on an unloaded model are inert while the flags are 0,
+    """Stop serving: both hooks hand every call on a module in mlx's layout on
+    from here on, the drafter's included. A slab-only module, which nothing else
+    can read, is still served from its slab paths, and a call on one they cannot
+    take raises. Tags left on an unloaded model are inert while the flags are 0,
     and untagging it would need a reference that keeps its weights alive."""
     global _active, _draft_active
     _active = 0
@@ -961,17 +963,17 @@ def _decline_verify(linears: Sequence[Any], x: Any) -> None:
 
 def _serve_plain(module: Any, x: Any) -> Any | None:
     """The kernel's output for one call of a tagged module while the flag is set,
-    else None, and the wrapper calls the method it wrapped: mlx's, or int8's,
-    which takes its own calls of 128 rows and more, and a slab-only module's
-    from nine. Rows are the product of the leading dimensions, so this serves
-    one-row decode, a last prefill chunk of at most MAX_ROWS rows and the
-    one-row forward that ends every prefill segment, and nothing longer. Inside
-    the projection tile's decode window a call of two rows and more on a module
-    with planes there (the decode's own generation-prompt chunk) goes to the
-    tile; one row stays on the one-row kernel. A slab-only module is served
-    whatever its tag, and a call on one that neither this nor int8 takes raises:
-    the wrapped method would reach mlx's own kernels, which cannot read its
-    planes."""
+    or of a slab-only module whatever the flag and its tag say; else None, and
+    the wrapper calls the method it wrapped: mlx's, or int8's, which takes its
+    own calls of 128 rows and more, and a slab-only module's from nine. A call
+    on a slab-only module that neither this nor int8 takes raises instead of
+    returning None: the wrapped method would reach mlx's own kernels, which
+    cannot read its planes. Rows are the product of the leading dimensions, so
+    this serves one-row decode, a last prefill chunk of at most MAX_ROWS rows
+    and the one-row forward that ends every prefill segment, and nothing
+    longer. Inside the projection tile's decode window a call of two rows and
+    more on a module with planes there (the decode's own generation-prompt
+    chunk) goes to the tile; one row stays on the one-row kernel."""
     info = slab.slab_info(module)
     if info is None and not _tagged(module):
         return None

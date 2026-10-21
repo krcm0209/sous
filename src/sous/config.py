@@ -168,24 +168,23 @@ class SousConfig:
     # with the reason anywhere else. Read once, at daemon start.
     projection_kernel: bool = True
     # The drafter's verify projections on the M5 Pro's tensor units, from
-    # weights held in the order those units read them. The MLP weights are
-    # held in that order and every path reads them from it; the attention and
-    # GDN weights get a tile-ordered copy (4.1 GB on the default model)
-    # beside the originals only when the automatic prompt-cache budget left
-    # after the copy is at least 14 GiB, or a configured prompt_cache_gb
-    # still fits beside it, or, with prompt_cache off, whenever it fits
-    # beside the reserve. true decides by that rule, "mlp" never makes the
-    # copy and "all" always does; false leaves every projection where
-    # projection_kernel puts it. While it is active, greedy output with the
-    # drafter is the same at any block size but differs from output without
-    # the drafter by bf16 rounding inside the projections and, on prefill
-    # chunks of 9-127 rows, by int8 prefill's activations on the MLP (a load
-    # without the drafter never converts it, so stock serves those chunks
-    # there), so a near-tie can resolve the other way; where it is not active,
-    # the two are identical. Refused, with the reason, wherever the
-    # projection kernel, the attention tile, a DFlash drafter or int8 prefill
-    # is missing, or the GPU's core count is not one its plans were measured
-    # on. Read once, at daemon start.
+    # weights held in the order those units read them. The MLP weights are held
+    # in that order and every path reads them from it; the attention and GDN
+    # weights get a tile-ordered copy (4.1 GB on the default model) beside the
+    # originals only when the automatic prompt-cache budget left after the copy
+    # is at least 14 GiB, or a configured prompt_cache_gb still fits beside it,
+    # or, with prompt_cache off, whenever it fits beside the reserve and the
+    # 2 GiB slack. true decides by that rule, "mlp" never makes the copy and
+    # "all" always does; false leaves every projection where projection_kernel
+    # puts it. While it is active, greedy output with the drafter is the same at
+    # any block size but differs from output without the drafter by bf16
+    # rounding inside the projections and, on prefill chunks of 9-127 rows, by
+    # int8 prefill's activations on the MLP (a load without the drafter never
+    # converts it, so stock serves those chunks there), so a near-tie can
+    # resolve the other way; where it is not active, the two are identical.
+    # Refused, with the reason, wherever the projection kernel, the attention
+    # tile, a DFlash drafter or int8 prefill is missing, or the GPU's core count
+    # is not one its plans were measured on. Read once, at daemon start.
     projection_tile: bool | str = True
     # Decode's and the exact verifier's attention read an int8 copy of the
     # context's K/V (one symmetric scale per token and KV head) with int8
