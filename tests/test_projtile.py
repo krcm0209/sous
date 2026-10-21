@@ -176,7 +176,7 @@ def test_revert_mlp_restores_the_arrays_bitwise_and_clears_the_marker():
     assert projtile.revert_mlp(root) == 12
     for module, arrays, x, want in zip(linears, before, xs, stock, strict=True):
         assert slab.slab_info(module) is None and slab.SLAB_ATTR not in vars(module)
-        assert slab.PATH_ATTR not in vars(module)
+        assert slab.PATH_ATTR not in vars(module) and "_extra_repr" not in vars(module)
         for got, original in zip(_arrays(module), arrays, strict=True):
             assert _same(got, original)
         assert _same(module(x), want)
@@ -227,6 +227,29 @@ def test_a_revert_that_fails_on_a_layers_last_linear_leaves_that_layer_slab_only
         assert slab.slab_info(module) is None
         for got, want in zip(_arrays(module), arrays, strict=True):
             assert _same(got, want)
+
+
+def test_repr_of_a_converted_module_and_what_holds_it_works_converted_and_reverted(
+    monkeypatch,
+):
+    """mlx's own repr reads the weight as [N, K/8], which a flat plane is not: a
+    converted module reprs its slab form instead, and so does anything holding
+    one (its MLP, its layer, a Launch), and after the revert mlx's repr is
+    back."""
+    root = pfx.tiny_quantized_model(seed=0)
+    layer = root.model.layers[0]
+    gate = layer.mlp.gate_proj
+    stock = repr(gate)
+    projtile.convert_mlp(root)
+    assert repr(gate) == "QuantizedLinear(slab n_real=512 k=256 tiles=2, bits=4, group_size=64)"
+    assert "slab n_real=256 k=512 tiles=1" in repr(layer.mlp)
+    assert "slab n_real=512" in repr(layer)
+    ptfx.tiny_plans(monkeypatch)
+    launches = projtile.plan_for_call((gate, layer.mlp.up_proj))
+    assert launches is not None and "slab n_real=512" in repr(launches[0])
+    projtile.revert_mlp(root)
+    assert repr(gate) == stock and "_extra_repr" not in vars(gate)
+    assert "input_dims=256, output_dims=512" in repr(layer.mlp)
 
 
 def test_a_padded_module_converts_and_reverts_bitwise():

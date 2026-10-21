@@ -41,6 +41,7 @@ import operator
 import time
 import traceback
 import warnings
+import weakref
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -120,6 +121,34 @@ def _mlp_named(root: Any) -> Iterator[tuple[str, Any]]:
                 yield f"model.layers.{index}.mlp.{name}", module
 
 
+# mlx's QuantizedLinear._extra_repr unpacks weight.shape as [N, K/8], which a
+# flat plane is not, so repr() of a converted module, of anything holding one (its
+# MLP, its layer, the model, a Launch) would raise for the life of the load. A
+# converted module carries its own, set in its instance dict, which an attribute
+# lookup reads before the class's method.
+_REPR_ATTR = "_extra_repr"
+
+
+def _slab_repr(module: Any) -> Callable[[], str]:
+    """A converted module's _extra_repr: its slab form. It holds the module
+    weakly: a bound method would close a cycle through the module's own dict,
+    which only the cyclic collector breaks, keeping the planes past the last
+    reference to the model."""
+    ref = weakref.ref(module)
+
+    def extra_repr() -> str:
+        m = ref()
+        info = None if m is None else slab.slab_info(m)
+        if info is None:
+            return "slab"
+        return (
+            f"slab n_real={info.n_real} k={info.k} tiles={info.tiles}, "
+            f"bits={getattr(m, 'bits', None)}, group_size={getattr(m, 'group_size', None)}"
+        )
+
+    return extra_repr
+
+
 def _convert(module: Any, path: str | None = None) -> None:
     """One linear slab-only. The planes go through the module's own __setattr__, so
     mlx's parameter tree holds them and mlx's arrays are dropped here; repack has
@@ -129,14 +158,17 @@ def _convert(module: Any, path: str | None = None) -> None:
     module.weight, module.scales, module.biases = codes, scales, biases
     if path is not None:
         object.__setattr__(module, slab.PATH_ATTR, path)
+    object.__setattr__(module, _REPR_ATTR, _slab_repr(module))
     object.__setattr__(module, slab.SLAB_ATTR, info)
 
 
 def _unmark(module: Any) -> None:
-    """Take off what _convert() set beside the planes: the marker and the path."""
+    """Take off what _convert() set beside the planes: the marker, the path and
+    the repr, so mlx's own repr reads mlx's arrays again."""
     object.__delattr__(module, slab.SLAB_ATTR)
-    if slab.PATH_ATTR in vars(module):
-        object.__delattr__(module, slab.PATH_ATTR)
+    for name in (slab.PATH_ATTR, _REPR_ATTR):
+        if name in vars(module):
+            object.__delattr__(module, name)
 
 
 def _revert_group(modules: Sequence[Any]) -> int:
