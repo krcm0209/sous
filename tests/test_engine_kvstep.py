@@ -107,7 +107,9 @@ def test_decode_widens_every_kv_cache_and_hands_it_back_at_the_default_step(monk
     assert _engine().decode(cache, [4, 5], 8) == "ok"
     assert seen == [([DECODE_KV_STEP, DECODE_KV_STEP], DEFAULT_STEP, False)]
     for c in (*kv, sub):
-        assert "step" not in vars(c) and c.step == DEFAULT_STEP
+        # Nothing the decode set is left on the instance.
+        assert set(vars(c)) == {"keys", "values", "offset"}
+        assert c.step == DEFAULT_STEP
     assert "step" not in vars(recurrent)
     assert KVCache.step == DEFAULT_STEP
 
@@ -126,7 +128,46 @@ def test_decode_restores_the_default_step_when_the_generation_raises(monkeypatch
         _engine().decode(list(kv), [4, 5], 8)
     assert during == [[DECODE_KV_STEP, DECODE_KV_STEP]]
     for c in kv:
-        assert "step" not in vars(c) and c.step == DEFAULT_STEP
+        assert set(vars(c)) == {"keys", "values", "offset"}
+        assert c.step == DEFAULT_STEP
+
+
+def _padded(offset: int, capacity: int):
+    c = KVCache()
+    c.keys, c.values = _rows(capacity, seed=5)
+    c.offset = offset
+    return c
+
+
+def test_the_decodes_reserve_copies_only_when_the_rows_do_not_fit(monkeypatch):
+    """mlx-vlm's DFlash round loop reserves offset + block rows before its first
+    round, rounded up to a multiple of the step. At 4096 mlx-vlm's own reserve
+    copies a cache whose buffers already hold those rows; inside a decode the
+    reserve leaves it alone and grows only the cache that is short."""
+    from mlx_vlm.speculative.dflash import _reserve_dflash_target_cache
+
+    block = 8
+    # A 256-step prefill growth from 56,403 keys, then the 7-row generation
+    # prompt: 249 rows of room left.
+    control = _padded(56_410, 56_659)
+    control.step = DECODE_KV_STEP
+    _reserve_dflash_target_cache([control], block)
+    assert control.keys.shape[2] == 57_344, "mlx-vlm's reserve no longer copies a roomy cache"
+
+    roomy, short = _padded(56_410, 56_659), _padded(56_655, 56_659)
+    seen: list[tuple[bool, int, int]] = []
+
+    def stream_generate(model, processor, prompt, **kwargs):
+        before = roomy.keys
+        _reserve_dflash_target_cache(kwargs["prompt_cache"], block)
+        seen.append((roomy.keys is before, roomy.keys.shape[2], short.keys.shape[2]))
+        yield _result("ok")
+
+    _stub_mlx_vlm(monkeypatch, stream_generate)
+    assert _engine().decode([roomy, short], [4, 5], 8) == "ok"
+    assert seen == [(True, 56_659, 57_344)]
+    for c in (roomy, short):
+        assert set(vars(c)) == {"keys", "values", "offset"}
 
 
 # ---- growth on mlx-vlm's KVCache ---------------------------------------------------
