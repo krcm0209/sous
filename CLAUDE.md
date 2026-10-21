@@ -835,8 +835,11 @@ goal.
   `TILE_COPY_MIN_BUDGET_GIB` = 14 GiB (a fork beside a retaining
   conversation: a copy that evicts the forks costs more prefill than it
   saves decode), under a configured `prompt_cache_gb` iff that budget fits
-  beside the copy, and keeps `mlp` when the headroom is unreadable; never a
-  warning. The copy is 4.09 GB on the 27B (b+a pads to one tile). Measured on
+  beside the copy, with `[model].prompt_cache` off (`cache_enabled`, which
+  `VLMEngine.__init__` hands `enable()` from `prompt_cache`) iff the copy
+  fits beside the reserve and the slack, as under a budget of 0, since no
+  slot or fork holds any, and keeps `mlp` when the headroom is unreadable;
+  never a warning. The copy is 4.09 GB on the 27B (b+a pads to one tile). Measured on
   the 64 GB M5 Pro with the automatic budget: at 262144 the budget is about
   17.9 GiB without the copy and 14.07 GiB (15,102,367,760 bytes) with it,
   0.07 GiB above the rule, so the automatic scope is `active:all` there but

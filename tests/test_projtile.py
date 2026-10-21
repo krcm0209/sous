@@ -1164,6 +1164,7 @@ def _enable(root, ready, **overrides) -> dict:
         "config_value": True,
         **ready,
         "drafter_kind": "dflash",
+        "cache_enabled": True,
         "cache_budget": None,
         "headroom_bytes": 64 * G,
         "reserve_bytes": 8 * G,
@@ -1399,53 +1400,75 @@ def test_enable_refuses_an_exception_in_a_guard_with_its_error_line(monkeypatch,
     assert record.exc_info is not None and record.exc_info[1] is error
 
 
-# (config value, configured budget, headroom, copy, reserve, copies, text); the
-# automatic rule keeps 2 GiB of slack beside the reserve.
+# (config value, prompt cache on, configured budget, headroom, copy, reserve,
+# copies, text); the automatic rule keeps 2 GiB of slack beside the reserve.
 COPY_CASES = [
-    (True, None, 35 * G, 4 * G, 16 * G, False,
+    (True, True, None, 35 * G, 4 * G, 16 * G, False,
      "copy would leave 13.00 GiB of prompt-cache budget (< 14)"),
-    (True, None, 44 * G, 4 * G, 16 * G, True, "budget left 22.00 GiB"),
+    (True, True, None, 44 * G, 4 * G, 16 * G, True, "budget left 22.00 GiB"),
     # Exactly the rule's floor copies: the rule is "at least".
-    (True, None, 36 * G, 4 * G, 16 * G, True, "budget left 14.00 GiB"),
+    (True, True, None, 36 * G, 4 * G, 16 * G, True, "budget left 14.00 GiB"),
     # 40 MiB short of it does not, and the text must not round up to the floor.
-    (True, None, 36 * G - 40 * 2**20, 4 * G, 16 * G, False,
+    (True, True, None, 36 * G - 40 * 2**20, 4 * G, 16 * G, False,
      "copy would leave 13.96 GiB of prompt-cache budget (< 14)"),
-    (True, 12 * G, 35 * G, 4 * G, 16 * G, True,
+    (True, True, 12 * G, 35 * G, 4 * G, 16 * G, True,
      "configured budget 12.00 GiB fits beside the copy; budget left 13.00 GiB"),
     # A configured budget that exactly equals what is left still fits beside it.
-    (True, 13 * G, 35 * G, 4 * G, 16 * G, True,
+    (True, True, 13 * G, 35 * G, 4 * G, 16 * G, True,
      "configured budget 13.00 GiB fits beside the copy; budget left 13.00 GiB"),
-    (True, 14 * G, 35 * G, 4 * G, 16 * G, False,
+    (True, True, 14 * G, 35 * G, 4 * G, 16 * G, False,
      "configured budget 14.00 GiB does not fit beside the copy; budget left 13.00 GiB"),
     # 0 is a real budget (one slot): any headroom that leaves nothing negative copies.
-    (True, 0, 30 * G, 4 * G, 16 * G, True,
+    (True, True, 0, 30 * G, 4 * G, 16 * G, True,
      "configured budget 0.00 GiB fits beside the copy; budget left 8.00 GiB"),
-    (True, 0, 22 * G, 4 * G, 16 * G, True,
+    (True, True, 0, 22 * G, 4 * G, 16 * G, True,
      "configured budget 0.00 GiB fits beside the copy; budget left 0.00 GiB"),
-    (True, 0, 20 * G, 4 * G, 16 * G, False,
+    (True, True, 0, 20 * G, 4 * G, 16 * G, False,
      "configured budget 0.00 GiB does not fit beside the copy; budget left -2.00 GiB"),
-    (True, None, None, 4 * G, 16 * G, False, "headroom unreadable"),
-    (True, 12 * G, None, 4 * G, 16 * G, False, "headroom unreadable"),
-    ("mlp", None, 44 * G, 4 * G, 16 * G, False, "scope mlp by config"),
-    ("all", None, 20 * G, 4 * G, 16 * G, True, "scope all by config; budget left -2.00 GiB"),
-    ("all", 12 * G, None, 4 * G, 16 * G, True, "scope all by config; budget left unknown"),
+    (True, True, None, None, 4 * G, 16 * G, False, "headroom unreadable"),
+    (True, True, 12 * G, None, 4 * G, 16 * G, False, "headroom unreadable"),
+    ("mlp", True, None, 44 * G, 4 * G, 16 * G, False, "scope mlp by config"),
+    ("all", True, None, 20 * G, 4 * G, 16 * G, True, "scope all by config; budget left -2.00 GiB"),
+    ("all", True, 12 * G, None, 4 * G, 16 * G, True, "scope all by config; budget left unknown"),
+    # A 48 GB M5 Pro at 131072: about 21.9 GiB of headroom beside the weights and
+    # the drafter, so the 4.1 GB copy and the 8 GiB reserve leave a budget under
+    # the rule; with the prompt cache off nothing holds that budget, and it copies.
+    (True, True, None, int(21.9 * G), 4_100_000_000, 8 * G, False,
+     "copy would leave 8.08 GiB of prompt-cache budget (< 14)"),
+    (True, False, None, int(21.9 * G), 4_100_000_000, 8 * G, True,
+     "prompt cache off; the copy fits beside the reserve; budget left 8.08 GiB"),
+    # The 64 GB M5 Pro with a window near 270000 tokens (64 KiB of KV each): just
+    # under the rule with the cache on, a copy with it off.
+    (True, True, None, int(36.27 * G), 4_100_000_000, 270_000 * 65_536, False,
+     "copy would leave 13.97 GiB of prompt-cache budget (< 14)"),
+    (True, False, None, int(36.27 * G), 4_100_000_000, 270_000 * 65_536, True,
+     "prompt cache off; the copy fits beside the reserve; budget left 13.97 GiB"),
+    # With the cache off a configured budget holds nothing either: the copy needs
+    # only room beside the reserve.
+    (True, False, 24 * G, 30 * G, 4 * G, 16 * G, True,
+     "prompt cache off; the copy fits beside the reserve; budget left 8.00 GiB"),
+    (True, False, None, 20 * G, 4 * G, 16 * G, False,
+     "prompt cache off; the copy does not fit beside the reserve; budget left -2.00 GiB"),
+    (True, False, None, None, 4 * G, 16 * G, False, "headroom unreadable"),
+    ("mlp", False, None, 44 * G, 4 * G, 16 * G, False, "scope mlp by config"),
 ]  # fmt: skip
 
 
 def _copy_id(case) -> str:
-    config, budget, headroom, *_ = case
+    config, cache, budget, headroom, _, reserve, *_ = case
     gib = lambda v: "auto" if v is None else f"{v / G:g}G"  # noqa: E731
-    return f"{config}-budget-{gib(budget)}-headroom-{gib(headroom)}"
+    cached = "" if cache else "-cache-off"
+    return f"{config}{cached}-budget-{gib(budget)}-headroom-{gib(headroom)}-reserve-{gib(reserve)}"
 
 
 @pytest.mark.parametrize("case", COPY_CASES, ids=[_copy_id(c) for c in COPY_CASES])
 def test_copy_decision_table(case):
     """Bytes in, the copy and why out; never a warning, even where a configured
     budget no longer fits: the user chose it."""
-    config, budget, headroom, copy, reserve, copies, text = case
+    config, cache, budget, headroom, copy, reserve, copies, text = case
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        got = projtile.copy_decision(config, budget, headroom, copy, reserve)
+        got = projtile.copy_decision(config, budget, headroom, copy, reserve, cache_enabled=cache)
     assert got == (copies, text)
     assert caught == []
 
@@ -1508,6 +1531,21 @@ def test_enable_serves_mlp_only_when_the_copy_is_skipped(monkeypatch, config, he
         f"projection tile: scope=mlp copy=0.0 GB budget left {budget} "
         f"probe {status['probe_seconds']:.2f}s ({why})"
     ]
+
+
+def test_enable_copies_beside_the_reserve_alone_with_the_prompt_cache_off(monkeypatch):
+    """The headroom that leaves the automatic budget under the rule (13 GiB) still
+    makes the copy when the prompt cache is off: no slot or fork would hold it."""
+    ready = ptfx.tile_ready(monkeypatch)
+    root = ptfx.ready_model()
+    copy = projtile.copy_bytes(root, keys_with_plans=_planned)
+    status, messages, _ = _gated(
+        root, ready, cache_enabled=False, headroom_bytes=19 * G + copy, reserve_bytes=4 * G
+    )
+    assert messages == []
+    assert (status["state"], status["scope"], status["reason"]) == ("active", "all", None)
+    assert status["budget_left_gib"] == 13.0
+    assert _marked(root) == _CONVERTED
 
 
 def test_enable_reports_scope_mlp_when_no_stack_key_has_a_plan(monkeypatch):
@@ -2102,6 +2140,7 @@ def test_enable_goes_active_on_the_real_kernels(monkeypatch, scope):
         tile_status=tile_status,
         int8_status={"state": "active", "reason": None, "routed": 24},
         drafter_kind="dflash",
+        cache_enabled=True,
         cache_budget=None,
         headroom_bytes=None,
         reserve_bytes=0,

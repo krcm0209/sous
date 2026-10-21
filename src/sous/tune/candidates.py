@@ -215,6 +215,7 @@ def fit(
     tile_copy_bytes: int | None = None,
     tile_config: bool | str = False,
     cache_budget: int | None = None,
+    cache_enabled: bool = True,
 ) -> Fit:
     """Weights, the quantized drafter, one window of KV and the slack against
     Metal's recommended working set. A window that does not fit is lowered
@@ -223,9 +224,10 @@ def fit(
     itself.
 
     `tile_copy_bytes` is the projection tile's copy where its static check
-    passes, else None; `tile_config` is [model].projection_tile and
+    passes, else None; `tile_config` is [model].projection_tile,
     `cache_budget` the configured prompt-cache budget in bytes (None when
-    automatic). The scope the tile's guard would pick goes into `detail`, never
+    automatic) and `cache_enabled` [model].prompt_cache, as the engine hands
+    them to the guard. The scope the tile's guard would pick goes into `detail`, never
     into `needed` or the window: the copy is elective, and the guard skips it
     rather than shrink the window."""
     kv = target.kv_bytes_per_token
@@ -253,7 +255,12 @@ def fit(
         # working set less the weights and the quantized drafter.
         headroom = int(working_set_bytes - target.bytes - dbytes / DRAFTER_QUANT_DIVISOR)
         copy, why = projtile.copy_decision(
-            tile_config, cache_budget, headroom, tile_copy_bytes, kv * chosen
+            tile_config,
+            cache_budget,
+            headroom,
+            tile_copy_bytes,
+            kv * chosen,
+            cache_enabled=cache_enabled,
         )
         scope = "all" if copy else "mlp"
         copied = f" copy={tile_copy_bytes / _GB:.1f} GB" if copy else ""

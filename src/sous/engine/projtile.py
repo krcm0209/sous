@@ -1086,15 +1086,19 @@ def copy_decision(
     headroom_bytes: int | None,
     copy_bytes: int,
     reserve_bytes: int,
+    *,
+    cache_enabled: bool,
 ) -> tuple[bool, str]:
     """Whether to make the attention and GDN copies, and why, all in bytes: the
     MLP's conversion is size-neutral, the copies are not. "mlp" never copies,
     "all" always does; true copies only while the prompt cache keeps a budget
     worth having beside them: TILE_COPY_MIN_BUDGET_GIB under the automatic
-    budget, the configured budget itself under an explicit one. Never a warning:
-    a skipped copy still serves the MLP, and a configured budget is the user's
-    choice. Shared with sous tune's fit(), which names the scope a load would take
-    in its detail."""
+    budget, the configured budget itself under an explicit one. With the prompt
+    cache off (``cache_enabled`` false) no slot or fork holds any budget, so true
+    copies whenever the copy fits beside the reserve and the slack, as under a
+    configured budget of 0. Never a warning: a skipped copy still serves the MLP,
+    and a configured budget is the user's choice. Shared with sous tune's fit(),
+    which names the scope a load would take in its detail."""
     left = budget_left(headroom_bytes, copy_bytes, reserve_bytes)
     # Two decimals: at one, 13.96 GiB would read "14.0 GiB (< 14)".
     after = "unknown" if left is None else f"{left / _GIB:.2f} GiB"
@@ -1104,6 +1108,12 @@ def copy_decision(
         return True, f"scope all by config; budget left {after}"
     if left is None:
         return False, "headroom unreadable"
+    if not cache_enabled:
+        fits = "fits" if left >= 0 else "does not fit"
+        return (
+            left >= 0,
+            f"prompt cache off; the copy {fits} beside the reserve; budget left {after}",
+        )
     if cache_budget is None:
         if left >= TILE_COPY_MIN_BUDGET_GIB * _GIB:
             return True, f"budget left {after}"
@@ -1602,15 +1612,17 @@ def enable(
     tile_status: dict[str, Any],
     int8_status: dict[str, Any],
     drafter_kind: str | None,
+    cache_enabled: bool,
     cache_budget: int | None,
     headroom_bytes: int | None,
     reserve_bytes: int,
 ) -> dict[str, Any]:
     """Decide whether this load's verify projections run on the tile, and at which
     scope; on the loading thread, after the projection kernel, the drafter's
-    route and int8 prefill. ``cache_budget`` is the configured prompt-cache budget
-    in bytes (None when automatic), ``headroom_bytes`` live_headroom() read now,
-    ``reserve_bytes`` the turn's own reserve. Returns the status the engine
+    route and int8 prefill. ``cache_enabled`` is whether the prompt cache is on,
+    ``cache_budget`` the configured prompt-cache budget in bytes (None when
+    automatic), ``headroom_bytes`` live_headroom() read now, ``reserve_bytes``
+    the turn's own reserve. Returns the status the engine
     exposes and never raises: a model load must not fail because an accelerator
     is missing. probe_seconds covers the real-shape compile, the conversion, the
     copy, the warm-up and the probe, the tile's whole cost to a load."""
@@ -1658,7 +1670,12 @@ def enable(
             else:
                 wanted = copy_bytes(root, keys_with_plans=_has_plan)
                 copy, why = copy_decision(
-                    config_value, cache_budget, headroom_bytes, wanted, reserve_bytes
+                    config_value,
+                    cache_budget,
+                    headroom_bytes,
+                    wanted,
+                    reserve_bytes,
+                    cache_enabled=cache_enabled,
                 )
                 touched = True
                 if convert_mlp(root) == 0:

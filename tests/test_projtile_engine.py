@@ -393,6 +393,7 @@ def test_vlm_engine_enables_the_tile_after_the_kernel_and_before_the_drafter_rou
     assert seen["tile_status"] is tile_status
     assert seen["int8_status"] is int8_status
     assert seen["drafter_kind"] == ("dflash" if drafter_loads else None)
+    assert seen["cache_enabled"] is True
     assert seen["cache_budget"] == cache_budget
     assert seen["headroom_bytes"] == headroom
     assert seen["reserve_bytes"] == 8 * _GIB

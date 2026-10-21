@@ -167,6 +167,7 @@ class VLMEngine:
             tile_status=self.attention_tile_status,
             int8_status=self.int8_prefill_status,
             drafter_kind=self._draft_kind if self._draft is not None else None,
+            cache_enabled=prompt_cache,
             cache_budget=cache_budget,
             headroom_bytes=live_headroom(),
             reserve_bytes=reserve_bytes,

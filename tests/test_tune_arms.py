@@ -710,12 +710,24 @@ def test_quick_arms_hand_fit_the_tiles_copy_only_where_its_static_check_passes(
     assert fits and {d is None for d, _, _ in fits} == {True, False}
     for drafter, kw, f in fits:
         assert kw["tile_config"] is True and kw["cache_budget"] == 12 * 2**30
+        assert kw["cache_enabled"] is True
         if drafter is None:
             # "no drafter": the tile serves the drafter's verify only.
             assert kw["tile_copy_bytes"] is None and "projection tile" not in f.detail
         else:
             assert kw["tile_copy_bytes"] == 4_090_000_000
             assert "projection tile scope=all" in f.detail
+
+
+def test_quick_arms_hand_fit_the_prompt_cache_switch(tmp_path, monkeypatch):
+    """With the prompt cache off the tile's memory rule copies whenever the copy
+    fits beside the reserve, so the fit's note must be told the cache is off."""
+    _, _, fits = _tile_check(monkeypatch, None)
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", prompt_cache=False)
+    quick_arms(user, _candidates()[:1], _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET)
+    assert fits and all(kw["cache_enabled"] is False for _, kw, _ in fits)
+    noted = [f.detail for d, _, f in fits if d is not None]
+    assert noted and all("prompt cache off; the copy fits beside the reserve" in d for d in noted)
 
 
 def test_quick_arms_hand_fit_no_copy_where_the_tiles_static_check_refuses(tmp_path, monkeypatch):

@@ -242,6 +242,19 @@ def test_fit_reports_the_scope_the_config_and_an_explicit_budget_decide():
     assert "configured budget 24.00 GiB does not fit beside the copy" in tight.detail
 
 
+def test_fit_reports_the_copy_the_prompt_cache_off_allows():
+    """The copy that would leave the automatic budget under the rule is made with
+    the prompt cache off: nothing would hold that budget."""
+    on = _fit_27b(tile_copy_bytes=_LARGE_COPY, tile_config=True)
+    off = _fit_27b(tile_copy_bytes=_LARGE_COPY, tile_config=True, cache_enabled=False)
+    assert "projection tile scope=mlp (copy would leave 11.85 GiB" in on.detail
+    assert (
+        "projection tile scope=all copy=15.0 GB (prompt cache off; the copy fits beside "
+        "the reserve; budget left 11.85 GiB)" in off.detail
+    )
+    assert (off.fits, off.window, off.needed_bytes) == (on.fits, on.window, on.needed_bytes)
+
+
 def test_fit_reports_no_scope_for_a_model_it_refuses():
     f = fit(
         _cp(16_100_000_000),

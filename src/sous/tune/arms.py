@@ -216,6 +216,7 @@ def _fit(
         tile_config=user.projection_tile,
         # In bytes, as the engine factory hands the configured budget on.
         cache_budget=None if user.prompt_cache_gb is None else int(user.prompt_cache_gb * 2**30),
+        cache_enabled=user.prompt_cache,
     )
 
 

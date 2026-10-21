@@ -310,7 +310,9 @@ the automatic prompt-cache budget the copy would leave — is at least 14 GiB,
 the budget a fork kept beside a retaining conversation wants (see
 `prompt_cache_gb` above): a copy that evicts the forks costs more prefill than
 it saves decode. With `prompt_cache_gb` set, it is made when that budget still
-fits beside the copy. On a 64 GB M5 Pro with the default model and drafter,
+fits beside the copy. With `prompt_cache = false` no slot or fork holds any
+budget, so it is made whenever the copy fits beside the window of KV and the
+slack. On a 64 GB M5 Pro with the default model and drafter,
 Metal's working set is about 51.8 GiB and the resident weights about 17 GiB;
 at `max_context_tokens = 131072` (8 GiB of KV reserve) the automatic budget is
 about 26 GiB, the copy (3.8 GiB) leaves about 22, and the load is `active:all`;

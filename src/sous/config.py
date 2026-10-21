@@ -173,7 +173,8 @@ class SousConfig:
     # GDN weights get a tile-ordered copy (4.1 GB on the default model)
     # beside the originals only when the automatic prompt-cache budget left
     # after the copy is at least 14 GiB, or a configured prompt_cache_gb
-    # still fits beside it. true decides by that rule, "mlp" never makes the
+    # still fits beside it, or, with prompt_cache off, whenever it fits
+    # beside the reserve. true decides by that rule, "mlp" never makes the
     # copy and "all" always does; false leaves every projection where
     # projection_kernel puts it. While it is active, greedy output with the
     # drafter is the same at any block size but differs from output without
