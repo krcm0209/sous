@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 import warnings
 from collections.abc import Callable
@@ -23,6 +24,7 @@ from sous.engine.promptcache import (
     Speculation,
     probe_boundaries,
 )
+from sous.engine.window import DECODE_KV_STEP
 
 
 def _load_quantized_drafter(model: object, draft_id: str) -> tuple[Any, str]:
@@ -59,6 +61,28 @@ def _pin_block_size(drafter: Any, block_size: int) -> None:
     nothing to pin."""
     if drafter is not None and block_size > 0:
         drafter.prefer_requested_block_size = True
+
+
+def _kv_layers(cache: list) -> list:
+    """The layers of `cache` that are mlx-vlm's KVCache itself: its subclasses
+    keep other layouts and growth rules, and a recurrent layer's state does not
+    grow. Looked up in sys.modules rather than imported: a list that holds a
+    KVCache has loaded its module, and the engine tests drive decode() with
+    mlx_vlm stubbed."""
+    kv_cache = getattr(sys.modules.get("mlx_vlm.models.cache"), "KVCache", None)
+    return [c for c in cache if kv_cache is not None and type(c) is kv_cache]
+
+
+def _widen_kv_step(layers: list) -> None:
+    for c in layers:
+        c.step = DECODE_KV_STEP
+
+
+def _restore_kv_step(layers: list) -> None:
+    """Back to the class's own step. Never raises: it runs first in decode()'s
+    finally."""
+    for c in layers:
+        vars(c).pop("step", None)
 
 
 class VLMEngine:
@@ -552,6 +576,16 @@ class VLMEngine:
             tile_window = bool(projtile._active)
             if tile_window:
                 projtile.open_window()
+            # This decode's KV grows by DECODE_KV_STEP rows, and only the
+            # decode's: a fork is copied during a prefill and the fork store
+            # saves the padded buffers, so prefill() and the load-time probes
+            # keep mlx-vlm's step, and the step goes back before the cache is
+            # handed back, so every prefill grows by the default whichever
+            # cache it extends. A published turn slot keeps the capacity this
+            # decode grew, up to DECODE_KV_STEP rows past its last token, and
+            # slot_bytes counts it.
+            kv_layers = _kv_layers(cache)
+            _widen_kv_step(kv_layers)
             try:
                 for r in stream_generate(
                     model,
@@ -573,6 +607,7 @@ class VLMEngine:
                     if on_delta is not None:
                         on_delta(Delta(r.text, r.generation_tokens, r.finish_reason))
             finally:
+                _restore_kv_step(kv_layers)
                 # The tile's first, in a try of its own: whatever kv8's close
                 # does, the next turn's prefill finds the tile's window shut.
                 try:
