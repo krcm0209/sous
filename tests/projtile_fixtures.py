@@ -32,8 +32,7 @@ TINY_PLANS: dict[projtile.Key, projtile.Plan] = {
     for key in (
         (256, (2048, 512, 512)),  # q+k+v
         (256, (512, 512)),  # gate+up, the dual
-        (256, (512, 256)),  # in_proj_qkv+in_proj_z
-        (256, (4, 4)),  # in_proj_b+in_proj_a
+        (256, (512, 256, 4, 4)),  # in_proj qkv+z+b+a
         (512, (256,)),  # down
         (1024, (256,)),  # o_proj
         (256, (256,)),  # out_proj, in_proj_z alone
@@ -48,7 +47,8 @@ def tiny_slab_model(*, seed: int = 0, scope: str = "all") -> Any:
     """pfx.tiny_quantized_model() with every gate, up and down slab-only and, at
     scope "all", every attention and GDN group stacked whatever its key. Its K are
     256, 512 and 1024 and every MLP width a multiple of 256, so nothing on its MLP
-    pads (b+a, N 8, is the one stack that does)."""
+    pads (the GDN stack, N 776, b and a alone in its last tile, is the one stack
+    that does)."""
     if scope not in ("all", "mlp"):
         raise ValueError(f'scope must be "all" or "mlp", got {scope!r}')
     root = pfx.tiny_quantized_model(seed=seed)

@@ -751,9 +751,9 @@ goal.
   tile. A call goes to it only when `plan_for_call(linears)` gives every
   linear a launch at a tuned plan — a lone linear keyed by its K and width,
   gate+up as one dual launch, a stacked call one launch per run of a stack's
-  members whole and in order, so the GDN four are qkv+z then b+a — else the
-  whole call stays on the MMA kernel. `plan_for_call` returns the `Launch`es
-  (key, members, plan) that `verify()` and `plain()` launch from
+  members whole and in order, so q+k+v and the GDN four are one launch each —
+  else the whole call stays on the MMA kernel. `plan_for_call` returns the
+  `Launch`es (key, members, plan) that `verify()` and `plain()` launch from
   (`_check_call` refuses another call's by identity), so a call's launches
   are worked out once, not per run; `slab.slab_info` and `stack_of` read
   their markers with `vars(m).get`, since a `getattr` miss goes through
@@ -784,10 +784,17 @@ goal.
   GDN linears keep mlx's arrays for prefill and the one-row kernel and, at
   scope `all`, gain a stacked slab copy: one `Stack` shared by its members
   as `_sous_tile`, each member's place in it as `_sous_tile_index` — q+k+v
-  and o_proj per attention layer, qkv+z, b+a and out_proj per GDN layer (the
-  four GDN inputs as one stack ran 1.06x the kernel's time); a member called
-  alone launches only its own tiles when its columns sit on tile edges, else
-  its whole stack (b and a share one tile). Every reader takes the
+  and o_proj per attention layer, qkv+z+b+a and out_proj per GDN layer (b+a
+  as a stack of its own, a split launch, ran beside qkv+z's and cost 0.027 ms
+  a layer in the forward's order on the M5 Pro, about 1.2 ms a block-8 round;
+  as one stack at qkv+z's plan it costs 0.002–0.003 ms, and qkv and z keep
+  their bits, since they end on a tile edge and read the same tiles at the
+  same plan); a member called alone launches only the tiles that cover its
+  columns and cuts its own from them, never its stack: b and a share the GDN
+  stack's last tile and each reads that tile at the split plan tuned for it,
+  so a lone b or a can differ from its fused columns in the last place (a
+  verify always calls the four together, a decode's own chunk each alone, so
+  no contract ties the two). Every reader takes the
   descriptor `projkernel._weights(m)` returns — the bare `(weight, scales,
   biases)` 3-tuple for an mlx-layout module, `Weights(w, scales, biases,
   slab)` for a slab-only one, normalised by `_as_weights` — and derives K
@@ -806,14 +813,15 @@ goal.
   active, and why the fork key reads the conversion — those prefill chunks
   carry int8's bits where stock's were. `PLANS` maps a key, (K, the members'
   real widths in call order), to a `Plan(tn, s, groups, pipe, splits)`: the
-  27B's fused verifier keys at the plans tuned for them and the alone forms
-  hook 2 reaches, 12 keys, all tuned on the 20-core M5 Pro (`MEASURED_CORES`
-  = {20}). A key outside the table stays on the MMA kernel, never on a
-  default plan (one GROUPS step off cost 15–20 %), and split counts are
-  frozen per key, since another count adds in another order. `enable()` runs
-  on the `sous-model-load` thread after `projkernel.enable` and before block
-  resolution, the drafter's route (which reads none of the target's modules
-  and runs once the block has resolved), kv8, the fork store and
+  27B's fused verifier keys at the plans tuned for them (the GDN stack at
+  qkv+z's) and the alone forms hook 2 reaches, 11 keys, all tuned on the
+  20-core M5 Pro (`MEASURED_CORES` = {20}). A key outside the table stays on
+  the MMA kernel, never on a default plan (one GROUPS step off cost 15–20 %),
+  and split counts are frozen per key, since another count adds in another
+  order. `enable()` runs on the `sous-model-load` thread after
+  `projkernel.enable` and before block resolution, the drafter's route
+  (which reads none of the target's modules and runs once the block has
+  resolved), kv8, the fork store and
   `measure_cache_budget`, never raises and starts with `clear()`. It checks, in order: the config
   (`false` is `off`); the projection kernel `active`; the attention tile
   `active`; a DFlash drafter (else `no drafter`); int8 prefill `active`; the
@@ -850,7 +858,8 @@ goal.
   `VLMEngine.__init__` hands `enable()` from `prompt_cache`) iff the copy
   fits beside the reserve and the slack, as under a budget of 0, since no
   slot or fork holds any, and keeps `mlp` when the headroom is unreadable;
-  never a warning. The copy is 4.09 GB on the 27B (b+a pads to one tile). Measured on
+  never a warning. The copy is 4.09 GB on the 27B (the GDN stack's last tile
+  holds b and a alone, 96 of its 256 columns). Measured on
   the 64 GB M5 Pro with the automatic budget: at 262144 the budget is about
   17.9 GiB without the copy and 14.07 GiB (15,102,367,760 bytes) with it,
   0.07 GiB above the rule, so the automatic scope is `active:all` there but
@@ -866,7 +875,10 @@ goal.
   alone; each linear's relative RMS against an elementwise fp32 reference
   within `TILE_FLOOR_FACTOR` = 1.05x the bf16 floor (that reference rounded
   to bf16 — T-invariance compares the tile with itself, this catches one
-  that lost precision); a NaN in one row leaving the others bitwise alone.
+  that lost precision); a NaN in one row leaving the others bitwise alone;
+  on a stack's launch (q+k+v, the GDN four) a NaN planted in each member's
+  scales in turn reaching all of that member's columns and leaving every
+  other member's bitwise alone, b's and a's inside their shared tile too.
   Then the slab-only MLP's other paths, bitwise against mlx's layout (the
   MMA kernel at T = 1..8 and, for a lone linear, the one-row kernel and
   int8's GEMM at 9, 64 and 128 rows) on its real linears, gate+up and a

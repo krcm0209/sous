@@ -223,18 +223,21 @@ def revert_mlp(root: Any) -> int:
 
 def stack_groups(root: Any) -> list[tuple[Any, ...]]:
     """The attention and GDN linears grouped as the verifier calls them, layer by
-    layer: a GDN layer's in_proj_qkv+in_proj_z, in_proj_b+in_proj_a and out_proj;
-    an attention layer's q+k+v and o_proj. The verifier calls the four GDN input
-    projections at once, but as one stack they ran slower on the tile than on the
-    projection kernel (1.06x its time, the 27B on the M5 Pro), and as two stacks
-    faster."""
+    layer: a GDN layer's in_proj_qkv+in_proj_z+in_proj_b+in_proj_a and out_proj;
+    an attention layer's q+k+v and o_proj. The four GDN input projections are one
+    stack, one launch, because b+a as a stack of its own (one tile, split launch)
+    ran beside qkv+z's launch and slowed it: on the 27B on the M5 Pro the pair
+    cost 0.027 ms a layer over qkv+z alone in the forward's dispatch order, and
+    0.090 ms when both were evaluated together, while the one stack at qkv+z's
+    plan costs 0.002-0.003 ms over qkv+z alone (about 1.2 ms per block-8 round
+    over the 48 GDN layers). qkv and z end on a tile edge, so b and a fill the
+    last tile alone, padded as the b+a stack was: the copy is no larger."""
     groups: list[tuple[Any, ...]] = []
     for layer in root.model.layers:
         if layer.is_linear:
             gdn = layer.linear_attn
             groups += [
-                (gdn.in_proj_qkv, gdn.in_proj_z),
-                (gdn.in_proj_b, gdn.in_proj_a),
+                (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a),
                 (gdn.out_proj,),
             ]
         else:
@@ -375,24 +378,30 @@ class Plan:
         return f"TN{self.tn}/S{self.s}/G{self.groups}/{'pipe' if self.pipe else 'seq'}{split}"
 
 
-# The 27B's dispatch keys on the M5 Pro. The six fused keys the verifier calls carry
-# the plans tuned for them (1,440 candidates, 0.835x the projection kernel's
-# forward); the alone forms, which decode's two-to-eight-row calls reach through the
-# module hook, carry the plans chosen for each linear alone. One GROUPS step off a
-# tuned plan cost 15-20 %, so a key outside the table gets no default plan: the
-# projection kernel serves it.
+# The 27B's dispatch keys on the M5 Pro. The verifier's fused keys carry the plans
+# tuned for them (1,440 candidates); the GDN stack takes the plan tuned for
+# in_proj_qkv+in_proj_z, over which its last tile costs 0.002-0.003 ms (130 column
+# tiles of TN 128 over 80 threadgroups, at most two each, as qkv+z's 128 were). The
+# alone forms, which decode's two-to-eight-row calls reach through the module hook,
+# carry the plans chosen for each linear alone. One GROUPS step off a tuned plan
+# cost 15-20 %, so a key outside the table gets no default plan: the projection
+# kernel serves it.
 PLANS: dict[Key, Plan] = {
     (5120, (12288, 1024, 1024)): Plan(128, 8, 80, True),  # q+k+v
     (6144, (5120,)): Plan(256, 8, 20, True, 2),  # o_proj, out_proj
-    (5120, (10240, 6144)): Plan(128, 8, 80, True),  # in_proj_qkv+in_proj_z
-    (5120, (48, 48)): Plan(128, 8, 2, True, 8),  # in_proj_b+in_proj_a
+    (5120, (10240, 6144, 48, 48)): Plan(128, 8, 80, True),  # in_proj qkv+z+b+a
     (5120, (17408, 17408)): Plan(128, 4, 100, True),  # gate+up, one dual launch
     (17408, (5120,)): Plan(256, 8, 20, True, 2),  # down
     (5120, (12288,)): Plan(128, 8, 80, True),  # q
     (5120, (1024,)): Plan(128, 8, 8, True),  # k, v
     (5120, (10240,)): Plan(128, 4, 80, True),  # in_proj_qkv
     (5120, (6144,)): Plan(128, 8, 48, True),  # in_proj_z
-    # in_proj_b, in_proj_a: alone, each runs the b+a stack's one tile.
+    # in_proj_b, in_proj_a alone: each launches the GDN stack's last tile, the one
+    # they share, split eight ways as tuned for that one tile (4x faster than
+    # unsplit). The split adds in another order than the stack's unsplit launch,
+    # so a lone call's output can differ from the fused call's columns in the last
+    # place; nothing equates the two, since a verify always calls the four
+    # together and a decode's own short chunk always calls each alone.
     (5120, (48,)): Plan(128, 8, 2, True, 8),
     (5120, (17408,)): Plan(256, 4, 68, True),  # gate, up
 }
@@ -423,10 +432,12 @@ def _launches(linears: Sequence[Any]) -> list[_Launch] | None:
     the linears it serves: a lone linear keyed by its own K and width (the alone
     form, whether it is slab-only or a stack member); gate+up (two slab-only
     linears of one shape) as one dual launch; and, for a call of stacked linears,
-    one launch per run of them that is a stack's members whole and in order (the
-    GDN call makes two, qkv+z and b+a). None when a linear has no planes, the
-    forms mix, or a run is not its stack's members in order: widths alone would
-    take q+v+k for q+k+v, k and v being one width."""
+    one launch per run of them that is a stack's members whole and in order (every
+    verifier call is one stack whole, q+k+v or the GDN four, so one launch). None
+    when a linear has no planes, the forms mix, or a run is not its stack's members
+    in order: widths alone would take q+v+k for q+k+v, k and v being one width,
+    and part of a stack (in_proj_qkv+in_proj_z without b and a, which no verifier
+    issues) stays on the projection kernel."""
     if not linears:
         return None
     infos = [slab.slab_info(m) for m in linears]
@@ -863,11 +874,12 @@ def _cut(y8: Any, rows: int, x: Any, start: int, stop: int) -> Any:
 
 def _alone(module: Any, x8: Any, rows: int, x: Any, plan: Plan) -> Any:
     """One linear's own launch at its alone plan. A slab-only linear reads its
-    planes. A stack member whose columns start and end on tile edges reads only
-    its own tiles, a contiguous range of every plane ([T][G][256] units), so a
-    member called alone costs its own bytes rather than its stack's; one sharing
-    a tile with another member (in_proj_b and in_proj_a share b+a's one tile)
-    runs its whole stack and takes its columns."""
+    planes. A stack member reads only the tiles that cover its columns, a
+    contiguous range of every plane ([T][G][256] units), and takes its columns
+    from them, so a member called alone costs its own tiles' bytes, never its
+    stack's: q, k, v, in_proj_qkv and in_proj_z start and end on tile edges and
+    read exactly their own tiles; in_proj_b and in_proj_a share the GDN stack's
+    last tile, and each reads that one tile."""
     info = slab.slab_info(module)
     if info is not None:
         y = tile(x8, module.weight, module.scales, module.biases, info, plan)
@@ -877,9 +889,6 @@ def _alone(module: Any, x8: Any, rows: int, x: Any, plan: Plan) -> Any:
         raise ValueError("projection tile: a linear without planes")
     start, stop = stack.slices[vars(module)[INDEX_ATTR]]
     whole = stack.info
-    if start % slab.TILE or (stop % slab.TILE and stop != whole.n_real):
-        y = tile(x8, stack.codes, stack.scales, stack.biases, whole, plan)
-        return _cut(y, rows, x, start, stop)
     t0, t1 = start // slab.TILE, -(-stop // slab.TILE)
     planes = (stack.codes, stack.scales, stack.biases)
     if (t0, t1) != (0, whole.tiles):
@@ -891,8 +900,11 @@ def _alone(module: Any, x8: Any, rows: int, x: Any, plan: Plan) -> Any:
             stack.scales[t0 * units : t1 * units],
             stack.biases[t0 * units : t1 * units],
         )
-    own = SlabInfo(n_real=stop - start, k=whole.k, tiles=t1 - t0)
-    return _cut(tile(x8, *planes, own, plan), rows, x, 0, stop - start)
+    # The real columns those tiles hold: a member's own, and on a shared tile its
+    # neighbours' too, which the cut drops.
+    base = t0 * slab.TILE
+    own = SlabInfo(n_real=min(t1 * slab.TILE, whole.n_real) - base, k=whole.k, tiles=t1 - t0)
+    return _cut(tile(x8, *planes, own, plan), rows, x, start - base, stop - base)
 
 
 def _check_call(linears: Sequence[Any], launches: Sequence[Launch]) -> None:
@@ -940,8 +952,9 @@ def verify(linears: Sequence[Any], x: Any, launches: Sequence[Launch]) -> tuple[
 def plain(module: Any, x: Any, launches: Sequence[Launch]) -> Any:
     """One module call on the tile: x [..., K] bf16 of 2..MAX_ROWS rows through
     ``module`` as ``launches``, plan_for_call's for the module alone; [...,
-    n_real]. A stack member launches only its own tiles where it can (_alone).
-    Raises ValueError when ``launches`` are not that call's, as verify() does."""
+    n_real]. A stack member launches only the tiles that cover its columns
+    (_alone). Raises ValueError when ``launches`` are not that call's, as verify()
+    does."""
     _check_call((module,), launches)
     x8, rows = _padded(x)
     return _alone(module, x8, rows, x, launches[0].plan)
@@ -1377,10 +1390,12 @@ def _check_tile_call(
     [MAX_ROWS, K] bf16, evaluated: every row at T = 1..MAX_ROWS equals the same
     row at T = 1; each linear's rows sit within TILE_FLOOR_FACTOR of the bf16
     floor against an fp32 reference (block invariance compares the tile with
-    itself; this catches a kernel that lost precision); and a NaN in one row
-    leaves the others bitwise alone. ``refs`` holds each linear's reference and
-    floor by id, computed on first use: the probe calls a fused group's linears
-    alone too, over the same ``x``, and the reference is the costly step."""
+    itself; this catches a kernel that lost precision); a NaN in one row leaves
+    the others bitwise alone; and on a stack's launch a NaN in one member's
+    scales leaves every other member's columns bitwise alone (_check_columns).
+    ``refs`` holds each linear's reference and floor by id, computed on first
+    use: the probe calls a fused group's linears alone too, over the same ``x``,
+    and the reference is the costly step."""
     import mlx.core as mx
 
     label = "+".join(names)
@@ -1412,6 +1427,59 @@ def _check_tile_call(
     for got, clean, name in zip(verify(call, x_nan, launches), full, names, strict=True):
         if not mx.array_equal(mx.take(got, keep, axis=0), mx.take(clean, keep, axis=0)).item():
             return f"isolation: a NaN in row {_NAN_ROW} changed the other rows of {name}"
+    first = 0
+    for launch in launches:
+        count = len(launch.members)
+        stack = stack_of(launch.members[0])
+        if count > 1 and stack is not None:
+            span = slice(first, first + count)
+            reason = _check_columns(stack, launch.plan, x, full[span], names[span])
+            if reason is not None:
+                return reason
+        first += count
+    return None
+
+
+def _poisoned_scales(stack: Stack, start: int, stop: int) -> Any:
+    """The stack's scales with a NaN in every unit of columns [start, stop):
+    unit i of the [T][G][256] plane is column (i // (G * 256)) * 256 + i % 256.
+    Evaluated."""
+    import mlx.core as mx
+
+    info = stack.info
+    unit = mx.arange(info.units)
+    column = (unit // (info.groups * slab.TILE)) * slab.TILE + unit % slab.TILE
+    nan = mx.array(float("nan"), dtype=mx.bfloat16)
+    scales = mx.where((column >= start) & (column < stop), nan, stack.scales)
+    mx.eval(scales)
+    return scales
+
+
+def _check_columns(
+    stack: Stack, plan: Plan, x: Any, clean: Sequence[Any], names: Sequence[str]
+) -> str | None:
+    """One stack's launch with a NaN planted in each member's scales in turn: the
+    member's own columns turn NaN, so the plant reached the kernel, and every other
+    member's columns stay bitwise ``clean`` (the launch's evaluated output over
+    ``x`` [MAX_ROWS, K], cut per member). That proves each column reads its own
+    planes and nothing else, between members sharing a tile (b and a in the GDN
+    stack) as between members in tiles of their own."""
+    import mlx.core as mx
+
+    for i, (start, stop) in enumerate(stack.slices):
+        y = tile(
+            x, stack.codes, _poisoned_scales(stack, start, stop), stack.biases, stack.info, plan
+        )
+        checks = [mx.all(mx.isnan(y[:, start:stop]))]
+        others = [j for j in range(len(stack.slices)) if j != i]
+        checks += [mx.array_equal(y[:, slice(*stack.slices[j])], clean[j]) for j in others]
+        same = mx.stack(checks)
+        mx.eval(same)
+        if not same[0].item():
+            return f"isolation: a NaN in the scales of {names[i]} did not reach its columns"
+        for n, j in enumerate(others, start=1):
+            if not same[n].item():
+                return f"isolation: a NaN in the columns of {names[i]} changed {names[j]}"
     return None
 
 
@@ -1827,8 +1895,7 @@ def static_copy_bytes(model_config: dict) -> int:
     v_heads = text["linear_num_value_heads"]
     value_dim = v_heads * text["linear_value_head_dim"]
     linear: list[Key] = [
-        (hidden, (2 * key_dim + value_dim, value_dim)),
-        (hidden, (v_heads, v_heads)),
+        (hidden, (2 * key_dim + value_dim, value_dim, v_heads, v_heads)),
         (value_dim, (hidden,)),
     ]
     full: list[Key] = [(hidden, (2 * heads * head_dim, kv, kv)), (heads * head_dim, (hidden,))]

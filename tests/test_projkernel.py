@@ -1500,7 +1500,7 @@ def test_the_verifier_hook_serves_every_run_on_the_tile_while_the_window_is_open
 
 
 def test_every_verifier_call_of_a_converted_load_runs_on_the_tile(monkeypatch):
-    """q+k+v, the GDN four (two launches), gate+up (the dual), down, o_proj and
+    """q+k+v, the GDN four (one stack), gate+up (the dual), down, o_proj and
     out_proj: each call one served run."""
     root = _tile_target(monkeypatch)
     monkeypatch.setattr(projkernel, "mma", _no_mma)
@@ -1555,13 +1555,13 @@ def test_a_key_outside_the_plan_table_is_served_by_the_mma_kernel(monkeypatch):
     assert seen == [(5, 2)]
 
 
-def test_a_call_with_one_launch_unplanned_stays_on_the_mma_kernel_whole(monkeypatch):
-    """The GDN call takes two launches, qkv+z and b+a: without b+a's key the
-    whole four-linear call runs on the MMA kernel, qkv+z included, never split
-    between the two paths."""
+def test_a_stacked_call_without_a_plan_stays_on_the_mma_kernel_whole(monkeypatch):
+    """The GDN call is one stack: without its key the whole four-linear call runs
+    on the MMA kernel, while each member alone, whose keys the table holds, could
+    still run on the tile; the call is never split between the two paths."""
     root = _tile_target(monkeypatch)
     plans = dict(projtile.PLANS)
-    del plans[(256, (4, 4))]
+    del plans[(256, (512, 256, 4, 4))]
     monkeypatch.setattr(projtile, "PLANS", plans)
     seen = _recording_mma(monkeypatch)
     gdn = root.model.layers[0].linear_attn
@@ -1588,7 +1588,7 @@ def test_the_module_hook_routes_two_to_eight_rows_to_the_tile_inside_the_window_
     """Inside the window a call of two to eight rows runs on the tile and a call of
     one on the one-row kernel; outside it, every one of them on the projection
     kernel. A stack member reads its own tiles (k), a slab-only linear its own
-    planes (gate), a member sharing a tile the whole stack (in_proj_a)."""
+    planes (gate), a member sharing a tile that one tile (in_proj_a)."""
     root = _tile_target(monkeypatch)
     # The real dispatcher over the stand-ins, so a one-row call shows its dispatch.
     monkeypatch.setattr(projkernel, "mma", projkernel.linears)

@@ -299,8 +299,7 @@ def _layer_groups(root) -> list:
         if layer.is_linear:
             gdn = layer.linear_attn
             out += [
-                (gdn.in_proj_qkv, gdn.in_proj_z),
-                (gdn.in_proj_b, gdn.in_proj_a),
+                (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a),
                 (gdn.out_proj,),
             ]
         else:
@@ -314,8 +313,7 @@ def _layer_groups(root) -> list:
 
 # The tiny model's stack keys in call order: GDN layer 0, attention layer 1, again.
 _TINY_KEYS = [
-    (256, (512, 256)),
-    (256, (4, 4)),
+    (256, (512, 256, 4, 4)),
     (256, (256,)),
     (256, (2048, 512, 512)),
     (1024, (256,)),
@@ -356,14 +354,14 @@ def test_build_stacks_concatenates_before_padding_and_records_slices():
     assert o is not None and o.key == (1024, (256,)) and o.slices == ((0, 256),)
 
     gdn = root.model.layers[0].linear_attn
-    ba = projtile.stack_of(gdn.in_proj_b)
-    assert ba is not None and projtile.stack_of(gdn.in_proj_a) is ba
-    assert ba.key == (256, (4, 4)) and ba.slices == ((0, 4), (4, 8))
-    assert (ba.info.tiles, ba.info.n_pad) == (1, 256)
-    _assert_unpacks_to(ba, (gdn.in_proj_b, gdn.in_proj_a))
-    qkvz = projtile.stack_of(gdn.in_proj_qkv)
-    assert qkvz is not None and projtile.stack_of(gdn.in_proj_z) is qkvz
-    assert qkvz.key == (256, (512, 256)) and qkvz.slices == ((0, 512), (512, 768))
+    inputs = (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a)
+    four = projtile.stack_of(gdn.in_proj_qkv)
+    assert four is not None and all(projtile.stack_of(m) is four for m in inputs)
+    assert [getattr(m, projtile.INDEX_ATTR) for m in inputs] == [0, 1, 2, 3]
+    assert four.key == (256, (512, 256, 4, 4))
+    assert four.slices == ((0, 512), (512, 768), (768, 772), (772, 776))
+    assert four.info == slab.SlabInfo(n_real=776, k=256, tiles=4)
+    _assert_unpacks_to(four, inputs)
     out = projtile.stack_of(gdn.out_proj)
     assert out is not None and out.key == (256, (256,))
 
@@ -375,25 +373,59 @@ def test_build_stacks_concatenates_before_padding_and_records_slices():
     assert all(projtile.stack_of(m) is None for m in _mlp_linears(root))
 
 
+def _planes_of(members) -> tuple[Any, Any, Any, slab.SlabInfo]:
+    """The slab planes of ``members`` stacked alone, in call order, and their
+    SlabInfo."""
+    w, scales, biases = (mx.concatenate([_arrays(m)[i] for m in members], axis=0) for i in range(3))
+    return slab.repack(w, scales, biases)
+
+
+def test_the_gdn_stack_is_qkv_z_tiles_then_one_tile_of_b_then_a():
+    """qkv and z end on a tile edge, so the four-member stack's planes are, tile
+    for tile, the qkv+z stack's then a b+a stack's: the columns qkv and z read
+    are the bytes they read before, and b and a fill the last tile alone, b then
+    a, padded as before. The copy is no larger."""
+    root = pfx.tiny_quantized_model(seed=0)
+    projtile.build_stacks(root, keys_with_plans=lambda key: True)
+    gdn = root.model.layers[0].linear_attn
+    four = projtile.stack_of(gdn.in_proj_qkv)
+    assert four is not None
+    *qkvz, qkvz_info = _planes_of((gdn.in_proj_qkv, gdn.in_proj_z))
+    *ba, ba_info = _planes_of((gdn.in_proj_b, gdn.in_proj_a))
+    assert (qkvz_info.tiles, ba_info.tiles, four.info.tiles) == (3, 1, 4)
+    planes = (four.codes, four.scales, four.biases)
+    for got, head, tail in zip(planes, qkvz, ba, strict=True):
+        assert _same(got[: head.size], head) and _same(got[head.size :], tail)
+    # The last tile, read as a stack of its own: b's four columns, a's four, then
+    # zero padding.
+    codes, scales, biases = (p[-p.size // four.info.tiles :] for p in planes)
+    last = slab.unpack(codes, scales, biases, slab.SlabInfo(n_real=256, k=256, tiles=1))
+    for i, plane in enumerate(last):
+        assert _same(plane[:4], _arrays(gdn.in_proj_b)[i])
+        assert _same(plane[4:8], _arrays(gdn.in_proj_a)[i])
+        assert not mx.any(plane[8:]).item()
+
+
 def test_build_stacks_skips_a_group_without_a_plan():
     root = pfx.tiny_quantized_model(seed=0)
     asked = []
 
     def keys_with_plans(key):
         asked.append(key)
-        return key != (256, (4, 4))
+        return key != (256, (512, 256, 4, 4))
 
     projtile.build_stacks(root, keys_with_plans=keys_with_plans)
     assert asked == _TINY_KEYS
     for layer in (root.model.layers[0], root.model.layers[2]):
         gdn = layer.linear_attn
-        assert projtile.stack_of(gdn.in_proj_b) is None
-        assert projtile.stack_of(gdn.in_proj_a) is None
-        assert projtile.stack_of(gdn.in_proj_qkv) is not None
+        for member in (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a):
+            assert projtile.stack_of(member) is None
         assert projtile.stack_of(gdn.out_proj) is not None
 
 
-@pytest.mark.parametrize("reject", [None, (256, (4, 4))], ids=["every-key", "no-b+a"])
+@pytest.mark.parametrize(
+    "reject", [None, (256, (512, 256, 4, 4))], ids=["every-key", "no-gdn-inputs"]
+)
 def test_copy_bytes_is_the_stacks_padded_bytes(reject):
     root = pfx.tiny_quantized_model(seed=0)
 
@@ -401,10 +433,11 @@ def test_copy_bytes_is_the_stacks_padded_bytes(reject):
         return key != reject
 
     want = projtile.copy_bytes(root, keys_with_plans=keys_with_plans)
-    # Per layer pair: qkv+z, b+a, out_proj (K 256, 3 + 1 + 1 tiles), q+k+v (K 256,
-    # 12 tiles), o_proj (K 1024, 1 tile); 9/16 byte per padded weight.
-    pair = (768 * 256 + 256 * 256 + 256 * 256 + 3072 * 256 + 256 * 1024) * 9 // 16
-    assert want == 2 * pair - (0 if reject is None else 2 * 256 * 256 * 9 // 16)
+    # Per layer pair: qkv+z+b+a (776 wide, 4 tiles, as many as qkv+z and b+a
+    # stacked apart) and out_proj (K 256, 1 tile), q+k+v (K 256, 12 tiles), o_proj
+    # (K 1024, 1 tile); 9/16 byte per padded weight.
+    pair = (1024 * 256 + 256 * 256 + 3072 * 256 + 256 * 1024) * 9 // 16
+    assert want == 2 * pair - (0 if reject is None else 2 * 1024 * 256 * 9 // 16)
     assert projtile.build_stacks(root, keys_with_plans=keys_with_plans) == want
     stacks = {
         id(stack): stack
@@ -499,20 +532,20 @@ def test_fork_key_state_is_off_for_a_model_without_dense_mlps():
 
 P = projtile.Plan
 
-# The six fused keys at the plans tuned for them on the M5 Pro, then the alone forms
-# decode's two-to-eight-row calls reach.
+# The fused keys at the plans tuned for them on the M5 Pro (the GDN stack at
+# in_proj_qkv+in_proj_z's), then the alone forms decode's two-to-eight-row calls
+# reach.
 _TABLE = {
     (5120, (12288, 1024, 1024)): P(128, 8, 80, True),  # q+k+v
     (6144, (5120,)): P(256, 8, 20, True, 2),  # o_proj, out_proj
-    (5120, (10240, 6144)): P(128, 8, 80, True),  # in_proj_qkv+in_proj_z
-    (5120, (48, 48)): P(128, 8, 2, True, 8),  # in_proj_b+in_proj_a
+    (5120, (10240, 6144, 48, 48)): P(128, 8, 80, True),  # in_proj qkv+z+b+a
     (5120, (17408, 17408)): P(128, 4, 100, True),  # gate+up, the dual
     (17408, (5120,)): P(256, 8, 20, True, 2),  # down
     (5120, (12288,)): P(128, 8, 80, True),  # q
     (5120, (1024,)): P(128, 8, 8, True),  # k, v
     (5120, (10240,)): P(128, 4, 80, True),  # in_proj_qkv
     (5120, (6144,)): P(128, 8, 48, True),  # in_proj_z
-    (5120, (48,)): P(128, 8, 2, True, 8),  # in_proj_b, in_proj_a: the b+a stack's tile
+    (5120, (48,)): P(128, 8, 2, True, 8),  # in_proj_b, in_proj_a: the GDN stack's last tile
     (5120, (17408,)): P(256, 4, 68, True),  # gate, up
 }
 _DUAL = (5120, (17408, 17408))
@@ -528,7 +561,15 @@ def test_the_plan_table_holds_the_tuned_fused_plans_and_the_alone_forms():
         assert projtile.check_plan(info, plan, dual=key == _DUAL) is None, key
     assert projtile.plan_for((5120, (248320,))) is None  # lm_head
     assert projtile.plan_for((4096, (256,))) is None
-    assert projtile.PLANS[(5120, (48, 48))].label == "TN128/S8/G2/pipe x8"
+    # in_proj_qkv+in_proj_z and in_proj_b+in_proj_a are no stacks any more, and no
+    # call reaches their keys.
+    assert projtile.plan_for((5120, (10240, 6144))) is None
+    assert projtile.plan_for((5120, (48, 48))) is None
+    # The GDN stack's 65 slab tiles at TN 128: 130 column tiles over 80 threadgroups.
+    gdn = projtile.PLANS[(5120, (10240, 6144, 48, 48))]
+    n_pad = -(-(10240 + 6144 + 48 + 48) // slab.TILE) * slab.TILE
+    assert (n_pad // gdn.tn, gdn.groups) == (130, 80)
+    assert projtile.PLANS[(5120, (48,))].label == "TN128/S8/G2/pipe x8"
     assert projtile.PLANS[(5120, (17408,))].label == "TN256/S4/G68/pipe"
     assert P(128, 8, 40, False).label == "TN128/S8/G40/seq"
     # availability() compiles every plan the table holds, and nothing else.
@@ -574,17 +615,17 @@ def test_plan_for_call_needs_planes_and_a_plan(monkeypatch):
     # A distinct plan per key, so each lookup shows which key it took.
     plans = {key: P(128, 4, i + 1, True) for i, key in enumerate(ptfx.TINY_PLANS)}
     monkeypatch.setattr(projtile, "PLANS", plans)
-    # One plan per launch: a stack the call covers whole, the GDN call's two.
+    # One plan per launch: a stack the call covers whole, q+k+v's and the GDN four's.
     assert call(qkv) == (plans[(256, (2048, 512, 512))],)
-    assert call(gdn_call) == (plans[(256, (512, 256))], plans[(256, (4, 4))])
+    assert call(gdn_call) == (plans[(256, (512, 256, 4, 4))],)
     # Each launch carries its key and its linears, so verify() never works them out again.
     launches = projtile.plan_for_call(gdn_call)
     assert launches is not None
-    assert [launch.key for launch in launches] == [(256, (512, 256)), (256, (4, 4))]
-    assert [tuple(map(id, launch.members)) for launch in launches] == [
-        tuple(map(id, gdn_call[:2])),
-        tuple(map(id, gdn_call[2:])),
-    ]
+    assert [launch.key for launch in launches] == [(256, (512, 256, 4, 4))]
+    assert [tuple(map(id, launch.members)) for launch in launches] == [tuple(map(id, gdn_call))]
+    # A call of two stacks whole, which no verifier issues, takes one launch each.
+    two = (*gdn_call, gdn.out_proj)
+    assert call(two) == (plans[(256, (512, 256, 4, 4))], plans[(256, (256,))])
     # gate+up is the dual's key; every lone linear is keyed by its own width.
     assert call((mlp.gate_proj, mlp.up_proj)) == (plans[(256, (512, 512))],)
     assert call((mlp.down_proj,)) == (plans[(512, (256,))],)
@@ -592,10 +633,15 @@ def test_plan_for_call_needs_planes_and_a_plan(monkeypatch):
     assert call((attention.q_proj,)) == (plans[(256, (2048,))],)
     assert call((attention.v_proj,)) == (plans[(256, (512,))],)
     assert call((attention.o_proj,)) == (plans[(1024, (256,))],)
+    assert call((gdn.in_proj_qkv,)) == (plans[(256, (512,))],)
     assert call((gdn.in_proj_z,)) == (plans[(256, (256,))],)
+    assert call((gdn.in_proj_b,)) == (plans[(256, (4,))],)
     assert call((gdn.in_proj_a,)) == (plans[(256, (4,))],)
-    # Part of a stack, a mix of forms, three slab-only linears: no launch takes them.
+    # Part of a stack (in_proj_qkv+in_proj_z without b and a), a mix of forms,
+    # three slab-only linears: no launch takes them.
+    assert call(gdn_call[:2]) is None
     assert call(gdn_call[:3]) is None
+    assert call(gdn_call[2:]) is None
     assert call(qkv[:2]) is None
     assert call((mlp.gate_proj, attention.q_proj)) is None
     assert call((mlp.gate_proj, mlp.up_proj, mlp.down_proj)) is None
@@ -605,16 +651,19 @@ def test_plan_for_call_needs_planes_and_a_plan(monkeypatch):
     narrow = ptfx.tiny_slab_model(seed=0, scope="mlp")
     narrow_gdn = narrow.model.layers[0].linear_attn
     assert call((narrow.model.layers[1].self_attn.q_proj,)) is None
-    assert call((narrow_gdn.in_proj_qkv, narrow_gdn.in_proj_z)) is None
+    assert call((narrow_gdn.in_proj_qkv, narrow_gdn.in_proj_z, narrow_gdn.in_proj_b)) is None
     assert call((narrow_gdn.in_proj_b,)) is None
     mlp_narrow = narrow.model.layers[2].mlp
     assert call((mlp_narrow.gate_proj, mlp_narrow.up_proj)) == (plans[(256, (512, 512))],)
     plain = pfx.tiny_quantized_model(seed=0).model.layers[0].mlp
     assert call((plain.gate_proj, plain.up_proj)) is None
-    # A key the table lacks takes the whole call off the tile, the GDN pair's too.
-    del plans[(256, (512, 512))], plans[(256, (4, 4))]
+    # A key the table lacks takes the whole call off the tile, every launch of it:
+    # the GDN four, and a call of two stacks whose one key has a plan.
+    del plans[(256, (512, 512))], plans[(256, (512, 256, 4, 4))]
     assert call((mlp.gate_proj, mlp.up_proj)) is None
     assert call(gdn_call) is None
+    assert call(two) is None
+    assert call((gdn.out_proj,)) == (plans[(256, (256,))],)
     assert call((mlp.gate_proj,)) == (plans[(256, (512,))],)
 
 
@@ -953,28 +1002,36 @@ def test_verify_slices_a_stack_back_to_its_members(monkeypatch):
         assert _close(out, _alone(member, x))
 
 
-def test_the_gdn_call_runs_as_two_launches(monkeypatch):
+def test_the_gdn_call_runs_as_one_launch(monkeypatch):
+    """The verifier's four GDN input projections are one stack, one launch at its
+    key, each member's columns cut from it. qkv and z read the tiles they read as
+    a qkv+z stack, at that stack's plan, so their columns equal that launch's bit
+    for bit; b and a come close to their b+a launch's (on the tensor units that
+    stack's split plan added in another order; the probe holds them to the
+    floor)."""
     plans = _distinct_plans(monkeypatch)
     launches = _recorded_launches(monkeypatch)
     root = ptfx.tiny_slab_model(seed=0)
     gdn = root.model.layers[2].linear_attn
     call = (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a)
-    qkvz, ba = projtile.stack_of(gdn.in_proj_qkv), projtile.stack_of(gdn.in_proj_b)
-    assert qkvz is not None and ba is not None
+    four = projtile.stack_of(gdn.in_proj_qkv)
+    assert four is not None
     x = pfx.activations(3, 256, seed=2).reshape(1, 3, 256)
     outs = projtile.verify(call, x, _plans(call))
-    first, second = plans[(256, (512, 256))], plans[(256, (4, 4))]
-    assert [(seam, info, p) for seam, info, p, _ in launches] == [
-        ("tile", qkvz.info, first),
-        ("tile", ba.info, second),
-    ]
+    plan = plans[(256, (512, 256, 4, 4))]
+    assert [(seam, info, p) for seam, info, p, _ in launches] == [("tile", four.info, plan)]
+    assert launches[0][3] is four.codes
     assert [o.shape for o in outs] == [(1, 3, 512), (1, 3, 256), (1, 3, 4), (1, 3, 4)]
-    pieces = [(qkvz, first, 0), (qkvz, first, 1), (ba, second, 0), (ba, second, 1)]
-    for out, member, (stack, plan, index) in zip(outs, call, pieces, strict=True):
-        start, stop = stack.slices[index]
-        want = _stack_columns(stack, x, plan)[:3, start:stop].reshape(1, 3, stop - start)
-        assert _same(out, want)
+    y8 = _stack_columns(four, x, plan)
+    for out, member, (start, stop) in zip(outs, call, four.slices, strict=True):
+        assert _same(out, y8[:3, start:stop].reshape(1, 3, stop - start))
         assert _close(out, _alone(member, x))
+    # The two stacks of before, built from the same arrays and run at one plan.
+    x8 = projtile.pad8(x.reshape(3, 256))
+    qkvz, ba = _planes_of(call[:2]), _planes_of(call[2:])
+    before = [ptfx.stand_in_tile(x8, *planes, plan)[:3] for planes in (qkvz, ba)]
+    assert _same(outs[0][0], before[0][:, :512]) and _same(outs[1][0], before[0][:, 512:768])
+    assert _close(outs[2][0], before[1][:, :4]) and _close(outs[3][0], before[1][:, 4:8])
 
 
 def test_verify_runs_gate_and_up_as_one_dual_launch_and_keeps_a_batch(monkeypatch):
@@ -1018,41 +1075,56 @@ def test_a_cut_of_the_whole_output_is_the_launch_itself(monkeypatch):
 
 
 def test_plain_on_a_stack_member_launches_its_own_tiles(monkeypatch):
-    """q, k and v each read only their own tiles of the q+k+v planes at their own
-    alone plan; in_proj_b and in_proj_a share one tile, so each runs the b+a stack
-    and takes its slice."""
+    """q, k and v, in_proj_qkv and in_proj_z each read only their own tiles of
+    their stack at their own alone plan; in_proj_b and in_proj_a share the GDN
+    stack's last tile, so each reads that one tile and takes its columns, never
+    the whole stack."""
     plans = _distinct_plans(monkeypatch)
     launches = _recorded_launches(monkeypatch)
     root = ptfx.tiny_slab_model(seed=0)
-    attention = root.model.layers[1].self_attn
-    stack = projtile.stack_of(attention.q_proj)
-    assert stack is not None
-    groups = stack.info.groups
     x = pfx.activations(3, 256, seed=4).reshape(1, 3, 256)
-    for member, (start, stop) in zip(
-        (attention.q_proj, attention.k_proj, attention.v_proj), stack.slices, strict=True
+    attention, gdn = root.model.layers[1].self_attn, root.model.layers[0].linear_attn
+    for members in (
+        (attention.q_proj, attention.k_proj, attention.v_proj),
+        (gdn.in_proj_qkv, gdn.in_proj_z),
     ):
-        launches.clear()
-        out = projtile.plain(member, x, _plans((member,)))
-        t0, t1 = start // slab.TILE, stop // slab.TILE
-        ((seam, info, plan, codes),) = launches
-        assert seam == "tile" and plan == plans[(256, (stop - start,))]
-        assert info == slab.SlabInfo(n_real=stop - start, k=256, tiles=t1 - t0)
-        words = groups * slab.TILE * slab.UNIT_BYTES // 4
-        assert _same(codes, stack.codes[t0 * words : t1 * words])
-        assert out.shape == (1, 3, stop - start)
-        assert _same(out, _alone(member, x))
+        stack = projtile.stack_of(members[0])
+        assert stack is not None
+        words = stack.info.groups * slab.TILE * slab.UNIT_BYTES // 4
+        for member in members:
+            start, stop = stack.slices[getattr(member, projtile.INDEX_ATTR)]
+            launches.clear()
+            out = projtile.plain(member, x, _plans((member,)))
+            t0, t1 = start // slab.TILE, stop // slab.TILE
+            ((seam, info, plan, codes),) = launches
+            assert seam == "tile" and plan == plans[(256, (stop - start,))]
+            assert info == slab.SlabInfo(n_real=stop - start, k=256, tiles=t1 - t0)
+            assert _same(codes, stack.codes[t0 * words : t1 * words])
+            assert out.shape == (1, 3, stop - start)
+            assert _same(out, _alone(member, x))
 
-    gdn = root.model.layers[0].linear_attn
-    ba = projtile.stack_of(gdn.in_proj_b)
-    assert ba is not None
-    for member, (start, stop) in zip((gdn.in_proj_b, gdn.in_proj_a), ba.slices, strict=True):
+    four = projtile.stack_of(gdn.in_proj_b)
+    assert four is not None
+    # The last tile's planes: [T][G][256] units, a tile's codes eight words a unit.
+    units = four.info.groups * slab.TILE
+    last = four.info.tiles - 1
+    shared_codes, shared_scales, shared_biases = (
+        plane[last * size : (last + 1) * size]
+        for plane, size in zip(
+            (four.codes, four.scales, four.biases), (8 * units, units, units), strict=True
+        )
+    )
+    base = last * slab.TILE
+    x8 = projtile.pad8(x.reshape(3, 256))
+    for member, (start, stop) in zip((gdn.in_proj_b, gdn.in_proj_a), four.slices[2:], strict=True):
         launches.clear()
         out = projtile.plain(member, x, _plans((member,)))
+        # One tile, holding b's and a's eight real columns, never the whole stack.
         ((seam, info, plan, codes),) = launches
-        assert (seam, info, plan) == ("tile", ba.info, plans[(256, (4,))])
-        assert codes is ba.codes
-        assert _same(out, _stack_columns(ba, x, plan)[:3, start:stop].reshape(1, 3, 4))
+        assert (seam, info, plan) == ("tile", slab.SlabInfo(8, 256, 1), plans[(256, (4,))])
+        assert _same(codes, shared_codes)
+        want = ptfx.stand_in_tile(x8, shared_codes, shared_scales, shared_biases, info, plan)
+        assert _same(out[0], want[:3, start - base : stop - base])
         assert _close(out, _alone(member, x))
 
     # A slab-only linear reads its own planes whole.
@@ -1064,6 +1136,28 @@ def test_plain_on_a_stack_member_launches_its_own_tiles(monkeypatch):
     ]
     assert launches[0][3] is up.weight
     assert _same(out, _alone(up, x))
+
+
+@pytest.mark.parametrize("name", ["in_proj_b", "in_proj_a"])
+def test_a_lone_b_or_a_call_through_the_module_hook_launches_one_tile(monkeypatch, name):
+    """The decode's own short chunk calls in_proj_b and in_proj_a each as a module:
+    through the module hook inside the window, one served call and one launch of
+    the one tile they share, at their alone plan, never the whole GDN stack."""
+    ptfx.hooked_tile(monkeypatch)
+    launches = _recorded_launches(monkeypatch)
+    root = ptfx.tiny_slab_model(seed=0)
+    projkernel.tag(root)
+    module = getattr(root.model.layers[0].linear_attn, name)
+    x = pfx.activations(5, 256, seed=7).reshape(1, 5, 256)
+    with ptfx.window():
+        before = dict(projkernel.calls)
+        out = module(x)
+        moved = {k: n - before[k] for k, n in projkernel.calls.items() if n != before[k]}
+    assert moved == {"plain_tile": 1}
+    ((seam, info, plan, _),) = launches
+    assert (seam, info.tiles, plan) == ("tile", 1, projtile.PLANS[(256, (4,))])
+    assert out.shape == (1, 5, 4)
+    assert _close(out, _alone(module, x))
 
 
 def test_a_stack_run_must_be_its_members_in_order(monkeypatch):
@@ -1162,6 +1256,27 @@ def test_the_dual_launch_equals_two_single_launches(shape, n):
     y0, y1 = projtile.run_dual(x8, gate, up, info, plan)
     assert _same(y0, projtile.run(x8, *gate, info, plan))
     assert _same(y1, projtile.run(x8, *up, info, plan))
+
+
+@tile_nax
+@pytest.mark.parametrize("shape", projtile.DISTINCT_SHAPES, ids=_shape_id)
+def test_a_stacks_leading_tiles_equal_the_launch_of_those_tiles_alone(shape):
+    """A tile's columns read its own planes and nothing else, whatever the launch
+    holds beside them: a stack's first tiles equal the launch of those tiles
+    alone at the same plan, bit for bit. That is why in_proj_qkv and in_proj_z,
+    which end on a tile edge, kept their bits when b and a joined their stack as
+    its last tile."""
+    plan = P(*shape)
+    head, head_info, head_linear = _tile_linear(768, seed=31)
+    tail_linear = pfx.rand_linear(96, TILE_K, seed=32)
+    w, scales, biases = (
+        mx.concatenate(pair, axis=0) for pair in zip(head_linear, tail_linear, strict=True)
+    )
+    codes, scales, biases, info = slab.repack(w, scales, biases)
+    assert (head_info.tiles, info.tiles) == (3, 4)
+    x8 = pfx.activations(8, TILE_K, seed=33)
+    stacked = projtile.run(x8, codes, scales, biases, info, plan)
+    assert _same(stacked[:, :768], projtile.run(x8, *head, head_info, plan))
 
 
 def _f64(a) -> np.ndarray:
@@ -1885,10 +2000,32 @@ def _mixes_rows(x8, codes, scales, biases, info, plan):
     return y + 0 * mx.sum(y, axis=0, keepdims=True)
 
 
+def _mixes_columns(x8, codes, scales, biases, info, plan):
+    """Exact on finite weights, but a NaN in one column reaches every column."""
+    y = ptfx.stand_in_tile(x8, codes, scales, biases, info, plan)
+    return y + 0 * mx.sum(y, axis=1, keepdims=True)
+
+
+def _mixes_a_tile(x8, codes, scales, biases, info, plan):
+    """A NaN in one column reaches only the columns of its own tile: what a kernel
+    that shared a tile's epilogue between its columns would look like."""
+    y = ptfx.stand_in_tile(x8, codes, scales, biases, info, plan)
+    tiles = y.reshape(y.shape[0], info.tiles, slab.TILE)
+    return (tiles + 0 * mx.sum(tiles, axis=-1, keepdims=True)).reshape(y.shape)
+
+
+def _drops_nans(x8, codes, scales, biases, info, plan):
+    """Exact on finite weights, but a NaN never reaches the output, so a check
+    that plants one proves nothing unless it sees it arrive."""
+    y = ptfx.stand_in_tile(x8, codes, scales, biases, info, plan)
+    return mx.where(mx.isnan(y), mx.zeros_like(y), y)
+
+
 _QKV = (
     "model.layers.1.self_attn.q_proj+model.layers.1.self_attn.k_proj"
     "+model.layers.1.self_attn.v_proj"
 )
+_GDN = "model.layers.0.linear_attn"
 
 
 @pytest.mark.parametrize(
@@ -1897,8 +2034,24 @@ _QKV = (
         (_by_rows, f"T-invariance: {_QKV} at T=2 differs from its rows alone"),
         (_off_the_floor, "floor: model.layers.1.self_attn.q_proj is "),
         (_mixes_rows, "isolation: a NaN in row 3 changed the other rows of "),
+        (
+            _mixes_columns,
+            "isolation: a NaN in the columns of model.layers.1.self_attn.q_proj changed "
+            "model.layers.1.self_attn.k_proj",
+        ),
+        # q, k and v hold tiles of their own, so only the GDN stack's last tile,
+        # b's and a's, shows a leak inside one tile.
+        (
+            _mixes_a_tile,
+            f"isolation: a NaN in the columns of {_GDN}.in_proj_b changed {_GDN}.in_proj_a",
+        ),
+        (
+            _drops_nans,
+            "isolation: a NaN in the scales of model.layers.1.self_attn.q_proj did not "
+            "reach its columns",
+        ),
     ],
-    ids=["t-invariance", "floor", "isolation"],
+    ids=["t-invariance", "floor", "rows", "columns", "one-tile", "no-nan"],
 )
 def test_probe_fails_t_invariance_floor_and_isolation_for_broken_stand_ins(
     monkeypatch, broken, reason
@@ -2065,8 +2218,8 @@ def test_warm_up_runs_the_int8_slab_gemm_once_per_mlp_shape(monkeypatch):
         ("tile", 256, 3072),  # q+k+v
         ("tile", 256, 2048),  # q alone
         ("tile", 1024, 256),  # o_proj
-        ("tile", 256, 768),  # in_proj_qkv+in_proj_z
-        ("tile", 256, 256),  # in_proj_b+in_proj_a, in_proj_z alone, out_proj
+        ("tile", 256, 1024),  # in_proj qkv+z+b+a
+        ("tile", 256, 256),  # in_proj_z, in_proj_b and in_proj_a alone, out_proj
     }
     assert (dict(projkernel.calls), dict(int8prefill.calls)) == counted
     # At scope mlp only the MLP's launches.
@@ -2191,17 +2344,20 @@ def test_static_copy_bytes_matches_copy_bytes_on_the_tiny_model(monkeypatch):
         assert projtile.static_copy_bytes(config) == want
     # A key without a plan is left out of both.
     plans = dict(projtile.PLANS)
-    del plans[(256, (4, 4))]
+    del plans[(256, (512, 256, 4, 4))]
     monkeypatch.setattr(projtile, "PLANS", plans)
     fewer = projtile.copy_bytes(root, keys_with_plans=_planned)
     assert fewer < want and projtile.static_copy_bytes(text) == fewer
 
 
 def test_static_copy_bytes_of_the_27b():
-    """64 layers, every fourth full attention: per linear-attention layer qkv+z
-    (16384 wide), b+a (96, one tile) and out_proj; per full-attention layer q+k+v
-    (14336) and o_proj; 9/16 byte per padded weight."""
-    linear = (16384 * 5120 + 256 * 5120 + 5120 * 6144) * 9 // 16
+    """64 layers, every fourth full attention: per linear-attention layer
+    qkv+z+b+a (16480 wide, padded to 65 tiles: qkv+z's 64 and the one b and a
+    share, as many as the two stacks of before) and out_proj; per full-attention
+    layer q+k+v (14336) and o_proj; 9/16 byte per padded weight. The same
+    4,093,378,560 bytes as qkv+z and b+a stacked apart."""
+    assert -(-(10240 + 6144 + 48 + 48) // 256) == 65 == 16384 // 256 + 1
+    linear = (65 * 256 * 5120 + 5120 * 6144) * 9 // 16
     full = (14336 * 5120 + 5120 * 6144) * 9 // 16
     assert projtile.static_copy_bytes(_CONFIG_27B) == 48 * linear + 16 * full == 4_093_378_560
 
