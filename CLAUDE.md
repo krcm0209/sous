@@ -877,9 +877,11 @@ goal.
   logged per turn; `projkernel.calls["verify_tile"]` (runs) and
   `["plain_tile"]` and `int8prefill.calls["int8_small"]` count its paths.
   The fork key's `ptile` (`fork_key_state`: `active` when every MLP linear
-  carries the marker, `off` when none does, `partial:<marked>/<total>` after
-  a revert that raised part-way, whose layers split between int8's bits and
-  stock's on a 9–127-row chunk, KV neither other load computes) keys the
+  carries the marker, `off` when none does, `partial:<marked>/<total>:<8
+  hex of sha256 over the marked linears' sorted paths>` after a revert that
+  raised part-way, whose layers split between int8's bits and stock's on a
+  9–127-row chunk, KV neither other load computes, and which layers split
+  matters as much as how many) keys the
   moved 9–127-row chunks; `slab.py` and `projtile.py` are in
   `_EPOCH_FILES` (the repack decides the path every MLP read takes) and
   `projection_tile.metal` and `.h` in `_EPOCH_EXCLUDED_KERNELS`: they serve

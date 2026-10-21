@@ -8,6 +8,7 @@ which run the kernel on the tensor units."""
 
 import contextlib
 import gc
+import hashlib
 import logging
 import types
 import warnings
@@ -211,8 +212,9 @@ def test_a_revert_that_fails_on_a_layers_last_linear_leaves_that_layer_slab_only
         projtile.revert_mlp(root)
     # Layer 0's MLP is back on stock and layers 1-3 still slab-only: a 9-to-127-row
     # prefill chunk computes KV neither form computes, so it keys apart from both.
-    assert projtile.fork_key_state(root) == "partial:9/12"
-    keys = [_fork_key(ptile) for ptile in ("partial:9/12", "active", "off")]
+    partial = projtile.fork_key_state(root)
+    assert partial == _partial(root, range(1, 4))
+    keys = [_fork_key(ptile) for ptile in (partial, "active", "off")]
     assert len({tuple(sorted(k.items())) for k in keys}) == 3
     for i, module in enumerate(linears):
         if i < 3:
@@ -446,10 +448,40 @@ def test_fork_key_state_follows_the_markers():
     assert projtile.fork_key_state(root) == "off"
 
 
+def _partial(root, layers) -> str:
+    """The partial key of a model whose MLP is slab-only in `layers` alone."""
+    paths = sorted(
+        f"model.layers.{i}.mlp.{name}"
+        for i in layers
+        for name in ("gate_proj", "up_proj", "down_proj")
+    )
+    digest = hashlib.sha256("\n".join(paths).encode()).hexdigest()[:8]
+    return f"partial:{len(paths)}/{3 * len(root.model.layers)}:{digest}"
+
+
 def test_a_part_converted_model_keys_as_neither_form():
     root = pfx.tiny_quantized_model(seed=0)
     projtile._convert(root.model.layers[0].mlp.gate_proj)
-    assert projtile.fork_key_state(root) == "partial:1/12"
+    key = projtile.fork_key_state(root)
+    digest = hashlib.sha256(b"model.layers.0.mlp.gate_proj").hexdigest()[:8]
+    assert key == f"partial:1/12:{digest}"
+
+
+def test_two_partial_conversions_of_one_size_key_apart():
+    """A conversion that failed part-way leaves its first layers slab-only, a
+    revert that did its last: as many linears either way, but a prefill chunk of
+    9 to 127 rows sends other layers to int8, so the two store other KV."""
+    keys = []
+    for layers in ((0, 1), (2, 3)):
+        root = pfx.tiny_quantized_model(seed=0)
+        for i in layers:
+            mlp = root.model.layers[i].mlp
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                projtile._convert(getattr(mlp, name))
+        keys.append(projtile.fork_key_state(root))
+        assert keys[-1] == _partial(root, layers)
+    assert keys[0].startswith("partial:6/12:") and keys[1].startswith("partial:6/12:")
+    assert keys[0] != keys[1]
 
 
 def test_fork_key_state_is_off_for_a_model_without_dense_mlps():
@@ -1695,7 +1727,7 @@ def test_a_revert_that_raises_part_way_is_named_and_keyed_partial(monkeypatch):
     assert status["state"] == "unavailable"
     assert status["reason"] == "floor: boom; the revert failed with 9 of 12 MLP linears slab-only"
     assert len(messages) == 1
-    assert projtile.fork_key_state(root) == "partial:9/12"
+    assert projtile.fork_key_state(root) == _partial(root, range(1, 4))
 
 
 def test_a_conversion_that_converts_nothing_refuses_the_load(monkeypatch):

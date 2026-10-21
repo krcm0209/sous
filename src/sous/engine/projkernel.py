@@ -855,6 +855,21 @@ def _no_slab_path(module: Any, info: SlabInfo, x: Any, why: str) -> RuntimeError
     )
 
 
+def _int8_refusal(module: Any, x: Any, rows: int) -> str:
+    """Why int8's wrapper does not take a call past MAX_ROWS rows (or of none) on a
+    slab-only module, its real cause first: the dtype, then a module int8 never
+    tagged, and only then the rows."""
+    import mlx.core as mx
+
+    if not rows:
+        return "no rows"
+    if x.dtype not in (mx.bfloat16, mx.float16):
+        return f"int8 prefill takes bf16 or fp16 rows, not {x.dtype}"
+    if not int8prefill._tagged(module):
+        return "int8 prefill never tagged it"
+    return f"int8 prefill does not take these {rows} rows"
+
+
 def _int8_takes(module: Any, x: Any, info: SlabInfo) -> bool:
     """Whether int8's wrapper serves this call on a slab-only module: then this hook
     hands it on, and int8's wrapper takes it wherever it sits in the chain."""
@@ -966,8 +981,7 @@ def _serve_plain(module: Any, x: Any) -> Any | None:
     rows = math.prod(shape[:-1])
     if not 1 <= rows <= MAX_ROWS:
         if info is not None and not _int8_takes(module, x, info):
-            why = "no rows" if not rows else f"int8 prefill does not take these {rows} rows"
-            raise _no_slab_path(module, info, x, why)
+            raise _no_slab_path(module, info, x, _int8_refusal(module, x, rows))
         return None
     if len(shape) < 2 or x.dtype != mx.bfloat16:
         if info is not None:

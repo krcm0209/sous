@@ -259,19 +259,21 @@ class _Tokenizer:
     chat_template = None
 
 
+@pytest.mark.parametrize("prompt_cache", [True, False], ids=["cache-on", "cache-off"])
 @pytest.mark.parametrize(
     ("drafter_loads", "cache_budget", "headroom"),
     [(True, None, 40 * _GIB), (False, 12 * _GIB, None)],
     ids=["automatic-budget", "explicit-budget"],
 )
 def test_vlm_engine_enables_the_tile_after_the_kernel_and_before_the_drafter_route(
-    monkeypatch, tmp_path, drafter_loads, cache_budget, headroom
+    monkeypatch, tmp_path, drafter_loads, cache_budget, headroom, prompt_cache
 ):
     """After the kernel, whose status it reads, with int8's status and the
-    drafter's kind; the headroom read just before it, the budget as configured
-    (None when automatic) and the turn's reserve; the conversion read for the
-    fork key right after; then the block pin, the drafter's route (decided once
-    the block has resolved), kv8, the store and the budget."""
+    drafter's kind; whether the prompt cache is on, which decides the copy rule;
+    the headroom read just before it, the budget as configured (None when
+    automatic) and the turn's reserve; the conversion read for the fork key right
+    after; then the block pin, the drafter's route (decided once the block has
+    resolved), kv8, the store (with the cache on) and the budget."""
     from sous.engine import base, int8prefill, projkernel, tileattn, verifyattn, vlm
 
     model = types.SimpleNamespace(
@@ -371,7 +373,7 @@ def test_vlm_engine_enables_the_tile_after_the_kernel_and_before_the_drafter_rou
         return vlm.VLMEngine(
             "test/model",
             draft_id="z-lab/drafter",
-            prompt_cache=True,
+            prompt_cache=prompt_cache,
             int8_prefill=True,
             attention_tile=True,
             projection_kernel=True,
@@ -387,7 +389,8 @@ def test_vlm_engine_enables_the_tile_after_the_kernel_and_before_the_drafter_rou
         with pytest.warns(UserWarning, match="speculative drafter"):
             engine = build()
     route = ["drafter_route"] if drafter_loads else []
-    tail = ["kv_int8", "fork_store"] + (["budget"] if cache_budget is None else [])
+    store = ["fork_store"] if prompt_cache else []
+    tail = ["kv_int8", *store] + (["budget"] if cache_budget is None else [])
     assert order == [
         "headroom",
         "projection_tile",
@@ -404,15 +407,16 @@ def test_vlm_engine_enables_the_tile_after_the_kernel_and_before_the_drafter_rou
     assert seen["tile_status"] is tile_status
     assert seen["int8_status"] is int8_status
     assert seen["drafter_kind"] == ("dflash" if drafter_loads else None)
-    assert seen["cache_enabled"] is True
+    assert seen["cache_enabled"] is prompt_cache
     assert seen["cache_budget"] == cache_budget
     assert seen["headroom_bytes"] == headroom
     assert seen["reserve_bytes"] == 8 * _GIB
     assert seen["root"] is model.language_model
     assert engine.projection_tile_status is ptile_status
     assert engine._ptile == "active"
-    fields = seen["fields"]
-    assert isinstance(fields, dict) and fields["ptile"] == "active"
+    if prompt_cache:
+        fields = seen["fields"]
+        assert isinstance(fields, dict) and fields["ptile"] == "active"
 
 
 def test_vlm_engine_leaves_the_tile_off_by_default(monkeypatch):

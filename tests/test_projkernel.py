@@ -1756,9 +1756,11 @@ _PLAIN_UNSERVABLE = {
     "float16": (lambda: _acts(1, 1, 256, dtype=mx.float16), "bf16 rows, not mlx.core.float16"),
     "one dimension": (lambda: _acts(256), "a 1-D x"),
     "no rows": (lambda: _acts(1, 0, 256), "no rows"),
-    "nine rows int8 does not take": (
-        lambda: _acts(1, 9, 256),
-        "int8 prefill does not take these 9 rows",
+    "nine rows int8 never tagged": (lambda: _acts(1, 9, 256), "int8 prefill never tagged it"),
+    # Nine rows are int8's to take: the dtype is the cause, and the error says so.
+    "nine float32 rows": (
+        lambda: _acts(1, 9, 256, dtype=mx.float32),
+        "int8 prefill takes bf16 or fp16 rows, not mlx.core.float32",
     ),
 }
 
@@ -1837,8 +1839,9 @@ def test_a_slab_only_call_int8_declines_fails_whichever_wrapper_sits_on_top(monk
     assert gate(_acts(1, 5, 256)).shape == (1, 5, 512)
     assert served == [9]
     assert _proj_counts_since(before) == {"plain_kernel": 1}
-    with pytest.raises(RuntimeError, match=_GATE):
+    with pytest.raises(RuntimeError, match=_GATE) as raised:
         gate(_acts(1, 9, 256, dtype=mx.float32))
+    assert "int8 prefill takes bf16 or fp16 rows, not mlx.core.float32" in str(raised.value)
     assert served == [9]
 
 

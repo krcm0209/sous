@@ -36,6 +36,7 @@ mlx is imported inside each function.
 from __future__ import annotations
 
 import functools
+import hashlib
 import itertools
 import logging
 import operator
@@ -306,19 +307,22 @@ def copy_bytes(root: Any, *, keys_with_plans: Callable[[Key], bool]) -> int:
 
 def fork_key_state(root: Any) -> str:
     """The fork key's ``ptile``: "active" when every MLP linear is slab-only, "off"
-    when none is, and "partial:<slab-only>/<MLP linears>" otherwise. A revert
-    that raised part-way leaves some layers slab-only, whose 9-to-127-row prefill
-    calls carry int8's bits, beside layers back on stock: KV that matches neither
-    a converted load's nor an unconverted one's, so it keys apart from both. The
-    stacks are not read: they serve only inside a decode, and no stored KV comes
-    from one."""
-    linears = list(_mlp_linears(root))
-    converted = sum(slab.slab_info(m) is not None for m in linears)
+    when none is, and "partial:<slab-only>/<MLP linears>:<digest>" otherwise. A
+    revert that raised part-way leaves some layers slab-only, whose 9-to-127-row
+    prefill calls carry int8's bits, beside layers back on stock: KV that matches
+    neither a converted load's nor an unconverted one's, so it keys apart from
+    both. Which layers matter, not only how many (a failed conversion leaves a
+    prefix slab-only, a failed revert a suffix), so the digest is the first 8 hex
+    of sha256 over the slab-only linears' sorted paths. The stacks are not read:
+    they serve only inside a decode, and no stored KV comes from one."""
+    named = list(_mlp_named(root))
+    converted = sorted(path for path, m in named if slab.slab_info(m) is not None)
     if not converted:
         return "off"
-    if converted == len(linears):
+    if len(converted) == len(named):
         return "active"
-    return f"partial:{converted}/{len(linears)}"
+    digest = hashlib.sha256("\n".join(converted).encode()).hexdigest()[:8]
+    return f"partial:{len(converted)}/{len(named)}:{digest}"
 
 
 # --------------------------------------------------------------------------------
