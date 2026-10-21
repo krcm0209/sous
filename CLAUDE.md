@@ -978,10 +978,11 @@ goal.
   tile only across runs. `L` (`_ceiling`) is computed once by `enable()` with the pure
   `ceiling(window, splits)` from `[model].max_context_tokens`: the largest
   step boundary whose mirror fits beside the turn's bf16 KV inside the
-  window-sized reserve at every instant (`1.504·C + 0.504·C/16 + 272 ≤
-  window`, `C = round_up(L, 256)`: the bf16 KV, the mirror, one layer's old
-  buffer during a growth, and the rows a straddling verify holds past L),
-  about 84K at 131072 and 170K at 262144. The reserve, the slot budget and
+  window-sized reserve at every instant (`1.504·C + 0.504·C/16 + 16 +
+  DECODE_KV_STEP ≤ window`, `C = round_up(L, 256)`: the bf16 KV, the
+  mirror, one layer's old buffer during a growth, and the rows a straddling
+  verify holds past L plus one growth of the decode's bf16 KV, 4,096 rows),
+  about 82K at 131072 and 168K at 262144. The reserve, the slot budget and
   the pressure valve are deliberately untouched: scaling the reserve would
   cost 4–8 GiB of slot budget, and admitting against live memory would
   make a prompt's output depend on slot occupancy. A call whose first row

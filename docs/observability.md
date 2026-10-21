@@ -84,11 +84,11 @@ example (wrapped here):
 
 ```
 2026-09-10T19:26:14.025Z INFO sous.api: POST /v1/messages id=msg_… model=sous-local
-  stream=1 status=200 input_tokens=84335 output_tokens=2887 stop=end_turn
-  cache=hit took=turn@82647 reused_tokens=82647 prefilled_tokens=1681 forks=0 evicted=1 pressure=0
+  stream=1 status=200 input_tokens=81775 output_tokens=2887 stop=end_turn
+  cache=hit took=turn@80087 reused_tokens=80087 prefilled_tokens=1681 forks=0 evicted=1 pressure=0
   load_s=0.0 queue_s=2.5 engine_wait_s=0.0 tokenize_s=1.1 ttft_s=9.8 prefill_s=7.9 decode_s=196.6
   prefill_tps=212.8 decode_tps=14.7 draft_rounds=1104 drafted=2208 accepted=1782 draft_context=1688
-  kv8=capped kv8_rows=84671 seconds=207.4 tools=1b21cd75 system=9f8e7d6c
+  kv8=capped kv8_rows=82111 seconds=207.4 tools=1b21cd75 system=9f8e7d6c
 ```
 
 `id` is the response's message id (the same one in `message_start`, so the
@@ -155,7 +155,7 @@ decode, `served` when at least one decode or verify call read it, and
 `capped` when a call started at or past the ceiling (`kv_int8_ceiling=`)
 — from there every call of that decode ran on the bf16 attention tile,
 whether or not earlier calls were served, as the turn above did once its
-84,335-token prompt grew past a ceiling of 84,481. `kv8_rows` is how many
+81,775-token prompt grew past a ceiling of 81,921. `kv8_rows` is how many
 rows the decode quantised into the copy, counted per layer (every
 full-attention layer quantises the same rows): the whole context on its first
 served call, then each call's new rows, counting again the rows a
@@ -267,7 +267,7 @@ each generation and dropped at its end, from `kv_int8_floor=` keys up to
 `kv_int8_ceiling=`, with those two and `kv_int8_probe_s=` when it does;
 the ceiling is the largest attention-tile step at which that copy still
 fits beside the turn's bf16 K/V in the `[model].max_context_tokens`
-reserve — about 84.5K keys at 131072 and 170K at 262144 — so the copy
+reserve — about 82K keys at 131072 and 168K at 262144 — so the copy
 never takes memory from the prompt-cache slots; `off` means
 `[model].kv_int8 = false` or the mlx-lm backend, and `unavailable` a load
 it cannot serve, every load whose attention tile is not `active` included,

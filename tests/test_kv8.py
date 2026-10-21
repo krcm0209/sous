@@ -26,6 +26,7 @@ from sous.engine import (  # noqa: E402 — after the guard
     tileattn,
     verifyattn,
 )
+from sous.engine.window import DECODE_KV_STEP  # noqa: E402
 from tests import kv8_fixtures as kfx  # noqa: E402
 from tests import tile_fixtures as tfx  # noqa: E402
 
@@ -658,12 +659,12 @@ def _mirror_recording_quantize(monkeypatch):
 
 def _mirror_fits(window, b):
     c = -(-b // 256) * 256
-    return 1.504 * c + 0.504 * c / 16 + 272 <= window
+    return 1.504 * c + 0.504 * c / 16 + 16 + DECODE_KV_STEP <= window
 
 
 @pytest.mark.parametrize(
     ("window", "limit"),
-    [(4096, 1921), (65536, 42241), (131072, 84481), (262144, 170241)],
+    [(8192, 1921), (65536, 39681), (131072, 81921), (262144, 167681)],
 )
 def test_ceiling_is_the_last_step_boundary_whose_mirror_fits_beside_the_kv(window, limit):
     assert kv8.ceiling(window, _MIRROR_S) == limit
@@ -673,11 +674,11 @@ def test_ceiling_is_the_last_step_boundary_whose_mirror_fits_beside_the_kv(windo
 
 
 def test_ceiling_is_zero_below_the_first_fitting_window():
-    """N0 rounds up to a capacity of 1,536 rows, which needs a 2,631-token window."""
+    """N0 rounds up to a capacity of 1,536 rows, which needs a 6,471-token window."""
     assert kv8.ceiling(0, _MIRROR_S) == 0
     assert kv8.ceiling(1535, _MIRROR_S) == 0
-    assert kv8.ceiling(2630, _MIRROR_S) == 0
-    assert kv8.ceiling(2631, _MIRROR_S) == tileattn.N0
+    assert kv8.ceiling(6470, _MIRROR_S) == 0
+    assert kv8.ceiling(6471, _MIRROR_S) == tileattn.N0
 
 
 def test_floor_must_be_a_step_boundary(monkeypatch):
@@ -1683,7 +1684,7 @@ _GATE_BUILD_ERROR = "Unable to build metal library\nprogram_source:3:1: error: b
 # The attention tile's and exact verify's statuses as active loads report them.
 _ACTIVE_TILE = {"state": "active", "reason": None, "splits": 20, "probe_seconds": 0.5}
 _ACTIVE_VERIFY = {"state": "active", "reason": None, "probe_seconds": 0.2}
-# The default window; at S = 20 its ceiling is 84,481 keys.
+# The default window; at S = 20 its ceiling is 81,921 keys.
 _WINDOW = 131_072
 _PINNED = {
     ("mlx_vlm.models.cache", "KVCache.update_and_fetch"),
@@ -1847,7 +1848,7 @@ _GUARD_REASONS = [
     "mlx-vlm KVCache.trim changed",
     "the int8 K/V kernels failed: program_source:3:1: error: boom",
     "floor 1600 keys is not a tile step boundary at 20 splits",
-    "window below the kv8 floor (window 3000, ceiling 1536, floor 1536)",
+    "window below the kv8 floor (window 6500, ceiling 1536, floor 1536)",
     "parity: verify rows at prefix 1535, T=6 differ from decode",
 ]
 # Which of them warn: a pinned source that drifted, kernels this OS rejects, a
@@ -1872,7 +1873,7 @@ def test_enable_names_the_first_failing_guard(monkeypatch, first):
             kv8, "availability", lambda: nax.Availability(False, _GUARD_REASONS[2])
         ),
         lambda: monkeypatch.setattr(kv8, "N8", 1600),
-        lambda: kwargs.update(window=3000),
+        lambda: kwargs.update(window=6500),
         lambda: monkeypatch.setattr(
             kv8, "probe", lambda modules, splits, arch, verify_active: _GUARD_REASONS[5]
         ),
@@ -1885,9 +1886,9 @@ def test_enable_names_the_first_failing_guard(monkeypatch, first):
     assert (status["probe_seconds"] is None) == (first < 2)
 
 
-@pytest.mark.parametrize(("window", "limit"), [(0, 0), (3000, 1536)])
+@pytest.mark.parametrize(("window", "limit"), [(0, 0), (6500, 1536)])
 def test_enable_refuses_a_window_below_the_floor(monkeypatch, window, limit):
-    """A window of 0, every test-built engine's, fits no ceiling at all; 3,000
+    """A window of 0, every test-built engine's, fits no ceiling at all; 6,500
     tokens fit one at the floor itself, below which kv8 serves nothing."""
     _kv8_ready(monkeypatch)
     monkeypatch.setattr(kv8, "probe", _untouchable)
@@ -1915,7 +1916,7 @@ def test_the_floor_is_a_step_boundary_at_every_measured_split():
 
 
 @pytest.mark.parametrize("splits", [10, 16, 20])
-@pytest.mark.parametrize("window", [4096, 32_768, 131_072, 262_144])
+@pytest.mark.parametrize("window", [8192, 32_768, 131_072, 262_144])
 def test_the_ceiling_fits_its_mirror_and_the_next_boundary_does_not(window, splits):
     limit = kv8.ceiling(window, splits)
     bounds = tileattn.boundaries(window + 32 * splits, splits)
@@ -2043,15 +2044,15 @@ def test_enable_activates_and_probes_the_verifier_only_beside_exact_verify(
         "reason": None,
         "probe_seconds": status["probe_seconds"],
         "floor": 1536,
-        "ceiling": 84_481,
+        "ceiling": 81_921,
     }
     assert isinstance(status["probe_seconds"], float)
     # The flag and the ceiling are raised only once the probe has passed.
     modules = [id(m) for m in verifyattn._attention_modules(lm)]
     assert seen == [(modules, 20, tileattn._arch(), verify_active, 0, 0)]
-    assert kv8._active == 1 and kv8._ceiling == 84_481 and kv8._window is None
+    assert kv8._active == 1 and kv8._ceiling == 81_921 and kv8._window is None
     assert [r.getMessage() for r in caplog.records if r.name == "sous.engine.kv8"] == [
-        f"int8 K/V mirror: 2 layers, 1536 <= keys < 84481, probe {status['probe_seconds']:.2f}s"
+        f"int8 K/V mirror: 2 layers, 1536 <= keys < 81921, probe {status['probe_seconds']:.2f}s"
     ]
 
 
@@ -2059,7 +2060,7 @@ def test_a_refused_load_after_an_active_one_leaves_nothing_serving(monkeypatch):
     tile = _kv8_ready(monkeypatch)
     lm = tfx.tiny_language_model()
     status = kv8.enable(lm, enabled=True, tile_status=tile, verify_status=None, window=_WINDOW)
-    assert status["state"] == "active" and kv8._ceiling == 84_481
+    assert status["state"] == "active" and kv8._ceiling == 81_921
     _refusal(lm, warned=False, tile_status={"state": "off", "reason": None, "splits": None})
     assert not kv8.serving_now() and not kv8.serves(2_000)
 
@@ -2074,7 +2075,7 @@ def test_enable_goes_active_through_the_real_availability_and_probe(monkeypatch)
         lm, enabled=True, tile_status=tile, verify_status=dict(_ACTIVE_VERIFY), window=_WINDOW
     )
     assert status["state"] == "active", status
-    assert (status["floor"], status["ceiling"]) == (1536, 84_481)
+    assert (status["floor"], status["ceiling"]) == (1536, 81_921)
     assert kv8._active == 1 and kv8._compile_ok
 
 

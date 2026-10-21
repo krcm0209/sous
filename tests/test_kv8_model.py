@@ -30,6 +30,7 @@ mx = pytest.importorskip("mlx.core")
 
 from sous.engine import gpucores, kv8, tileattn  # noqa: E402 — after the importorskip guard
 from sous.engine.vlm import VLMEngine  # noqa: E402
+from sous.engine.window import DECODE_KV_STEP  # noqa: E402
 
 pytestmark = pytest.mark.model
 
@@ -82,9 +83,10 @@ def _ceiling(line: int | None) -> Iterator[None]:
 def _fits(boundary: int) -> bool:
     """Whether a mirror ending at this boundary fits beside the turn's bf16 KV in WINDOW:
     the bf16 KV up to the capacity, the mirror at it, one layer's old mirror during a growth,
-    and the rows a straddling verify may hold past the line plus one capacity step."""
+    and the rows a straddling verify may hold past the line plus one growth of the decode's
+    bf16 KV."""
     cap = math.ceil(boundary / 256) * 256
-    return 1.504 * cap + 0.504 * cap / 16 + 272 <= WINDOW
+    return 1.504 * cap + 0.504 * cap / 16 + 16 + DECODE_KV_STEP <= WINDOW
 
 
 def _targets(splits: int) -> dict[str, tuple[int, tuple[int, ...], int | None]]:
