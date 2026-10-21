@@ -21,7 +21,11 @@ one by one, then measures prefill and decode throughput of every arm — a
 model, a drafter or none, a block size — through sous's own engine
 (`--repeat` sets the attempts per measurement, default 2; the best wins and
 the spread is printed). It proposes only the settings that cannot change
-what the model says: the drafter, its block size, and a window that fits.
+what the model says beyond a near-tie: the drafter, its block size, and a
+window that fits — a block size, or one drafter for another, changes
+nothing, and a drafter against none moves a near-tie only where the
+projection tile is active (the 20-core M5 Pro; see `projection_tile` in
+[Configuration](configuration.md)).
 Other models are measured and reported with a "quality untested" label; a
 quick run never changes the model.
 
@@ -52,36 +56,60 @@ The rule, printed in full with every number:
 - the **winner** is the eligible arm with the lowest total suite wall time
   (a tie goes to the smaller memory footprint).
 
-On the winner, the same rule then judges one extra arm: INT8 prefill, only
-for a winner that has it off (it ships on) and only where the tensor units and
-the checkpoint allow it. It lands in the diff only when its own measured arm is
-eligible and faster. The tune never changes `temperature`: every arm inherits
-yours, and greedy decoding (`temperature = 0`) is never proposed, because it
-leaves a model that starts repeating itself no way out and, as above, the suite
-cannot measure that risk; it runs only when you set it. The full run may
-therefore change `[model].id`, the drafter and block size, the window and
-`int8_prefill`.
-Every arm inherits `[model].attention_tile`, `[model].projection_kernel` and
-`[model].kv_int8` and no arm changes them; suite rows are keyed by all three,
-so a `--resume` after any of them was flipped runs those arms again instead of
-mixing rows measured with and without it (a row written before a setting
-existed reads as `false` for it), and where the engine reports one
-`unavailable`, the arm prints a notice with the reason and runs without it, as
-the daemon would: stock attention or projections, or attention over the bf16
-cache for `kv_int8` (an `off` engine, such as the mlx-lm backend's, gets no
-notice). The projection kernel's route for the drafter's own linears reports
+On the winner, the same rule then judges one extra arm: INT8 prefill, only for a
+winner that has it off (it ships on) and only where the tensor units and the
+checkpoint allow it. That arm keeps your `projection_tile`, like every other
+setting: the tile serves only beside active int8 prefill, so where it can run
+the winner ran without it and the int8 arm with it, and the grade is that of the
+configuration the diff (which writes `int8_prefill` alone) then deploys. It
+lands in the diff only when its own measured arm is eligible and faster. The
+tune never changes `temperature`: every arm inherits yours, and greedy decoding
+(`temperature = 0`) is never proposed, because it leaves a model that starts
+repeating itself no way out and, as above, the suite cannot measure that risk;
+it runs only when you set it. The full run may therefore change `[model].id`,
+the drafter and block size, the window and `int8_prefill`.
+Every arm inherits `[model].attention_tile`, `[model].projection_kernel`,
+`[model].kv_int8` and `[model].projection_tile`, and no arm changes them. Suite
+rows are keyed by the first three as set, so a `--resume` after one of them was
+flipped runs those arms again instead of mixing rows measured with and without
+it (a row written before a setting existed reads as `false` for it). For
+`projection_tile` a row records what the arm's load reported instead of the
+setting: the scope `all` or `mlp` when the tile went active, `unavailable` when
+it was refused, `off` under `false`, and `absent` under any other setting for an
+engine without the tile, such as the mlx-lm backend's. `"mlp"` and `"all"` put
+different projections on the tile and `true` picks either at load, from the
+headroom it finds, so rows of two scopes never pool. After a flip, a `--resume`
+keeps the rows whose recorded state the new setting can load and runs the rest
+again: `true` and `"all"` count `all`, `mlp` (what an `"all"` load reports when
+none of its copies has a tuned plan) and `unavailable`, `"mlp"` counts `mlp` and
+`unavailable`, all three count `absent`, and `false` counts only `off`. A row
+recorded `off` ran with the tile switched off, so a flip from `false` grades
+every arm again. An arm is graded on the rows of the one state that finished the
+most runs; a `--resume` loads it again only while no state has finished every
+run, and then counts as done only the runs finished under the state that load
+reports, so a load that picks the other scope runs the arm's tasks again under
+it. Where the engine reports one `unavailable`, the arm prints a notice with the
+reason and runs without it, as the daemon would: stock attention or projections,
+attention over the bf16 cache for `kv_int8`, or no tile for `projection_tile`
+(an `off` engine, such as the mlx-lm backend's, gets no notice, and neither does
+the projection tile's `no drafter` refusal, which every drafterless arm would
+print). The projection kernel's route for the drafter's own linears reports
 apart from the kernel and gets a notice of its own only when it is
 `unavailable`, the arm then drafting on stock projections: where the kernel
 serves the target but the drafter's probe failed, say, and also wherever the
 kernel itself is `unavailable` and the arm's block is 0 or 6 and up, which
 prints both notices with the same reason. A block of 1 to 5 leaves the route
-`off`, with no notice. `kv_int8` matters most here of the three: attention
-past its floor reads keys and values quantised to int8, which moves more
-than the last bits, and the suite's grades are where that would show. Bench
-rows are keyed only by model, drafter, block and window, so a `--resume`
-across a sous upgrade or a flip of `attention_tile`, `projection_kernel` or
-`kv_int8` reuses decode and prefill timings measured before it, which can
-rank the blocks the other way: start a fresh tune after any of them.
+`off`, with no notice. `kv_int8` matters most here of the four: attention past
+its floor reads keys and values quantised to int8, which moves more than the
+last bits, and the suite's grades are where that would show. Fitting a candidate
+also works out the scope the projection tile's memory rule would pick at the
+fitted window (the copy is elective, so it never lowers the window), but the
+tune prints that scope nowhere today; the daemon's model-load line
+(`projection_tile=active:<scope>`) is where a load's scope shows. Bench rows are
+keyed only by model, drafter, block and window, so a `--resume` across a sous
+upgrade or a flip of `attention_tile`, `projection_kernel`, `kv_int8` or
+`projection_tile` reuses decode and prefill timings measured before it, which
+can rank the blocks the other way: start a fresh tune after any of them.
 
 Every drafter arm runs exactly the block its label names. Your configured arm
 is the block the daemon would run: with `speculative_block_size` unset, that

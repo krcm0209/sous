@@ -16,12 +16,11 @@ mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
 from sous.engine import int8prefill as i8  # noqa: E402 — after the importorskip guards
+from sous.engine.slab import SLAB_ATTR, SlabInfo, repack, slab_info  # noqa: E402
+from tests import proj_fixtures as pfx  # noqa: E402
+from tests import projtile_fixtures as ptfx  # noqa: E402
 
-
-def _unreorder(qa):
-    """Inverse of reorder_k: (c, a, b, j) -> (c, a, j, b) within each 64-code group."""
-    m, k = qa.shape
-    return qa.reshape(m, k // 64, 4, 2, 2, 4).transpose(0, 1, 2, 3, 5, 4).reshape(m, k)
+_unreorder = ptfx.unreorder
 
 
 # ---- K-order --------------------------------------------------------------------
@@ -63,6 +62,19 @@ def test_kernel_sources_ship_as_package_files():
     assert "MetalPerformancePrimitives" in texts["nax.h"]
     assert "MetalPerformancePrimitives" not in texts["common.h"] + texts["stage_a.metal"]
     assert "mpp::tensor_ops" in texts["q4_int8_gemm.metal"]
+
+
+def test_the_gemm_source_defaults_slab_to_zero():
+    """The slab read is switched by a header define, never a template argument
+    the preprocessor cannot see: only the slab kernel's header sets it, so the
+    mlx-layout kernel compiles from the source it compiled from before."""
+    text = i8._kernel_text("q4_int8_gemm.metal")
+    assert "#ifndef SLAB\n#define SLAB 0\n#endif\n" in text
+    first = text.index("#if SLAB\n")
+    assert text.index("#ifndef SLAB") < first
+    # the weight base and strides, the per-group step, the scale and bias rows
+    assert text.count("#if SLAB\n") == 3
+    assert text.count("#else\n") == 3 and text.count("#endif\n") == 4
 
 
 def test_kernel_hands_mlx_only_the_arguments_it_was_given(monkeypatch):
@@ -260,16 +272,11 @@ def _random_words(n, words):
     return (hi << mx.array(16, dtype=mx.uint32)) | lo
 
 
-@nax
-@pytest.mark.parametrize(
-    ("k", "n", "m"),
-    [(64, 64, 32), (128, 64, 32), (1024, 128, 37), (1024, 128, 64), (256, 192, 300)],
-)
-def test_gemm_is_bit_exact_with_power_of_two_metadata(k, n, m):
-    """With power-of-two scales and biases every fp32 partial sum is exact, so the
-    kernel's only rounding is the final bf16 cast: it must equal the fp64-exact
-    reference rounded to bf16. This is the test that fails if the fragment layout
-    or the K-order is wrong."""
+def _exact_case(k, n, m):
+    """Random int8 activations and Q4 words with power-of-two scales and biases:
+    every fp32 partial sum the GEMM forms is exact, so its one rounding is the
+    final bf16 cast. Returns (qa reordered, sa, ra, weight, scales, biases, the
+    exact result rounded to bf16)."""
     qa_nat = mx.random.randint(-127, 128, (m, k)).astype(mx.int8)
     ra = qa_nat.astype(mx.int32).reshape(m, k // 64, 64).sum(axis=-1)  # [M, G]
     sa = mx.ones((m,), dtype=mx.float32)
@@ -287,9 +294,46 @@ def test_gemm_is_bit_exact_with_power_of_two_metadata(k, n, m):
     ref = mx.sum(dots_g * scales.astype(mx.float32)[None], axis=-1) + mx.sum(
         ra.astype(mx.float32)[:, None, :] * biases.astype(mx.float32)[None], axis=-1
     )
-    got = i8.qmm(i8.reorder_k(qa_nat), sa, mx.contiguous(ra.astype(mx.int16).T), w, scales, biases)
+    qa, ra16 = i8.reorder_k(qa_nat), mx.contiguous(ra.astype(mx.int16).T)
+    return qa, sa, ra16, w, scales, biases, ref.astype(mx.bfloat16)
+
+
+@nax
+@pytest.mark.parametrize(
+    ("k", "n", "m"),
+    [(64, 64, 32), (128, 64, 32), (1024, 128, 37), (1024, 128, 64), (256, 192, 300)],
+)
+def test_gemm_is_bit_exact_with_power_of_two_metadata(k, n, m):
+    """With power-of-two scales and biases the kernel must equal the fp64-exact
+    reference rounded to bf16. This is the test that fails if the fragment layout
+    or the K-order is wrong."""
+    qa, sa, ra, w, scales, biases, want = _exact_case(k, n, m)
+    got = i8.qmm(qa, sa, ra, w, scales, biases)
     assert got.shape == (m, n) and got.dtype == mx.bfloat16
-    assert mx.array_equal(got, ref.astype(mx.bfloat16)).item()
+    assert mx.array_equal(got, want).item()
+
+
+@nax
+@pytest.mark.parametrize("n", [1024, 4160], ids=["n1024", "n4160"])
+@pytest.mark.parametrize("rows", [9, 64, 128])
+def test_the_slab_gemm_equals_the_mlx_layout_gemm(n, rows):
+    """The slab read moves where a column's group and its scale and bias are
+    read and nothing else, so on the same Stage A it equals the mlx-layout read
+    bit for bit, at a width that fills its slab tiles and one (4160) whose last
+    tile pads; and on power-of-two metadata both equal the exact result."""
+    k = 1024
+    w, scales, biases = pfx.rand_linear(n, k, seed=rows)
+    stage = i8.stage_a(pfx.activations(rows, k, seed=n))
+    codes, s, b, info = repack(w, scales, biases)
+    want = i8.qmm(*stage, w, scales, biases)
+    got = i8.qmm(*stage, codes, s, b, slab=info)
+    assert got.shape == (rows, n) and got.dtype == mx.bfloat16
+    assert mx.array_equal(got, want).item()
+
+    qa, sa, ra, w, scales, biases, exact = _exact_case(k, n, rows)
+    codes, s, b, info = repack(w, scales, biases)
+    assert mx.array_equal(i8.qmm(qa, sa, ra, codes, s, b, slab=info), exact).item()
+    assert mx.array_equal(i8.qmm(qa, sa, ra, w, scales, biases), exact).item()
 
 
 @nax
@@ -351,6 +395,64 @@ def test_qmm_rejects_untiled_shapes():
         i8.qmm(qa, sa, ra, mx.zeros((64, 12), dtype=mx.uint32), mx.ones((64, 2)), mx.zeros((64, 2)))
 
 
+def _capture_launches(monkeypatch):
+    """Every int8 kernel launch as (name, header, inputs, template, grid,
+    output_shapes); each returns zeros of its shapes and nothing compiles."""
+    launches = []
+
+    def kernel(name, input_names, output_names, source, header, **options):
+        def launch(*, inputs, template, grid, output_shapes, output_dtypes, **rest):
+            launches.append((name, header, inputs, dict(template), grid, output_shapes))
+            return [mx.zeros(s, dtype=d) for s, d in zip(output_shapes, output_dtypes, strict=True)]
+
+        return launch
+
+    monkeypatch.setattr(i8, "_kernel", kernel)
+    return launches
+
+
+def test_qmm_reads_slab_planes_in_place(monkeypatch):
+    """A slab-only module's planes go to the slab kernel as they are, with no
+    per-call transposed copy of its scales, and N is its real width, which the
+    padded planes no longer show; mlx's layout keeps today's kernel and copy."""
+    n, k, m = 320, 256, 9
+    w, scales, biases = pfx.rand_linear(n, k, seed=1)
+    codes, s, b, info = repack(w, scales, biases)
+    assert info == SlabInfo(n_real=n, k=k, tiles=2)
+    stage = i8.stage_a(pfx.activations(m, k, seed=2))
+    launches = _capture_launches(monkeypatch)
+    out = i8.qmm(*stage, codes, s, b, slab=info)
+    assert out.shape == (m, n)
+    name, header, inputs, template, grid, shapes = launches[-1]
+    assert name == "sous_int8_q4_gemm_slab"
+    common, nax_h = i8._kernel_text("common.h"), i8._kernel_text("nax.h")
+    assert header == common + "#define SLAB 1\n" + nax_h
+    assert inputs[3] is codes and inputs[4] is s and inputs[5] is b
+    assert (template["K"], template["N"]) == (k, n)
+    assert grid[0] == 32 * (n // i8.BN) and shapes == [(m, n)]
+
+    i8.qmm(*stage, w, scales, biases)
+    name, header, inputs, template, grid, shapes = launches[-1]
+    assert name == "sous_int8_q4_gemm" and header == common + nax_h
+    assert inputs[3] is w and inputs[4].shape == (k // 64, n) and inputs[5].shape == (k // 64, n)
+    assert template["N"] == n and shapes == [(m, n)]
+
+
+@pytest.mark.parametrize(("k_x", "k_planes"), [(1024, 256), (256, 1024)])
+def test_qmm_refuses_slab_planes_of_another_k(monkeypatch, k_x, k_planes):
+    """K comes from the activations: planes repacked at another K would be read
+    with the wrong group count, past their end or short of it, so the call is
+    refused before any launch."""
+    w, scales, biases = pfx.rand_linear(256, k_planes, seed=3)
+    codes, s, b, info = repack(w, scales, biases)
+    launches = _capture_launches(monkeypatch)
+    qa = mx.zeros((16, k_x), dtype=mx.int8)
+    sa = ra = mx.zeros((16,), dtype=mx.float32)
+    with pytest.raises(ValueError, match=f"planes hold K={k_planes}, not K={k_x}"):
+        i8.qmm(qa, sa, ra, codes, s, b, slab=info)
+    assert launches == []
+
+
 # ---- eligibility --------------------------------------------------------------
 
 
@@ -376,10 +478,8 @@ def test_eligible_linear_table():
 # ---- routing (any Metal GPU: qmm is replaced by an exact-enough reference) ------
 
 
-def _reference_qmm(qa, sa, ra, w, scales, biases):
-    x_hat = _unreorder(qa).astype(mx.float32) * sa[:, None]
-    wd = mx.dequantize(w, scales, biases, group_size=64, bits=4, mode="affine")
-    return (x_hat @ wd.astype(mx.float32).T).astype(scales.dtype)
+_reference_qmm = ptfx.reference_qmm
+_either_form_qmm = ptfx.slab_reference_qmm
 
 
 class _TinyGDN(nn.Module):
@@ -458,6 +558,173 @@ def test_rows_below_the_floor_take_the_stock_path(monkeypatch, wrappers):
     mlp((mx.random.normal((1, 127, 128)) * 0.5).astype(mx.bfloat16))
     mlp((mx.random.normal((1, 1, 128)) * 0.5).astype(mx.bfloat16))
     assert counter.qmm_calls == 0
+
+
+def test_rows_ok_admits_nine_rows_on_a_slab_only_module_and_not_otherwise():
+    """Stock quantized_matmul cannot read a slab-only module's flat planes, so
+    int8 takes its calls from nine rows (the projection kernel serves up to
+    eight); every other module keeps the 128-row floor."""
+    info = SlabInfo(n_real=512, k=256, tiles=2)
+
+    def rows(n, dtype=mx.bfloat16):
+        return mx.zeros((1, n, 256), dtype=dtype)
+
+    assert (i8.SLAB_MIN_ROWS, i8.MIN_ROWS) == (9, 128)
+    assert i8._rows_ok(rows(9), info) and i8._rows_ok(rows(127), info)
+    assert not i8._rows_ok(rows(8), info)
+    assert not i8._rows_ok(rows(9)) and not i8._rows_ok(rows(127), None)
+    assert i8._rows_ok(rows(128)) and i8._rows_ok(rows(128), info)
+    assert i8._rows_ok(rows(9, mx.float16), info)
+    assert not i8._rows_ok(rows(9, mx.float32), info)
+    assert not i8._rows_ok(mx.zeros((256,), dtype=mx.bfloat16), info)
+    # A slab-only module's rows are the product of the leading dimensions, as the
+    # projection kernel counts them: the two gates meet at nine rows whatever the
+    # batch. Every other module keeps its floor on the last of them.
+    assert i8._rows_ok(mx.zeros((2, 5, 256), dtype=mx.bfloat16), info)
+    assert not i8._rows_ok(mx.zeros((2, 4, 256), dtype=mx.bfloat16), info)
+    assert not i8._rows_ok(mx.zeros((2, 100, 256), dtype=mx.bfloat16))
+
+
+def test_a_nine_row_mlp_call_on_a_converted_module_routes_to_int8_with_one_stage(
+    monkeypatch, wrappers
+):
+    """A slab-only MLP's 9-to-127-row call is int8's in one pass: gate and up
+    share one Stage A as above the 128-row floor, down takes its own, and the
+    call counts once as int8_small. Below nine rows it is not int8's: with no
+    projection kernel hooked here it reaches stock, which refuses the planes."""
+    stages, qas = [], []
+    real_stage_a = i8.stage_a
+
+    def counting_stage_a(x):
+        stages.append(real_stage_a(x))
+        return stages[-1]
+
+    def either(qa, *args, slab=None):
+        assert slab is not None, "every MLP linear here is slab-only"
+        qas.append(qa)
+        return _either_form_qmm(qa, *args, slab=slab)
+
+    monkeypatch.setattr(i8, "stage_a", counting_stage_a)
+    monkeypatch.setattr(i8, "qmm", either)
+    monkeypatch.setitem(i8.calls, "int8_small", 0)
+    stock = pfx.tiny_quantized_model(seed=0).model.layers[0].mlp
+    mlp = ptfx.tiny_slab_model(seed=0, scope="mlp").model.layers[0].mlp
+    _tag_all(mlp)
+    x = pfx.activations(9, 256, seed=5).reshape(1, 9, 256)
+    routed = mlp(x)
+    assert len(stages) == 2 and len(qas) == 3
+    assert qas[0] is stages[0][0] and qas[1] is stages[0][0] and qas[2] is stages[1][0]
+    assert i8.calls["int8_small"] == 1
+    want = stock(x)
+    assert routed.shape == want.shape == (1, 9, 256)
+    rel = mx.sqrt(mx.mean((routed - want).astype(mx.float32) ** 2)) / mx.sqrt(
+        mx.mean(want.astype(mx.float32) ** 2)
+    )
+    assert rel.item() < 3e-2
+
+    with pytest.raises(ValueError):
+        mx.eval(mlp(x[:, :8]))
+    assert len(qas) == 3 and i8.calls["int8_small"] == 1
+
+
+def test_a_nine_row_call_of_a_slab_only_linear_routes_alone(monkeypatch, wrappers):
+    """The same floor where a slab-only linear is called on its own, through the
+    nn.QuantizedLinear wrapper, while a tagged linear in mlx's layout keeps 128."""
+    served = []
+
+    def either(*args, slab=None):
+        served.append(slab)
+        return _either_form_qmm(*args, slab=slab)
+
+    monkeypatch.setattr(i8, "qmm", either)
+    monkeypatch.setitem(i8.calls, "int8_small", 0)
+    converted = ptfx.tiny_slab_model(seed=0, scope="mlp").model.layers[0].mlp.gate_proj
+    plain = pfx.rand_module(512, 256, seed=7)
+    for module in (converted, plain):
+        object.__setattr__(module, i8._TAG, True)
+    x = pfx.activations(9, 256, seed=6).reshape(1, 9, 256)
+    assert converted(x).shape == (1, 9, 512)
+    assert served == [slab_info(converted)] and i8.calls["int8_small"] == 1
+    assert plain(x).shape == (1, 9, 512)
+    assert len(served) == 1 and i8.calls["int8_small"] == 1
+
+
+def test_a_batch_of_short_calls_on_a_slab_only_linear_routes_as_its_total_rows(
+    monkeypatch, wrappers
+):
+    """[2, 5, K] is ten rows: past the projection kernel's eight, and stock cannot
+    read the planes, so int8 takes it in one GEMM over the flattened rows."""
+    served = []
+
+    def either(*args, slab=None):
+        served.append((args[0].shape[0], slab))
+        return _either_form_qmm(*args, slab=slab)
+
+    monkeypatch.setattr(i8, "qmm", either)
+    monkeypatch.setitem(i8.calls, "int8_small", 0)
+    stock = pfx.tiny_quantized_model(seed=0).model.layers[0].mlp.gate_proj
+    converted = ptfx.tiny_slab_model(seed=0, scope="mlp").model.layers[0].mlp.gate_proj
+    object.__setattr__(converted, i8._TAG, True)
+    x = pfx.activations(10, 256, seed=8).reshape(2, 5, 256)
+    got = converted(x)
+    assert served == [(10, slab_info(converted))] and i8.calls["int8_small"] == 1
+    want = stock(x)
+    assert got.shape == want.shape == (2, 5, 512)
+    rel = mx.sqrt(mx.mean((got - want).astype(mx.float32) ** 2)) / mx.sqrt(
+        mx.mean(want.astype(mx.float32) ** 2)
+    )
+    assert rel.item() < 3e-2
+
+
+def test_int8_small_counts_the_nine_to_127_row_calls_and_not_the_128_row_ones(
+    monkeypatch, wrappers
+):
+    """The projection tile's gate reads int8_small as the evidence that a slab-only
+    call went to int8 on its own floor: it moves from nine rows to 127, where stock
+    served the call before the conversion, and not from 128 rows up, which int8
+    takes with or without it. A linear and an MLP count the same."""
+    monkeypatch.setattr(i8, "qmm", _either_form_qmm)
+    monkeypatch.setitem(i8.calls, "int8_small", 0)
+    mlp = ptfx.tiny_slab_model(seed=0, scope="mlp").model.layers[0].mlp
+    _tag_all(mlp)
+    for caller in (mlp.gate_proj, mlp):
+        for rows in (9, 64, 127):
+            before = i8.calls["int8_small"]
+            caller(pfx.activations(rows, 256, seed=rows).reshape(1, rows, 256))
+            assert i8.calls["int8_small"] == before + 1, (caller, rows)
+        for rows in (128, 200):
+            before = i8.calls["int8_small"]
+            caller(pfx.activations(rows, 256, seed=rows).reshape(1, rows, 256))
+            assert i8.calls["int8_small"] == before, (caller, rows)
+
+
+def test_linear_int8_hands_qmm_a_slab_only_for_a_slab_only_module(monkeypatch):
+    """Only a slab-only module's call names its form, so a six-argument qmm
+    stand-in keeps serving an unconverted model, and the output is reshaped to
+    the real width rather than the padded planes' length."""
+    seen = []
+
+    def six(qa, sa, ra, w, scales, biases):
+        seen.append(None)
+        return _reference_qmm(qa, sa, ra, w, scales, biases)
+
+    def either(*args, slab=None):
+        seen.append(slab)
+        return _either_form_qmm(*args, slab=slab)
+
+    module = ptfx.padded_module(320, 256, seed=3)
+    x = pfx.activations(10, 256, seed=4).reshape(1, 10, 256)
+    monkeypatch.setattr(i8, "qmm", six)
+    want = i8.linear_int8(module, x)
+    assert want.shape == (1, 10, 320)
+    codes, s, b, info = repack(module.weight, module.scales, module.biases)
+    module.weight, module.scales, module.biases = codes, s, b
+    object.__setattr__(module, SLAB_ATTR, info)
+    monkeypatch.setattr(i8, "qmm", either)
+    got = i8.linear_int8(module, x)
+    assert seen == [None, info]
+    assert got.shape == (1, 10, 320)
+    assert mx.array_equal(got, want).item()
 
 
 def test_untagged_modules_are_never_routed(monkeypatch, wrappers):

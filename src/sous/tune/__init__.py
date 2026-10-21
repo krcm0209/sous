@@ -94,16 +94,12 @@ def _suite_stage(
     time. Returns the text of what must stop the run — a daemon that is no
     longer free, or weights left resident — else None."""
     for arm in stage:
-        mine = [r for r in suite_runs if r.key == arm.suite_key and r.window == arm.window]
-        # Only the latest attempt at a (task, index) decides whether it is
-        # done — a retry leaves its earlier row in suite_runs too, appended
-        # rather than replaced. And a runner-only "error" row (TaskState has
-        # no such state) is not a result to count as done; a task that ran
-        # and failed is.
-        latest: dict[tuple[str, int], runner_mod.SuiteRun] = {}
-        for r in mine:
-            latest[(r.task, r.index)] = r
-        done = {key for key, r in latest.items() if r.state != "error"}
+        # One done set per projection tile state the arm's rows ran under: the
+        # state arm_runs takes decides whether the arm needs a load, and the
+        # runner keeps the one of the state its load then reports.
+        groups, state = runner_mod.arm_runs(arm, suite_runs)
+        done_by_tile = {tile: runner_mod.done_pairs(rows) for tile, rows in groups.items()}
+        done = set() if state is None else done_by_tile[state]
         if len(done) >= len(tasks) * runs_per_task:
             continue
         # Minutes to hours have passed since the last check: a session or a
@@ -122,6 +118,7 @@ def _suite_stage(
             tasks,
             runs=runs_per_task,
             done=done,
+            done_by_tile=done_by_tile,
             record=record,
             scratch=run.path / "suite",
             out=out,

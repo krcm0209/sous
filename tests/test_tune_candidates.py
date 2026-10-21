@@ -191,3 +191,98 @@ def test_describe_keeps_the_config_it_read_for_checks_that_read_more_of_it():
     # Equality and the hash stay about the summarised fields.
     assert cp == dataclasses.replace(cp, config={})
     assert hash(cp) == hash(dataclasses.replace(cp, config={}))
+
+
+# The default 27B with its DFlash2 drafter at 131072 on the M5 Pro: headroom
+# 51.8 GiB - 16.1 GB - 3.85 GB / 3.5, the window's KV reserve 8 GiB, and the
+# daemon's 2 GiB slack leave 22.0 GiB of prompt-cache budget beside a 4.09 GB
+# copy and 11.9 GiB beside a 15 GB one.
+_SMALL_COPY = 4_090_000_000
+_LARGE_COPY = 15_000_000_000
+
+
+def _fit_27b(**tile):
+    return fit(
+        _cp(16_100_000_000),
+        _cp(3_850_000_000, kv=2 * 5 * 8 * 128 * 2),
+        window=131072,
+        floor=8192,
+        working_set_bytes=fx.M5_PRO_WORKING_SET,
+        **tile,
+    )
+
+
+def test_fit_reports_the_projection_tiles_scope_without_counting_the_copy():
+    base = _fit_27b()
+    assert "projection tile" not in base.detail
+    small = _fit_27b(tile_copy_bytes=_SMALL_COPY, tile_config=True)
+    large = _fit_27b(tile_copy_bytes=_LARGE_COPY, tile_config=True)
+    # The copy is elective: the guard skips it rather than shrink the window.
+    for f in (small, large):
+        assert (f.fits, f.window, f.needed_bytes) == (base.fits, base.window, base.needed_bytes)
+    assert "projection tile scope=all copy=4.1 GB (budget left 22.01 GiB)" in small.detail
+    assert "projection tile scope=mlp (copy would leave 11.85 GiB" in large.detail
+
+
+def test_fit_reports_the_scope_the_config_and_an_explicit_budget_decide():
+    off = _fit_27b(tile_copy_bytes=_SMALL_COPY)  # the tile switched off
+    assert "projection tile" not in off.detail
+    assert (
+        "projection tile scope=mlp"
+        in _fit_27b(tile_copy_bytes=_SMALL_COPY, tile_config="mlp").detail
+    )
+    assert (
+        "projection tile scope=all"
+        in _fit_27b(tile_copy_bytes=_LARGE_COPY, tile_config="all").detail
+    )
+    fits = _fit_27b(tile_copy_bytes=_SMALL_COPY, tile_config=True, cache_budget=20 * 2**30)
+    tight = _fit_27b(tile_copy_bytes=_SMALL_COPY, tile_config=True, cache_budget=24 * 2**30)
+    assert "projection tile scope=all" in fits.detail
+    assert "projection tile scope=mlp" in tight.detail
+    assert "configured budget 24.00 GiB does not fit beside the copy" in tight.detail
+
+
+def test_fit_reports_the_copy_the_prompt_cache_off_allows():
+    """The copy that would leave the automatic budget under the rule is made with
+    the prompt cache off: nothing would hold that budget."""
+    on = _fit_27b(tile_copy_bytes=_LARGE_COPY, tile_config=True)
+    off = _fit_27b(tile_copy_bytes=_LARGE_COPY, tile_config=True, cache_enabled=False)
+    assert "projection tile scope=mlp (copy would leave 11.85 GiB" in on.detail
+    assert (
+        "projection tile scope=all copy=15.0 GB (prompt cache off; the copy fits beside "
+        "the reserve; budget left 11.85 GiB)" in off.detail
+    )
+    assert (off.fits, off.window, off.needed_bytes) == (on.fits, on.window, on.needed_bytes)
+
+
+def test_fit_reports_no_scope_for_a_model_it_refuses():
+    f = fit(
+        _cp(16_100_000_000),
+        None,
+        window=131072,
+        floor=8192,
+        working_set_bytes=fx.M2_AIR_WORKING_SET,
+        tile_copy_bytes=_SMALL_COPY,
+        tile_config=True,
+    )
+    assert f.fits is False
+    assert "projection tile" not in f.detail
+
+
+def _fit_lowered(**tile):
+    return fit(
+        _cp(6_000_000_000, kv=32768),
+        None,
+        window=131072,
+        floor=8192,
+        working_set_bytes=fx.M2_AIR_WORKING_SET,
+        **tile,
+    )
+
+
+def test_a_lowered_window_stays_where_the_fit_put_it_beside_the_copy():
+    base = _fit_lowered()
+    tiled = _fit_lowered(tile_copy_bytes=_SMALL_COPY, tile_config=True)
+    assert base.window < 131072
+    assert (tiled.window, tiled.needed_bytes) == (base.window, base.needed_bytes)
+    assert "projection tile scope=mlp" in tiled.detail

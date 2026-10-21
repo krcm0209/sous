@@ -266,7 +266,7 @@ def test_a_text_only_model_gets_no_drafter_arms(tmp_path):
     assert any("text-only" in r.reason for r in refusals)
 
 
-def _winner(tmp_path, temperature=0.7, int8=False, tile=True, proj=True, kv8=True):
+def _winner(tmp_path, temperature=0.7, int8=False, tile=True, proj=True, kv8=True, ptile=True):
     cfg = SousConfig(
         data_dir=tmp_path / "d",
         config_path=tmp_path / "c.toml",
@@ -275,6 +275,7 @@ def _winner(tmp_path, temperature=0.7, int8=False, tile=True, proj=True, kv8=Tru
         attention_tile=tile,
         projection_kernel=proj,
         kv_int8=kv8,
+        projection_tile=ptile,
     )
     return Arm(
         label="27B + DFlash2 @3",
@@ -291,13 +292,14 @@ def _winner(tmp_path, temperature=0.7, int8=False, tile=True, proj=True, kv8=Tru
         attention_tile=tile,
         projection_kernel=proj,
         kv_int8=kv8,
+        projection_tile=ptile,
     )
 
 
 def test_the_suite_key_extends_the_bench_key_with_the_quality_dimensions(tmp_path):
     arm = _winner(tmp_path)
     assert arm.key == ("mlx-community/Qwen3.8-27B-4bit", "z-lab/Qwen3.8-27B-DFlash2", 3)
-    assert arm.suite_key == (*arm.key, False, False, True, True, True)
+    assert arm.suite_key == (*arm.key, False, False, True, True, True, True)
 
 
 def test_on_nax_a_routable_checkpoint_gets_an_int8_arm_and_no_greedy_arm(tmp_path):
@@ -307,7 +309,7 @@ def test_on_nax_a_routable_checkpoint_gets_an_int8_arm_and_no_greedy_arm(tmp_pat
     (int8,) = arms
     assert int8.int8_prefill and int8.config.int8_prefill
     assert not int8.greedy and int8.config.temperature == 0.7
-    assert int8.suite_key == (*int8.key, True, False, True, True, True)
+    assert int8.suite_key == (*int8.key, True, False, True, True, True, True)
     assert not int8.current and int8.fit_window == 131072
     # Only the winner stage's own int8 arm is under test: the engine
     # refusing it must fail the arm, unlike an arm that merely inherited
@@ -367,7 +369,7 @@ def test_quick_arms_mirror_the_users_int8_and_greedy_settings(tmp_path):
         assert arm.greedy is True
         # Inherited, not proposed: quick_arms never puts an arm under test.
         assert arm.int8_under_test is False
-        assert arm.suite_key == (*arm.key, True, True, True, True, True)
+        assert arm.suite_key == (*arm.key, True, True, True, True, True, True)
         cp = _checkpoints()[arm.model_id]
         extra_arms = winner_stage_arms(arm, nax=True, checkpoint=cp)
         assert extra_arms == []
@@ -388,7 +390,7 @@ def test_quick_arms_mirror_the_users_attention_tile_and_key_their_suite_rows_by_
         assert refusals == []
         for arm in arms:
             assert arm.attention_tile is tile and arm.config.attention_tile is tile
-            assert arm.suite_key == (*arm.key, False, False, tile, True, True)
+            assert arm.suite_key == (*arm.key, False, False, tile, True, True, True)
         keys[tile] = {arm.suite_key for arm in arms}
     # A run resumed after the setting was flipped matches none of the old rows.
     assert keys[True].isdisjoint(keys[False])
@@ -580,7 +582,7 @@ def test_quick_arms_mirror_the_users_projection_kernel_and_key_their_suite_rows_
         assert refusals == []
         for arm in arms:
             assert arm.projection_kernel is proj and arm.config.projection_kernel is proj
-            assert arm.suite_key == (*arm.key, False, False, True, proj, True)
+            assert arm.suite_key == (*arm.key, False, False, True, proj, True, True)
         keys[proj] = {arm.suite_key for arm in arms}
     # A run resumed after the setting was flipped matches none of the old rows.
     assert keys[True].isdisjoint(keys[False])
@@ -609,7 +611,7 @@ def test_quick_arms_mirror_the_users_kv_int8_and_key_their_suite_rows_by_it(tmp_
         assert refusals == []
         for arm in arms:
             assert arm.kv_int8 is kv8 and arm.config.kv_int8 is kv8
-            assert arm.suite_key == (*arm.key, False, False, True, True, kv8)
+            assert arm.suite_key == (*arm.key, False, False, True, True, kv8, True)
         keys[kv8] = {arm.suite_key for arm in arms}
     # A run resumed after the setting was flipped matches none of the old rows.
     assert keys[True].isdisjoint(keys[False])
@@ -620,4 +622,124 @@ def test_the_winner_stage_carries_kv_int8_and_adds_no_arm_for_it(tmp_path):
     arms = winner_stage_arms(_winner(tmp_path, kv8=False), nax=True, checkpoint=cp)
     assert [a.label for a in arms] == ["27B + DFlash2 @3 + int8 prefill"]
     assert all(a.kv_int8 is False and a.config.kv_int8 is False for a in arms)
-    assert [a.suite_key[-1] for a in arms] == [False]
+    assert [a.suite_key[7] for a in arms] == [False]
+
+
+def test_quick_arms_mirror_the_users_projection_tile_and_key_only_their_suite_rows_by_it(tmp_path):
+    keys = {}
+    for ptile in (True, False, "mlp", "all"):
+        user = SousConfig(
+            data_dir=tmp_path / "d",
+            config_path=tmp_path / "c.toml",
+            projection_tile=ptile,
+            int8_prefill=False,
+        )
+        arms, refusals = quick_arms(
+            user, _candidates(), _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
+        )
+        assert refusals == []
+        for arm in arms:
+            assert arm.projection_tile == ptile and arm.config.projection_tile == ptile
+            assert type(arm.projection_tile) is type(ptile)
+            assert arm.suite_key == (*arm.key, False, False, True, True, True, ptile)
+            # Bench rows and a resume's bench stage match on the bench key: the
+            # flag changes numerics, which only the suite grades.
+            assert arm.key == (arm.model_id, arm.drafter_id, arm.block_size)
+        keys[ptile] = {arm.suite_key for arm in arms}
+    # A run resumed after the setting changed matches none of the old suite rows.
+    assert len(set().union(*keys.values())) == sum(len(k) for k in keys.values())
+
+
+def test_the_int8_stage_arm_keeps_the_users_projection_tile(tmp_path):
+    """The tile serves only beside active int8 prefill, so turning int8 on is
+    what lets it load: the diff writes int8_prefill alone, and the arm that
+    earns it grades the configuration that diff deploys, the tile as the user
+    has it included."""
+    cp = _checkpoints()["mlx-community/Qwen3.8-27B-4bit"]
+    for ptile in (True, "mlp", "all", False):
+        winner = _winner(tmp_path, ptile=ptile)
+        (int8,) = winner_stage_arms(winner, nax=True, checkpoint=cp)
+        assert int8.projection_tile == ptile and int8.config.projection_tile == ptile
+        assert type(int8.projection_tile) is type(ptile)
+        assert int8.int8_prefill is True and int8.config.int8_prefill is True
+        assert int8.suite_key == (*winner.key, True, False, True, True, True, ptile)
+        assert int8.key == winner.key
+
+
+def _tile_check(monkeypatch, answer):
+    """Stand in for the projection tile's static check (it reads this machine's
+    GPU) and its copy size, and record every fit() quick_arms makes."""
+    from sous.engine import projtile
+    from sous.tune import arms as arms_mod
+
+    asked, sized, fits = [], [], []
+
+    def static_reason(config, model_config, kind):
+        asked.append((config, model_config, kind))
+        return "no drafter" if kind is None else answer
+
+    def static_copy_bytes(model_config):
+        sized.append(model_config)
+        return 4_090_000_000
+
+    real_fit = arms_mod.fit
+
+    def recording_fit(target, drafter, **kw):
+        f = real_fit(target, drafter, **kw)
+        fits.append((drafter, kw, f))
+        return f
+
+    monkeypatch.setattr(projtile, "static_reason", static_reason)
+    monkeypatch.setattr(projtile, "static_copy_bytes", static_copy_bytes)
+    monkeypatch.setattr(arms_mod, "fit", recording_fit)
+    return asked, sized, fits
+
+
+def test_quick_arms_hand_fit_the_tiles_copy_only_where_its_static_check_passes(
+    tmp_path, monkeypatch
+):
+    asked, sized, fits = _tile_check(monkeypatch, None)
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", prompt_cache_gb=12.0)
+    arms, refusals = quick_arms(
+        user, _candidates()[:1], _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
+    )
+    assert arms and refusals == []
+    assert {kind for _, _, kind in asked} == {None, "dflash"}
+    assert all(c is user and m == fx.qwen_27b() for c, m, _ in asked)
+    assert sized and all(m == fx.qwen_27b() for m in sized)
+    assert fits and {d is None for d, _, _ in fits} == {True, False}
+    for drafter, kw, f in fits:
+        assert kw["tile_config"] is True and kw["cache_budget"] == 12 * 2**30
+        assert kw["cache_enabled"] is True
+        if drafter is None:
+            # "no drafter": the tile serves the drafter's verify only.
+            assert kw["tile_copy_bytes"] is None and "projection tile" not in f.detail
+        else:
+            assert kw["tile_copy_bytes"] == 4_090_000_000
+            assert "projection tile scope=all" in f.detail
+
+
+def test_quick_arms_hand_fit_the_prompt_cache_switch(tmp_path, monkeypatch):
+    """With the prompt cache off the tile's memory rule copies whenever the copy
+    fits beside the reserve, so the fit's note must be told the cache is off."""
+    _, _, fits = _tile_check(monkeypatch, None)
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml", prompt_cache=False)
+    quick_arms(user, _candidates()[:1], _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET)
+    assert fits and all(kw["cache_enabled"] is False for _, kw, _ in fits)
+    noted = [f.detail for d, _, f in fits if d is not None]
+    assert noted and all("prompt cache off; the copy fits beside the reserve" in d for d in noted)
+
+
+def test_quick_arms_hand_fit_no_copy_where_the_tiles_static_check_refuses(tmp_path, monkeypatch):
+    asked, sized, fits = _tile_check(monkeypatch, "int8 prefill off")
+    user = SousConfig(data_dir=tmp_path, config_path=tmp_path / "c.toml")
+    arms, _ = quick_arms(
+        user, _candidates()[:1], _checkpoints(), working_set_bytes=fx.M5_PRO_WORKING_SET
+    )
+    assert arms and asked and fits
+    # A refused check never reaches the copy's size: its config may lack the
+    # fields the size is read from.
+    assert sized == []
+    for _, kw, f in fits:
+        assert kw["tile_copy_bytes"] is None and kw["cache_budget"] is None
+        assert "projection tile" not in f.detail

@@ -55,9 +55,22 @@ MAX_FAILURES = 3
 # The modules whose bytes decide what KV a token id produces; hashed into
 # the identity key so a change to them can never be forgotten.
 _ENGINE_SOURCES = files("sous.engine")
-_EPOCH_FILES = ("vlm.py", "lm.py", "int8prefill.py", "tileattn.py", "projkernel.py")
+_EPOCH_FILES = (
+    "vlm.py",
+    "lm.py",
+    "int8prefill.py",
+    "tileattn.py",
+    "projkernel.py",
+    "slab.py",
+    "projtile.py",
+)
 # Kernel sources the kernels/ scan skips (engine_epoch says why).
-_EPOCH_EXCLUDED_KERNELS = ("attention_tile_kv8.metal", "kv8_quant.metal")
+_EPOCH_EXCLUDED_KERNELS = (
+    "attention_tile_kv8.metal",
+    "kv8_quant.metal",
+    "projection_tile.metal",
+    "projection_tile.h",
+)
 
 
 class ForkFileError(Exception):
@@ -156,15 +169,18 @@ def fork_key_fields(
     int8_status: Mapping[str, Any],
     tile_status: Mapping[str, Any],
     proj_status: Mapping[str, Any],
+    ptile: str,
 ) -> dict[str, str]:
     """Everything that changes the KV arrays behind identical token ids, and
     nothing else: the backend and its package, mlx, the GPU, the weights,
     the engine sources (epoch) and the file layout, which side supplies the
     rotary positions, whether int8 prefill actually ran, whether the
     attention tile served the load and at which split target, whether the
-    projection kernel served it, the macOS build, and the two mlx-core
-    environment switches that change matmul precision and attention
-    accumulation.
+    projection kernel served it, whether the projection tile left the MLP
+    slab-only (`ptile`, read off the modules: "active", "off", or
+    "partial:<slab-only>/<total>:<digest of which>" after a revert that raised
+    part-way), the macOS build, and the two mlx-core environment switches
+    that change matmul precision and attention accumulation.
 
     The tile and the projection kernel both run the one-row forward that
     ends every prefill segment, and the projection kernel any prefill tail
@@ -179,7 +195,12 @@ def fork_key_fields(
     the last bits any of them produces. The template, tokenizer, sampling,
     drafter and window are deliberately absent: ids are compared exactly,
     and none of them touches a prefill (the projection kernel routes a
-    prefill the same with a drafter loaded or without one)."""
+    prefill the same with a drafter loaded or without one). The projection
+    tile is the exception the `ptile` field covers: a slab-only MLP sends a
+    prefill chunk of 9 to 127 rows to int8's GEMM where stock served it, and
+    only a load with a drafter converts the MLP, so the drafter's presence
+    reaches the KV through the conversion, which the key reads, never
+    through the drafter itself."""
     from importlib.metadata import version
 
     int8_active = int8_status.get("state") == "active"
@@ -196,6 +217,7 @@ def fork_key_fields(
         "int8": f"active:{int8_status.get('routed', 0)}" if int8_active else "off",
         "tile": f"active:{tile_status['splits']}" if tile_active else "off",
         "proj": "active" if proj_status.get("state") == "active" else "off",
+        "ptile": ptile,
         "os": os_release(),
     }
     env = ";".join(f"{k}={os.environ[k]}" for k in _NUMERIC_ENV if k in os.environ)
@@ -249,12 +271,13 @@ def engine_epoch() -> str:
     # helper), so they are part of the numerics too.
     kernels = _ENGINE_SOURCES.joinpath("kernels")
     for entry in sorted(kernels.iterdir(), key=lambda e: e.name):
-        # The int8 K/V mirror's quantiser and attention kernel run only
-        # inside a generation, and the KV a generation appends is never
-        # stored: the prompt cache restores the snapshot taken before the
-        # decode, or drops the cache. Hashing them would cold-start every
-        # store on each edit to kernels no stored KV depends on, which is
-        # also why verifyattn.py is not in _EPOCH_FILES. The headers they
+        # The int8 K/V mirror's quantiser and attention kernel, and the
+        # projection tile's kernel and its own header, run only inside a
+        # generation, and the KV a generation appends is never stored: the
+        # prompt cache restores the snapshot taken before the decode, or
+        # drops the cache. Hashing them would cold-start every store on each
+        # edit to kernels no stored KV depends on, which is also why
+        # verifyattn.py is not in _EPOCH_FILES. The shared headers they
         # include stay hashed: the stored-KV kernels include them too.
         if entry.name in _EPOCH_EXCLUDED_KERNELS:
             continue

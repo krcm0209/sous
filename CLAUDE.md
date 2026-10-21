@@ -161,9 +161,10 @@ goal.
   on disk written by a build with wrong KV would survive a restart, which is
   why the fork store's identity key hashes the engine sources
   (`forkstore.engine_epoch`: vlm.py, lm.py, int8prefill.py, tileattn.py,
-  projkernel.py, kernels/*.metal and *.h except the two kv8 kernels,
-  `attention_tile_kv8.metal` and `kv8_quant.metal`, which
-  `_EPOCH_EXCLUDED_KERNELS` names because they serve only inside a
+  projkernel.py, slab.py, projtile.py, kernels/*.metal and *.h except the
+  two kv8 kernels, `attention_tile_kv8.metal` and `kv8_quant.metal`, and
+  the projection tile's `projection_tile.metal` and `projection_tile.h`,
+  which `_EPOCH_EXCLUDED_KERNELS` names because they serve only inside a
   generation and never touch stored KV) beside the versions, the GPU and
   the weights snapshot — any
   change to what a token id produces invalidates every file; `rm -rf
@@ -289,12 +290,17 @@ goal.
   the GEMM's nibble decode are two halves of one K-order contract (slot
   `16c+4t+j` holds code `16c+8*(t>>1)+2j+(t&1)`): never change one alone; the
   power-of-two bit-exactness test is what catches a mismatch. Only rows >= 128
-  route (decode/verify never do), only tagged modules route (tags are set with
+  on `shape[-2]` route (decode/verify never do) — except on a slab-only MLP
+  linear (`engine/projtile.py` bullet), which `_rows_ok(x, slab)` admits
+  from `SLAB_MIN_ROWS` = 9 rows counted as the product of the leading
+  dimensions, since stock cannot read its flat planes and the projection
+  kernel takes it only up to 8 — only tagged modules route (tags are set with
   `object.__setattr__` so they stay out of mlx's parameter tree) and only on
   `model_type` `qwen3_5` (the MoE variant reuses the same classes and is refused), and only the
-  tensor-op kernels — the GEMM and the attention tile's split kernel — get
+  tensor-op kernels — the GEMM, the attention tile's and kv8's split kernels
+  and the projection tile — get
   `nax.h`, whose Metal-4 `MetalPerformancePrimitives` include needs macOS
-  26.2+: the Stage-A kernel and the tile's reduce kernel stay MPP-free, and
+  26.2+: the Stage-A kernel and both tiles' reduce kernels stay MPP-free, and
   Stage A must keep compiling on any Metal GPU so CI (macos-15, no tensor
   units) can test it.
 - `int8prefill.enable()` never raises and a model load never fails because of
@@ -311,14 +317,15 @@ goal.
   reject a kernel that compiled before. Whether a tensor-op kernel may run
   is therefore decided in two halves. The platform half (macOS >= 26.2, GPU
   generation >= 17, >= 18 for 'p' parts) is `nax.platform_reason()`, shared
-  by both tensor-op kernels; past it, the compile half:
+  by every tensor-op kernel; past it, the compile half:
   `int8prefill.availability()` compiles and runs the GEMM once where the
-  tensor units exist (`_gemm_probe`) and `tileattn.availability()` every tile
-  variant (`_compile_probe`) — GPU work only, success remembered, the full
+  tensor units exist (`_gemm_probe`), `tileattn.availability()` every tile
+  variant (`_compile_probe`), and kv8's and the projection tile's
+  `availability()` theirs — GPU work only, success remembered, the full
   compiler report logged: a rejected kernel reads as `unavailable` and that
   kernel's `nax` tests skip, where a compile failure with a CPU-stream op in
-  flight deadlocks in mlx's exception path. Being mlx ops, both inherit the
-  thread rules above.
+  flight deadlocks in mlx's exception path. Being mlx ops, they all inherit
+  the thread rules above.
 - `engine/verifyattn.py` replaces mlx-vlm's per-row SDPA loop in the exact
   verifier (`Qwen3_5BatchInvariantForward._attention`, T = 3..8 while the
   attention tile is inactive) with one stock
@@ -359,8 +366,11 @@ goal.
 - `engine/tileattn.py` serves decode's one-row attention and the exact
   verifier's attention from one GQA-packed MPP tile on the M5's tensor
   units (`kernels/attention_tile.metal`: a split kernel and a fixed-order
-  reduce, specialised to bf16, 24/4/256 heads and scale 1/16). Greedy
-  parity with the drafter on or off holds only because a row's output
+  reduce, specialised to bf16, 24/4/256 heads and scale 1/16). A verify row
+  equals its one-row decode call — what greedy parity with the drafter on
+  or off rests on while the projection tile is not active, and what block
+  invariance on the drafter's path rests on while it is active
+  (`engine/projtile.py` bullet) — only because a row's output
   depends on its chunk and nothing else about the call, and the chunk is
   fixed per 32·S-key step: `chunk_for(n, S)` is 0 (stock) below `N0` =
   1536 keys and `32 * ceil(n / (32 * S))` from there. `verify_plan` cuts a
@@ -389,7 +399,7 @@ goal.
   (`nax.platform_reason()`); the model (qwen3_5, every full-attention
   module at 24/4/256, scale 1/16, bf16); the drafter (none, or `dflash`
   with verify attention active — else the verifier would run stock beside
-  a tiled decode and drafter-on output would stop equalling drafter-off);
+  a tiled decode and a verify row would stop equalling its one-row call);
   verifyattn's whole `_gate()`; the source hashes of the three decode
   functions (`VALIDATED_DECODE_SOURCES`); the split target, the GPU core
   count read once per process by `gpucores.read()` (IOKit, then
@@ -441,10 +451,17 @@ goal.
   exact-verifier projection and the verify head, and every target call of
   1–8 rows outside the verifier — one-row decode, a prefill's last chunk of
   ≤ 8 rows and the one-row forward that ends every prefill segment, and the
-  sampled DFlash drafter's call of the target's shared `lm_head`. Greedy
-  parity with the drafter on or off holds only because the kernel's rows
-  are bitwise independent of the row count T and of which linears share a
-  dispatch: weights dequantize exactly (`as_type<half2>(nibble |
+  sampled DFlash drafter's call of the target's shared `lm_head`. Inside
+  a decode window the projection tile takes a verify run or a call of 2–8
+  rows instead where it can (`engine/projtile.py` bullet). With the tile
+  not active, greedy parity with the drafter on or off holds only because the
+  kernel's rows are bitwise independent of the row count T and of which
+  linears share a dispatch (with it active the verify projections it holds
+  planes for run on the tile, whose rows are T-invariant but not the
+  one-row kernel's bits,
+  so the contract there is block invariance, and this independence is what
+  keeps every path outside the tile's window at the same bits): weights
+  dequantize exactly (`as_type<half2>(nibble |
   0x64006400) - 1024`) against bf16 activations widened to fp32, so every
   product is exact; each 8×8×8 `simdgroup_multiply_accumulate` sums in a
   fixed order in fp32; each quant group's epilogue is
@@ -497,7 +514,15 @@ goal.
   `nn.QuantizedLinear.__call__` and routes when the flag is set, the module
   is tagged, x is bf16 and its rows (the product of the leading
   dimensions) are 1–8. Anything else falls through to what was wrapped,
-  and both reach the kernel through `projkernel.mma`, looked up per call.
+  and both reach the kernel through `projkernel.mma`, looked up per call —
+  except on a slab-only module (`engine/projtile.py` bullet), which has no
+  reader but its slab paths: both hooks serve it whatever the flag or its
+  tag says, and a call on one that neither they nor int8 take (not bf16,
+  1-D, zero rows, a verifier batch past 8 rows) raises a `RuntimeError`
+  naming the module (`slab.PATH_ATTR`, set by `convert_mlp`), its shape and
+  why, rather than reach mlx's kernels on the flat planes; past 8 rows hook 2
+  hands a call on only when int8 will take it, so the wrapper order still
+  does not matter.
   The Gemma4, NemotronH and Qwen4Exp verifiers subclass
   `Qwen3_5BatchInvariantForward` and inherit hook 1, so only the tag keeps
   them stock. Tags (`_TAG`, set with `object.__setattr__` so they stay out
@@ -562,13 +587,21 @@ goal.
   traceback logged beside it, as the kernel's). The greedy drafter's head
   argmax (`quantized_argmax`) stays stock, since it too shapes proposals
   only. int8 prefill wraps the same `__call__` for its own tags at ≥ 128
-  rows on `shape[-2]`: the row ranges are disjoint and each wrapper falls
+  rows on `shape[-2]`, and on a slab-only MLP linear from 9 rows counted
+  as hook 2 counts them, the product of the leading dimensions: the row
+  ranges are disjoint (on a slab-only module complementary, since stock
+  cannot read its planes) and each wrapper falls
   through to what it wrapped, so install order does not matter — keep the
   two gates disjoint if either moves. The flag `_active` is a plain int, 1
   or 0, never a model reference: the first statement of every `enable()`
   clears it, only an `active` result sets it, the probe raises it only
   while it runs, and `VLMEngine.unload()` clears it through
-  `projkernel.clear()` beside `tileattn.clear()`. A failed probe untags the
+  `projkernel.clear()` beside `tileattn.clear()`. It switches the kernel off
+  for modules in mlx's layout only: a converted load's MLP is served from
+  its slab paths regardless, so at 0 that load runs its MLP there beside
+  stock attention and GDN projections, and a harness that wants a round off
+  the tile on a converted load clears the tile's round flag
+  (`projtile.set_round_flag`), not `_active`. A failed probe untags the
   model it was given; tags left on an unloaded model are inert while the
   flag is 0, and holding a reference to untag it would keep its weights
   alive. `enable()` checks, in order: the config (`off`); the attention
@@ -613,7 +646,8 @@ goal.
   `speculative_verify_dflash_hidden`, pin drift, a compile or probe failure
   and any exception (logged with its traceback) say it should have run: one
   `warnings.warn`, `sous: projection kernel unavailable (…)`. Both are
-  `unavailable`; `off` is never a refusal. Parity still rests on one thing
+  `unavailable`; `off` is never a refusal. With the projection tile not
+  active, parity still rests on one thing
   the probe cannot cover: drafter-off greedy takes its argmax over bf16
   `logits − logsumexp(logits)` (`generate/ar.py`) and greedy verify over
   raw logits (`sampler(logits)` in `dflash.py`), so the two can differ only
@@ -640,9 +674,11 @@ goal.
   The engine constructors default it off
   (`VLMEngine(projection_kernel=False, draft_block_explicit=True)`); only
   `default_engine_factory` hands them the config. Nothing is logged per
-  turn; `projkernel.calls` (`verify_kernel`, `verify_split`,
-  `plain_kernel`, `draft_kernel`, `declined`, and `one_row`, one per one-row
-  dispatch `linears()` serves; warm-up and probe leave them all as found) counts
+  turn; `projkernel.calls` (`verify_kernel`, which counts the calls whose
+  runs the projection tile served too, `verify_split`, `verify_tile`,
+  `plain_kernel`, `plain_tile`, `draft_kernel`, `declined`, and `one_row`,
+  one per one-row dispatch `linears()` serves; warm-up and probe leave them
+  all as found) counts
   every path for the tests and for
   harnesses, and the load line carries `projection_kernel=`, then on the
   VLM backend the drafter route's `projection_kernel_drafter=active|unavailable|off` (with
@@ -652,15 +688,18 @@ goal.
   and, with a drafter, `draft_block=`. The fork key records `proj` (`active`, else
   `off`) and `projkernel.py` is in `_EPOCH_FILES`: the one-row forward that
   ends every prefill segment, and any tail of ≤ 8 rows, runs on the
-  kernel, so stored KV and GDN state depend on it, while routing never
-  depends on whether a drafter loaded, so the drafter stays out of the
-  key. Every kernel edit, and every change to the pins or `VALIDATED_MLX`,
+  kernel, so stored KV and GDN state depend on it, while the kernel routes
+  a prefill the same with a drafter loaded or without, so the drafter
+  stays out of the key — its presence reaches stored KV only through the
+  projection tile's conversion, which `ptile` keys. Every kernel edit, and
+  every change to the pins or `VALIDATED_MLX`,
   re-runs the exactness tests (`tests/test_projkernel.py`, and `uv run
   pytest -m model tests/test_projkernel_model.py` on the M5 Pro) and the
   timing check — the 12 dispatch keys at T = 1..8 against the kernel before
   the edit, interleaved in one process with an A/A pair for the noise
   floor, the per-forward sum within ±2%: the bits are the parity contract
-  and the speed is the only reason the kernel exists. Tests install the
+  (with the projection tile active, what every path outside its window
+  keeps) and the speed is the only reason the kernel exists. Tests install the
   hooks through `pfx.guard_proj_state` and `pfx.hooked`, swap the plain-mlx
   stand-ins in for `projkernel.mma` and `projkernel.one_row`
   (`pfx.stand_ins`; `pfx.real_kernel` puts both real kernels back), and
@@ -669,6 +708,194 @@ goal.
   kernel bitwise against the MMA kernel at T = 1, random and cancelling)
   and remembers success only: the lane map was probed on Apple GPUs,
   so a GPU where it differs skips rather than fails.
+- `engine/projtile.py` serves the DFlash round's verify projections from an
+  MPP tile on the M5 Pro's tensor units over slab-ordered weights
+  (`kernels/projection_tile.metal`: the tile body and, after its `// REDUCE`
+  line, the split's reduce; `projection_tile.h`, prepended to the tile body
+  alone; Splash's `q4_mpp_tiles.h` at 0d5a035): per quant group one
+  `matmul2d` of 8 bf16 rows against the group's 4-bit codes into a fresh
+  fp32 cooperative tensor, then `acc = fma(P, scale, acc); acc = fma(rowsum,
+  bias, acc)` in ascending group order from +0 and one bf16 rounding; a
+  split plan writes fp32 partials that `sous_proj_tile_reduce` adds in split
+  order. Every launch computes 8 rows (`pad8` appends zero rows), so a row's
+  bits depend on neither T nor which rows share the call, but they are not
+  the one-row kernel's: the tensor op adds adjacent product pairs first, an
+  order no sequential fp32 sum reproduces. So while the tile is active the
+  contract is block invariance on the drafter's path — a position's logits
+  depend on neither the block size nor which rows share a call (the tile's
+  rows are independent, the attention tile and kv8 give a verify row its
+  one-row bits, the GDN verifier is batch-invariant), so for a given load
+  and scope greedy output with the drafter is the same at any block — and
+  drafter-on output differs from drafter-off by bf16 rounding inside the
+  projections and, on prefill chunks of 9–127 rows, by int8 prefill's
+  activations on the MLP (a drafterless load is refused with `no drafter`
+  and never converts, so stock `quantized_matmul` serves those chunks
+  there), so the two agree except at near-ties. Where it is not active
+  (`projection_tile = false`, or `unavailable`: no DFlash drafter, int8
+  prefill off, another Mac) drafter on equals drafter off bit for bit, as
+  before the tile. It serves only while `serves(rows, hook=)` holds — `_active`, a
+  decode window open, the round flag set — through projkernel's two hooks:
+  hook 1 (`_serve_verify`) run by run after its cut into runs of ≤ 8, at any
+  rows, a one-row remainder included, so a verify of more than 8 rows never
+  mixes paths; hook 2 (`_serve_plain`) at 2–8 rows, the short chunk the
+  decode call prefills itself. One row stays on the one-row kernel;
+  `lm_head` (never copied) and the drafter's own linears never reach the
+  tile. A call goes to it only when `plan_for_call(linears)` gives every
+  linear a launch at a tuned plan — a lone linear keyed by its K and width,
+  gate+up as one dual launch, a stacked call one launch per run of a stack's
+  members whole and in order, so the GDN four are qkv+z then b+a — else the
+  whole call stays on the MMA kernel. `plan_for_call` returns the `Launch`es
+  (key, members, plan) that `verify()` and `plain()` launch from
+  (`_check_call` refuses another call's by identity), so a call's launches
+  are worked out once, not per run; `slab.slab_info` and `stack_of` read
+  their markers with `vars(m).get`, since a `getattr` miss goes through
+  `nn.Module.__getattr__` and raises inside it, six times the cost, on a
+  path every projection of every round takes. `VLMEngine.decode()` opens the
+  window (`open_window()`, which also sets the round flag to 1) after kv8's,
+  inside the draft-context `seed` block just before `stream_generate`, when
+  `projtile._active`, and closes it first in that loop's `finally`, in a
+  `try` of its own, so kv8's close runs whatever happens (`close_window()`
+  never raises). `prefill()` finding a window open closes it and warns,
+  naming the window's serial, before the forward: KV with the tile's bits
+  would reach a fork under a key that cannot tell, and a refusal would fail
+  every prompt-cache turn (each prefills before the decode that replaces
+  the window) until a reload.
+  The round flag (`set_round_flag`) is a harness's per-round lever that only
+  `serves()` reads. One module-global window suffices:
+  `ManagedEngine._gen_lock` serialises every forward and `decode()` runs on
+  the caller's session thread. The weights take two forms, both on the
+  modules (nothing at module level holds an array). The MLP's gate, up and
+  down are slab-only: `convert_mlp` replaces their `weight`, `scales` and `biases`
+  through the module's own `__setattr__`, one linear at a time (mlx's
+  parameter tree holds the planes, mlx's arrays are dropped), and marks each
+  `_sous_slab` (`slab.SLAB_ATTR`, a `SlabInfo(n_real, k, tiles)`, set with
+  `object.__setattr__`); stock `quantized_matmul` raises on the flat planes
+  rather than compute garbage, and every path reads them — the MMA kernel's
+  `SLAB` bodies and the one-row kernel's slab body (bitwise the mlx-layout
+  bodies), int8's GEMM through its slab address, the tile. The attention and
+  GDN linears keep mlx's arrays for prefill and the one-row kernel and, at
+  scope `all`, gain a stacked slab copy: one `Stack` shared by its members
+  as `_sous_tile`, each member's place in it as `_sous_tile_index` — q+k+v
+  and o_proj per attention layer, qkv+z, b+a and out_proj per GDN layer (the
+  four GDN inputs as one stack ran 1.06x the kernel's time); a member called
+  alone launches only its own tiles when its columns sit on tile edges, else
+  its whole stack (b and a share one tile). Every reader takes the
+  descriptor `projkernel._weights(m)` returns — the bare `(weight, scales,
+  biases)` 3-tuple for an mlx-layout module, `Weights(w, scales, biases,
+  slab)` for a slab-only one, normalised by `_as_weights` — and derives K
+  and N from it, never from `w.shape`. `engine/slab.py` holds the layout
+  (codes `[T][G][256][8 words]`, each 32-byte unit one column's one group of
+  64 codes, mlx's bytes verbatim; bf16 scales and biases `[T][G][256]`; N
+  zero-padded to whole 256-column tiles, whose padding computes exactly 0),
+  `repack` and `unpack` (a bitwise round trip), `SlabInfo` and the marker,
+  and imports nothing of sous's: projtile imports projkernel and int8prefill
+  at module level, so `projkernel` imports `projtile` only inside its two
+  seams and `int8prefill` never does — both read the marker through `slab`.
+  A slab-only linear's calls of 9–127 rows, which hook 2 hands on and stock
+  cannot read, go to int8's GEMM: `_rows_ok(x, slab)` admits a slab-only
+  module from `SLAB_MIN_ROWS` = 9 rows counted as the product of the leading
+  dimensions, as hook 2 counts them; that is why int8 prefill must be
+  active, and why the fork key reads the conversion — those prefill chunks
+  carry int8's bits where stock's were. `PLANS` maps a key, (K, the members'
+  real widths in call order), to a `Plan(tn, s, groups, pipe, splits)`: the
+  27B's fused verifier keys at the plans tuned for them and the alone forms
+  hook 2 reaches, 12 keys, all tuned on the 20-core M5 Pro (`MEASURED_CORES`
+  = {20}). A key outside the table stays on the MMA kernel, never on a
+  default plan (one GROUPS step off cost 15–20 %), and split counts are
+  frozen per key, since another count adds in another order. `enable()` runs
+  on the `sous-model-load` thread after `projkernel.enable` and before block
+  resolution, the drafter's route (which reads none of the target's modules
+  and runs once the block has resolved), kv8, the fork store and
+  `measure_cache_budget`, never raises and starts with `clear()`. It checks, in order: the config
+  (`false` is `off`); the projection kernel `active`; the attention tile
+  `active`; a DFlash drafter (else `no drafter`); int8 prefill `active`; the
+  GPU core count in `MEASURED_CORES`; the model (`_model_reason`: a dense
+  MLP, every MLP and to-be-copied linear eligible and tagged by the kernel,
+  every MLP linear tagged by int8, every MLP key planned and passing
+  `check_plan`) — each one INFO line and `unavailable`
+  (`_refuse(expected=True)`); then the kernel's source pins
+  (`projkernel._pins_reason()`) and `availability()` (the platform rule,
+  then one compile and run of every distinct plan, the dual, the slab MMA
+  bodies, the slab one-row body and int8's slab GEMM, success remembered
+  only) — one `warnings.warn` and `unavailable`. Then, all counted in
+  `probe_seconds`: `_compile_real_shapes` (every slab path at the MLP's own
+  shapes on zero planes, evaluated before the first launch for the deadlock
+  above, and before anything is converted, so a toolchain that rejects one
+  refuses the tile with the model untouched), the memory rule, the
+  conversion, the copy (nothing built leaves scope `mlp`, "no stack key has
+  a plan"), `warm_up` (every launch the model reaches on the tile and every
+  slab path, on zero rows, so nothing compiles inside a turn) and the probe.
+  A failure there warns, and once the conversion started also undoes it
+  (`revert_mlp`, bitwise, then `drop_stacks`), an exception's frames cleared
+  first so its arrays go before the revert; a revert that raises leaves the
+  markers authoritative, since every reader and the fork key are
+  marker-driven, and the refusal's reason adds how many MLP linears stay
+  slab-only. The memory rule (`copy_decision`) decides in bytes: the
+  conversion is size-neutral; `"mlp"` never copies and `"all"` always does;
+  `true` under the automatic budget copies iff `budget_left` —
+  `live_headroom()` read before the copy with the drafter loaded, less
+  `copy_bytes`, the turn's reserve and `CACHE_BUDGET_SLACK` — is at least
+  `TILE_COPY_MIN_BUDGET_GIB` = 14 GiB (a fork beside a retaining
+  conversation: a copy that evicts the forks costs more prefill than it
+  saves decode), under a configured `prompt_cache_gb` iff that budget fits
+  beside the copy, with `[model].prompt_cache` off (`cache_enabled`, which
+  `VLMEngine.__init__` hands `enable()` from `prompt_cache`) iff the copy
+  fits beside the reserve and the slack, as under a budget of 0, since no
+  slot or fork holds any, and keeps `mlp` when the headroom is unreadable;
+  never a warning. The copy is 4.09 GB on the 27B (b+a pads to one tile). Measured on
+  the 64 GB M5 Pro with the automatic budget: at 262144 the budget is about
+  17.9 GiB without the copy and 14.07 GiB (15,102,367,760 bytes) with it,
+  0.07 GiB above the rule, so the automatic scope is `active:all` there but
+  sits on the rule's edge (a change to the weights, the drafter, mlx, the
+  window or the reserve can flip it to `mlp`), and a maintainer who wants a
+  fixed scope pins `"all"` or `"mlp"`. At 131072 the same arithmetic (the
+  reserve 8 GiB smaller) leaves about 22 GiB and the scope `all` — derived,
+  not measured. `measure_cache_budget` runs after the copy and finds
+  it inside `active`. The probe takes the first
+  full-attention layer's MLP (layer 3 of the 27B) and, at `all`, its
+  attention and the first GDN layer's linears (layer 0), every call and each
+  of its linears alone: every row at T = 1..8 `array_equal` to the same row
+  alone; each linear's relative RMS against an elementwise fp32 reference
+  within `TILE_FLOOR_FACTOR` = 1.05x the bf16 floor (that reference rounded
+  to bf16 — T-invariance compares the tile with itself, this catches one
+  that lost precision); a NaN in one row leaving the others bitwise alone.
+  Then the slab-only MLP's other paths, bitwise against mlx's layout (the
+  MMA kernel at T = 1..8 and, for a lone linear, the one-row kernel and
+  int8's GEMM at 9, 64 and 128 rows) on its real linears, gate+up and a
+  synthetic linear per K in each `CANCELLING` layout; last, the verifier's
+  `_feed_forward` and the MLP's own call at 5 rows through both hooks, on
+  the tile inside a window and on the MMA kernel outside it. It leaves
+  `_active` 0, the window shut, the round flag and both counter dicts as
+  found, and calls `mx.clear_cache()` in `finally`. `projection_tile_status`
+  carries `state`, `scope`, `reason` (at `mlp`, why the copy was skipped),
+  `copy_gb` (GB of 1e9 bytes, at `all`), `probe_seconds` and
+  `budget_left_gib`: the status document copies the first five, and the load
+  line prints `projection_tile=<state>`, active as `active:<scope>` followed
+  by `projection_tile_probe_s=`, `projection_tile_budget_gib=` (what the
+  automatic budget has left beside what was copied) and
+  `projection_tile_copy_gb=` or `projection_tile_copy=skipped`. Nothing is
+  logged per turn; `projkernel.calls["verify_tile"]` (runs) and
+  `["plain_tile"]` and `int8prefill.calls["int8_small"]` count its paths.
+  The fork key's `ptile` (`fork_key_state`: `active` when every MLP linear
+  carries the marker, `off` when none does, `partial:<marked>/<total>:<8
+  hex of sha256 over the marked linears' sorted paths>` after a revert that
+  raised part-way, whose layers split between int8's bits and stock's on a
+  9–127-row chunk, KV neither other load computes, and which layers split
+  matters as much as how many) keys the
+  moved 9–127-row chunks; `slab.py` and `projtile.py` are in
+  `_EPOCH_FILES` (the repack decides the path every MLP read takes) and
+  `projection_tile.metal` and `.h` in `_EPOCH_EXCLUDED_KERNELS`: they serve
+  only inside the window and no stored KV carries their bits, while the
+  three re-addressed kernels' slab bodies stay hashed. `clear()`
+  (`VLMEngine.unload()`, beside `projkernel.clear()`) drops `_active`, the
+  window, the round flag and the scope, every one a plain value; the planes
+  go with the modules. The constructors default it off
+  (`VLMEngine(projection_tile=False)`; `LMEngine` reports `off`) and only
+  `default_engine_factory` hands them the config's value. Tests swap
+  plain-mlx stand-ins in for `projtile.tile` and `tile_dual`
+  (`tests/projtile_fixtures.py`: `guard_tile_state`, `window()`,
+  `hooked_tile`, `tile_ready`), and the `tile_nax` tests skip on
+  `projtile.availability()`, never another kernel's.
 - `engine/kv8.py` serves decode's one-row attention and the exact
   verifier's attention from an int8 *mirror* of the bf16 KV cache, on the
   attention tile's partition: `kernels/attention_tile_kv8.metal`
@@ -683,14 +910,18 @@ goal.
   score and the V scale folds into the probability, so nothing is
   dequantised in the loop. The mirror is a pure per-row function of the
   bf16 rows, so bulk and incremental quantisation agree bit for bit and a
-  verify row reads the same codes as the decode step at its key count:
-  greedy parity with the drafter on or off holds as for the tile, while
-  kv8 itself differs from the bf16 tile by the quantisation, not in the
+  verify row reads the same codes as the decode step at its key count, so
+  a verify row equals its one-row call: as for the tile, what greedy
+  parity with the drafter on or off rests on while the projection tile is
+  not active and block invariance while it is. kv8 itself differs from the
+  bf16 tile by the quantisation, not in the
   last bits. The mirror exists only inside `VLMEngine.decode()`, which,
   when kv8 is active, calls `kv8.open_window()` inside the draft-context `seed` block
-  immediately before `stream_generate` (so the one-row forward that ends
-  the decode call's own prefill segment is covered) and
-  `kv8.close_window(cache)` in that loop's `finally`: it drops every
+  just before `stream_generate`, only the projection tile's window opening
+  between them (so the one-row forward that ends
+  the decode call's own prefill segment is covered), and
+  `kv8.close_window(cache)` in that loop's `finally`, after the projection
+  tile's close: it drops every
   layer's mirror and trim wrap, returns `(state, rows)` for the
   `Speculation` (`rows` one full-attention layer's count: every layer
   quantises the same rows, and the window sums them over its `layers`), and
@@ -754,8 +985,9 @@ goal.
   serves nothing; `open_window(force=True)` lifts `L` for the probe and the
   array-level tests only. `tileattn` imports `kv8` function-locally inside
   its two seams and `kv8` imports `tileattn` at module level, so there is
-  no cycle. `enable()` runs after `projkernel.enable` (the tile's state is
-  settled) and before the fork store and `measure_cache_budget` (the
+  no cycle. `enable()` runs after `projkernel.enable` and `projtile.enable`
+  (the tile's state is settled) and before the fork store and
+  `measure_cache_budget` (the
   probe's arrays are released first); its first statement clears
   `_active`, `_window` and `_ceiling`. It checks, in order: the config (`off`); the
   tile (`active`, else one INFO line and `unavailable` with the tile's

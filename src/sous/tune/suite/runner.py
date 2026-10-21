@@ -14,7 +14,7 @@ import shutil
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +50,10 @@ ETA_TURNS = 8
 ETA_PROMPT_TOKENS = 3000
 ETA_OUTPUT_TOKENS = 300
 
+# A suite row's projection_tile: a state a load reported, or, on a row written
+# before rows recorded it, the setting as written.
+TileState = bool | str
+
 
 @dataclass(frozen=True)
 class SuiteRun:
@@ -64,6 +68,11 @@ class SuiteRun:
     attention_tile: bool
     projection_kernel: bool
     kv_int8: bool
+    # What the load reported (loaded_tile): "all", "mlp", "unavailable", "off"
+    # or "absent", never the setting, since true picks a scope at load and the
+    # two scopes verify differently. A row written before that holds the setting
+    # as written (true or false, or "mlp" or "all").
+    projection_tile: bool | str
     window: int
     state: str
     outcome: str | None
@@ -79,8 +88,10 @@ class SuiteRun:
     transcript_path: str | None
 
     @property
-    def key(self) -> tuple[str, str, int, bool, bool, bool, bool, bool]:
-        """The arm this run measured — `Arm.suite_key`, never the label."""
+    def key(self) -> tuple[str, str, int, bool, bool, bool, bool, bool, bool | str]:
+        """The arm this run measured — `Arm.suite_key`, never the label — with
+        the projection tile as its load reported it (arm_runs matches the
+        two)."""
         return (
             self.model_id,
             self.drafter_id,
@@ -90,6 +101,7 @@ class SuiteRun:
             self.attention_tile,
             self.projection_kernel,
             self.kv_int8,
+            self.projection_tile,
         )
 
     @property
@@ -102,12 +114,92 @@ class SuiteRun:
     @classmethod
     def from_dict(cls, d: dict) -> SuiteRun:
         # A row written before a setting existed ran without what it switches
-        # on — stock attention, stock projections, bf16 K/V — on every
-        # machine, so it reads False, and a resume under an arm that has the
-        # setting runs the task again rather than pool the two. Without the
-        # fallback, resuming such a run would raise KeyError.
-        d = {"attention_tile": False, "projection_kernel": False, "kv_int8": False, **d}
+        # on — stock attention, stock projections, bf16 K/V, no projection
+        # tile — on every machine, so it reads False, and a resume under an
+        # arm that has the setting runs the task again rather than pool the
+        # two. Without the fallback, resuming such a run would raise KeyError.
+        d = {
+            "attention_tile": False,
+            "projection_kernel": False,
+            "kv_int8": False,
+            "projection_tile": False,
+            **d,
+        }
         return cls(**{f.name: d[f.name] for f in dataclasses.fields(cls)})
+
+
+def loaded_tile(status: dict | None, setting: TileState) -> str:
+    """The projection tile as a load under ``setting`` reported it, as a suite row
+    records it: the scope ("all" or "mlp") while active, "unavailable" when it
+    was refused, "off" under false. Under any other setting a load that reports
+    off, or no status, has no tile at all (the mlx-lm backend), and records
+    "absent": a VLM load reports off only under false, so "off" stays the state
+    of a tile switched off, which no tile-capable setting may count."""
+    status = status or {}
+    state = status.get("state") or "off"
+    if state == "active":
+        return status.get("scope") or state
+    if state == "off" and setting is not False:
+        return "absent"
+    return state
+
+
+def _tile_states(setting: TileState) -> frozenset[TileState]:
+    """The row values a load under this projection_tile setting can have written,
+    as a resume after a flip counts them: true and "all" load either scope (under
+    "all" a load whose stacks had no plan serves the MLP alone and reports
+    "mlp"), "mlp" only its own, and each may be refused; "absent" is an engine
+    without the tile under any of them. A row recorded "off" ran with the tile
+    switched off, which a tile-capable setting must not count: the arm runs
+    again. Rows written before the state was recorded hold the setting: false
+    joins "off", and true is admitted under true, where its scope is unknown and
+    it keeps a group of its own."""
+    if setting is False:
+        return frozenset({"off", False})
+    scopes = {"mlp"} if setting == "mlp" else {"all", "mlp"}
+    return frozenset({*scopes, "unavailable", "absent", setting})
+
+
+def done_pairs(rows: Iterable[SuiteRun]) -> set[tuple[str, int]]:
+    """The (task, index) pairs these rows finished. Only the latest attempt at a
+    pair decides — a retry leaves its earlier row in the run's rows too,
+    appended rather than replaced — and a runner-only "error" row (TaskState has
+    no such state) is not a result to count as done; a task that ran and failed
+    is."""
+    latest: dict[tuple[str, int], SuiteRun] = {}
+    for r in rows:
+        latest[(r.task, r.index)] = r
+    return {key for key, r in latest.items() if r.state != "error"}
+
+
+def arm_runs(
+    arm: Arm, runs: Iterable[SuiteRun]
+) -> tuple[dict[TileState, list[SuiteRun]], TileState | None]:
+    """The rows of ``runs`` this arm measured, by the tile state each ran under,
+    and the state a reader takes (None when there is no row): the arm's key but
+    for the tile, its window, and a state a load of its setting reports
+    (_tile_states). Rows of two states never pool. The state taken is the one
+    whose rows finished the most (task, index) pairs, the latest of those tied:
+    a resume loads only while no state is complete, so a finished measurement
+    is never set aside for a later load's partial one."""
+    allowed = _tile_states(arm.projection_tile)
+    groups: dict[TileState, list[SuiteRun]] = {}
+    last: dict[TileState, int] = {}
+    for i, r in enumerate(runs):
+        if r.window != arm.window or r.key[:-1] != arm.suite_key[:-1]:
+            continue
+        if r.projection_tile not in allowed:
+            continue
+        state = "off" if r.projection_tile is False else r.projection_tile
+        groups.setdefault(state, []).append(r)
+        last[state] = i
+    if not groups:
+        return groups, None
+
+    def finished(state: TileState) -> tuple[int, int]:
+        return len(done_pairs(groups[state])), last[state]
+
+    return groups, max(groups, key=finished)
 
 
 @dataclass(frozen=True)
@@ -139,8 +231,8 @@ class CountingEngine:
         # drafter, draft_block, positions, int8_prefill_status,
         # verify_attention_status, draft_context_status, attention_tile_status,
         # projection_kernel_status, projection_kernel_drafter_status,
-        # kv_int8_status: whatever the backend has, read through
-        # getattr(..., None) by ManagedEngine.
+        # projection_tile_status, kv_int8_status: whatever the backend has,
+        # read through getattr(..., None) by ManagedEngine.
         return getattr(self._inner, name)
 
     def generate(
@@ -224,7 +316,7 @@ def interpreter_first(python: Path) -> Iterator[None]:
             os.environ["PATH"] = before
 
 
-def _error_run(task: SuiteTask, index: int, arm: Arm, error: str) -> SuiteRun:
+def _error_run(task: SuiteTask, index: int, arm: Arm, error: str, projection_tile: str) -> SuiteRun:
     return SuiteRun(
         task=task.name,
         index=index,
@@ -237,6 +329,7 @@ def _error_run(task: SuiteTask, index: int, arm: Arm, error: str) -> SuiteRun:
         attention_tile=arm.attention_tile,
         projection_kernel=arm.projection_kernel,
         kv_int8=arm.kv_int8,
+        projection_tile=projection_tile,
         window=arm.window,
         state="error",
         outcome=None,
@@ -310,6 +403,7 @@ def run_one(
         attention_tile=arm.attention_tile,
         projection_kernel=arm.projection_kernel,
         kv_int8=arm.kv_int8,
+        projection_tile=loaded_tile(engine.projection_tile_status, arm.projection_tile),
         window=arm.window,
         state="failed" if failed else "done",
         outcome=None if failed else result.outcome,
@@ -403,6 +497,22 @@ def _check_proj(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> No
         )
 
 
+def _check_projtile(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> None:
+    """The projection tile is inherited and unmeasured like the kernel, so the
+    same holds: where the engine reports it unavailable, the daemon would
+    serve this checkpoint without it, and the arm runs the same way after a
+    notice. Except for `no drafter`: the tile loads only beside a drafter,
+    so every drafterless arm on a machine it runs on gets that refusal, and
+    a notice there would say nothing. `off`, or no status, is
+    the setting switched off or an engine without the tile: no notice."""
+    if not arm.projection_tile:
+        return
+    status = engine.projection_tile_status or {}
+    if (status.get("reason") or "").startswith("no drafter"):
+        return
+    _notice_unavailable(arm, "projection tile", status, out, runs="without it")
+
+
 def _check_kv8(arm: Arm, engine: ManagedEngine, out: Callable[..., None]) -> None:
     """int8 K/V is inherited and unmeasured like the tile, so the same holds:
     where the engine reports it unavailable, the daemon would serve this
@@ -449,6 +559,7 @@ def _run_suite(
     tasks: list[SuiteTask],
     runs: int,
     done: set[tuple[str, int]],
+    done_by_tile: Mapping[TileState, set[tuple[str, int]]] | None,
     record: Callable[[SuiteRun], None],
     scratch: Path,
     out: Callable[..., None],
@@ -499,9 +610,16 @@ def _run_suite(
             _check_int8(arm, engine, out)
             _check_tile(arm, engine, out)
             _check_proj(arm, engine, out)
+            _check_projtile(arm, engine, out)
             _check_kv8(arm, engine, out)
         except RuntimeError as e:
             check_error = str(e)
+        tile = loaded_tile(engine.projection_tile_status, arm.projection_tile)
+        # Only the rows of the state this load reported count as done: rows of
+        # another scope verified another way, and the runs go again under this
+        # one rather than pool with them.
+        if done_by_tile is not None:
+            done = done_by_tile.get(tile, set())
         if check_error is None:
             for task in tasks:
                 for index in range(runs):
@@ -528,7 +646,7 @@ def _run_suite(
                             work=work,
                         )
                     except Exception as e:  # noqa: BLE001 — one run's failure, recorded; goes on
-                        result = _error_run(task, index, arm, f"{type(e).__name__}: {e}")
+                        result = _error_run(task, index, arm, f"{type(e).__name__}: {e}", tile)
                     # Before record(): a budget-exhausted run's generation can
                     # still be decoding under the engine's lock, and the next
                     # run's own budget clock must not start against it.
@@ -563,13 +681,17 @@ def run_suite(
     python: Path | None = None,
     active_memory: Callable[[], int] | None = None,
     work: Path | None = None,
+    done_by_tile: Mapping[TileState, set[tuple[str, int]]] | None = None,
 ) -> SuiteOutcome:
     """Every (task, run index) of the arm not in `done`, on a thread of its
     own that loads the engine once, hands each run to `record` as it
-    finishes, and releases its mlx state on the way out. Every run's project
-    runs at `work`, by default `project` beside `scratch` (outside every
-    arm's archive), before it is archived under `scratch`: arms compared on
-    one `work` see one prompt."""
+    finishes, and releases its mlx state on the way out. With `done_by_tile`
+    (the done set of each tile state, arm_runs' groups), the done set is the
+    one of the state the load reports instead, since a resume's load can pick
+    another scope than the rows' did. Every run's project runs at `work`, by
+    default `project` beside `scratch` (outside every arm's archive), before
+    it is archived under `scratch`: arms compared on one `work` see one
+    prompt."""
     outcome: list[SuiteOutcome | BaseException] = []
 
     def run() -> None:
@@ -580,6 +702,7 @@ def run_suite(
                     tasks,
                     runs,
                     done,
+                    done_by_tile,
                     record,
                     scratch,
                     out,

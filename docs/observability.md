@@ -237,8 +237,25 @@ code it was validated on, a failed warm-up or probe — the same way; the
 status document's `projection_kernel` block carries it as `drafter`, with
 its reason; at `draft_block=0` with the default DFlash2 drafter, whose own
 policy stays at five rows, an `active` route serves nothing in steady
-state), and, whenever
-a drafter loaded,
+state), then
+`projection_tile=active:all|active:mlp|unavailable|off` (whether speculative
+verify's projections, and the short chunk a generation prefills itself, run
+on the tensor-unit tile over slab-ordered weights, and at which scope: `all`
+with the attention and linear-attention projections copied, `mlp` with the
+MLP alone; when active, `projection_tile_probe_s=` (the real-shape compile,
+the conversion, the copy, the warm-up and the probe together),
+`projection_tile_budget_gib=` (what the automatic prompt-cache budget has
+left beside what was copied, `unknown` when Metal's headroom could not be
+read) and either `projection_tile_copy_gb=` (GB of 10⁹ bytes) or
+`projection_tile_copy=skipped`; `off` means `[model].projection_tile = false`
+or the mlx-lm backend, and `unavailable` a load the tile cannot serve, every
+load without an active projection kernel, attention tile, DFlash drafter or
+int8 prefill included — the status document's engine block carries
+`projection_tile` with `state`, `scope`, `reason` (at `mlp`, why the copy was
+skipped), `copy_gb` and `probe_seconds`, and the log splits INFO and
+`WARNING` the way it does for the kernel, beside one INFO `projection tile:
+scope=…` line at an active load naming the copy, the budget left, the
+seconds and, at `mlp`, the reason), and, whenever a drafter loaded,
 `draft_block=` (the verify block the engine pinned: the configured
 `speculative_block_size`, or for an unset one 8 where the projection kernel
 is active, 4 where only the attention tile is and 3 elsewhere, 0 being the
@@ -257,8 +274,18 @@ it cannot serve, every load whose attention tile is not `active` included,
 since it rides on the tile, and a window too small to put the ceiling
 above the floor — the status document's engine block carries `kv_int8`
 with its state and reason, and the log splits INFO and `WARNING` the way
-it does for the tile). One
-more line names the Anthropic tool *types* a turn dropped, when any.
+it does for the tile). Beyond these fields, and kv8's on the turn line, none
+of these kernels logs anything per turn: in-process counters count their paths
+for the tests and for harnesses that wrap the daemon. `tileattn.calls`,
+`projkernel.calls` and `kv8.calls` count every path they serve — the projection
+tile's verify runs as `projkernel.calls["verify_tile"]` and its module calls as
+`projkernel.calls["plain_tile"]`. `int8prefill.calls` has one key,
+`"int8_small"`: the calls on the slab-only MLP that only its own nine-row floor
+admits (under 128 rows in the last leading dimension, nine or more in all),
+which stock served before the conversion, counted once per MLP call and once per
+linear called on its own; the calls int8 prefill always took, from 128 rows, are
+not counted. One more line names the Anthropic tool *types* a turn dropped,
+when any.
 Each forwarded request logs one line too: `upstream`, method, path, the
 model id when the body named one, the upstream's status, and seconds to
 its headers — at `INFO` whatever the status, since that is the upstream's

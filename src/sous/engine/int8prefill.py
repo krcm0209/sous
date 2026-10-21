@@ -6,6 +6,11 @@ accelerators, with the affine correction applied per 64-code group. The two Meta
 kernels live as ``.metal`` files in ``kernels/`` and are compiled by mlx at model load
 (``mx.fast.metal_kernel``): no native build, no ABI coupling to an mlx version.
 
+A slab-only module (``sous.engine.slab``: the projection tile holds the MLP's
+weights in slab order) is read by the same GEMM through its slab address, and from
+SLAB_MIN_ROWS rows rather than MIN_ROWS, since stock ``quantized_matmul`` cannot
+read its flat planes at all.
+
 Derived from oMLX (jundot/omlx#3548, Apache License 2.0): qwen35_oq_a8.metal,
 qwen35_oq_a8_nax.metal and oq_a8_decode.h. See THIRD_PARTY_NOTICES.md.
 """
@@ -14,13 +19,15 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 import warnings
 from collections.abc import Callable, Iterable
 from importlib.resources import files
 from typing import Any, cast
 
-from sous.engine import nax
+from sous.engine import nax, slab
 from sous.engine.nax import Availability
+from sous.engine.slab import SlabInfo
 
 logger = logging.getLogger("sous.engine.int8prefill")
 
@@ -30,12 +37,20 @@ GROUP = 64
 # crossover so decode (1 row) and a speculative verify (one drafted block, at
 # most 16 rows under the drafter's own policy) never route.
 MIN_ROWS = 128
+# A slab-only module's floor: stock quantized_matmul cannot read its flat planes,
+# and the projection kernel serves its calls of up to 8 rows, so every call of 9
+# rows and more is int8's, whatever the Stage-A pass costs at that size. Its rows
+# are the product of the leading dimensions, as the projection kernel counts them,
+# so no batch shape falls between the two.
+SLAB_MIN_ROWS = 9
 # The PR's best Q4 tile: BM = 2 * 16 * WM rows, BN = 32 * WN columns, 32 * WM * WN
 # threads per threadgroup. The seven tile variants are within ~3% of each other.
 TILE_WM = 1
 TILE_WN = 2
 BM = 2 * 16 * TILE_WM
 BN = 32 * TILE_WN
+# The slab read takes a threadgroup's BN columns from one 256-column slab tile.
+assert slab.TILE % BN == 0
 # The dense Qwen3.5-family text model (Qwen3.6/3.8 checkpoints declare it too). The
 # MoE variant reuses the same GatedDeltaNet and MLP classes for its shared expert,
 # so the class wrappers would fire there as well; it is untested and refused by
@@ -51,6 +66,12 @@ def _kernel_text(name: str) -> str:
 
 
 _kernels: dict[str, Callable[..., list[Any]]] = {}
+
+# Served calls by path, for the tests and for harnesses that wrap the daemon;
+# nothing is logged per turn. int8_small: calls on slab-only modules that only their
+# own floor admits, under MIN_ROWS in the last leading dimension, which stock served
+# before the conversion (one per MLP call, one per linear called on its own).
+calls: dict[str, int] = {"int8_small": 0}
 
 
 def _kernel(
@@ -191,33 +212,47 @@ def _error_line(text: str) -> str:
     return (named or lines or [text])[0]
 
 
-def qmm(qa: Any, sa: Any, ra: Any, weight: Any, scales: Any, biases: Any) -> Any:
+def qmm(
+    qa: Any,
+    sa: Any,
+    ra: Any,
+    weight: Any,
+    scales: Any,
+    biases: Any,
+    *,
+    slab: SlabInfo | None = None,
+) -> Any:
     """``[M, N]`` in ``scales.dtype`` from Stage-A outputs and a projection's packed
-    affine-Q4 weight with its scales/biases in their stored ``[N, K/64]`` layout."""
+    affine-Q4 weight with its scales/biases in their stored ``[N, K/64]`` layout, or,
+    with ``slab``, a slab-only module's flat planes, read in place, N its real
+    width."""
     import mlx.core as mx
 
     m, k = qa.shape
-    n = weight.shape[0]
+    n = weight.shape[0] if slab is None else slab.n_real
     if n % BN or k % GROUP:
         raise ValueError(
             f"int8 prefill GEMM needs N % {BN} == 0 and K % {GROUP} == 0; got N={n} K={k}"
         )
+    # The flat planes carry no K of their own: the activations' K would address
+    # them with another group count, past their end or short of it.
+    if slab is not None and slab.k != k:
+        raise ValueError(f"int8 prefill GEMM: the slab planes hold K={slab.k}, not K={k}")
+    if slab is None:
+        name, switch = "sous_int8_q4_gemm", ""
+        planes = [weight, mx.contiguous(scales.T), mx.contiguous(biases.T)]
+    else:
+        # A header define, never a template argument: the preprocessor cannot see one.
+        name, switch = "sous_int8_q4_gemm_slab", "#define SLAB 1\n"
+        planes = [weight, scales, biases]
     (out,) = _kernel(
-        "sous_int8_q4_gemm",
+        name,
         ["qa", "sa", "ra", "w", "scales", "biases", "Mp"],
         ["out"],
         _kernel_text("q4_int8_gemm.metal"),
-        _kernel_text("common.h") + _kernel_text("nax.h"),
+        _kernel_text("common.h") + switch + _kernel_text("nax.h"),
     )(
-        inputs=[
-            qa,
-            sa,
-            ra,
-            weight,
-            mx.contiguous(scales.T),
-            mx.contiguous(biases.T),
-            mx.array([m], dtype=mx.int32),
-        ],
+        inputs=[qa, sa, ra, *planes, mx.array([m], dtype=mx.int32)],
         template=[
             ("T", scales.dtype),
             ("WM", TILE_WM),
@@ -237,8 +272,14 @@ def linear_int8(linear: Any, x: Any, stage: tuple[Any, Any, Any] | None = None) 
     """One tagged projection on the INT8 path; ``stage`` is a Stage A already taken
     for this exact ``x`` (shared across gate/up or qkv/z), else it is taken here."""
     qa, sa, ra = stage if stage is not None else stage_a(x)
-    out = qmm(qa, sa, ra, linear.weight, linear.scales, linear.biases)
-    return out.reshape(*x.shape[:-1], linear.weight.shape[0])
+    info = slab.slab_info(linear)
+    if info is None:
+        # No slab keyword: a six-argument qmm stand-in still serves a model in
+        # mlx's layout.
+        out = qmm(qa, sa, ra, linear.weight, linear.scales, linear.biases)
+        return out.reshape(*x.shape[:-1], linear.weight.shape[0])
+    out = qmm(qa, sa, ra, linear.weight, linear.scales, linear.biases, slab=info)
+    return out.reshape(*x.shape[:-1], info.n_real)
 
 
 # --------------------------------------------------------------------------------
@@ -284,10 +325,22 @@ def _tagged(module: Any) -> bool:
     return bool(getattr(module, _TAG, False))
 
 
-def _rows_ok(x: Any) -> bool:
+def _rows_ok(x: Any, slab: SlabInfo | None = None) -> bool:
+    """Whether int8 takes a call of ``x``: MIN_ROWS rows and more in its last
+    leading dimension, or, on a module whose SlabInfo is ``slab``, SLAB_MIN_ROWS
+    and more across all of them (Stage A flattens them)."""
     import mlx.core as mx
 
-    return x.ndim >= 2 and x.shape[-2] >= MIN_ROWS and x.dtype in (mx.bfloat16, mx.float16)
+    if x.ndim < 2 or x.dtype not in (mx.bfloat16, mx.float16):
+        return False
+    if slab is not None and math.prod(x.shape[:-1]) >= SLAB_MIN_ROWS:
+        return True
+    return x.shape[-2] >= MIN_ROWS
+
+
+def _count(x: Any) -> None:
+    if x.shape[-2] < MIN_ROWS:
+        calls["int8_small"] += 1
 
 
 def _root(model: Any) -> Any:
@@ -382,12 +435,15 @@ def _wrap_mlp(cls: type) -> None:
     # with inspect.getsource follow it, and would otherwise hash this wrapper.
     @functools.wraps(orig)
     def call(self: Any, x: Any, *args: Any, **kwargs: Any) -> Any:
+        # gate_proj's form stands for the MLP's: convert_mlp converts all three,
+        # and linear_int8 reads each linear's own marker either way.
         if (
-            _rows_ok(x)
+            _rows_ok(x, slab.slab_info(self.gate_proj))
             and _tagged(self.gate_proj)
             and _tagged(self.up_proj)
             and _tagged(self.down_proj)
         ):
+            _count(x)
             shared = stage_a(x)
             gate = linear_int8(self.gate_proj, x, shared)
             up = linear_int8(self.up_proj, x, shared)
@@ -428,7 +484,8 @@ def _wrap_quantized_linear() -> None:
 
     @functools.wraps(orig)
     def call(self: Any, x: Any) -> Any:
-        if _tagged(self) and _rows_ok(x):
+        if _tagged(self) and _rows_ok(x, slab.slab_info(self)):
+            _count(x)
             handed = getattr(self, _STAGE, None)
             # Identity, not equality: the GDN wrapper handed a stage for this exact
             # input object; any other array gets its own Stage A.

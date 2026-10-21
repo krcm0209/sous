@@ -17,6 +17,13 @@ same per-row arithmetic in the same order with one simdgroup per column, so its
 output equals the MMA kernel's at one row bitwise; ``kernel_available()`` and the
 load-time probe check that it does.
 
+Both kernels also read slab-ordered weights (``sous.engine.slab``), the form a
+slab-only module holds: the MMA bodies under a ``SLAB`` header define that moves
+only where a (column, group) unit is read, the one-row kernel through a second
+body. Either way a row's bits are those over mlx's layout. A linear reaches them
+as an entry of ``linears()``: mlx's ``(weight, scales, biases)``, or a
+``Weights`` descriptor carrying the flat planes and their ``SlabInfo``.
+
 The kernel needs no tensor units and no MPP, so it compiles on any Metal GPU with
 half x float simdgroup MMA; ``kernel_available()`` is what its tests skip on. Its
 lane map, W x^T orientation and epilogue follow Splash (incoai/splash), and its
@@ -34,11 +41,12 @@ import math
 import time
 import traceback
 import warnings
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Sequence
+from typing import Any, NamedTuple
 
-from sous.engine import nax, tileattn, verifyattn
+from sous.engine import int8prefill, nax, slab, tileattn, verifyattn
 from sous.engine.int8prefill import _error_line, _kernel, _kernel_text, _model_type, _root
+from sous.engine.slab import SlabInfo
 
 logger = logging.getLogger("sous.engine.projkernel")
 
@@ -89,6 +97,42 @@ _ROW_THREADS = 32 * _ROW_NSG
 _THREADGROUP_BYTES = 32 * 1024
 _ROW_MAX_K = _THREADGROUP_BYTES // (_ROW_NSG * (_ROW_RC + 1) * 4) * _GROUP
 _ROW_KERNEL = "sous_proj_row"
+# projection_row.metal holds the mlx-layout body, this line, then the slab body,
+# whose launch is one lane per column of a slab tile. linears() routes both by
+# _ROW_MAX_K; the slab body's threadgroup memory, one fp32 per quant group, stays
+# far below Apple's 32 KB there.
+_ROW_SLAB_MARK = "// SLAB\n"
+_ROW_SLAB_KERNEL = "sous_proj_row_slab"
+_ROW_SLAB_THREADS = slab.TILE
+
+
+class Weights(NamedTuple):
+    """A linear as linears() takes it when its module is slab-only: the flat
+    planes and the SlabInfo that says what they hold. A module holding mlx's
+    arrays is handed over as the bare (weight, scales, biases) instead, so every
+    caller that unpacks three fields keeps working on an unconverted model;
+    readers normalise either with _as_weights() and never splat an entry."""
+
+    w: Any
+    scales: Any
+    biases: Any
+    slab: SlabInfo | None
+
+
+# One linear of a linears() call: mlx's arrays, or a Weights.
+Entry = tuple[Any, Any, Any] | Weights
+
+
+def _as_weights(entry: Entry) -> Weights:
+    if isinstance(entry, Weights):
+        return entry
+    w, scales, biases = entry
+    return Weights(w, scales, biases, None)
+
+
+def _width(entry: Weights) -> int:
+    """N: the real width, which a slab's flat planes no longer show."""
+    return entry.slab.n_real if entry.slab is not None else int(entry.w.shape[0])
 
 
 @functools.cache
@@ -131,31 +175,34 @@ def _source(kind: str, nl: int) -> str:
 
 
 @functools.cache
-def _header(presum: bool) -> str:
-    switch = "#define PRESUM 1\n" if presum else ""
+def _header(presum: bool, slab: bool) -> str:
+    """The switches are header defines, never template arguments: the
+    preprocessor cannot see a template argument."""
+    switch = ("#define PRESUM 1\n" if presum else "") + ("#define SLAB 1\n" if slab else "")
     return _kernel_text("common.h") + switch + _kernel_text("projection_mma.h")
 
 
 @functools.cache
-def _kernel_spec(kind: str, nl: int) -> tuple[str, list[str], list[str], str, str]:
+def _kernel_spec(kind: str, nl: int, slab: bool) -> tuple[str, list[str], list[str], str, str]:
     """A variant's name, input names, output names, source and header at one
-    linear count: text only, so a launch does not build it again."""
+    linear count and weight form: text only, so a launch does not build it
+    again. The slab form is the same source under its own name and header."""
     inputs = ["x", "sums"] if kind == "staged_ps" else ["x"]
     for i in range(nl):
         inputs += [f"w{i}", f"s{i}", f"b{i}"]
     return (
-        f"sous_proj_{kind}_n{nl}",
+        f"sous_proj_{kind}_slab_n{nl}" if slab else f"sous_proj_{kind}_n{nl}",
         inputs,
         [f"y{i}" for i in range(nl)],
         _source(kind, nl),
-        _header(kind == "staged_ps"),
+        _header(kind == "staged_ps", slab),
     )
 
 
-def _projection_kernel(kind: str, nl: int) -> Callable[..., list[Any]]:
-    """One kernel per variant and linear count: int8prefill's builder caches by name,
-    and each count generates a different selection."""
-    return _kernel(*_kernel_spec(kind, nl), compile_options=_SAFE_MATH)
+def _projection_kernel(kind: str, nl: int, slab: bool = False) -> Callable[..., list[Any]]:
+    """One kernel per variant, linear count and weight form: int8prefill's builder
+    caches by name, and each count generates a different selection."""
+    return _kernel(*_kernel_spec(kind, nl, slab), compile_options=_SAFE_MATH)
 
 
 def _group_sums_kernel() -> Callable[..., list[Any]]:
@@ -164,22 +211,34 @@ def _group_sums_kernel() -> Callable[..., list[Any]]:
         ["x"],
         ["sums"],
         _bodies()[2],
-        _header(False),
+        _header(False, False),
         compile_options=_SAFE_MATH,
     )
 
 
+@functools.cache
+def _row_bodies() -> tuple[str, str]:
+    """The one-row kernel's mlx-layout and slab bodies."""
+    mlx_body, slab_body = _kernel_text("projection_row.metal").split(_ROW_SLAB_MARK)
+    return mlx_body, slab_body
+
+
 def _row_source() -> str:
-    return _kernel_text("projection_row.metal")
+    return _row_bodies()[0]
 
 
-def _row_kernel() -> Callable[..., list[Any]]:
-    """The one-row kernel: one body, its K and N template arguments."""
+def _row_slab_source() -> str:
+    return _row_bodies()[1]
+
+
+def _row_kernel(slab: bool = False) -> Callable[..., list[Any]]:
+    """The one-row kernel for mlx's layout, or with `slab` for slab planes: one
+    body each, their K and N template arguments."""
     return _kernel(
-        _ROW_KERNEL,
+        _ROW_SLAB_KERNEL if slab else _ROW_KERNEL,
         ["x", "w", "scales", "biases"],
         ["y"],
-        _row_source(),
+        _row_slab_source() if slab else _row_source(),
         _kernel_text("common.h"),
         compile_options=_SAFE_MATH,
     )
@@ -306,46 +365,73 @@ def _dispatch(rows: int, k: int, ns: tuple[int, ...]) -> dict[str, Any]:
     }
 
 
-def _launch(kind: str, x2: Any, weights: list[tuple[Any, Any, Any]]) -> list[Any]:
-    """One dispatch of one variant over [T, K] rows and 1..4 linears; [T, N_i] bf16
-    each."""
+def _launch(kind: str, x2: Any, weights: Sequence[Entry]) -> list[Any]:
+    """One dispatch of one variant over [T, K] rows and 1..4 linears of one form;
+    [T, N_i] bf16 each, N_i a slab's real width."""
     rows, k = x2.shape
+    entries = [_as_weights(e) for e in weights]
     inputs = [x2, _group_sums(x2)] if kind == "staged_ps" else [x2]
-    for w, scales, biases in weights:
-        inputs += [w, scales, biases]
-    dispatch = _dispatch(rows, k, tuple(w.shape[0] for w, _, _ in weights))
-    return _projection_kernel(kind, len(weights))(inputs=inputs, **dispatch)
+    for e in entries:
+        inputs += [e.w, e.scales, e.biases]
+    dispatch = _dispatch(rows, k, tuple(_width(e) for e in entries))
+    kernel = _projection_kernel(kind, len(entries), entries[0].slab is not None)
+    return kernel(inputs=inputs, **dispatch)
 
 
 @functools.cache
-def _row_dispatch(k: int, n: int) -> dict[str, Any]:
+def _row_dispatch(k: int, n: int, tiles: int | None = None) -> dict[str, Any]:
     """The one-row launch arguments for K and N, built once per shape for the
-    reason _dispatch is."""
+    reason _dispatch is; with a slab's `tiles`, the slab body's, one threadgroup
+    per tile."""
     import mlx.core as mx
 
+    if tiles is None:
+        grid, threads = _ROW_THREADS * -(-n // _ROW_COLS), _ROW_THREADS
+    else:
+        grid, threads = _ROW_SLAB_THREADS * tiles, _ROW_SLAB_THREADS
     return {
         "template": [("KD", k), ("ND", n)],
-        "grid": (_ROW_THREADS * -(-n // _ROW_COLS), 1, 1),
-        "threadgroup": (_ROW_THREADS, 1, 1),
+        "grid": (grid, 1, 1),
+        "threadgroup": (threads, 1, 1),
         "output_shapes": [(1, n)],
         "output_dtypes": [mx.bfloat16],
     }
 
 
-def _launch_row(x2: Any, w: Any, scales: Any, biases: Any) -> Any:
-    """One [1, K] bf16 row through one linear on the one-row kernel; [1, N] bf16."""
-    (y,) = _row_kernel()(inputs=[x2, w, scales, biases], **_row_dispatch(x2.shape[-1], w.shape[0]))
+def _launch_row(x2: Any, w: Any, scales: Any, biases: Any, slab: SlabInfo | None = None) -> Any:
+    """One [1, K] bf16 row through one linear on the one-row kernel; [1, N] bf16.
+    mlx's layout is called with the arrays alone, a slab-only linear's planes
+    with their SlabInfo as `slab`."""
+    k = x2.shape[-1]
+    if slab is None:
+        (y,) = _row_kernel()(inputs=[x2, w, scales, biases], **_row_dispatch(k, w.shape[0]))
+    else:
+        dispatch = _row_dispatch(k, slab.n_real, slab.tiles)
+        (y,) = _row_kernel(True)(inputs=[x2, w, scales, biases], **dispatch)
     return y
 
 
-def linears(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]:
+def _row(x2: Any, entry: Entry) -> Any:
+    """One row through `one_row`, which is read at call time (the seam tests swap
+    a stand-in into): mlx's form as the four arrays, today's call, and a slab
+    entry with `slab=` only, so a stand-in that takes four arguments keeps
+    serving every unconverted model."""
+    e = _as_weights(entry)
+    if e.slab is None:
+        return one_row(x2, e.w, e.scales, e.biases)
+    return one_row(x2, e.w, e.scales, e.biases, slab=e.slab)
+
+
+def linears(x: Any, weights: Sequence[Entry]) -> tuple[Any, ...]:
     """x [..., K] bf16 with 1..MAX_ROWS rows (the product of its leading dimensions)
     through 1..4 affine-Q4 gs64 linears that share it, given as (weight uint32
-    [N, K/8], scales bf16 [N, K/64], biases bf16 [N, K/64]); one [..., N_i] bf16 per
-    linear. One row goes to the one-row kernel, one dispatch per linear (a row's
-    bits do not depend on the linears beside it), unless K is past _ROW_MAX_K.
-    Raises ValueError for what the kernel cannot take; the hooks check their
-    calls before reaching here, so a raise is a caller's bug, never a fallback."""
+    [N, K/8], scales bf16 [N, K/64], biases bf16 [N, K/64]) or, for slab-only
+    linears, as Weights; one [..., N_i] bf16 per linear, N_i a slab's real width.
+    The linears of one call share a form: a dispatch compiles one. One row goes
+    to the one-row kernel, one dispatch per linear (a row's bits do not depend on
+    the linears beside it), unless K is past _ROW_MAX_K. Raises ValueError for
+    what the kernel cannot take; the hooks check their calls before reaching
+    here, so a raise is a caller's bug, never a fallback."""
     import mlx.core as mx
 
     k = x.shape[-1]
@@ -356,32 +442,47 @@ def linears(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]:
         raise ValueError(f"projection kernel takes 1..{MAX_ROWS} rows, got {rows}")
     if not 1 <= len(weights) <= _MAX_LINEARS:
         raise ValueError(f"projection kernel takes 1..{_MAX_LINEARS} linears, got {len(weights)}")
-    for w, scales, _ in weights:
-        if w.shape[-1] * 8 != k or scales.shape[-1] * _GROUP != k:
+    entries = [_as_weights(e) for e in weights]
+    if len({e.slab is None for e in entries}) > 1:
+        raise ValueError("projection kernel: a call mixes slab-ordered and mlx-layout linears")
+    for e in entries:
+        if e.slab is None:
+            if e.w.shape[-1] * 8 != k or e.scales.shape[-1] * _GROUP != k:
+                raise ValueError(f"projection kernel: a linear's K is not the activations' K={k}")
+        elif e.slab.k != k:
             raise ValueError(f"projection kernel: a linear's K is not the activations' K={k}")
-        if scales.size < _MIN_DEVICE_SIZE:
+        elif (
+            e.w.size != e.slab.code_words
+            or e.scales.size != e.slab.units
+            or e.biases.size != e.slab.units
+        ):
+            raise ValueError(f"projection kernel: a linear's planes do not hold its {e.slab}")
+        if e.scales.size < _MIN_DEVICE_SIZE:
             raise ValueError(
-                f"projection kernel: a linear's {scales.size} scales are fewer than "
+                f"projection kernel: a linear's {e.scales.size} scales are fewer than "
                 f"{_MIN_DEVICE_SIZE}"
             )
-    kind = variant(k, sum(int(w.shape[0]) for w, _, _ in weights))
+    kind = variant(k, sum(_width(e) for e in entries))
     if k // _GROUP < _KS or (kind != "plain" and k % _STAGED_K):
         raise ValueError(f"projection kernel: K={k} does not fit the {kind} variant")
     x2 = x if x.ndim == 2 else x.reshape(rows, k)
+    # The normalised entries, so neither seam normalises them again: every
+    # projection of every decoded token comes through here.
     if rows == 1 and k <= _ROW_MAX_K:
-        calls["one_row"] += len(weights)
-        # `one_row` is read at call time, the seam tests swap a stand-in into.
-        outs = [one_row(x2, w, scales, biases) for w, scales, biases in weights]
+        calls["one_row"] += len(entries)
+        outs = [_row(x2, e) for e in entries]
     else:
-        outs = _launch(kind, x2, weights)
+        outs = _launch(kind, x2, entries)
     if x.ndim == 2:
         return tuple(outs)
     return tuple(out.reshape(*x.shape[:-1], out.shape[-1]) for out in outs)
 
 
-def linear(x: Any, w: Any, scales: Any, biases: Any) -> Any:
-    """One linear: linears() with a single (w, scales, biases)."""
-    return linears(x, [(w, scales, biases)])[0]
+def linear(x: Any, w: Any, scales: Any, biases: Any, slab: SlabInfo | None = None) -> Any:
+    """One linear: linears() with a single (w, scales, biases), or with `slab` a
+    slab-only linear's planes."""
+    entry = (w, scales, biases) if slab is None else Weights(w, scales, biases, slab)
+    return linears(x, [entry])[0]
 
 
 # The seams the hooks and linears() call through, looked up at call time so
@@ -605,7 +706,12 @@ _DRAFT_TAG = "_sous_projection_kernel_draft"
 # 1 while the kernel serves, else 0: set only by an enable() that reached active,
 # raised by the probe only around its calls through the hooks, and cleared first
 # by every enable(), by clear() and by the probe on its way out. A plain int, so
-# nothing it holds outlives an unload.
+# nothing it holds outlives an unload. It switches the kernel off for modules in
+# mlx's layout only: a slab-only module (a converted load's MLP) has no reader but
+# its slab paths, so both hooks serve it whatever this says, and at 0 a converted
+# load runs its MLP there beside stock attention and GDN projections. A harness
+# that wants a round off the projection tile on a converted load clears the tile's
+# round flag (projtile.set_round_flag), which keeps the window's calls here.
 _active = 0
 # The drafter's flag, with the same discipline. Its writers: enable_drafter(),
 # which clears it first and sets it last, on `active` only; the probe's hook step
@@ -627,9 +733,11 @@ _DRAFT_MIN_ROWS = 6
 # Per projection call, not per turn: the tests read deltas, and so can a harness
 # that wraps the daemon. Nothing is logged per turn.
 calls: dict[str, int] = {
-    "verify_kernel": 0,  # verifier _linear/_linears calls the kernel served
+    "verify_kernel": 0,  # verifier _linear/_linears calls served, run by run here or on the tile
     "verify_split": 0,  # of those, calls over MAX_ROWS rows cut into runs
+    "verify_tile": 0,  # runs of those the projection tile served
     "plain_kernel": 0,  # QuantizedLinear calls the kernel served
+    "plain_tile": 0,  # QuantizedLinear calls the projection tile served
     "draft_kernel": 0,  # the drafter's own QuantizedLinear calls the kernel served
     "declined": 0,  # a route's flag set and every linear tagged, refused for dtype or shape
     "one_row": 0,  # one-row kernel dispatches linears() served, one per linear
@@ -709,19 +817,68 @@ def untag_drafter(drafter: Any) -> None:
 
 
 def clear() -> None:
-    """Stop serving: both hooks hand every call on from here on, the drafter's
-    included. Tags left on an unloaded model are inert while the flags are 0,
+    """Stop serving: both hooks hand every call on a module in mlx's layout on
+    from here on, the drafter's included. A slab-only module, which nothing else
+    can read, is still served from its slab paths, and a call on one they cannot
+    take raises. Tags left on an unloaded model are inert while the flags are 0,
     and untagging it would need a reference that keeps its weights alive."""
     global _active, _draft_active
     _active = 0
     _draft_active = 0
 
 
-def _weights(module: Any) -> tuple[Any, Any, Any]:
-    return module.weight, module.scales, module.biases
+def _weights(module: Any) -> Entry:
+    """A module's linears() entry: the bare arrays while it holds mlx's layout, a
+    Weights with its SlabInfo once it is slab-only."""
+    return _entry(module, slab.slab_info(module))
 
 
-def _run_mma(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]:
+def _entry(module: Any, info: SlabInfo | None) -> Entry:
+    """_weights() for a module whose marker the caller has read already."""
+    if info is None:
+        return module.weight, module.scales, module.biases
+    return Weights(module.weight, module.scales, module.biases, info)
+
+
+def _any_slab(linears: Sequence[Any]) -> bool:
+    return any(slab.slab_info(m) is not None for m in linears)
+
+
+def _no_slab_path(module: Any, info: SlabInfo, x: Any, why: str) -> RuntimeError:
+    """The error for a call on a slab-only module that none of its slab paths
+    takes: mlx's own kernels would misread its flat planes or fail inside mlx on
+    their shape, so the call fails here, naming the module, its shape and why."""
+    path = vars(module).get(slab.PATH_ATTR, "a slab-only linear")
+    return RuntimeError(
+        f"{path} (slab-only, N={info.n_real} K={info.k}) has no path for x "
+        f"{tuple(x.shape)} {x.dtype}: {why}; its planes are served only by the "
+        f"projection kernel (bf16 rows, 1..{MAX_ROWS}) and int8 prefill (bf16 or fp16 "
+        f"rows, {int8prefill.SLAB_MIN_ROWS} and more), never by mlx's own kernels"
+    )
+
+
+def _int8_refusal(module: Any, x: Any, rows: int) -> str:
+    """Why int8's wrapper does not take a call past MAX_ROWS rows (or of none) on a
+    slab-only module, its real cause first: the dtype, then a module int8 never
+    tagged, and only then the rows."""
+    import mlx.core as mx
+
+    if not rows:
+        return "no rows"
+    if x.dtype not in (mx.bfloat16, mx.float16):
+        return f"int8 prefill takes bf16 or fp16 rows, not {x.dtype}"
+    if not int8prefill._tagged(module):
+        return "int8 prefill never tagged it"
+    return f"int8 prefill does not take these {rows} rows"
+
+
+def _int8_takes(module: Any, x: Any, info: SlabInfo) -> bool:
+    """Whether int8's wrapper serves this call on a slab-only module: then this hook
+    hands it on, and int8's wrapper takes it wherever it sits in the chain."""
+    return int8prefill._tagged(module) and int8prefill._rows_ok(x, info)
+
+
+def _run_mma(x: Any, weights: list[Entry]) -> tuple[Any, ...]:
     """mma over the call's linears, at most _MAX_LINEARS per launch: a fused
     group's rows equal its singles', so where a longer list is cut changes no
     bit. `mma` is read from the module at call time, the seam tests swap the
@@ -733,52 +890,120 @@ def _run_mma(x: Any, weights: list[tuple[Any, Any, Any]]) -> tuple[Any, ...]:
 
 
 def _serve_verify(linears: Any, x: Any) -> tuple[Any, ...] | None:
-    """The kernel's outputs for one verifier call while the flag is set, else
-    None, and the wrapper calls mlx-vlm's method with the call's own arguments.
-    A call of more than MAX_ROWS rows (block 0 lets the drafter's own policy
-    verify 16) is cut along T into runs of at most MAX_ROWS: a row's bits do not
-    depend on the rows beside it, so every run equals its rows computed one at a
-    time, as decode computes them."""
-    if not linears or not all(_tagged(m) for m in linears):
+    """The kernel's outputs for one verifier call while the flag is set or the
+    call holds a slab-only linear, else None, and the wrapper calls mlx-vlm's
+    method with the call's own arguments. A call of more than MAX_ROWS rows
+    (block 0 lets the drafter's own policy verify 16) is cut along T into runs
+    of at most MAX_ROWS: a row's bits do not depend on the rows beside it, so
+    every run equals its rows computed one at a time, as decode computes them.
+    Inside the projection tile's decode window a run goes to the tile instead
+    when every linear of the call has a launch there at a tuned plan; else the
+    whole call stays here, so no call mixes the two. A call holding a slab-only
+    linear that this declines raises: mlx-vlm's method would read its planes as
+    mlx's layout."""
+    # The slab test only where the tags do not settle it: every linear of a
+    # default load is tagged, and every verifier projection of every round
+    # passes through here.
+    if not linears or not (all(_tagged(m) for m in linears) or _any_slab(linears)):
         return None
     import mlx.core as mx
 
-    if getattr(x, "ndim", 0) != 3 or x.dtype != mx.bfloat16:
-        calls["declined"] += 1
-        return None
+    if (
+        getattr(x, "ndim", 0) != 3
+        or x.dtype != mx.bfloat16
+        or not 0 < x.shape[0] <= MAX_ROWS
+        or not x.shape[1]
+    ):
+        return _decline_verify(linears, x)
     batch, rows = x.shape[0], x.shape[1]
-    step = MAX_ROWS // batch if batch else 0
-    if not step or not rows:
+    step = MAX_ROWS // batch
+    calls["verify_kernel"] += 1
+    # Function-local: projtile imports this module.
+    from sous.engine import projtile
+
+    # Hook 1's answer does not depend on a run's rows, so a call none of whose runs
+    # the tile can serve (outside the window, a round the harness closed) never
+    # pays for the lookup; likewise the MMA path's entries are built only for a run
+    # it serves. Every verifier projection of every round passes through here.
+    launches = projtile.plan_for_call(linears) if projtile.serves(batch * rows, hook=1) else None
+
+    def run(part: Any) -> tuple[Any, ...]:
+        if launches is not None and projtile.serves(part.size // part.shape[-1], hook=1):
+            calls["verify_tile"] += 1
+            return projtile.verify(linears, part, launches)
+        return _run_mma(part, [_weights(m) for m in linears])
+
+    if rows <= step:
+        return run(x)
+    calls["verify_split"] += 1
+    runs = [run(x[:, j : j + step]) for j in range(0, rows, step)]
+    return tuple(mx.concatenate(list(parts), axis=1) for parts in zip(*runs, strict=True))
+
+
+def _decline_verify(linears: Sequence[Any], x: Any) -> None:
+    """A verifier call hook 1 cannot serve: handed on, unless it holds a slab-only
+    linear, which mlx-vlm's method would read as mlx's layout."""
+    import mlx.core as mx
+
+    slabbed = next(((m, i) for m in linears if (i := slab.slab_info(m)) is not None), None)
+    if slabbed is None:
         calls["declined"] += 1
         return None
-    weights = [_weights(m) for m in linears]
-    calls["verify_kernel"] += 1
-    if rows <= step:
-        return _run_mma(x, weights)
-    calls["verify_split"] += 1
-    runs = [_run_mma(x[:, j : j + step], weights) for j in range(0, rows, step)]
-    return tuple(mx.concatenate(list(parts), axis=1) for parts in zip(*runs, strict=True))
+    ndim = getattr(x, "ndim", 0)
+    if ndim != 3:
+        why = f"the verifier's rows are [batch, T, K], not {ndim}-D"
+    elif x.dtype != mx.bfloat16:
+        why = f"the kernel takes bf16 rows, not {x.dtype}"
+    elif x.shape[0] > MAX_ROWS:
+        why = f"a batch of {x.shape[0]} is wider than {MAX_ROWS} rows"
+    else:
+        why = "no rows"
+    raise _no_slab_path(*slabbed, x, why)
 
 
 def _serve_plain(module: Any, x: Any) -> Any | None:
     """The kernel's output for one call of a tagged module while the flag is set,
-    else None, and the wrapper calls the method it wrapped: mlx's, or int8's,
-    which takes its own calls of 128 rows and more. Rows are the product of the
-    leading dimensions, so this serves one-row decode, a last prefill chunk of
-    at most MAX_ROWS rows and the one-row forward that ends every prefill
-    segment, and nothing longer."""
-    if not _tagged(module):
+    or of a slab-only module whatever the flag and its tag say; else None, and
+    the wrapper calls the method it wrapped: mlx's, or int8's, which takes its
+    own calls of 128 rows and more, and a slab-only module's from nine. A call
+    on a slab-only module that neither this nor int8 takes raises instead of
+    returning None: the wrapped method would reach mlx's own kernels, which
+    cannot read its planes. Rows are the product of the leading dimensions, so
+    this serves one-row decode, a last prefill chunk of at most MAX_ROWS rows
+    and the one-row forward that ends every prefill segment, and nothing
+    longer. Inside the projection tile's decode window a call of two rows and
+    more on a module with planes there (the decode's own generation-prompt
+    chunk) goes to the tile; one row stays on the one-row kernel."""
+    info = slab.slab_info(module)
+    if info is None and not _tagged(module):
         return None
     import mlx.core as mx
 
     shape = x.shape
-    if not 1 <= math.prod(shape[:-1]) <= MAX_ROWS:
+    rows = math.prod(shape[:-1])
+    if not 1 <= rows <= MAX_ROWS:
+        if info is not None and not _int8_takes(module, x, info):
+            raise _no_slab_path(module, info, x, _int8_refusal(module, x, rows))
         return None
     if len(shape) < 2 or x.dtype != mx.bfloat16:
+        if info is not None:
+            why = "a 1-D x" if len(shape) < 2 else f"the kernel takes bf16 rows, not {x.dtype}"
+            raise _no_slab_path(module, info, x, why)
         calls["declined"] += 1
         return None
+    # Never for one row: one-row decode calls every projection of the model per
+    # token, and pays nothing here for the tile.
+    if rows > 1:
+        # Function-local: projtile imports this module.
+        from sous.engine import projtile
+
+        if projtile.serves(rows, hook=2):
+            launches = projtile.plan_for_call((module,))
+            if launches is not None:
+                calls["plain_tile"] += 1
+                return projtile.plain(module, x, launches)
     calls["plain_kernel"] += 1
-    return _run_mma(x, [_weights(module)])[0]
+    return _run_mma(x, [_entry(module, info)])[0]
 
 
 def _serve_draft(module: Any, x: Any) -> Any | None:
@@ -813,7 +1038,7 @@ def _wrap_linear(original: Callable[..., Any]) -> Callable[..., Any]:
     # functools.wraps: the source pins follow __wrapped__ back to mlx-vlm's body.
     @functools.wraps(original)
     def _linear(self: Any, linear: Any, x: Any) -> Any:
-        if _active:
+        if _active or slab.slab_info(linear) is not None:
             out = _serve_verify((linear,), x)
             if out is not None:
                 return out[0]
@@ -828,7 +1053,7 @@ def _wrap_linears(original: Callable[..., Any]) -> Callable[..., Any]:
 
     @functools.wraps(original)
     def _linears(self: Any, linears: Any, x: Any) -> Any:
-        if _active:
+        if _active or _any_slab(linears):
             out = _serve_verify(linears, x)
             if out is not None:
                 return out
@@ -846,7 +1071,7 @@ def _wrap_call(original: Callable[..., Any]) -> Callable[..., Any]:
 
     @functools.wraps(original)
     def call(self: Any, x: Any) -> Any:
-        if _active:
+        if _active or slab.slab_info(self) is not None:
             out = _serve_plain(self, x)
             if out is not None:
                 return out
@@ -864,8 +1089,9 @@ def install_hooks() -> None:
     """Wrap the exact verifier's _linear and _linears and nn.QuantizedLinear's
     __call__, once per process: a method already carrying the mark is left alone.
     enable() calls this on the first activation only, and the wrappers are never
-    removed; while the flags are 0 each costs an int read per call, the module
-    hook two (the target's flag and the drafter's).
+    removed; while the flags are 0 each costs an int read and a marker read per
+    call (a slab-only module is served whatever the flag says), the module hook
+    also the drafter's flag.
 
     The verifier is wrapped on the class because its projections reach mlx-vlm's
     ops through names imported into its own module, and verifyattn's _attention
@@ -873,7 +1099,9 @@ def install_hooks() -> None:
     hook. gemma4's, nemotron_h's and qwen4_exp's verifiers inherit the wrap: only
     the tags keep them stock. Each wrapper falls through to what it wrapped, so
     int8's wrapper of nn.QuantizedLinear.__call__ may sit above or below this
-    one: int8 takes 128 rows and more, this one 8 and fewer."""
+    one: int8 takes 128 rows and more, and 9 and more on a slab-only module, this
+    one 8 and fewer; on a slab-only module this one raises for any call int8
+    would not take either, wherever int8's wrapper sits."""
     import mlx.nn as nn
 
     verifier = _verifier_class()
@@ -1037,14 +1265,24 @@ _NAN_ROW = 3
 
 
 def _in_features(module: Any) -> int:
-    """K of an eligible projection, read off its per-group scales."""
-    return module.scales.shape[1] * _GROUP
+    """K of an eligible projection, read off its per-group scales, or its SlabInfo
+    once its planes are flat."""
+    info = slab.slab_info(module)
+    return info.k if info is not None else module.scales.shape[1] * _GROUP
 
 
-def _dispatch_key(group: tuple[Any, ...]) -> tuple[int, tuple[int, ...]]:
-    """What picks a pipeline: K and each linear's N, in order. The variant follows
-    from K and their sum, and T is the template's own argument."""
-    return _in_features(group[0]), tuple(m.weight.shape[0] for m in group)
+def _out_features(module: Any) -> int:
+    """N, the real width, as _in_features reads K."""
+    info = slab.slab_info(module)
+    return info.n_real if info is not None else int(module.weight.shape[0])
+
+
+def _dispatch_key(group: tuple[Any, ...]) -> tuple[int, tuple[int, ...], bool]:
+    """What picks a pipeline: K, each linear's N in order, and whether the
+    weights are slab-ordered, whose bodies are kernels of their own. The variant
+    follows from K and the N's sum, and T is the template's own argument."""
+    form = slab.slab_info(group[0]) is not None
+    return _in_features(group[0]), tuple(_out_features(m) for m in group), form
 
 
 def _dispatch_groups(root: Any) -> list[tuple[Any, ...]]:
@@ -1063,7 +1301,7 @@ def _dispatch_groups(root: Any) -> list[tuple[Any, ...]]:
             groups.append((attention.q_proj, attention.k_proj, attention.v_proj))
         groups.append((layer.mlp.gate_proj, layer.mlp.up_proj))
     groups += [(m,) for _, m in root.named_modules() if isinstance(m, nn.QuantizedLinear)]
-    unique: dict[tuple[int, tuple[int, ...]], tuple[Any, ...]] = {}
+    unique: dict[tuple[int, tuple[int, ...], bool], tuple[Any, ...]] = {}
     for group in groups:
         unique.setdefault(_dispatch_key(group), group)
     return list(unique.values())
@@ -1088,19 +1326,19 @@ def warm_up(model: Any) -> None:
     mx.eval(list(inputs.values()))
     counted = dict(calls)
     try:
-        singles: dict[tuple[int, int], Any] = {}
+        singles: dict[tuple[int, tuple[int, ...], bool], Any] = {}
         for group in groups:
             weights = [_weights(m) for m in group]
             x = inputs[_in_features(group[0])]
             mx.eval([mma(x[:, :t], weights) for t in range(1, MAX_ROWS + 1)])
             for m in group:
-                singles.setdefault((_in_features(m), m.weight.shape[0]), m)
+                singles.setdefault(_dispatch_key((m,)), m)
         # The real `mma` already sends each T = 1 call above to the one-row
         # kernel; this states the one-row pipelines in their own right, so the
         # warm-up still covers them when `mma` is a stand-in that does not.
-        for (k, _), m in singles.items():
+        for (k, _, _), m in singles.items():
             if k <= _ROW_MAX_K:
-                mx.eval(one_row(inputs[k][0, :1], *_weights(m)))
+                mx.eval(_row(inputs[k][0, :1], _weights(m)))
     finally:
         calls.update(counted)
 
@@ -1144,7 +1382,11 @@ def _check_group(group: tuple[Any, ...], names: list[str], key: Any) -> str | No
             (single,) = mma(x, [weights[i]])
             if not mx.array_equal(single, full[i]).item():
                 return f"grouping: {name} fused in {label} differs from {name} alone"
-    for (w, scales, biases), got, name in zip(weights, full, names, strict=True):
+    for entry, got, name in zip(weights, full, names, strict=True):
+        w, scales, biases, info = _as_weights(entry)
+        if info is not None:
+            # stock reads mlx's layout only: the planes' own arrays, unpacked
+            w, scales, biases = slab.unpack(w, scales, biases, info)
         want = mx.quantized_matmul(
             x, w, scales=scales, biases=biases, transpose=True, group_size=_GROUP, bits=4
         )
@@ -1174,7 +1416,9 @@ def _probe_steps(root: Any) -> str | None:
     # Through both hooks, on the first full-attention layer (layer 3 of the
     # 27B): the exact verifier's feed-forward over _PROBE_ROWS rows (gate+up
     # fused, then down) against the plain MLP one row at a time, as decode
-    # calls it. Its rows must be identical, which is what greedy parity rests on.
+    # calls it. Its rows must be identical: drafter-on/off greedy parity rests
+    # on that while the projection tile is not active, and while it is, every
+    # path outside the tile's decode window keeps these bits.
     mlp = full.mlp
     verifier = _verifier_class()()
     x = mx.random.normal((1, _PROBE_ROWS, _in_features(mlp.gate_proj)), key=mx.random.key(0))
@@ -1234,7 +1478,9 @@ def _check_rows(root: Any, names: dict[int, str]) -> str | None:
     import mlx.core as mx
 
     groups = [g for g in _dispatch_groups(root) if _in_features(g[0]) <= _ROW_MAX_K]
-    cases = [([_weights(m) for m in g], [names.get(id(m), "?") for m in g]) for g in groups]
+    cases: list[tuple[Sequence[Entry], list[str]]] = [
+        ([_weights(m) for m in g], [names.get(id(m), "?") for m in g]) for g in groups
+    ]
     kinds = ("random", *(f"{layout}-cancelling" for layout in CANCELLING))
     rows: dict[int, Any] = {}
     for i, k in enumerate(sorted({_in_features(g[0]) for g in groups})):
@@ -1247,11 +1493,12 @@ def _check_rows(root: Any, names: dict[int, str]) -> str | None:
         rows[k] = mx.concatenate(built)
     mx.eval(list(rows.values()), [weights for weights, _ in cases])
     for weights, labels in cases:
-        x = rows[weights[0][0].shape[1] * 8]
+        first = _as_weights(weights[0])
+        x = rows[first.slab.k if first.slab is not None else first.w.shape[1] * 8]
         refs = mma(x, weights)
         checks = [
-            (label, kind, mx.array_equal(one_row(x[r : r + 1], *linear_), ref[r : r + 1]))
-            for linear_, ref, label in zip(weights, refs, labels, strict=True)
+            (label, kind, mx.array_equal(_row(x[r : r + 1], entry), ref[r : r + 1]))
+            for entry, ref, label in zip(weights, refs, labels, strict=True)
             for r, kind in enumerate(kinds)
         ]
         same = mx.stack([check for *_, check in checks])
@@ -1525,7 +1772,7 @@ def _probe_drafter(linears: list[Any]) -> str | None:
     counted = dict(calls)
     try:
         for i, ((k, _), (name, m)) in enumerate(shapes.items()):
-            w, scales, biases = _weights(m)
+            w, scales, biases, _ = _as_weights(_weights(m))
             x = mx.random.normal((1, MAX_ROWS, k), key=mx.random.key(900 + i)).astype(mx.bfloat16)
             for t in range(_DRAFT_MIN_ROWS, MAX_ROWS + 1):
                 (got,) = mma(x[:, :t], [(w, scales, biases)])

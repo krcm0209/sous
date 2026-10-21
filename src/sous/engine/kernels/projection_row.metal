@@ -24,7 +24,9 @@
 // projkernel.py routes past _ROW_MAX_K to the MMA kernel instead.
 // sous's own, except the nibble decode and the two-fma epilogue it shares with
 // projection_mma.metal, which follow Splash and its Apple7/8 port (Apache-2.0;
-// see THIRD_PARTY_NOTICES.md). Prepended by projkernel.py with common.h.
+// see THIRD_PARTY_NOTICES.md). projkernel.py splits this file in two at the SLAB
+// marker line and prepends common.h to each body: this one reads mlx's layout,
+// the one after the marker slab-ordered weights.
 //
 // Template: KD (K), ND (N). Grid (32 * NSG * ceil(N / (RC * NSG)), 1, 1),
 // threadgroup (32 * NSG, 1, 1).
@@ -104,3 +106,86 @@
     const float a3 = simd_shuffle_down(acc, 3);
     if (r < RC && q == 0 && n < ND) y[n] = static_cast<bfloat>(((acc + a1) + a2) + a3);
   }
+
+// SLAB
+// Slab body: the same arithmetic over slab-ordered weights (slab.py: codes
+// [tiles][G][256] units of 32 bytes, one column's one quant group each, and
+// scales and biases [tiles][G][256]), so its output equals the body above's, and
+// the MMA kernel's, bit for bit. A tile's 256 columns of one group lie side by
+// side, so one lane takes one output column: lane r of threadgroup t walks
+// column 256t + r's groups in K order, and the lanes of a simdgroup read 32
+// adjacent units of each group. Each group's activation sum, in the MMA bodies'
+// tree, is computed once per threadgroup into gsum; then each lane runs the four
+// quarters [q*G/4, (q+1)*G/4), each group's dot an fma chain from +0 in the MMA's
+// order and its epilogue the two fmas, each quarter from +0, and adds them
+// ((p0 + p1) + p2) + p3 before one bf16 rounding. Columns past N read the zero
+// padding the planes carry and write nothing. The layout is Splash's
+// (incoai/splash, Apache-2.0); the arithmetic is the body above's.
+//
+// Template: KD (K), ND (N, the real width). Grid (256 * tiles, 1, 1),
+// threadgroup (256, 1, 1).
+  constexpr uint G = KD / 64;
+  constexpr uint KS = 4;  // K quarters: part of the summation order
+  const uint tile = threadgroup_position_in_grid.x;
+  const uint r = thread_position_in_threadgroup.x;
+  const uint n = tile * 256 + r;
+  threadgroup float gsum[G];
+  const device bfloat *xb = (const device bfloat *)x;
+  for (uint g = r; g < G; g += 256) {
+    const device vec<bfloat, 8> *xg = (const device vec<bfloat, 8> *)(xb + g * 64);
+    float xf[64];
+#pragma unroll
+    for (uint j = 0; j < 8; ++j) {
+      const vec<bfloat, 8> v = xg[j];
+#pragma unroll
+      for (uint i = 0; i < 8; ++i) xf[8 * j + i] = float(v[i]);
+    }
+    // the MMA bodies' tree: each fm lane's eight values, then the butterfly
+    float L[8];
+#pragma unroll
+    for (uint fm = 0; fm < 8; ++fm) {
+      const uint o = 16 * (fm >> 1) + 4 * (fm & 1);
+      L[fm] = ((xf[o] + xf[o + 1]) + (xf[o + 2] + xf[o + 3])) +
+              ((xf[o + 8] + xf[o + 9]) + (xf[o + 10] + xf[o + 11]));
+    }
+    gsum[g] = ((L[0] + L[1]) + (L[2] + L[3])) + ((L[4] + L[5]) + (L[6] + L[7]));
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const device uint8_t *wb = (const device uint8_t *)w + (ulong(tile) * G * 256 + r) * 32;
+  const device bfloat *sc = (const device bfloat *)scales + ulong(tile) * G * 256 + r;
+  const device bfloat *bi = (const device bfloat *)biases + ulong(tile) * G * 256 + r;
+  float part[KS];
+  for (uint q = 0; q < KS; ++q) {
+    float acc = 0.0f;
+    const uint g0 = (q * G) / KS, g1 = ((q + 1) * G) / KS;
+    for (uint g = g0; g < g1; ++g) {
+      const device vec<bfloat, 8> *xg = (const device vec<bfloat, 8> *)(xb + g * 64);
+      float xf[64];
+#pragma unroll
+      for (uint j = 0; j < 8; ++j) {
+        const vec<bfloat, 8> v = xg[j];
+#pragma unroll
+        for (uint i = 0; i < 8; ++i) xf[8 * j + i] = float(v[i]);
+      }
+      // a column's next group is 256 units, 8192 bytes, on
+      const device uint4 *wr = (const device uint4 *)(wb + ulong(g) * 8192);
+      const uint4 lo = wr[0], hi = wr[1];
+      const uint wd[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+      float dot = 0.0f;
+#pragma unroll
+      for (uint h = 0; h < 2; ++h)
+#pragma unroll
+        for (uint s = 0; s < 4; ++s)
+#pragma unroll
+          for (uint c = 0; c < 4; ++c) {
+            const uint j = 2 * c + h;
+            const half2 a = as_type<half2>(((wd[j] >> (4 * s)) & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);
+            dot = fma(float(a.x), xf[8 * j + s], dot);
+            dot = fma(float(a.y), xf[8 * j + s + 4], dot);
+          }
+      acc = fma(dot, float(sc[ulong(g) * 256]), acc);
+      acc = fma(gsum[g], float(bi[ulong(g) * 256]), acc);
+    }
+    part[q] = acc;
+  }
+  if (n < ND) y[n] = static_cast<bfloat>(((part[0] + part[1]) + part[2]) + part[3]);

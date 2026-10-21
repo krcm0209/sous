@@ -56,6 +56,15 @@ class Arm:
     # Inherited and keyed the same way: attention over int8 K/V differs from
     # attention over bf16 K/V by the quantisation, not only in the last bits.
     kv_int8: bool = True
+    # Inherited, and the setting the arm loads with: the tile's verify rows
+    # differ from the projection kernel's in their last bits. Its suite rows
+    # record what the load reported instead (runner.loaded_tile), since "mlp"
+    # and "all" put different linears on the tile and true picks either at
+    # load, and runner.arm_runs matches them to the setting. The winner stage's
+    # int8 arm inherits it too: int8 prefill is what lets the tile load, so
+    # that arm grades the two together, as the diff that writes int8_prefill
+    # deploys them.
+    projection_tile: bool | str = True
     # True only for the winner stage's own int8 arm, built to *measure*
     # INT8 prefill: the engine refusing it must fail that arm. Every other
     # arm's int8_prefill is merely inherited from the user's config (every
@@ -73,11 +82,13 @@ class Arm:
         return (self.model_id, self.drafter_id, self.block_size)
 
     @property
-    def suite_key(self) -> tuple[str, str, int, bool, bool, bool, bool, bool]:
+    def suite_key(self) -> tuple[str, str, int, bool, bool, bool, bool, bool, bool | str]:
         """What identifies an arm across suite runs and a resume: the bench
         key, the one setting only the suite may change, and whether the
-        sampler is greedy, the attention tile, the projection kernel and
-        int8 K/V, which every arm inherits."""
+        sampler is greedy, the attention tile, the projection kernel, int8
+        K/V and the projection tile, which every arm inherits. A suite row's
+        last field is the tile state its load reported, so rows are matched to
+        an arm through runner.arm_runs, never by equality with this."""
         return (
             *self.key,
             self.int8_prefill,
@@ -85,6 +96,7 @@ class Arm:
             self.attention_tile,
             self.projection_kernel,
             self.kv_int8,
+            self.projection_tile,
         )
 
 
@@ -182,6 +194,36 @@ def resolve_block(user: SousConfig, checkpoints: dict[str, Checkpoint]) -> SousC
     return user
 
 
+def _fit(
+    user: SousConfig, target: Checkpoint, drafter: Checkpoint | None, working_set_bytes: int
+) -> Fit:
+    """The user's window fitted with this drafter or none, and with what the
+    projection tile's memory guard weighs: the copy only where the tile's
+    static check passes for this pair, so the fit names the scope a load
+    would take and none where the tile would not run (every drafterless fit
+    among them)."""
+    from sous.engine import projtile
+
+    kind = None if drafter is None else drafter_kind(drafter.config)
+    copy = None
+    # Only a model that passes the check is sure to have every field the
+    # copy's size is read from.
+    if projtile.static_reason(user, target.config, kind) is None:
+        copy = projtile.static_copy_bytes(target.config)
+    return fit(
+        target,
+        drafter,
+        window=user.max_context_tokens,
+        floor=MIN_CONTEXT_TOKENS,
+        working_set_bytes=working_set_bytes,
+        tile_copy_bytes=copy,
+        tile_config=user.projection_tile,
+        # In bytes, as the engine factory hands the configured budget on.
+        cache_budget=None if user.prompt_cache_gb is None else int(user.prompt_cache_gb * 2**30),
+        cache_enabled=user.prompt_cache,
+    )
+
+
 def _arm(
     user: SousConfig,
     cand: Candidate,
@@ -225,6 +267,7 @@ def _arm(
         attention_tile=user.attention_tile,
         projection_kernel=user.projection_kernel,
         kv_int8=user.kv_int8,
+        projection_tile=user.projection_tile,
     )
 
 
@@ -239,8 +282,6 @@ def quick_arms(
     configuration among them. All arms of a model share one window: the one
     the fit yields with the model's heaviest drafter, so a block size is never
     measured at a window another block size could not run at."""
-    window = user.max_context_tokens
-    floor = MIN_CONTEXT_TOKENS
     arms: list[Arm] = []
     refusals: list[Refusal] = []
     for cand in _with_current(user, candidates):
@@ -276,11 +317,11 @@ def quick_arms(
             if cand.id == user.model_id and drafter_id == user.speculative_draft_id:
                 users_drafter_unusable = True
         heaviest = max(drafters, key=lambda d: d.bytes or 0, default=None)
-        f = fit(target, heaviest, window=window, floor=floor, working_set_bytes=working_set_bytes)
+        f = _fit(user, target, heaviest, working_set_bytes)
         if not f.fits:
             refusals.append(Refusal(cand.id, "", f.detail))
             continue
-        own = fit(target, None, window=window, floor=floor, working_set_bytes=working_set_bytes)
+        own = _fit(user, target, None, working_set_bytes)
         arms.append(
             _arm(
                 user,
@@ -293,9 +334,7 @@ def quick_arms(
             )
         )
         for drafter in drafters:
-            own = fit(
-                target, drafter, window=window, floor=floor, working_set_bytes=working_set_bytes
-            )
+            own = _fit(user, target, drafter, working_set_bytes)
             is_users_own_pair = cand.id == user.model_id and drafter.id == user.speculative_draft_id
             # The user's own block size may sit outside the curated set (0 is
             # the drafter's adaptive policy; anything else they set by hand),
@@ -315,10 +354,14 @@ def winner_stage_arms(winner: Arm, *, nax: bool, checkpoint: Checkpoint) -> list
     """An INT8 prefill arm for a winner that has it off, where the tensor
     units and the checkpoint's quantization allow it (the engine refuses
     anything else with a status, and the arm would measure the stock path
-    under the int8 label), judged on its own against the winner. Greedy
-    sampling is never an arm: it removes the variety a stuck agent needs to
-    get out of a repetition loop, and a suite whose greedy runs of a task
-    repeat one trajectory cannot measure that."""
+    under the int8 label), judged on its own against the winner. It keeps the
+    user's projection_tile like every other setting: the tile serves only
+    beside active int8 prefill, so where it can run the winner ran without
+    it and this arm with it, and the grade is that of the configuration the
+    diff (int8_prefill alone) then deploys. Greedy sampling is never an arm:
+    it removes the variety a stuck agent needs to get out of a repetition
+    loop, and a suite whose greedy runs of a task repeat one trajectory
+    cannot measure that."""
     from sous.engine.int8prefill import SUPPORTED_MODEL_TYPES
 
     arms: list[Arm] = []

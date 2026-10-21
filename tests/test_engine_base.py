@@ -2653,6 +2653,7 @@ def test_default_engine_factory_maps_every_model_value_onto_the_backend(monkeypa
         int8_prefill=True,
         attention_tile=False,
         projection_kernel=False,
+        projection_tile="mlp",
         kv_int8=False,
         speculative_block_explicit=True,
     )
@@ -2668,6 +2669,7 @@ def test_default_engine_factory_maps_every_model_value_onto_the_backend(monkeypa
         "int8_prefill": True,
         "attention_tile": False,
         "projection_kernel": False,
+        "projection_tile": "mlp",
         "kv_int8": False,
         "fork_dir": None,
         "fork_budget": None,
@@ -3331,4 +3333,231 @@ def test_status_carries_the_kv_int8_view_when_the_engine_reports_one(tmp_path):
     assert manager.status()["kv_int8"] == {
         "state": "unavailable",
         "reason": "window below the kv8 floor",
+    }
+
+
+# ---- projection tile -------------------------------------------------------------
+
+_PTILE_ALL = {
+    "state": "active",
+    "scope": "all",
+    "reason": None,
+    "copy_gb": 4.0912,
+    "probe_seconds": 1.2,
+    "budget_left_gib": 13.08,
+}
+
+
+def _tile_engine_factory(ptile: dict | None):
+    """An engine with an active kernel, its drafter route active, block 8 and the
+    projection tile reporting `ptile`."""
+
+    def factory(model_id):
+        engine = _positional_factory(model_id)
+        engine.projection_kernel_status = {  # ty: ignore[unresolved-attribute]
+            "state": "active",
+            "reason": None,
+            "probe_seconds": 0.37,
+        }
+        engine.projection_kernel_drafter_status = {  # ty: ignore[unresolved-attribute]
+            "state": "active",
+            "reason": None,
+            "linears": 47,
+            "probe_seconds": 0.12,
+        }
+        engine.draft_block = 8  # ty: ignore[unresolved-attribute]
+        if ptile is not None:
+            engine.projection_tile_status = ptile  # ty: ignore[unresolved-attribute]
+        return engine
+
+    return factory
+
+
+def _load_line(caplog, tmp_path, ptile: dict | None) -> str:
+    import logging
+
+    mgr = EngineManager(_cfg(tmp_path), engine_factory=_tile_engine_factory(ptile))
+    with caplog.at_level(logging.INFO, logger="sous.engine"):
+        mgr.get()
+    lines = [r.getMessage() for r in caplog.records if r.name == "sous.engine"]
+    assert len(lines) == 1, lines
+    return lines[0]
+
+
+def test_the_load_line_carries_the_projection_tile_after_the_drafter_route(caplog, tmp_path):
+    """The tile's tokens follow the kernel's and its drafter route's and precede
+    the block: the scope, the load's cost, the prompt-cache budget the copy
+    leaves, and the copy itself in GB."""
+    line = _load_line(caplog, tmp_path, _PTILE_ALL)
+    assert line.endswith(
+        " projection_kernel=active projection_kernel_probe_s=0.37"
+        " projection_kernel_drafter=active projection_kernel_drafter_probe_s=0.12"
+        " projection_tile=active:all"
+        " projection_tile_probe_s=1.2 projection_tile_budget_gib=13.1"
+        " projection_tile_copy_gb=4.1 draft_block=8"
+    ), line
+
+
+@pytest.mark.parametrize(
+    ("status", "tokens"),
+    [
+        (
+            {
+                **_PTILE_ALL,
+                "scope": "mlp",
+                "reason": "copy would leave 9.0 GiB of prompt-cache budget (< 14)",
+                "copy_gb": None,
+                "probe_seconds": 0.84,
+                "budget_left_gib": 13.04,
+            },
+            " projection_tile=active:mlp projection_tile_probe_s=0.84"
+            " projection_tile_budget_gib=13.0 projection_tile_copy=skipped",
+        ),
+        (
+            {
+                **_PTILE_ALL,
+                "scope": "mlp",
+                "reason": "headroom unreadable",
+                "copy_gb": None,
+                "budget_left_gib": None,
+            },
+            " projection_tile=active:mlp projection_tile_probe_s=1.2"
+            " projection_tile_budget_gib=unknown projection_tile_copy=skipped",
+        ),
+        (
+            {
+                "state": "unavailable",
+                "scope": None,
+                "reason": "no drafter",
+                "copy_gb": None,
+                "probe_seconds": None,
+                "budget_left_gib": None,
+            },
+            " projection_tile=unavailable",
+        ),
+        (
+            {
+                "state": "unavailable",
+                "scope": None,
+                "reason": "probe: row 3 differs",
+                "copy_gb": None,
+                "probe_seconds": 2.5,
+                "budget_left_gib": None,
+            },
+            " projection_tile=unavailable",
+        ),
+        (
+            {
+                "state": "off",
+                "scope": None,
+                "reason": None,
+                "copy_gb": None,
+                "probe_seconds": None,
+                "budget_left_gib": None,
+            },
+            " projection_tile=off",
+        ),
+        (None, ""),
+    ],
+    ids=["mlp", "mlp-unknown-budget", "unavailable", "unavailable-probed", "off", "absent"],
+)
+def test_the_load_line_prints_the_mlp_scope_and_unavailable(caplog, tmp_path, status, tokens):
+    """An unavailable or off tile prints its state alone, as the kernel's does,
+    whatever its status still holds from a probe that ran; an engine without
+    the attribute prints nothing."""
+    line = _load_line(caplog, tmp_path, status)
+    assert line.endswith(
+        " projection_kernel_drafter=active projection_kernel_drafter_probe_s=0.12"
+        + tokens
+        + " draft_block=8"
+    ), line
+
+
+def test_the_status_document_reports_the_projection_tile_with_get(tmp_path):
+    """Five keys, read with get: the budget figure is the load line's, and a
+    status that lacks a key (an older engine, an LM-style off dict) reads None
+    rather than raising inside the status route."""
+    inner = FakeEngine([])
+    manager = EngineManager(_cfg(tmp_path), engine_factory=lambda mid: inner)
+    manager.get()
+    assert "projection_tile" not in manager.status(), "fakes without the attribute stay silent"
+    inner.projection_tile_status = _PTILE_ALL  # ty: ignore[unresolved-attribute]
+    assert manager.status()["projection_tile"] == {
+        "state": "active",
+        "scope": "all",
+        "reason": None,
+        "copy_gb": 4.0912,
+        "probe_seconds": 1.2,
+    }
+    inner.projection_tile_status = {"state": "off", "reason": None}  # ty: ignore[unresolved-attribute]
+    assert manager.status()["projection_tile"] == {
+        "state": "off",
+        "scope": None,
+        "reason": None,
+        "copy_gb": None,
+        "probe_seconds": None,
+    }
+
+
+@pytest.mark.parametrize("value", [True, False, "mlp", "all"])
+def test_default_engine_factory_hands_the_tile_value_to_the_vlm_engine(
+    monkeypatch, tmp_path, value
+):
+    """The config's value reaches the VLM engine as it was parsed, its scope
+    strings included; the LM backend has no parameter for it."""
+    from sous.engine import base, lm, vlm
+
+    seen: dict[str, dict] = {}
+
+    class RecordingVLM:
+        def __init__(self, model_id, **kwargs):
+            seen["vlm"] = kwargs
+
+    class RecordingLM:
+        def __init__(self, model_id, **kwargs):
+            seen["lm"] = kwargs
+
+    monkeypatch.setattr(vlm, "VLMEngine", RecordingVLM)
+    monkeypatch.setattr(lm, "LMEngine", RecordingLM)
+    monkeypatch.setattr("sous.engine.window.kv_bytes_per_token", lambda cfg: 1024)
+    factory = base.default_engine_factory(_cfg(tmp_path, projection_tile=value), forks=False)
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"vision_config": {}})
+    factory("m")
+    got = seen["vlm"]["projection_tile"]
+    assert got == value and type(got) is type(value)
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"model_type": "qwen3_5"})
+    factory("m")
+    assert "projection_tile" not in seen["lm"]
+
+
+def test_a_direct_factory_caller_leaves_the_projection_tile_off(monkeypatch):
+    """Scripts and tests that call the factory themselves keep the projection
+    kernel's paths and mlx's weight layout unless they ask."""
+    from sous.engine import base, vlm
+
+    seen: dict[str, dict] = {}
+
+    class RecordingVLM:
+        def __init__(self, model_id, **kwargs):
+            seen["vlm"] = kwargs
+
+    monkeypatch.setattr(vlm, "VLMEngine", RecordingVLM)
+    monkeypatch.setattr(base, "fetch_model_config", lambda mid: {"vision_config": {}})
+    monkeypatch.setattr("sous.engine.window.kv_bytes_per_token", lambda cfg: 1024)
+    base._default_factory("m", 0.7, 0.8, 20, True, cache_budget=0)
+    assert seen["vlm"]["projection_tile"] is False
+
+
+def test_lm_engine_reports_the_projection_tile_off(monkeypatch):
+    from sous.engine.lm import LMEngine
+
+    _stub(monkeypatch, "mlx_lm", load=lambda model_id: (object(), _RecordingTokenizer()))
+    _stub(monkeypatch, "mlx_lm.sample_utils", make_sampler=lambda **kw: None)
+    engine = LMEngine("test/model", cache_budget=0)
+    assert engine.projection_tile_status == {
+        "state": "off",
+        "scope": None,
+        "reason": None,
+        "copy_gb": None,
+        "probe_seconds": None,
     }

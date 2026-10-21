@@ -460,8 +460,11 @@ def serves(n_row: int) -> bool:
     """Whether the row that sees n_row keys reads the mirror: N8 <= n_row < L in
     an open, uncapped window (a forced one serves from N8 whatever L). A row's
     path depends on its own key count alone, so a drafter-on and a drafter-off
-    decode of one request serve the same rows. The seams look this up through
-    the module on every call, so a harness may wrap it."""
+    decode of one request serve the same rows, which drafter-on/off parity
+    needs while the projection tile is not active; while it is, the same
+    property keeps a row's path independent of the block size, which block
+    invariance on the drafter's path needs. The seams look this up through the
+    module on every call, so a harness may wrap it."""
     window = _window
     if not _active or window is None or window.state == "capped":
         return False
@@ -928,11 +931,12 @@ def _probe_exactness(
 
 
 def _probe_parity(codes: Any, sc: Any, qpool: Any, marks: list[int], splits: int) -> str | None:
-    """What greedy parity with the drafter on or off rests on: every verify
-    row array_equal to the one-row call at its own key count, at each mark
-    for T = 1..MAX_RUN, with the rows below the mark, straddling it and from
-    it (the tile's three placements). Query row i of the pool sits at
-    position mark - 10 + i."""
+    """What greedy parity with the drafter on or off rests on while the
+    projection tile is not active, and block invariance on the drafter's path
+    while it is: every verify row array_equal to the one-row call at its own
+    key count, at each mark for T = 1..MAX_RUN, with the rows below the mark,
+    straddling it and from it (the tile's three placements). Query row i of
+    the pool sits at position mark - 10 + i."""
     import mlx.core as mx
 
     for mark in marks:

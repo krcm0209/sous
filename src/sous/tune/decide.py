@@ -11,7 +11,7 @@ from sous.config import SousConfig
 from sous.tune.arms import Arm
 from sous.tune.bench import BenchRow
 from sous.tune.hardware import gib
-from sous.tune.suite.runner import SuiteRun
+from sous.tune.suite.runner import SuiteRun, arm_runs
 
 MARGIN = 0.05
 # The floor and every mean grade are float arithmetic over pass fractions
@@ -155,7 +155,7 @@ def quick_decision(user: SousConfig, arms: list[Arm], rows: list[BenchRow]) -> Q
 @dataclass(frozen=True)
 class ArmSummary:
     label: str
-    key: tuple[str, str, int, bool, bool, bool, bool, bool]
+    key: tuple[str, str, int, bool, bool, bool, bool, bool, bool | str]
     model_id: str
     runs: int
     completed: int
@@ -172,13 +172,15 @@ def summarize(arm: Arm, runs: list[SuiteRun], rows: list[BenchRow]) -> ArmSummar
     """The arm's suite result in the rule's terms; None when it has no run.
     The peak comes from the bench row of the same model, drafter and block:
     the suite measures time and quality, the bench measured memory."""
-    # A resumed run whose window changed carries suite rows of two windows
-    # (see _suite_stage's own done-set, keyed the same way): only rows at
-    # this arm's window belong to it, or wall time and completed counts mix
-    # two different measurements.
-    mine = [r for r in runs if r.key == arm.suite_key and r.window == arm.window]
-    if not mine:
+    # A resumed run whose window changed carries suite rows of two windows,
+    # and one whose load picked another projection tile scope rows of two
+    # scopes (see _suite_stage's own done-set, matched the same way): only
+    # rows at this arm's window and of the one state arm_runs takes belong to
+    # it, or wall time and completed counts mix two measurements.
+    groups, state = arm_runs(arm, runs)
+    if state is None:
         return None
+    mine = groups[state]
     # A retried (task, index) — _suite_stage no longer treats a runner-only
     # "error" row as done, so it runs again — leaves the stale row in
     # results.jsonl beside the fresh one; only the later row (last write
@@ -194,7 +196,8 @@ def summarize(arm: Arm, runs: list[SuiteRun], rows: list[BenchRow]) -> ArmSummar
     )
     return ArmSummary(
         label=arm.label,
-        key=arm.suite_key,
+        # The tile as the rows ran under it, which the setting does not say.
+        key=(*arm.suite_key[:-1], state),
         model_id=arm.model_id,
         runs=len(mine),
         completed=sum(1 for r in mine if r.completed),

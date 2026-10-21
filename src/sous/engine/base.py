@@ -262,6 +262,7 @@ def _default_factory(
     int8_prefill: bool = False,
     attention_tile: bool = False,
     projection_kernel: bool = False,
+    projection_tile: bool | str = False,
     kv_int8: bool = False,
     fork_dir: Path | None = None,
     fork_budget: int | None = None,
@@ -326,6 +327,7 @@ def _default_factory(
             int8_prefill=int8_prefill,
             attention_tile=attention_tile,
             projection_kernel=projection_kernel,
+            projection_tile=projection_tile,
             kv_int8=kv_int8,
             # In tokens, the window the reserve above is sized from: kv8's
             # mirror must fit beside the turn's bf16 KV inside it. With no
@@ -335,9 +337,10 @@ def _default_factory(
             fork_budget=fork_budget,
             weights_identity=weights,
         )
-    # The drafter settings, the attention tile, the projection kernel and kv8
-    # stop here: speculative decoding and the kernels' hooks are mlx-vlm
-    # paths, and the mlx-lm backend has no parameter for any of them.
+    # The drafter settings, the attention tile, the projection kernel, the
+    # projection tile and kv8 stop here: speculative decoding and the
+    # kernels' hooks are mlx-vlm paths, and the mlx-lm backend has no
+    # parameter for any of them.
     from sous.engine import lm
 
     return lm.LMEngine(
@@ -383,6 +386,7 @@ def default_engine_factory(config: SousConfig, *, forks: bool = True) -> Callabl
         int8_prefill=config.int8_prefill,
         attention_tile=config.attention_tile,
         projection_kernel=config.projection_kernel,
+        projection_tile=config.projection_tile,
         kv_int8=config.kv_int8,
         fork_dir=fork_dir,
         fork_budget=fork_budget,
@@ -444,6 +448,13 @@ class ManagedEngine:
         # (`off` without a DFlash drafter); the LM backend and fakes have
         # none, and the load line and the status document then leave it out.
         return getattr(self._inner, "projection_kernel_drafter_status", None)
+
+    @property
+    def projection_tile_status(self) -> dict | None:
+        # Optional on purpose, like projection_kernel_status: the VLM backend
+        # reports whether the tile serves this load and at which scope, the
+        # LM backend reports it off, and fakes have neither.
+        return getattr(self._inner, "projection_tile_status", None)
 
     @property
     def kv_int8_status(self) -> dict | None:
@@ -774,6 +785,24 @@ class EngineManager:
                 line += f" projection_kernel_drafter={drafter['state']}"
                 if drafter["state"] == "active":
                     line += f" projection_kernel_drafter_probe_s={drafter['probe_seconds']}"
+        ptile = engine.projection_tile_status
+        if ptile is not None:
+            line += f" projection_tile={ptile['state']}"
+            # The scope follows the memory free at load, so the config alone
+            # cannot say whether the attention and GDN projections were
+            # copied; the budget is what the automatic prompt-cache budget
+            # had left beside whatever was copied.
+            if ptile["state"] == "active":
+                left = ptile.get("budget_left_gib")
+                budget = "unknown" if left is None else f"{left:.1f}"
+                line += (
+                    f":{ptile['scope']} projection_tile_probe_s={ptile['probe_seconds']}"
+                    f" projection_tile_budget_gib={budget}"
+                )
+                if ptile["scope"] == "all":
+                    line += f" projection_tile_copy_gb={ptile['copy_gb']:.1f}"
+                elif ptile["scope"] == "mlp":
+                    line += " projection_tile_copy=skipped"
         # Resolved at load, so the config alone cannot say which block runs:
         # an unset one is 8 where the kernel is active, 4 where only the
         # attention tile is and 3 elsewhere.
@@ -1123,6 +1152,13 @@ class EngineManager:
                             "reason": drafter["reason"],
                             "linears": drafter["linears"],
                         }
+                # The budget left is the load line's, said once per load.
+                ptile = self._engine.projection_tile_status
+                if ptile is not None:
+                    out["projection_tile"] = {
+                        k: ptile.get(k)
+                        for k in ("state", "scope", "reason", "copy_gb", "probe_seconds")
+                    }
                 # The block the drafter runs, as resolved at load: present
                 # whenever the backend knows drafters, None while it runs
                 # without one.
