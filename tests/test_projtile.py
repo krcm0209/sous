@@ -486,7 +486,7 @@ _TABLE = {
 _DUAL = (5120, (17408, 17408))
 
 
-def test_the_six_fused_plans_match_the_spike_and_the_alone_forms_the_spec():
+def test_the_plan_table_holds_the_tuned_fused_plans_and_the_alone_forms():
     assert projtile.PLANS == _TABLE
     for key, plan in _TABLE.items():
         assert projtile.plan_for(key) == plan

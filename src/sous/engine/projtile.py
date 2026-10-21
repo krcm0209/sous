@@ -329,8 +329,9 @@ def fork_key_state(root: Any) -> str:
 # rows is padded with zero rows (pad8), so T is never an argument.
 MAX_ROWS = 8
 # The tile against an fp32 reference: its relative RMS within this factor of the
-# floor, that reference rounded to bf16. The spike's tile sat on the floor to four
-# digits on every linear of the 27B.
+# floor, that reference rounded to bf16. On every linear of the 27B the tile's
+# relative RMS against that elementwise fp32 reference equalled the floor to four
+# significant digits (M5 Pro).
 TILE_FLOOR_FACTOR = 1.05
 # GPU core counts the plans were tuned on: the M5 Pro's 20. A plan's GROUPS and
 # split count are chosen for one wave of threadgroups on that chip.

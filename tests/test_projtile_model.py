@@ -347,15 +347,15 @@ def test_greedy_output_is_block_invariant_on_the_tile():
 
 # ---- the bf16 floor against float64 -----------------------------------------------
 
-# The float64 reference and its element bound, from the spike's accuracy checker. The
-# reference dequantises exactly (a bf16 scale times a 4-bit code is a 12-bit product) and
-# multiplies in float64; `mag` is the sum of the absolute terms the kernel's fp32
-# arithmetic adds, |x| . (|scale| q + |bias|), since scale * (x . q) and bias * sum(x) can
-# cancel. The bound, |y - ref| <= ulp_bf16(|ref|) + (64 + 2G + 4) 2^-24 mag + K 2^-126,
-# covers the one bf16 rounding, any order of a group's 64-product dot and of its row sum,
-# the epilogue's 2G fmas (a split plan's chain is shorter: G / SPLITS groups' fmas plus
-# SPLITS - 1 adds in the reduce) and fp32 denormal flushing: any correct fp32 evaluation
-# meets it, so a wrong scale, bias, code or column fails it.
+# The float64 reference and its element bound. The reference dequantises exactly (a
+# bf16 scale times a 4-bit code is a 12-bit product) and multiplies in float64; `mag`
+# is the sum of the absolute terms the kernel's fp32 arithmetic adds,
+# |x| . (|scale| q + |bias|), since scale * (x . q) and bias * sum(x) can cancel. The
+# bound, |y - ref| <= ulp_bf16(|ref|) + (64 + 2G + 4) 2^-24 mag + K 2^-126, covers the
+# one bf16 rounding, any order of a group's 64-product dot and of its row sum, the
+# epilogue's 2G fmas (a split plan's chain is shorter: G / SPLITS groups' fmas plus
+# SPLITS - 1 adds in the reduce) and fp32 denormal flushing: any correct fp32
+# evaluation meets it, so a wrong scale, bias, code or column fails it.
 _U = 2.0**-24
 _CHUNK = 1 << 22  # weights dequantised per float64 chunk: 32 MB
 
