@@ -525,11 +525,10 @@ def test_resume_grades_every_suite_arm_again_after_kv_int8_was_flipped(tmp_path,
     assert {r["kv_int8"] for r in suite_rows} == {True, False}
 
 
-def test_resume_grades_the_model_stage_again_after_projection_tile_changed(tmp_path, capsys):
+def test_resume_grades_every_suite_arm_again_after_projection_tile_changed(tmp_path, capsys):
     """projection_tile changes verify numerics, so suite rows are keyed by it:
-    a resume after the change grades every model-stage arm from scratch. The
-    winner stage's int8 arm runs with the tile off whatever the user set, so
-    its rows still count and it is not graded again."""
+    a resume after the change grades every arm from scratch, the winner
+    stage's int8 arm included, since it keeps the user's setting too."""
     seen = []
     deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N), seen=seen)
     assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 0
@@ -540,13 +539,14 @@ def test_resume_grades_the_model_stage_again_after_projection_tile_changed(tmp_p
     seen.clear()
     changed = _cfg(tmp_path, projection_tile="mlp")
     assert main(_args(quick=False, resume=run_id), config=changed, **deps) == 0
-    assert seen == first[:2]
+    assert seen == first
     results = (tmp_path / "tune" / run_id / "results.jsonl").read_text().splitlines()
     suite_rows = [r for r in map(json.loads, results) if r["kind"] == "suite"]
     assert {(r["int8_prefill"], r["projection_tile"]) for r in suite_rows} == {
         (False, True),
         (False, "mlp"),
-        (True, False),
+        (True, True),
+        (True, "mlp"),
     }
 
 

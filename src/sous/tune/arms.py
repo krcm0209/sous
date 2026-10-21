@@ -59,7 +59,9 @@ class Arm:
     # Inherited and keyed the same way: the tile's verify rows differ from the
     # projection kernel's in their last bits. Keyed by the setting as written,
     # since "mlp" and "all" put different linears on the tile and true picks
-    # either at load. The winner stage's int8 arm alone turns it off.
+    # either at load. The winner stage's int8 arm inherits it too: int8 prefill
+    # is what lets the tile load, so that arm grades the two together, as the
+    # diff that writes int8_prefill deploys them.
     projection_tile: bool | str = True
     # True only for the winner stage's own int8 arm, built to *measure*
     # INT8 prefill: the engine refusing it must fail that arm. Every other
@@ -347,12 +349,14 @@ def winner_stage_arms(winner: Arm, *, nax: bool, checkpoint: Checkpoint) -> list
     """An INT8 prefill arm for a winner that has it off, where the tensor
     units and the checkpoint's quantization allow it (the engine refuses
     anything else with a status, and the arm would measure the stock path
-    under the int8 label), judged on its own against the winner: with the
-    projection tile off, which serves only beside active int8 prefill, so
-    the winner ran without it and the grade is int8's alone. Greedy
-    sampling is never an arm: it removes the variety a stuck agent needs to
-    get out of a repetition loop, and a suite whose greedy runs of a task
-    repeat one trajectory cannot measure that."""
+    under the int8 label), judged on its own against the winner. It keeps the
+    user's projection_tile like every other setting: the tile serves only
+    beside active int8 prefill, so where it can run the winner ran without
+    it and this arm with it, and the grade is that of the configuration the
+    diff (int8_prefill alone) then deploys. Greedy sampling is never an arm:
+    it removes the variety a stuck agent needs to get out of a repetition
+    loop, and a suite whose greedy runs of a task repeat one trajectory
+    cannot measure that."""
     from sous.engine.int8prefill import SUPPORTED_MODEL_TYPES
 
     arms: list[Arm] = []
@@ -364,10 +368,9 @@ def winner_stage_arms(winner: Arm, *, nax: bool, checkpoint: Checkpoint) -> list
             dataclasses.replace(
                 winner,
                 label=f"{winner.label} + int8 prefill",
-                config=dataclasses.replace(winner.config, int8_prefill=True, projection_tile=False),
+                config=dataclasses.replace(winner.config, int8_prefill=True),
                 current=False,
                 int8_prefill=True,
-                projection_tile=False,
                 int8_under_test=True,
             )
         )

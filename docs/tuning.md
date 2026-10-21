@@ -58,18 +58,19 @@ The rule, printed in full with every number:
 
 On the winner, the same rule then judges one extra arm: INT8 prefill, only
 for a winner that has it off (it ships on) and only where the tensor units and
-the checkpoint allow it. That arm runs with `projection_tile = false` — the
-tile serves only beside active int8 prefill, so the winner ran without it — and
-its grade is int8's alone. It lands in the diff only when its own measured arm is
-eligible and faster. The tune never changes `temperature`: every arm inherits
+the checkpoint allow it. That arm keeps your `projection_tile`, like every
+other setting: the tile serves only beside active int8 prefill, so where it can
+run the winner ran without it and the int8 arm with it, and the grade is that of
+the configuration the diff (which writes `int8_prefill` alone) then deploys. It
+lands in the diff only when its own measured arm is eligible and faster. The tune never changes `temperature`: every arm inherits
 yours, and greedy decoding (`temperature = 0`) is never proposed, because it
 leaves a model that starts repeating itself no way out and, as above, the suite
 cannot measure that risk; it runs only when you set it. The full run may
 therefore change `[model].id`, the drafter and block size, the window and
 `int8_prefill`.
 Every arm inherits `[model].attention_tile`, `[model].projection_kernel`,
-`[model].kv_int8` and `[model].projection_tile`, and no arm changes them but
-the int8 arm above, which turns `projection_tile` off; suite rows are keyed by all four (`projection_tile` as
+`[model].kv_int8` and `[model].projection_tile`, and no arm changes them;
+suite rows are keyed by all four (`projection_tile` as
 written, since `"mlp"` and `"all"` put different projections on the tile and
 `true` picks either at load), so a `--resume` after any of them was flipped
 runs those arms again instead of

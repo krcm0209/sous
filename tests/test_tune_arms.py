@@ -309,7 +309,7 @@ def test_on_nax_a_routable_checkpoint_gets_an_int8_arm_and_no_greedy_arm(tmp_pat
     (int8,) = arms
     assert int8.int8_prefill and int8.config.int8_prefill
     assert not int8.greedy and int8.config.temperature == 0.7
-    assert int8.suite_key == (*int8.key, True, False, True, True, True, False)
+    assert int8.suite_key == (*int8.key, True, False, True, True, True, True)
     assert not int8.current and int8.fit_window == 131072
     # Only the winner stage's own int8 arm is under test: the engine
     # refusing it must fail the arm, unlike an arm that merely inherited
@@ -650,17 +650,19 @@ def test_quick_arms_mirror_the_users_projection_tile_and_key_only_their_suite_ro
     assert len(set().union(*keys.values())) == sum(len(k) for k in keys.values())
 
 
-def test_the_int8_stage_arm_measures_int8_with_the_projection_tile_off(tmp_path):
-    """The tile serves only beside active int8 prefill, so the winner the int8
-    arm is judged against (int8 off) ran without it: left on, the int8 arm
-    would grade int8 and the tile together."""
+def test_the_int8_stage_arm_keeps_the_users_projection_tile(tmp_path):
+    """The tile serves only beside active int8 prefill, so turning int8 on is
+    what lets it load: the diff writes int8_prefill alone, and the arm that
+    earns it grades the configuration that diff deploys, the tile as the user
+    has it included."""
     cp = _checkpoints()["mlx-community/Qwen3.8-27B-4bit"]
-    for ptile in (True, "mlp", "all"):
+    for ptile in (True, "mlp", "all", False):
         winner = _winner(tmp_path, ptile=ptile)
         (int8,) = winner_stage_arms(winner, nax=True, checkpoint=cp)
-        assert int8.projection_tile is False and int8.config.projection_tile is False
+        assert int8.projection_tile == ptile and int8.config.projection_tile == ptile
+        assert type(int8.projection_tile) is type(ptile)
         assert int8.int8_prefill is True and int8.config.int8_prefill is True
-        assert int8.suite_key == (*winner.key, True, False, True, True, True, False)
+        assert int8.suite_key == (*winner.key, True, False, True, True, True, ptile)
         assert int8.key == winner.key
 
 
