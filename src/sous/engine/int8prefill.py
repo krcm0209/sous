@@ -234,6 +234,10 @@ def qmm(
         raise ValueError(
             f"int8 prefill GEMM needs N % {BN} == 0 and K % {GROUP} == 0; got N={n} K={k}"
         )
+    # The flat planes carry no K of their own: the activations' K would address
+    # them with another group count, past their end or short of it.
+    if slab is not None and slab.k != k:
+        raise ValueError(f"int8 prefill GEMM: the slab planes hold K={slab.k}, not K={k}")
     if slab is None:
         name, switch = "sous_int8_q4_gemm", ""
         planes = [weight, mx.contiguous(scales.T), mx.contiguous(biases.T)]

@@ -438,6 +438,21 @@ def test_qmm_reads_slab_planes_in_place(monkeypatch):
     assert template["N"] == n and shapes == [(m, n)]
 
 
+@pytest.mark.parametrize(("k_x", "k_planes"), [(1024, 256), (256, 1024)])
+def test_qmm_refuses_slab_planes_of_another_k(monkeypatch, k_x, k_planes):
+    """K comes from the activations: planes repacked at another K would be read
+    with the wrong group count, past their end or short of it, so the call is
+    refused before any launch."""
+    w, scales, biases = pfx.rand_linear(256, k_planes, seed=3)
+    codes, s, b, info = repack(w, scales, biases)
+    launches = _capture_launches(monkeypatch)
+    qa = mx.zeros((16, k_x), dtype=mx.int8)
+    sa = ra = mx.zeros((16,), dtype=mx.float32)
+    with pytest.raises(ValueError, match=f"planes hold K={k_planes}, not K={k_x}"):
+        i8.qmm(qa, sa, ra, codes, s, b, slab=info)
+    assert launches == []
+
+
 # ---- eligibility --------------------------------------------------------------
 
 
