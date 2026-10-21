@@ -14,7 +14,7 @@ import shutil
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +50,10 @@ ETA_TURNS = 8
 ETA_PROMPT_TOKENS = 3000
 ETA_OUTPUT_TOKENS = 300
 
+# A suite row's projection_tile: a state a load reported, or, on a row written
+# before rows recorded it, the setting as written.
+TileState = bool | str
+
 
 @dataclass(frozen=True)
 class SuiteRun:
@@ -64,6 +68,10 @@ class SuiteRun:
     attention_tile: bool
     projection_kernel: bool
     kv_int8: bool
+    # What the load reported (loaded_tile): "all", "mlp", "unavailable" or
+    # "off", never the setting, since true picks a scope at load and the two
+    # scopes verify differently. A row written before that holds the setting as
+    # written (true or false, or "mlp" or "all").
     projection_tile: bool | str
     window: int
     state: str
@@ -81,7 +89,9 @@ class SuiteRun:
 
     @property
     def key(self) -> tuple[str, str, int, bool, bool, bool, bool, bool, bool | str]:
-        """The arm this run measured — `Arm.suite_key`, never the label."""
+        """The arm this run measured — `Arm.suite_key`, never the label — with
+        the projection tile as its load reported it (arm_runs matches the
+        two)."""
         return (
             self.model_id,
             self.drafter_id,
@@ -116,6 +126,70 @@ class SuiteRun:
             **d,
         }
         return cls(**{f.name: d[f.name] for f in dataclasses.fields(cls)})
+
+
+def loaded_tile(status: dict | None) -> str:
+    """The projection tile as a load reported it, as a suite row records it: the
+    scope ("all" or "mlp") while active, else the state ("unavailable", "off");
+    an engine with no status has no tile, which is "off"."""
+    status = status or {}
+    state = status.get("state") or "off"
+    return (status.get("scope") or state) if state == "active" else state
+
+
+def _tile_states(setting: TileState) -> frozenset[TileState]:
+    """The row values a load under this projection_tile setting can have written:
+    every state a load can report under it, and the setting itself, as rows
+    written before the state was recorded hold it. An engine without the tile
+    reports "off" under any setting; under false nothing else."""
+    if setting is False:
+        return frozenset({"off", False})
+    scopes = {"all", "mlp"} if setting is True else {setting}
+    return frozenset({*scopes, "unavailable", "off", setting})
+
+
+def done_pairs(rows: Iterable[SuiteRun]) -> set[tuple[str, int]]:
+    """The (task, index) pairs these rows finished. Only the latest attempt at a
+    pair decides — a retry leaves its earlier row in the run's rows too,
+    appended rather than replaced — and a runner-only "error" row (TaskState has
+    no such state) is not a result to count as done; a task that ran and failed
+    is."""
+    latest: dict[tuple[str, int], SuiteRun] = {}
+    for r in rows:
+        latest[(r.task, r.index)] = r
+    return {key for key, r in latest.items() if r.state != "error"}
+
+
+def arm_runs(
+    arm: Arm, runs: Iterable[SuiteRun]
+) -> tuple[dict[TileState, list[SuiteRun]], TileState | None]:
+    """The rows of ``runs`` this arm measured, by the tile state each ran under,
+    and the state a reader takes (None when there is no row): the arm's key but
+    for the tile, its window, and a state a load of its setting reports. Rows
+    of two states never pool. The state taken is the one whose rows finished
+    the most (task, index) pairs, the latest of those tied: a resume loads only
+    while no state is complete, so a finished measurement is never set aside
+    for a later load's partial one. Under false a row written before the state
+    was recorded ran off too, and joins the "off" rows; under any other setting
+    such a row's scope is unknown, and it keeps a group of its own."""
+    allowed = _tile_states(arm.projection_tile)
+    groups: dict[TileState, list[SuiteRun]] = {}
+    last: dict[TileState, int] = {}
+    for i, r in enumerate(runs):
+        if r.window != arm.window or r.key[:-1] != arm.suite_key[:-1]:
+            continue
+        if r.projection_tile not in allowed:
+            continue
+        state = "off" if r.projection_tile is False else r.projection_tile
+        groups.setdefault(state, []).append(r)
+        last[state] = i
+    if not groups:
+        return groups, None
+
+    def finished(state: TileState) -> tuple[int, int]:
+        return len(done_pairs(groups[state])), last[state]
+
+    return groups, max(groups, key=finished)
 
 
 @dataclass(frozen=True)
@@ -232,7 +306,7 @@ def interpreter_first(python: Path) -> Iterator[None]:
             os.environ["PATH"] = before
 
 
-def _error_run(task: SuiteTask, index: int, arm: Arm, error: str) -> SuiteRun:
+def _error_run(task: SuiteTask, index: int, arm: Arm, error: str, projection_tile: str) -> SuiteRun:
     return SuiteRun(
         task=task.name,
         index=index,
@@ -245,7 +319,7 @@ def _error_run(task: SuiteTask, index: int, arm: Arm, error: str) -> SuiteRun:
         attention_tile=arm.attention_tile,
         projection_kernel=arm.projection_kernel,
         kv_int8=arm.kv_int8,
-        projection_tile=arm.projection_tile,
+        projection_tile=projection_tile,
         window=arm.window,
         state="error",
         outcome=None,
@@ -319,7 +393,7 @@ def run_one(
         attention_tile=arm.attention_tile,
         projection_kernel=arm.projection_kernel,
         kv_int8=arm.kv_int8,
-        projection_tile=arm.projection_tile,
+        projection_tile=loaded_tile(engine.projection_tile_status),
         window=arm.window,
         state="failed" if failed else "done",
         outcome=None if failed else result.outcome,
@@ -475,6 +549,7 @@ def _run_suite(
     tasks: list[SuiteTask],
     runs: int,
     done: set[tuple[str, int]],
+    done_by_tile: Mapping[TileState, set[tuple[str, int]]] | None,
     record: Callable[[SuiteRun], None],
     scratch: Path,
     out: Callable[..., None],
@@ -529,6 +604,12 @@ def _run_suite(
             _check_kv8(arm, engine, out)
         except RuntimeError as e:
             check_error = str(e)
+        tile = loaded_tile(engine.projection_tile_status)
+        # Only the rows of the state this load reported count as done: rows of
+        # another scope verified another way, and the runs go again under this
+        # one rather than pool with them.
+        if done_by_tile is not None:
+            done = done_by_tile.get(tile, set())
         if check_error is None:
             for task in tasks:
                 for index in range(runs):
@@ -555,7 +636,7 @@ def _run_suite(
                             work=work,
                         )
                     except Exception as e:  # noqa: BLE001 — one run's failure, recorded; goes on
-                        result = _error_run(task, index, arm, f"{type(e).__name__}: {e}")
+                        result = _error_run(task, index, arm, f"{type(e).__name__}: {e}", tile)
                     # Before record(): a budget-exhausted run's generation can
                     # still be decoding under the engine's lock, and the next
                     # run's own budget clock must not start against it.
@@ -590,13 +671,17 @@ def run_suite(
     python: Path | None = None,
     active_memory: Callable[[], int] | None = None,
     work: Path | None = None,
+    done_by_tile: Mapping[TileState, set[tuple[str, int]]] | None = None,
 ) -> SuiteOutcome:
     """Every (task, run index) of the arm not in `done`, on a thread of its
     own that loads the engine once, hands each run to `record` as it
-    finishes, and releases its mlx state on the way out. Every run's project
-    runs at `work`, by default `project` beside `scratch` (outside every
-    arm's archive), before it is archived under `scratch`: arms compared on
-    one `work` see one prompt."""
+    finishes, and releases its mlx state on the way out. With `done_by_tile`
+    (the done set of each tile state, arm_runs' groups), the done set is the
+    one of the state the load reports instead, since a resume's load can pick
+    another scope than the rows' did. Every run's project runs at `work`, by
+    default `project` beside `scratch` (outside every arm's archive), before
+    it is archived under `scratch`: arms compared on one `work` see one
+    prompt."""
     outcome: list[SuiteOutcome | BaseException] = []
 
     def run() -> None:
@@ -607,6 +692,7 @@ def run_suite(
                     tasks,
                     runs,
                     done,
+                    done_by_tile,
                     record,
                     scratch,
                     out,

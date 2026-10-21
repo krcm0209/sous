@@ -20,6 +20,7 @@ from sous.tune.suite.runner import (
     SuiteRun,
     estimate_seconds,
     interpreter_first,
+    loaded_tile,
     metrics_from_transcript,
     run_one,
     run_suite,
@@ -118,7 +119,8 @@ def test_run_one_grades_a_solved_task_and_reads_every_metric_from_the_run(tmp_pa
     assert Path(run.transcript_path).is_file()
     written = (tmp_path / "s" / "project" / "rpn.py").read_text()
     assert written == (task.solution / "rpn.py").read_text()
-    assert run.key == (*_arm(tmp_path).key, False, False, True, True, True, True)
+    # The fake engine reports no projection tile, which is a load without it.
+    assert run.key == (*_arm(tmp_path).key, False, False, True, True, True, "off")
 
 
 def test_a_command_outside_the_allowlist_is_denied_and_counted(tmp_path):
@@ -1185,8 +1187,67 @@ def _suite_lines(tmp_path, name, arm, engine):
         active_memory=lambda: 0,
     )
     assert len(outcome.runs) == 1 and outcome.error is None, name
-    assert outcome.runs[0].projection_tile == arm.projection_tile, name
+    # The row records what the load reported, never the setting.
+    want = loaded_tile(getattr(engine, "projection_tile_status", None))
+    assert outcome.runs[0].projection_tile == want, name
     return [line for line in lines if "projection tile" in line]
+
+
+def test_loaded_tile_reads_the_scope_while_active_and_the_state_otherwise():
+    def status(state, scope=None):
+        return {"state": state, "scope": scope, "reason": None}
+
+    assert loaded_tile(status("active", "all")) == "all"
+    assert loaded_tile(status("active", "mlp")) == "mlp"
+    assert loaded_tile(status("unavailable")) == "unavailable"
+    assert loaded_tile(status("off")) == "off"
+    assert loaded_tile(None) == "off"
+
+
+def test_rows_record_the_scope_the_load_reported_and_resume_on_its_done_set(tmp_path):
+    """Under true the load picks the scope: rows record it, and the done set the
+    runner keeps is the one of the scope this load reported, so runs finished
+    under another scope go again rather than pool with these."""
+    arm = _arm(tmp_path)
+    assert arm.projection_tile is True
+    task = _task()
+
+    class Mlp(FakeEngine):
+        drafter = ""
+        projection_tile_status = {
+            "state": "active",
+            "scope": "mlp",
+            "reason": "copy would leave 13.00 GiB of prompt-cache budget (< 14)",
+            "copy_gb": None,
+            "probe_seconds": 0.5,
+            "budget_left_gib": 17.0,
+        }
+
+    def run(done, done_by_tile, name):
+        recorded = []
+        outcome = run_suite(
+            arm,
+            [task],
+            runs=2,
+            done=done,
+            done_by_tile=done_by_tile,
+            record=recorded.append,
+            scratch=tmp_path / name,
+            out=lambda *a: None,
+            factory=lambda mid: Mlp([FINISH] * 2),
+            python=PYTHON,
+            active_memory=lambda: 0,
+        )
+        assert outcome.error is None and outcome.runs == recorded
+        return [(r.index, r.projection_tile) for r in recorded]
+
+    first = {(task.name, 0), (task.name, 1)}
+    # Both runs finished under scope all: this load reports mlp, and runs both.
+    assert run(first, {"all": first}, "a") == [(0, "mlp"), (1, "mlp")]
+    # One finished under mlp already: only the other runs.
+    assert run(first, {"all": first, "mlp": {(task.name, 0)}}, "b") == [(1, "mlp")]
+    # Without the groups the done set handed in is the one kept.
+    assert run({(task.name, 0)}, None, "c") == [(1, "mlp")]
 
 
 def test_an_arm_that_inherits_the_projection_tile_runs_without_it_after_a_notice(tmp_path):

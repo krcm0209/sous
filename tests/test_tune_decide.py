@@ -321,16 +321,67 @@ def test_summarize_reads_the_runs_and_the_bench_peak(tmp_path):
     assert summarize(_arm(user, "27 @5", block=5), runs, []) is None
 
 
+def _tiled(arm, tile, grades, **kw):
+    """Runs of `arm` that recorded the projection tile as a load reported it."""
+    return [dataclasses.replace(r, projection_tile=tile) for r in _runs(arm, grades, **kw)]
+
+
 def test_a_summary_is_keyed_by_the_projection_tile_its_runs_were_graded_under(tmp_path):
     user = _user(tmp_path)
     arm = _arm(user, "27 @3", current=True)
     mlp = dataclasses.replace(
         arm, projection_tile="mlp", config=dataclasses.replace(user, projection_tile="mlp")
     )
-    s = summarize(mlp, _runs(mlp, [1.0]), [])
+    s = summarize(mlp, _tiled(mlp, "mlp", [1.0]), [])
     assert s is not None and s.key == (*arm.key, False, False, True, True, True, "mlp")
-    # Runs graded under another value of the flag belong to another arm.
-    assert summarize(arm, _runs(mlp, [1.0]), []) is None
+    # A load under true picks either scope, so its summary says which ran.
+    s = summarize(arm, _tiled(arm, "all", [1.0]), [])
+    assert s is not None and s.key == (*arm.key, False, False, True, True, True, "all")
+    # A scope the setting can never load belongs to another arm.
+    assert summarize(mlp, _tiled(mlp, "all", [1.0]), []) is None
+    off = dataclasses.replace(
+        arm, projection_tile=False, config=dataclasses.replace(user, projection_tile=False)
+    )
+    assert summarize(off, _tiled(off, "unavailable", [1.0]), []) is None
+
+
+def test_a_summary_never_pools_two_tile_scopes(tmp_path):
+    """Under true one load can pick scope all and a resumed one scope mlp: the
+    two verify differently, so the summary is one scope's rows alone, the scope
+    whose rows finished the most runs, the latest on a tie."""
+    user = _user(tmp_path)
+    arm = _arm(user, "27 @3", current=True)
+    runs = _tiled(arm, "all", [1.0, 1.0], seconds=30.0) + _tiled(arm, "mlp", [0.5], seconds=50.0)
+    s = summarize(arm, runs, [])
+    assert s is not None and (s.runs, s.mean_grade, s.wall_seconds) == (2, 1.0, 60.0)
+    assert s.key[-1] == "all"
+    runs = _tiled(arm, "all", [1.0], seconds=30.0) + _tiled(arm, "mlp", [0.5], seconds=50.0)
+    s = summarize(arm, runs, [])
+    assert s is not None and (s.runs, s.mean_grade, s.key[-1]) == (1, 0.5, "mlp")
+    # A runner-only error row finishes nothing.
+    errored = _tiled(arm, "mlp", [0.0], state="error")
+    s = summarize(arm, _tiled(arm, "all", [1.0]) + errored, [])
+    assert s is not None and s.key[-1] == "all"
+
+
+def test_older_tile_rows_read_as_before(tmp_path):
+    """A row written before rows recorded the load's state holds the setting:
+    under false it ran without the tile and pools with "off" rows; under true
+    its scope is unknown, so it never pools with a recorded scope."""
+    user = _user(tmp_path)
+    arm = _arm(user, "27 @3", current=True)
+    off = dataclasses.replace(
+        arm, projection_tile=False, config=dataclasses.replace(user, projection_tile=False)
+    )
+    newer = [dataclasses.replace(r, task="u0") for r in _tiled(off, "off", [0.0])]
+    s = summarize(off, _tiled(off, False, [1.0]) + newer, [])
+    assert s is not None and s.runs == 2 and s.key[-1] == "off"
+    s = summarize(arm, _tiled(arm, True, [1.0]), [])
+    assert s is not None and s.runs == 1 and s.key == arm.suite_key
+    s = summarize(arm, _tiled(arm, True, [1.0]) + _tiled(arm, "all", [0.0]), [])
+    assert s is not None and s.runs == 1 and s.key[-1] == "all"
+    # A row from before the tile existed reads false, which no tile arm loads.
+    assert summarize(arm, _tiled(arm, False, [1.0]), []) is None
 
 
 def test_summarize_takes_the_peak_from_the_row_at_the_arms_window(tmp_path):

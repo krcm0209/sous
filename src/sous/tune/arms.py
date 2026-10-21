@@ -56,12 +56,14 @@ class Arm:
     # Inherited and keyed the same way: attention over int8 K/V differs from
     # attention over bf16 K/V by the quantisation, not only in the last bits.
     kv_int8: bool = True
-    # Inherited and keyed the same way: the tile's verify rows differ from the
-    # projection kernel's in their last bits. Keyed by the setting as written,
-    # since "mlp" and "all" put different linears on the tile and true picks
-    # either at load. The winner stage's int8 arm inherits it too: int8 prefill
-    # is what lets the tile load, so that arm grades the two together, as the
-    # diff that writes int8_prefill deploys them.
+    # Inherited, and the setting the arm loads with: the tile's verify rows
+    # differ from the projection kernel's in their last bits. Its suite rows
+    # record what the load reported instead (runner.loaded_tile), since "mlp"
+    # and "all" put different linears on the tile and true picks either at
+    # load, and runner.arm_runs matches them to the setting. The winner stage's
+    # int8 arm inherits it too: int8 prefill is what lets the tile load, so
+    # that arm grades the two together, as the diff that writes int8_prefill
+    # deploys them.
     projection_tile: bool | str = True
     # True only for the winner stage's own int8 arm, built to *measure*
     # INT8 prefill: the engine refusing it must fail that arm. Every other
@@ -84,7 +86,9 @@ class Arm:
         """What identifies an arm across suite runs and a resume: the bench
         key, the one setting only the suite may change, and whether the
         sampler is greedy, the attention tile, the projection kernel, int8
-        K/V and the projection tile, which every arm inherits."""
+        K/V and the projection tile, which every arm inherits. A suite row's
+        last field is the tile state its load reported, so rows are matched to
+        an arm through runner.arm_runs, never by equality with this."""
         return (
             *self.key,
             self.int8_prefill,

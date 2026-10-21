@@ -550,6 +550,83 @@ def test_resume_grades_every_suite_arm_again_after_projection_tile_changed(tmp_p
     }
 
 
+def _scoped_suite(plan, loads):
+    """A suite whose load reports plan["scope"] as the projection tile's scope,
+    records it in every row and keeps the done set of that scope, as the runner
+    does; an arm named in plan["limit"] records at most that many runs."""
+
+    def suite(arm, tasks, *, runs, done, record, scratch, out, done_by_tile=None, **kw):
+        scope = plan["scope"]
+        if done_by_tile is not None:
+            done = done_by_tile.get(scope, set())
+        loads.append((arm.label, scope, sorted(done)))
+        results = []
+        limit = plan["limit"].get(arm.label, len(tasks) * runs)
+        for task in tasks:
+            for i in range(runs):
+                if (task.name, i) in done or len(results) >= limit:
+                    continue
+                r = SuiteRun(
+                    task=task.name,
+                    index=i,
+                    label=arm.label,
+                    model_id=arm.model_id,
+                    drafter_id=arm.drafter_id,
+                    block_size=arm.block_size,
+                    int8_prefill=arm.int8_prefill,
+                    greedy=arm.greedy,
+                    attention_tile=arm.attention_tile,
+                    projection_kernel=arm.projection_kernel,
+                    kv_int8=arm.kv_int8,
+                    projection_tile=scope,
+                    window=arm.window,
+                    state="done",
+                    outcome="completed",
+                    turns=3,
+                    seconds=10.0,
+                    output_tokens=100,
+                    malformed=0,
+                    repetitions=0,
+                    approvals_denied=0,
+                    grade=1.0,
+                    grade_detail="",
+                    error=None,
+                    transcript_path=None,
+                )
+                record(r)
+                results.append(r)
+        return SuiteOutcome(results, True, None)
+
+    return suite
+
+
+def test_a_resume_grades_an_arm_again_under_the_scope_its_load_reports(tmp_path, capsys):
+    """Rows record the projection tile scope the load reported. The current arm
+    finished one run under scope all; the resumed load picks scope mlp, so the
+    arm runs every task again under it rather than count a row that verified
+    another way, and the report grades it on the mlp rows alone. Arms whose
+    rows finished every run are not loaded again."""
+    loads: list = []
+    plan: dict = {"scope": "all", "limit": {CUR: 1}}
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N))
+    deps["suite"] = _scoped_suite(plan, loads)
+    assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 0
+    assert (CUR, "all", []) in loads
+    run_id = sorted(p.name for p in (tmp_path / "tune").iterdir())[-1]
+    loads.clear()
+    capsys.readouterr()
+    plan.update(scope="mlp", limit={})
+    assert main(_args(quick=False, resume=run_id), config=_cfg(tmp_path), **deps) == 0
+    assert loads == [(CUR, "mlp", [])]
+    results = (tmp_path / "tune" / run_id / "results.jsonl").read_text().splitlines()
+    mine = [r for r in map(json.loads, results) if r["kind"] == "suite" and r["label"] == CUR]
+    assert sorted(r["projection_tile"] for r in mine) == ["all", "mlp", "mlp", "mlp", "mlp"]
+    suite_line = next(
+        line for line in capsys.readouterr().out.splitlines() if CUR in line and "grade" in line
+    )
+    assert "completed 4/4" in suite_line
+
+
 def test_resume_retries_a_run_the_runner_recorded_as_an_error(tmp_path, capsys):
     """_error_run and the denier-failure relabel both leave a state="error"
     row in results.jsonl — a row is appended, never rewritten — so a stale

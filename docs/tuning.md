@@ -70,12 +70,18 @@ therefore change `[model].id`, the drafter and block size, the window and
 `int8_prefill`.
 Every arm inherits `[model].attention_tile`, `[model].projection_kernel`,
 `[model].kv_int8` and `[model].projection_tile`, and no arm changes them;
-suite rows are keyed by all four (`projection_tile` as
-written, since `"mlp"` and `"all"` put different projections on the tile and
-`true` picks either at load), so a `--resume` after any of them was flipped
+suite rows are keyed by all four, so a `--resume` after any of them was flipped
 runs those arms again instead of
 mixing rows measured with and without it (a row written before a setting
-existed reads as `false` for it), and where the engine reports one
+existed reads as `false` for it). For `projection_tile` a row records what the
+arm's load reported — the scope `all` or `mlp` when the tile went active, else
+`unavailable` or `off` — rather than the setting, since `"mlp"` and `"all"` put
+different projections on the tile and `true` picks either at load, from the
+headroom it finds: rows of two scopes never pool. An arm is graded on the rows
+of the one state that finished the most runs; a `--resume` loads it again only
+while no state has finished every run, and then counts as done only the runs
+finished under the state that load reports, so a load that picks the other
+scope runs the arm's tasks again under it. Where the engine reports one
 `unavailable`, the arm prints a notice with the reason and runs without it, as
 the daemon would: stock attention or projections, attention over the bf16
 cache for `kv_int8`, or no tile for `projection_tile` (an `off` engine, such as
