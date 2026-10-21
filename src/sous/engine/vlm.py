@@ -637,8 +637,9 @@ class VLMEngine:
                         on_delta(Delta(r.text, r.generation_tokens, r.finish_reason))
             finally:
                 _restore_kv_step(kv_layers)
-                # The tile's first, in a try of its own: whatever kv8's close
-                # does, the next turn's prefill finds the tile's window shut.
+                # Then the tile's close, in a try of its own: whatever kv8's
+                # close does, the next turn's prefill finds the tile's window
+                # shut.
                 try:
                     if tile_window:
                         projtile.close_window()
