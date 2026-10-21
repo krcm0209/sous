@@ -114,8 +114,23 @@ def _tasks(tmp_path):
     ]
 
 
+def _loaded_tile(arm):
+    """The projection tile as this machine's load of `arm` would report it, as
+    the runner records it: off under false; refused with no drafter or with
+    int8 prefill off, the tile riding on both; else active at the setting's
+    scope, true picking "all" from the M5 Pro's headroom."""
+    if arm.projection_tile is False:
+        return "off"
+    if not (arm.drafter_id and arm.int8_prefill):
+        return "unavailable"
+    return arm.projection_tile if arm.projection_tile in ("mlp", "all") else "all"
+
+
 def _suite(grades, seconds, seen):
-    def suite(arm, tasks, *, runs, done, record, scratch, out, **kw):
+    def suite(arm, tasks, *, runs, done, record, scratch, out, done_by_tile=None, **kw):
+        # As the runner does: the done set of the state this load reports.
+        if done_by_tile is not None:
+            done = done_by_tile.get(_loaded_tile(arm), set())
         seen.append((arm.label, sorted(done)))
         results = []
         for task in tasks:
@@ -134,7 +149,7 @@ def _suite(grades, seconds, seen):
                     attention_tile=arm.attention_tile,
                     projection_kernel=arm.projection_kernel,
                     kv_int8=arm.kv_int8,
-                    projection_tile=arm.projection_tile,
+                    projection_tile=_loaded_tile(arm),
                     window=arm.window,
                     state="done",
                     outcome="completed",
@@ -525,10 +540,11 @@ def test_resume_grades_every_suite_arm_again_after_kv_int8_was_flipped(tmp_path,
     assert {r["kv_int8"] for r in suite_rows} == {True, False}
 
 
-def test_resume_grades_every_suite_arm_again_after_projection_tile_changed(tmp_path, capsys):
-    """projection_tile changes verify numerics, so suite rows are keyed by it:
-    a resume after the change grades every arm from scratch, the winner
-    stage's int8 arm included, since it keeps the user's setting too."""
+def test_resume_keeps_rows_the_new_projection_tile_can_load_and_reruns_the_rest(tmp_path, capsys):
+    """Rows record what each load reported. After true became "mlp" the
+    model-stage arms' rows, refused for int8 prefill off, are what an "mlp" load
+    reports too and count, while the int8 arm's, active at scope all, are not
+    and run again under "mlp"."""
     seen = []
     deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N), seen=seen)
     assert main(_args(quick=False), config=_cfg(tmp_path), **deps) == 0
@@ -539,14 +555,36 @@ def test_resume_grades_every_suite_arm_again_after_projection_tile_changed(tmp_p
     seen.clear()
     changed = _cfg(tmp_path, projection_tile="mlp")
     assert main(_args(quick=False, resume=run_id), config=changed, **deps) == 0
+    assert seen == first[2:]
+    results = (tmp_path / "tune" / run_id / "results.jsonl").read_text().splitlines()
+    suite_rows = [r for r in map(json.loads, results) if r["kind"] == "suite"]
+    assert {(r["int8_prefill"], r["projection_tile"]) for r in suite_rows} == {
+        (False, "unavailable"),
+        (True, "all"),
+        (True, "mlp"),
+    }
+
+
+def test_resume_reruns_every_arm_after_projection_tile_false_became_true(tmp_path, capsys):
+    """Rows recorded "off" ran with the tile switched off, which no setting that
+    loads the tile counts: after false became true every arm runs again, and the
+    winner stage's int8 arm is graded with the tile its diff then deploys."""
+    seen = []
+    deps, _ = _deps(tmp_path, scores={}, cached=(M, D, N), seen=seen)
+    assert main(_args(quick=False), config=_cfg(tmp_path, projection_tile=False), **deps) == 0
+    first = list(seen)
+    assert len(first) == 3 and all(done == [] for _, done in first)
+    run_id = sorted(p.name for p in (tmp_path / "tune").iterdir())[-1]
+    seen.clear()
+    assert main(_args(quick=False, resume=run_id), config=_cfg(tmp_path), **deps) == 0
     assert seen == first
     results = (tmp_path / "tune" / run_id / "results.jsonl").read_text().splitlines()
     suite_rows = [r for r in map(json.loads, results) if r["kind"] == "suite"]
     assert {(r["int8_prefill"], r["projection_tile"]) for r in suite_rows} == {
-        (False, True),
-        (False, "mlp"),
-        (True, True),
-        (True, "mlp"),
+        (False, "off"),
+        (True, "off"),
+        (False, "unavailable"),
+        (True, "all"),
     }
 
 

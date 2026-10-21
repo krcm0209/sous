@@ -68,10 +68,10 @@ class SuiteRun:
     attention_tile: bool
     projection_kernel: bool
     kv_int8: bool
-    # What the load reported (loaded_tile): "all", "mlp", "unavailable" or
-    # "off", never the setting, since true picks a scope at load and the two
-    # scopes verify differently. A row written before that holds the setting as
-    # written (true or false, or "mlp" or "all").
+    # What the load reported (loaded_tile): "all", "mlp", "unavailable", "off"
+    # or "absent", never the setting, since true picks a scope at load and the
+    # two scopes verify differently. A row written before that holds the setting
+    # as written (true or false, or "mlp" or "all").
     projection_tile: bool | str
     window: int
     state: str
@@ -128,24 +128,36 @@ class SuiteRun:
         return cls(**{f.name: d[f.name] for f in dataclasses.fields(cls)})
 
 
-def loaded_tile(status: dict | None) -> str:
-    """The projection tile as a load reported it, as a suite row records it: the
-    scope ("all" or "mlp") while active, else the state ("unavailable", "off");
-    an engine with no status has no tile, which is "off"."""
+def loaded_tile(status: dict | None, setting: TileState) -> str:
+    """The projection tile as a load under ``setting`` reported it, as a suite row
+    records it: the scope ("all" or "mlp") while active, "unavailable" when it
+    was refused, "off" under false. Under any other setting a load that reports
+    off, or no status, has no tile at all (the mlx-lm backend), and records
+    "absent": a VLM load reports off only under false, so "off" stays the state
+    of a tile switched off, which no tile-capable setting may count."""
     status = status or {}
     state = status.get("state") or "off"
-    return (status.get("scope") or state) if state == "active" else state
+    if state == "active":
+        return status.get("scope") or state
+    if state == "off" and setting is not False:
+        return "absent"
+    return state
 
 
 def _tile_states(setting: TileState) -> frozenset[TileState]:
-    """The row values a load under this projection_tile setting can have written:
-    every state a load can report under it, and the setting itself, as rows
-    written before the state was recorded hold it. An engine without the tile
-    reports "off" under any setting; under false nothing else."""
+    """The row values a load under this projection_tile setting can have written,
+    as a resume after a flip counts them: true and "all" load either scope (under
+    "all" a load whose stacks had no plan serves the MLP alone and reports
+    "mlp"), "mlp" only its own, and each may be refused; "absent" is an engine
+    without the tile under any of them. A row recorded "off" ran with the tile
+    switched off, which a tile-capable setting must not count: the arm runs
+    again. Rows written before the state was recorded hold the setting: false
+    joins "off", and true is admitted under true, where its scope is unknown and
+    it keeps a group of its own."""
     if setting is False:
         return frozenset({"off", False})
-    scopes = {"all", "mlp"} if setting is True else {setting}
-    return frozenset({*scopes, "unavailable", "off", setting})
+    scopes = {"mlp"} if setting == "mlp" else {"all", "mlp"}
+    return frozenset({*scopes, "unavailable", "absent", setting})
 
 
 def done_pairs(rows: Iterable[SuiteRun]) -> set[tuple[str, int]]:
@@ -165,13 +177,11 @@ def arm_runs(
 ) -> tuple[dict[TileState, list[SuiteRun]], TileState | None]:
     """The rows of ``runs`` this arm measured, by the tile state each ran under,
     and the state a reader takes (None when there is no row): the arm's key but
-    for the tile, its window, and a state a load of its setting reports. Rows
-    of two states never pool. The state taken is the one whose rows finished
-    the most (task, index) pairs, the latest of those tied: a resume loads only
-    while no state is complete, so a finished measurement is never set aside
-    for a later load's partial one. Under false a row written before the state
-    was recorded ran off too, and joins the "off" rows; under any other setting
-    such a row's scope is unknown, and it keeps a group of its own."""
+    for the tile, its window, and a state a load of its setting reports
+    (_tile_states). Rows of two states never pool. The state taken is the one
+    whose rows finished the most (task, index) pairs, the latest of those tied:
+    a resume loads only while no state is complete, so a finished measurement
+    is never set aside for a later load's partial one."""
     allowed = _tile_states(arm.projection_tile)
     groups: dict[TileState, list[SuiteRun]] = {}
     last: dict[TileState, int] = {}
@@ -393,7 +403,7 @@ def run_one(
         attention_tile=arm.attention_tile,
         projection_kernel=arm.projection_kernel,
         kv_int8=arm.kv_int8,
-        projection_tile=loaded_tile(engine.projection_tile_status),
+        projection_tile=loaded_tile(engine.projection_tile_status, arm.projection_tile),
         window=arm.window,
         state="failed" if failed else "done",
         outcome=None if failed else result.outcome,
@@ -604,7 +614,7 @@ def _run_suite(
             _check_kv8(arm, engine, out)
         except RuntimeError as e:
             check_error = str(e)
-        tile = loaded_tile(engine.projection_tile_status)
+        tile = loaded_tile(engine.projection_tile_status, arm.projection_tile)
         # Only the rows of the state this load reported count as done: rows of
         # another scope verified another way, and the runs go again under this
         # one rather than pool with them.

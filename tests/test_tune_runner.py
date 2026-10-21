@@ -10,6 +10,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 from sous.config import SousConfig
 from sous.engine.base import ManagedEngine, ReplaySafe
 from sous.tune.arms import Arm
@@ -18,6 +20,7 @@ from sous.tune.suite import load_tasks
 from sous.tune.suite.runner import (
     CountingEngine,
     SuiteRun,
+    arm_runs,
     estimate_seconds,
     interpreter_first,
     loaded_tile,
@@ -119,8 +122,8 @@ def test_run_one_grades_a_solved_task_and_reads_every_metric_from_the_run(tmp_pa
     assert Path(run.transcript_path).is_file()
     written = (tmp_path / "s" / "project" / "rpn.py").read_text()
     assert written == (task.solution / "rpn.py").read_text()
-    # The fake engine reports no projection tile, which is a load without it.
-    assert run.key == (*_arm(tmp_path).key, False, False, True, True, True, "off")
+    # The fake engine reports no projection tile: under true, an engine without it.
+    assert run.key == (*_arm(tmp_path).key, False, False, True, True, True, "absent")
 
 
 def test_a_command_outside_the_allowlist_is_denied_and_counted(tmp_path):
@@ -1188,7 +1191,7 @@ def _suite_lines(tmp_path, name, arm, engine):
     )
     assert len(outcome.runs) == 1 and outcome.error is None, name
     # The row records what the load reported, never the setting.
-    want = loaded_tile(getattr(engine, "projection_tile_status", None))
+    want = loaded_tile(getattr(engine, "projection_tile_status", None), arm.projection_tile)
     assert outcome.runs[0].projection_tile == want, name
     return [line for line in lines if "projection tile" in line]
 
@@ -1197,11 +1200,83 @@ def test_loaded_tile_reads_the_scope_while_active_and_the_state_otherwise():
     def status(state, scope=None):
         return {"state": state, "scope": scope, "reason": None}
 
-    assert loaded_tile(status("active", "all")) == "all"
-    assert loaded_tile(status("active", "mlp")) == "mlp"
-    assert loaded_tile(status("unavailable")) == "unavailable"
-    assert loaded_tile(status("off")) == "off"
-    assert loaded_tile(None) == "off"
+    for setting in (True, "mlp", "all"):
+        assert loaded_tile(status("active", "all"), setting) == "all"
+        assert loaded_tile(status("active", "mlp"), setting) == "mlp"
+        assert loaded_tile(status("unavailable"), setting) == "unavailable"
+        # A VLM load reports off only under false: here it is an engine without
+        # the tile (the mlx-lm backend's), or one with no status at all.
+        assert loaded_tile(status("off"), setting) == "absent"
+        assert loaded_tile(None, setting) == "absent"
+    assert loaded_tile(status("off"), False) == "off"
+    assert loaded_tile(None, False) == "off"
+
+
+# setting -> the recorded states a resume under it counts, each mapped to the group
+# it joins; every other state reruns the arm. Rows written before rows recorded the
+# load's state hold the setting: false joins "off", true keeps a group of its own.
+_TILE_CELLS = {
+    False: {"off": "off", False: "off"},
+    True: {
+        "all": "all",
+        "mlp": "mlp",
+        "unavailable": "unavailable",
+        "absent": "absent",
+        True: True,
+    },
+    "mlp": {"mlp": "mlp", "unavailable": "unavailable", "absent": "absent"},
+    "all": {"all": "all", "mlp": "mlp", "unavailable": "unavailable", "absent": "absent"},
+}
+_RECORDED = ("all", "mlp", "unavailable", "off", "absent", True, False)
+_NOT_COUNTED = object()
+
+
+@pytest.mark.parametrize("recorded", _RECORDED, ids=repr)
+@pytest.mark.parametrize("setting", list(_TILE_CELLS), ids=repr)
+def test_a_resume_counts_a_row_only_under_a_setting_that_can_load_its_state(
+    tmp_path, setting, recorded
+):
+    """ "off" is a tile switched off, which no tile-capable setting counts; "mlp"
+    counts under "all" too, which reports it when no stack had a plan; "absent",
+    an engine without the tile, counts under every setting but false."""
+    arm = dataclasses.replace(_arm(tmp_path), projection_tile=setting)
+    row = dataclasses.replace(_finished_row(arm), projection_tile=recorded)
+    groups, state = arm_runs(arm, [row])
+    want = _TILE_CELLS[setting].get(recorded, _NOT_COUNTED)
+    if want is _NOT_COUNTED:
+        assert (groups, state) == ({}, None)
+    else:
+        assert state == want and type(state) is type(want) and groups == {want: [row]}
+
+
+def _finished_row(arm):
+    return SuiteRun(
+        task="t",
+        index=0,
+        label=arm.label,
+        model_id=arm.model_id,
+        drafter_id=arm.drafter_id,
+        block_size=arm.block_size,
+        int8_prefill=arm.int8_prefill,
+        greedy=arm.greedy,
+        attention_tile=arm.attention_tile,
+        projection_kernel=arm.projection_kernel,
+        kv_int8=arm.kv_int8,
+        projection_tile=arm.projection_tile,
+        window=arm.window,
+        state="done",
+        outcome="completed",
+        turns=1,
+        seconds=1.0,
+        output_tokens=1,
+        malformed=0,
+        repetitions=0,
+        approvals_denied=0,
+        grade=1.0,
+        grade_detail="",
+        error=None,
+        transcript_path=None,
+    )
 
 
 def test_rows_record_the_scope_the_load_reported_and_resume_on_its_done_set(tmp_path):
