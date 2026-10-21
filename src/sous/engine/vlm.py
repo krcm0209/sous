@@ -78,12 +78,15 @@ def _widen_kv_step(layers: list) -> None:
     for c in layers:
         c.step = DECODE_KV_STEP
         # mlx-vlm's DFlash round loop reserves offset + block rows on every
-        # layer before its first round, and the reserve rounds that up to a
-        # multiple of the step and copies the whole cache whenever the rounded
-        # figure passes the capacity, rows that fit or not. At 4096 that is
-        # nearly every decode, one copy the cost of a growth where at 256 the
-        # prefill's last growth had left the room, so this decode's reserve
-        # copies only when the rows do not fit.
+        # layer before its first round, rounded up to a multiple of the step,
+        # and copies the whole cache whenever the rounded figure passes the
+        # capacity, whether the rows fit or not. At 256 the prefill's last
+        # growth nearly always leaves the room; at 4096 nearly every decode
+        # would pay that copy, the cost of a growth, before its first round,
+        # a loss on every reply shorter than ~250 tokens. The step cannot wait
+        # until after the reserve: generate_step appends the decode's own
+        # prompt rows before the round loop starts. So this decode's reserve
+        # copies only when the rows do not fit, and then grows a full step.
         c.prefix_cache_reserve = functools.partial(_reserve_when_short, c)
 
 

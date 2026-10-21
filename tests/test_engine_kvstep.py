@@ -139,34 +139,62 @@ def _padded(offset: int, capacity: int):
     return c
 
 
-def test_the_decodes_reserve_copies_only_when_the_rows_do_not_fit(monkeypatch):
-    """mlx-vlm's DFlash round loop reserves offset + block rows before its first
-    round, rounded up to a multiple of the step. At 4096 mlx-vlm's own reserve
-    copies a cache whose buffers already hold those rows; inside a decode the
-    reserve leaves it alone and grows only the cache that is short."""
+# The generation prompt the decode call prefills itself, and the DFlash block.
+PROMPT_ROWS, BLOCK = 7, 8
+
+
+def _decode_start(caches: list) -> list[tuple[bool, int]]:
+    """What a decode does to its caches before the first round: generate_step
+    appends the decode's own prompt rows, then the DFlash round loop reserves
+    offset + block rows. Per cache, whether the reserve copied the buffers and
+    the capacity it left."""
     from mlx_vlm.speculative.dflash import _reserve_dflash_target_cache
 
-    block = 8
-    # A 256-step prefill growth from 56,403 keys, then the 7-row generation
-    # prompt: 249 rows of room left.
-    control = _padded(56_410, 56_659)
-    control.step = DECODE_KV_STEP
-    _reserve_dflash_target_cache([control], block)
-    assert control.keys.shape[2] == 57_344, "mlx-vlm's reserve no longer copies a roomy cache"
+    for c in caches:
+        c.update_and_fetch(*_rows(PROMPT_ROWS, seed=4))
+    before = [c.keys for c in caches]
+    _reserve_dflash_target_cache(caches, BLOCK)
+    return [(c.keys is not b, c.keys.shape[2]) for c, b in zip(caches, before, strict=True)]
 
-    roomy, short = _padded(56_410, 56_659), _padded(56_655, 56_659)
-    seen: list[tuple[bool, int, int]] = []
+
+def _first_growth(c) -> int:
+    """Rows the next growth adds, appending one row at a time as decode steps do."""
+    capacity = c.keys.shape[2]
+    while c.keys.shape[2] == capacity:
+        c.update_and_fetch(*_rows(1, seed=6))
+        mx.eval(c.keys, c.values)
+    return c.keys.shape[2] - capacity
+
+
+def test_a_decode_starts_without_a_copy_its_256_row_reserve_would_not_have_made(monkeypatch):
+    """Both caches end a 256-step prefill at capacity 56,659: one with room past
+    its prompt rows and the block, one 4 rows short. At mlx-vlm's step the
+    reserve leaves the roomy one alone and copies the short one, and the next
+    growth adds 256 rows; with the step at 4096 and mlx-vlm's own reserve the
+    roomy one is copied too. Inside a decode the reserve copies only the short
+    one, and the roomy one's first growth after it adds 4096 rows."""
+    roomy, short = 56_403, 56_648
+
+    at_default = [_padded(roomy, 56_659), _padded(short, 56_659)]
+    assert _decode_start(at_default) == [(False, 56_659), (True, 56_832)]
+    assert _first_growth(at_default[0]) == DEFAULT_STEP
+
+    step_only = _padded(roomy, 56_659)
+    step_only.step = DECODE_KV_STEP
+    assert _decode_start([step_only]) == [(True, 57_344)], "mlx-vlm's reserve stopped copying"
+
+    seen: list[object] = []
 
     def stream_generate(model, processor, prompt, **kwargs):
-        before = roomy.keys
-        _reserve_dflash_target_cache(kwargs["prompt_cache"], block)
-        seen.append((roomy.keys is before, roomy.keys.shape[2], short.keys.shape[2]))
+        caches = kwargs["prompt_cache"]
+        seen.append((_decode_start(caches), _first_growth(caches[0])))
         yield _result("ok")
 
+    decoded = [_padded(roomy, 56_659), _padded(short, 56_659)]
     _stub_mlx_vlm(monkeypatch, stream_generate)
-    assert _engine().decode([roomy, short], [4, 5], 8) == "ok"
-    assert seen == [(True, 56_659, 57_344)]
-    for c in (roomy, short):
+    assert _engine().decode(decoded, [4, 5], 8) == "ok"
+    assert seen == [([(False, 56_659), (True, 57_344)], DECODE_KV_STEP)]
+    for c in decoded:
         assert set(vars(c)) == {"keys", "values", "offset"}
 
 
