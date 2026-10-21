@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import sys
 import threading
 import warnings
@@ -76,13 +77,31 @@ def _kv_layers(cache: list) -> list:
 def _widen_kv_step(layers: list) -> None:
     for c in layers:
         c.step = DECODE_KV_STEP
+        # mlx-vlm's DFlash round loop reserves offset + block rows on every
+        # layer before its first round, and the reserve rounds that up to a
+        # multiple of the step and copies the whole cache whenever the rounded
+        # figure passes the capacity, rows that fit or not. At 4096 that is
+        # nearly every decode, one copy the cost of a growth where at 256 the
+        # prefill's last growth had left the room, so this decode's reserve
+        # copies only when the rows do not fit.
+        c.prefix_cache_reserve = functools.partial(_reserve_when_short, c)
+
+
+def _reserve_when_short(cache: Any, min_capacity_tokens: int) -> tuple:
+    """mlx-vlm's prefix_cache_reserve, skipped while the buffers already hold
+    the rows it asks for."""
+    keys = cache.keys
+    if keys is None or max(cache.offset, int(min_capacity_tokens)) <= keys.shape[2]:
+        return ()
+    return type(cache).prefix_cache_reserve(cache, min_capacity_tokens)
 
 
 def _restore_kv_step(layers: list) -> None:
-    """Back to the class's own step. Never raises: it runs first in decode()'s
-    finally."""
+    """Back to the class's own step and reserve. Never raises: it runs first in
+    decode()'s finally."""
     for c in layers:
         vars(c).pop("step", None)
+        vars(c).pop("prefix_cache_reserve", None)
 
 
 class VLMEngine:
