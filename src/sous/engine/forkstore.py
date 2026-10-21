@@ -179,9 +179,8 @@ def fork_key_fields(
     projection kernel served it, whether the projection tile left the MLP
     slab-only (`ptile`, read off the modules: "active", "off", or
     "partial:<slab-only>/<total>:<digest of which>" after a revert that raised
-    part-way), the macOS
-    build, and the two mlx-core environment switches that change matmul
-    precision and attention accumulation.
+    part-way), the macOS build, and the two mlx-core environment switches
+    that change matmul precision and attention accumulation.
 
     The tile and the projection kernel both run the one-row forward that
     ends every prefill segment, and the projection kernel any prefill tail
