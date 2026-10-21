@@ -1,5 +1,5 @@
 """The projection tile's engine wiring: where VLMEngine enables it and with what,
-the decode window around the generation, prefill's refusal of an open window,
+the decode window around the generation, prefill's close of a stale window,
 and unload. Engines are built without weights: object.__new__ for the decode,
 prefill and unload seams, and the constructor over stubbed mlx-vlm for the load
 order, so these run in CI."""
@@ -8,6 +8,7 @@ import contextlib
 import sys
 import threading
 import types
+import warnings
 
 import pytest
 
@@ -17,7 +18,7 @@ from sous.engine import draftctx, kv8, projtile  # noqa: E402 — after the guar
 from sous.engine.promptcache import PrefixCache, PromptMemo, Speculation  # noqa: E402
 from sous.engine.vlm import VLMEngine  # noqa: E402
 
-_WINDOW_OPEN = "projection tile window open across a prefill"
+_WINDOW_OPEN = "projection tile window {} was open across a prefill; closed it"
 
 
 @pytest.fixture(autouse=True)
@@ -71,22 +72,29 @@ def _stub_mlx_vlm(monkeypatch, **attrs) -> None:
 # ---- prefill ---------------------------------------------------------------------
 
 
-def test_prefill_refuses_an_open_tile_window(monkeypatch):
+def test_prefill_closes_a_stale_tile_window_and_warns(monkeypatch):
     """A window left open would put the tile's bits into KV a fork keeps, under a
-    key that cannot tell; prefill raises before it reads the model at all."""
+    key that cannot tell. Prefill closes it before the forward, with a warning
+    naming the window, and the turn goes on: refusing would fail every turn
+    after it, each of which prefills before the decode that replaces the window.
+    Each occurrence warns, never once for all."""
+    seen: list[object] = []
 
     def generate(*args, **kwargs):
-        raise AssertionError("prefill ran past an open window")
+        seen.append(projtile._window)
 
     _stub_mlx_vlm(monkeypatch, generate=generate)
+    monkeypatch.setattr(projtile, "_active", 1)
     engine = _engine()
-    engine._model = None  # _loaded() would raise its own error
-    projtile.open_window()
-    with pytest.raises(RuntimeError, match=_WINDOW_OPEN):
-        engine.prefill([], [1, 2, 3])
-    projtile.close_window()
-    with pytest.raises(RuntimeError, match="has been unloaded"):
-        engine.prefill([], [1, 2, 3])
+    for _ in range(3):
+        projtile.open_window()
+        window = projtile._window
+        assert window is not None
+        with pytest.warns(UserWarning, match=_WINDOW_OPEN.format(window.serial)) as caught:
+            engine.prefill([types.SimpleNamespace()], [1, 2, 3])
+        assert len(caught) == 1
+        assert projtile._window is None
+    assert seen == [None, None, None]
 
 
 def test_prefill_runs_with_the_window_closed_while_the_tile_is_active(monkeypatch):
@@ -189,9 +197,12 @@ def test_decode_closes_the_tile_window_even_when_kv8s_close_raises(monkeypatch):
         engine.decode([types.SimpleNamespace()], [4, 5], 8)
     assert len(during) == 1 and isinstance(during[0], projtile.Window)
     assert projtile._window is None
-    # Nothing was left open for the next turn's prefill to refuse.
+    # Nothing was left open for the next turn's prefill to find and close.
     _stub_mlx_vlm(monkeypatch, generate=lambda *args, **kwargs: None)
-    engine.prefill([types.SimpleNamespace()], [1])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        engine.prefill([types.SimpleNamespace()], [1])
+    assert caught == []
 
 
 def test_decode_closes_both_windows_when_the_generation_raises(monkeypatch):

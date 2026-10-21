@@ -755,8 +755,11 @@ goal.
   inside the draft-context `seed` block just before `stream_generate`, when
   `projtile._active`, and closes it first in that loop's `finally`, in a
   `try` of its own, so kv8's close runs whatever happens (`close_window()`
-  never raises). `prefill()` raises `RuntimeError` while a window is open:
-  KV with the tile's bits would reach a fork under a key that cannot tell.
+  never raises). `prefill()` finding a window open closes it and warns,
+  naming the window's serial, before the forward: KV with the tile's bits
+  would reach a fork under a key that cannot tell, and a refusal would fail
+  every prompt-cache turn (each prefills before the decode that replaces
+  the window) until a reload.
   The round flag (`set_round_flag`) is a harness's per-round lever that only
   `serves()` reads. One module-global window suffices:
   `ManagedEngine._gen_lock` serialises every forward and `decode()` runs on

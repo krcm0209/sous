@@ -371,10 +371,19 @@ class VLMEngine:
     def prefill(self, cache: list, token_ids: list[int], capture: Any = None) -> Any:
         # A window left open (a decode whose close never ran) would serve
         # this prefill's 2-8-row calls on the tile, and KV with the tile's
-        # bits would reach a fork under a key that cannot tell. Refuse rather
-        # than serve.
-        if projtile._window is not None:
-            raise RuntimeError("projection tile window open across a prefill")
+        # bits would reach a fork under a key that cannot tell. Close it and
+        # go on: a refusal would fail every prompt-cache turn and its cold
+        # retry until a reload, since each prefills before the decode that
+        # would replace the window. The serial makes each occurrence its own
+        # warning rather than one the filters show once.
+        stale = projtile._window
+        if stale is not None:
+            projtile.close_window()
+            warnings.warn(
+                f"sous: projection tile window {stale.serial} was open across a prefill; "
+                "closed it, so the prefill runs off the tile",
+                stacklevel=2,
+            )
         import mlx.core as mx
         from mlx_vlm import generate
 
