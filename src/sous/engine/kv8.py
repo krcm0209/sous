@@ -33,7 +33,6 @@ from typing import Any
 
 from sous.engine import nax, projkernel, tileattn, verifyattn
 from sous.engine.int8prefill import _error_line, _kernel, _kernel_text
-from sous.engine.window import DECODE_KV_STEP
 
 logger = logging.getLogger("sous.engine.kv8")
 
@@ -389,18 +388,22 @@ def ceiling(window: int, splits: int) -> int:
     """L for a `window`-token reserve at `splits` splits: the largest tile step
     boundary b whose mirror fits beside the turn's bf16 KV at every instant,
     else 0. With C = b rounded up to the capacity step, the rule is
-    1.504 C + 0.504 C / 16 + 16 + DECODE_KV_STEP <= window: the bf16 KV up to C
-    and the mirror at C (516 bytes per token per head against bf16's 1,024),
-    one of the 16 full-attention layers' old mirror while a growth copies it,
-    and the 16 rows a straddling verify holds past L plus one growth of the
-    decode's bf16 KV, which a decode grows by DECODE_KV_STEP rows. Being a step
-    boundary, L is a verify_plan cut, so no run straddles it."""
+    1.504 C + 0.504 C / 16 + 272 <= window: the bf16 KV up to C and the mirror
+    at C (516 bytes per token per head against bf16's 1,024), one of the 16
+    full-attention layers' old mirror while a growth copies it, and the 16 rows
+    a straddling verify holds past L plus one capacity step. A decode grows its
+    bf16 KV by window.DECODE_KV_STEP = 4096 rows, so its buffers can overshoot
+    the window-sized reserve by up to 4,095 rows (about 256 MiB on the default
+    model), mirror or none; promptcache's 2 GiB CACHE_BUDGET_SLACK absorbs that,
+    so the overhang term stays 16 + 256 rows and the rows kv8 serves do not
+    depend on the decode's step. Being a step boundary, L is a verify_plan cut,
+    so no run straddles it."""
     best = 0
     for b in tileattn.boundaries(window, splits):
         c = _round_up(b)
         # The rule in thousandths, so a boundary on the margin is decided in exact
         # integers (C // 16 is exact: C is a multiple of 256).
-        if 1504 * c + 504 * (c // 16) + 1000 * (16 + DECODE_KV_STEP) <= 1000 * window:
+        if 1504 * c + 504 * (c // 16) + 272_000 <= 1000 * window:
             best = b
     return best
 

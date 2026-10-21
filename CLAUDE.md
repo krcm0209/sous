@@ -978,11 +978,15 @@ goal.
   tile only across runs. `L` (`_ceiling`) is computed once by `enable()` with the pure
   `ceiling(window, splits)` from `[model].max_context_tokens`: the largest
   step boundary whose mirror fits beside the turn's bf16 KV inside the
-  window-sized reserve at every instant (`1.504·C + 0.504·C/16 + 16 +
-  DECODE_KV_STEP ≤ window`, `C = round_up(L, 256)`: the bf16 KV, the
-  mirror, one layer's old buffer during a growth, and the rows a straddling
-  verify holds past L plus one growth of the decode's bf16 KV, 4,096 rows),
-  about 82K at 131072 and 168K at 262144. The reserve, the slot budget and
+  window-sized reserve at every instant (`1.504·C + 0.504·C/16 + 272 ≤
+  window`, `C = round_up(L, 256)`: the bf16 KV, the mirror, one layer's old
+  buffer during a growth, and the rows a straddling verify holds past L),
+  about 84K at 131072 and 170K at 262144. A decode grows its KV by
+  `window.DECODE_KV_STEP` = 4096 rows, which can overshoot the window-sized
+  reserve by up to 4,095 rows (about 256 MiB on the default model), mirror
+  or none; `promptcache.CACHE_BUDGET_SLACK` (2 GiB) absorbs it, so the
+  ceiling keeps its 16 + 256 overhang term and the rows kv8 serves do not
+  depend on the decode's growth step. The reserve, the slot budget and
   the pressure valve are deliberately untouched: scaling the reserve would
   cost 4–8 GiB of slot budget, and admitting against live memory would
   make a prompt's output depend on slot occupancy. A call whose first row
