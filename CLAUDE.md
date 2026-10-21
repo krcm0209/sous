@@ -98,7 +98,13 @@ goal.
   honour), and a take retires the lengths below its slot
   (`_retire_ancestors`, read off `held`, never recorded), so a conversation
   holds its current and previous lengths and a chain a cold retry breaks
-  heals on the next take. Inline `role:"system"` messages after the first user message
+  heals on the next take. A slot is priced at `slot_bytes`, every layer's
+  `nbytes`, so the whole padded buffers: `VLMEngine.decode()`, and nothing
+  else, grows the full-attention `KVCache`s by `window.DECODE_KV_STEP` = 4096
+  rows (mlx-vlm's step is 256; a prefill keeps it, and the decode's `finally`
+  puts it back), so a published turn slot carries up to 4,096 rows past its
+  decode's last token, 256 MiB on the default model, while a `fork_copy`
+  holds only the offset's rows. Inline `role:"system"` messages after the first user message
   render as `<system-reminder>` blocks in the preceding user turn (after its
   tool results), or as a user turn of their own after an assistant turn
   (`api/convert._place_inline_system`), never hoisted into the system

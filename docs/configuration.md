@@ -98,7 +98,13 @@ from least-recently-used slots,
 forks included, so keeping a fork resident beside a retaining conversation
 wants about four slots' worth, ~14 GiB. A value below ~14 GiB makes every
 cold turn take a fork copy that a later turn then evicts to make room for
-its own copy, so it pays the fork and never reuses it. Slots are
+its own copy, so it pays the fork and never reuses it. A slot is charged
+for the buffers it holds, not for its token count: on the mlx-vlm backend
+(the default model's) a generation grows the turn's KV 4,096 tokens at a
+time (a prefill 256 at a time), so the slot a
+turn leaves carries up to 4,096 tokens of spare room past its reply, about
+256 MiB on the default model, while a fork holds exactly its boundary's
+tokens. Slots are
 evicted least-recently-used first when the budget, a count of 16, or memory
 pressure says so. Pressure is two readings: Metal's own headroom (room for one
 more window of KV), and the kernel's memory-pressure level — at *warn* each
