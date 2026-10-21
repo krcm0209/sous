@@ -9,6 +9,7 @@ which run the kernel on the tensor units."""
 import contextlib
 import gc
 import hashlib
+import itertools
 import logging
 import types
 import warnings
@@ -665,6 +666,43 @@ def test_plan_for_call_needs_planes_and_a_plan(monkeypatch):
     assert call(two) is None
     assert call((gdn.out_proj,)) == (plans[(256, (256,))],)
     assert call((mlp.gate_proj,)) == (plans[(256, (512,))],)
+
+
+def _stack_members(k: int, widths: tuple[int, ...]) -> tuple[Any, ...]:
+    """One stack's members at K ``k`` and these widths, carrying the markers
+    build_stacks sets and nothing else: all _launches and plan_for_call read of a
+    stacked call. Neither reads the planes, so the stack holds none."""
+    edges = tuple(itertools.accumulate(widths, initial=0))
+    info = slab.SlabInfo(n_real=edges[-1], k=k, tiles=-(-edges[-1] // slab.TILE))
+    stack = projtile.Stack(None, None, None, info, tuple(itertools.pairwise(edges)), (k, widths))
+    members = tuple(types.SimpleNamespace() for _ in widths)
+    for index, member in enumerate(members):
+        object.__setattr__(member, projtile.STACK_ATTR, stack)
+        object.__setattr__(member, projtile.INDEX_ATTR, index)
+    return members
+
+
+@pytest.mark.parametrize("widths", [(10240, 6144, 48, 48), (12288, 1024, 1024)], ids=["gdn", "qkv"])
+def test_a_stacked_call_is_one_launch_only_with_its_stack_whole(monkeypatch, widths):
+    """A stack's launch computes every member's columns, so a call takes it only
+    with the stack's members whole and in order. Part of one (in_proj_qkv+in_proj_z
+    without b and a, q+k without v) stays on the projection kernel even with a plan
+    at the part's own widths in the table: the rule is _launches', not the table's
+    lacking those keys."""
+    members = _stack_members(5120, widths)
+    key = (5120, widths)
+    plan = projtile.PLANS[key]
+    parts = [members[:n] for n in range(2, len(members))] + [members[1:], members[::-1]]
+    for part in parts:
+        part_widths = tuple(widths[vars(m)[projtile.INDEX_ATTR]] for m in part)
+        monkeypatch.setitem(projtile.PLANS, (5120, part_widths), plan)
+    for part in parts:
+        assert projtile._launches(part) is None
+        assert projtile.plan_for_call(part) is None
+    launches = projtile._launches(members)
+    assert launches is not None
+    assert [(k, tuple(map(id, run))) for k, run in launches] == [(key, tuple(map(id, members)))]
+    assert projtile.plan_for_call(members) == (projtile.Launch(key, members, plan),)
 
 
 _INFO = slab.SlabInfo(n_real=4160, k=2048, tiles=17)
