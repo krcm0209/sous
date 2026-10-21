@@ -466,11 +466,13 @@ def linears(x: Any, weights: Sequence[Entry]) -> tuple[Any, ...]:
     if k // _GROUP < _KS or (kind != "plain" and k % _STAGED_K):
         raise ValueError(f"projection kernel: K={k} does not fit the {kind} variant")
     x2 = x if x.ndim == 2 else x.reshape(rows, k)
+    # The normalised entries, so neither seam normalises them again: every
+    # projection of every decoded token comes through here.
     if rows == 1 and k <= _ROW_MAX_K:
-        calls["one_row"] += len(weights)
-        outs = [_row(x2, e) for e in weights]
+        calls["one_row"] += len(entries)
+        outs = [_row(x2, e) for e in entries]
     else:
-        outs = _launch(kind, x2, weights)
+        outs = _launch(kind, x2, entries)
     if x.ndim == 2:
         return tuple(outs)
     return tuple(out.reshape(*x.shape[:-1], out.shape[-1]) for out in outs)
