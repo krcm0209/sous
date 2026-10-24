@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gc
 import threading
+import types
 import weakref
 from pathlib import Path
 from typing import cast
@@ -29,6 +30,7 @@ from sous.engine.promptcache import (
     fork_copy,
     fork_file_bytes,
     fork_point,
+    held_bytes,
     metal_headroom,
     restore,
     reuse_length,
@@ -36,6 +38,7 @@ from sous.engine.promptcache import (
     snapshot,
     trim_to,
 )
+from sous.engine.window import DECODE_KV_STEP
 
 
 class FakeArray:
@@ -156,6 +159,64 @@ class FakeMeta:
     @property
     def nbytes(self) -> int:
         return sum(a.nbytes for a in self.cache if a is not None)
+
+
+# mlx-vlm's KVCache step: what a prefill grows the padded fake by.
+PREFILL_STEP = 256
+
+
+class FakePadded:
+    """A KVCache stand-in that keeps mlx's padded buffers: `keys.shape[2]` is
+    the capacity, grown by whole steps past the rows when an append passes it
+    and kept by a trim. `nbytes` prices the whole capacity while `state` holds
+    only the offset's rows, so a fork copy comes out with no padding and the
+    original keeps its own."""
+
+    ROW = 8  # K and V bytes per row
+
+    def __init__(self, offset: int = 0, step: int = PREFILL_STEP):
+        self.offset = offset
+        self.step = step
+        self.capacity = -(-offset // step) * step
+        self.growths = 0
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def trim(self, n: int) -> int:
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def append(self, n: int) -> None:
+        if self.offset + n > self.capacity:
+            self.capacity = self.offset + -(-n // self.step) * self.step
+            self.growths += 1
+        self.offset += n
+
+    @property
+    def keys(self) -> types.SimpleNamespace | None:
+        return types.SimpleNamespace(shape=(1, 1, self.capacity, 1)) if self.capacity else None
+
+    @property
+    def state(self):
+        return [FakeArray(self.offset, nbytes=self.offset * self.ROW)]
+
+    @state.setter
+    def state(self, v):
+        self.offset = self.capacity = v[0].value
+
+    @property
+    def meta_state(self):
+        return ""
+
+    @meta_state.setter
+    def meta_state(self, v):
+        assert not v
+
+    @property
+    def nbytes(self) -> int:
+        return self.capacity * self.ROW
 
 
 def _empty_stats() -> dict:
@@ -430,6 +491,43 @@ class FakeHooks:
         self.log.append("restore")
         self.restore_calls.append(list(ids))
         self._advance(cache, len(ids))
+
+
+class PaddedHooks(FakeHooks):
+    """FakeHooks over FakePadded attention layers, whose decode grows the KV by
+    `decode_step` rows, as the VLM engine's does, and puts the prefill step
+    back after; `ran_on` is every cache a decode extended."""
+
+    def __init__(self, trimmable: bool, decode_step: int = DECODE_KV_STEP):
+        super().__init__(trimmable)
+        self.decode_step = decode_step
+        self.ran_on: list[list] = []
+
+    def new_cache(self) -> list:
+        self.log.append("new_cache")
+        cache: list = (
+            [FakePadded() for _ in range(self.layers)]
+            if self.trimmable
+            else [FakePadded(), FakeRecurrent([FakeArray(0), None])]
+        )
+        self.caches.append(cache)
+        return cache
+
+    def _advance(self, cache, n):
+        for c in cache:
+            if isinstance(c, FakePadded):
+                c.append(n)
+
+    def decode(self, cache, token_ids, max_tokens, on_delta=None, context=None):
+        self.ran_on.append(cache)
+        padded = [c for c in cache if isinstance(c, FakePadded)]
+        for c in padded:
+            c.step = self.decode_step
+        try:
+            return super().decode(cache, token_ids, max_tokens, on_delta, context)
+        finally:
+            for c in padded:
+                c.step = PREFILL_STEP
 
 
 class FakeEntry:
@@ -1155,6 +1253,51 @@ def test_slot_bytes_tolerates_a_layer_without_nbytes():
     assert slot_bytes([Bare(), FakeTrimmable(offset=1)]) == 8
 
 
+def test_held_bytes_counts_a_padded_layers_share_of_its_buffers():
+    # K and V are padded alike, so the offset's share of the capacity is the
+    # share of the bytes the tokens hold.
+    layer = FakePadded(offset=10)
+    assert layer.nbytes == PREFILL_STEP * FakePadded.ROW
+    assert held_bytes([layer]) == 10 * FakePadded.ROW
+    odd = types.SimpleNamespace(
+        offset=3, keys=types.SimpleNamespace(shape=(1, 1, 7, 1)), nbytes=100
+    )
+    assert held_bytes([odd]) == 100 * 3 // 7
+
+
+def test_held_bytes_counts_a_layer_the_rule_cannot_read_whole():
+    # A recurrent state does not grow with the tokens; an offset beside no
+    # padded buffer, or one that is not an int (a batched cache's array),
+    # gives nothing to scale, and resident is the conservative side.
+    recurrent = FakeRecurrent([FakeArray(1, nbytes=24), None])
+    batched = types.SimpleNamespace(
+        offset=FakeArray(3), keys=types.SimpleNamespace(shape=(1, 1, 256, 1)), nbytes=100
+    )
+    assert held_bytes([recurrent]) == 24
+    assert held_bytes([FakeTrimmable(offset=10)]) == 80
+    assert held_bytes([batched]) == 100
+
+
+def test_held_bytes_never_counts_more_than_a_layer_holds():
+    # A rotating window that wrapped keeps counting tokens past its capacity;
+    # every row of it is held.
+    wrapped = types.SimpleNamespace(
+        offset=5000, keys=types.SimpleNamespace(shape=(1, 1, 256, 1)), nbytes=2048
+    )
+    assert held_bytes([wrapped]) == 2048
+
+
+def test_held_bytes_of_an_empty_kv_cache_is_zero():
+    layer = FakePadded()
+    assert layer.keys is None
+    assert held_bytes([layer]) == 0
+
+
+def test_held_bytes_sums_a_mixed_cache():
+    cache = [FakePadded(offset=10), FakeRecurrent([FakeArray(1, nbytes=24), None]), FakePadded()]
+    assert held_bytes(cache) == 10 * FakePadded.ROW + 24
+
+
 # ---- auto_cache_budget -------------------------------------------------------
 
 
@@ -1319,8 +1462,8 @@ def test_two_interleaved_conversations_both_reuse():
     assert pc.stats()["misses"] == 2
     assert h.decoded[2] == A2_FULL[len(A1) :]
     assert h.decoded[3] == B2_FULL[len(B1) :]
-    # each warm turn works on a copy of its slot; the slot itself stays for a
-    # branch to find
+    # each warm turn leaves a copy of its slot for a branch to find and
+    # extends the slot's own arrays
     assert len(h.caches) == 4
 
 
@@ -1382,7 +1525,7 @@ def test_a_turn_slot_is_retained_when_the_budget_holds_the_copy():
     """Claude Code branches a running subagent's conversation with progress
     summary calls: the same prefix, a different last turn. A slot the
     extending turn consumed would leave the next real turn nothing to start
-    from; copied and left in place, both branches start warm."""
+    from; with a copy left in its place, both branches start warm."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
     pc.generate(A1, A1_FULL, 16)
@@ -1391,9 +1534,10 @@ def test_a_turn_slot_is_retained_when_the_budget_holds_the_copy():
     s = pc.stats()
     assert (s["hits"], s["retained"], s["moved"], s["reused_tokens"]) == (1, 1, 0, len(A1))
     assert h.decoded[-1] == A2_FULL[len(A1) :]
-    turn1, turn2 = [c for c in h.caches]
-    assert cast(FakeTrimmable, turn1[0]).offset == len(A1)  # the original is untouched
-    assert cast(FakeTrimmable, turn2[0]).offset == len(A2)
+    original, copy = [c for c in h.caches]
+    # The turn extends the original and the copy stays in its place.
+    assert cast(FakeTrimmable, original[0]).offset == len(A2)
+    assert cast(FakeTrimmable, copy[0]).offset == len(A1)
 
 
 def test_a_retained_slot_serves_a_branch_and_then_the_real_conversation():
@@ -1585,11 +1729,149 @@ def test_a_copy_the_publish_could_not_keep_beside_the_original_is_not_taken():
     assert (s["retained"], s["moved"], s["evictions"]) == (1, 0, 0)
 
 
+def _asked(pc: PrefixCache, monkeypatch) -> list[int]:
+    """The bytes every `_make_room` call of `pc` is asked for, in order."""
+    asked: list[int] = []
+    real = pc._make_room
+
+    def recording(nbytes, protect=(), *, require=None):
+        asked.append(nbytes)
+        return real(nbytes, protect, require=require)
+
+    monkeypatch.setattr(pc, "_make_room", recording)
+    return asked
+
+
+def test_the_retained_take_forecasts_the_held_rows_plus_one_decode_step(monkeypatch):
+    """The parent's buffers carry the step its decode grew them by, which the
+    publish may or may not carry on; the forecast prices only the rows it
+    holds, per id, at the ids this turn will hold plus one decode step. The
+    room asked of _make_room is that forecast less the padding the swap
+    releases (the parent's buffers past its held rows): with the parent at one
+    step of buffers, the held ids plus this turn's; a cache that prices no
+    padding asks for a step less, floored at nothing."""
+    asked: dict[int, list[int]] = {}
+    for step in (0, DECODE_KV_STEP):
+        h = PaddedHooks(trimmable=True)
+        pc = (
+            PrefixCache(h, max_bytes=ROOMY, decode_step=step)
+            if step
+            else PrefixCache(h, max_bytes=ROOMY)
+        )
+        pc.generate(A1, A1_FULL, 16)
+        (slot,) = pc.slots()
+        assert slot.nbytes == h.layers * DECODE_KV_STEP * FakePadded.ROW
+        assert held_bytes(slot.cache) == h.layers * len(A1) * FakePadded.ROW
+        asked[step] = _asked(pc, monkeypatch)
+        pc.generate(A2, A2_FULL, 16)
+    per_id = h.layers * FakePadded.ROW
+    padding = per_id * (DECODE_KV_STEP - len(A1))
+    assert asked[DECODE_KV_STEP] == [per_id * (len(A2) + DECODE_KV_STEP) - padding]
+    assert asked[DECODE_KV_STEP] == [per_id * (len(A1) + len(A2))]
+    assert asked[0] == [max(0, per_id * len(A2) - padding)]
+
+
+def test_a_padded_parent_is_retained_where_its_scaled_padding_would_force_a_move():
+    """Scaled by stable/held, the parent's padding asks for half as much again
+    as the parent holds; a budget with room for the parent beside its held
+    rows plus a step retains it."""
+    h = PaddedHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY, decode_step=DECODE_KV_STEP)
+    pc.generate(A1, A1_FULL, 16)
+    (slot,) = pc.slots()
+    forecast = held_bytes(slot.cache) * (len(A2) + DECODE_KV_STEP) // len(A1)
+    assert slot.nbytes * len(A2) // len(A1) > forecast
+    pc.max_bytes = slot.nbytes + forecast
+    pc.generate(A2, A2_FULL, 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([A1, A2])
+    s = pc.stats()
+    assert (s["retained"], s["moved"], s["evictions"]) == (1, 0, 0)
+
+
+def test_a_budget_that_holds_the_compact_copy_beside_the_publish_retains():
+    """After the swap the map keeps the parent's held rows, so the room the
+    take needs is the publish beside those rows, not beside the padded
+    buffers: a budget exactly that large retains without evicting, where one
+    charged for the padded parent would have moved the slot."""
+    h = PaddedHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY, decode_step=DECODE_KV_STEP)
+    pc.generate(A1, A1_FULL, 16)
+    (slot,) = pc.slots()
+    held = held_bytes(slot.cache)
+    assert held < slot.nbytes
+    forecast = -(-held * (len(A2) + DECODE_KV_STEP) // len(A1))
+    pc.max_bytes = held + forecast
+    pc.generate(A2, A2_FULL, 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([A1, A2])
+    assert next(s for s in pc.slots() if s.held == A1).nbytes == held
+    s = pc.stats()
+    assert (s["retained"], s["moved"], s["evictions"]) == (1, 0, 0)
+
+
+def test_a_padded_parents_forecast_evicts_nothing_that_would_have_fit():
+    """An over-forecast cannot be undone: what it evicts at the take is gone
+    though the publish would have kept it. B1's slot fits beside A1's copy
+    and A2's slot, so the take must leave it."""
+    h = PaddedHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY, decode_step=DECODE_KV_STEP)
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(B1, B1_FULL, 16)
+    a1, b1 = (next(s for s in pc.slots() if s.held == held) for held in (A1, B1))
+    forecast = held_bytes(a1.cache) * (len(A2) + DECODE_KV_STEP) // len(A1)
+    pc.max_bytes = a1.nbytes + b1.nbytes + forecast
+    pc.generate(A2, A2_FULL, 16)
+    assert sorted(s.held for s in pc.slots()) == sorted([A1, B1, A2])
+    s = pc.stats()
+    assert (s["retained"], s["evictions"]) == (1, 0)
+
+
+@pytest.mark.parametrize("trimmable", [True, False])
+def test_a_retained_take_leaves_the_compact_copy_and_extends_the_original(trimmable):
+    """A fork copy holds exactly its offset's rows while the original carries
+    its padding, rows only the conversation that extends it can write into.
+    The map keeps the copy, priced at its own size, and the turn extends the
+    original, whose spare rows take this turn's tokens without a growth."""
+    h = PaddedHooks(trimmable=trimmable)
+    pc = PrefixCache(h, max_bytes=ROOMY, decode_step=DECODE_KV_STEP)
+    pc.generate(A1, A1_FULL, 16)
+    (slot,) = pc.slots()
+    original, padded = slot.cache, slot.nbytes
+    pc.generate(A2, A2_FULL, 16)
+    copy = h.caches[1]
+    a1, a2 = (next(s for s in pc.slots() if s.held == held) for held in (A1, A2))
+    assert a1 is slot and a1.cache is copy and a1.cache is not original
+    assert a1.nbytes == slot_bytes(copy) < padded
+    assert [(c.offset, c.capacity) for c in copy if isinstance(c, FakePadded)] == [
+        (len(A1), len(A1))
+    ] * (h.layers if trimmable else 1)
+    assert h.ran_on[-1] is original and a2.cache is original
+    layers = [c for c in original if isinstance(c, FakePadded)]
+    assert [(c.offset, c.growths) for c in layers] == [(len(A2), 1)] * len(layers)
+    assert pc.stats()["resident_bytes"] == a1.nbytes + a2.nbytes
+
+
+def test_a_branch_after_a_retained_take_copies_the_copy_the_map_kept():
+    h = PaddedHooks(trimmable=True)
+    pc = PrefixCache(h, max_bytes=ROOMY, decode_step=DECODE_KV_STEP)
+    summary = [*A1, 500]
+    pc.generate(A1, A1_FULL, 16)
+    pc.generate(A2, A2_FULL, 16)
+    kept = next(s for s in pc.slots() if s.held == A1).cache
+    pc.generate(summary, [*summary, 90, 91], 16)
+    assert h.decoded[-1] == [500, 90, 91]
+    assert h.ran_on[-1] is kept
+    a1 = next(s for s in pc.slots() if s.held == A1)
+    assert a1.cache is h.caches[-1] and a1.cache is not kept
+    assert sorted(x.held for x in pc.slots()) == sorted([A1, A2, summary])
+    s = pc.stats()
+    assert (s["hits"], s["retained"], s["moved"]) == (2, 2, 0)
+
+
 def test_a_cold_retry_keeps_the_conversation_at_two_lengths():
     """The warm attempt that took the slot was abandoned and the published
     cache built from nothing — but it is still the next length of the slot
-    it took, which is what the two-length rule is about: the original stays
-    for a branch, and the next turn retires it like any predecessor."""
+    it took, which is what the two-length rule is about: the slot's copy
+    stays for a branch, and the next turn retires it like any predecessor."""
     h = FakeHooks(trimmable=True)
     pc = PrefixCache(h, max_bytes=ROOMY)
     pc.generate(A1, A1_FULL, 16)

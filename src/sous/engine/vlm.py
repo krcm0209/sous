@@ -106,13 +106,15 @@ def _decode_kv_step(cache: list) -> Iterator[list]:
     before its first round, rounded up to a multiple of the step, and copies
     the whole cache whenever the rounded figure passes the capacity, whether
     the rows fit or not. At 256 a cache prefilled from empty in one segment
-    rarely pays it, since that leaves a multiple of 256. A copy (a fork, a
-    retained turn slot) holds exactly its offset's rows, and a prefill that
-    continues from an unaligned offset (after a fork stop, or from such a
-    copy) extends the cache by whole steps from there, so its capacity is
-    mostly not a multiple of 256 and its reserve copies whenever offset +
-    block passes that capacity rounded down to 256: on about half of warm
-    turns and of cold turns with a fork stop. At 4096 nearly every decode
+    rarely pays it, since that leaves a multiple of 256. A copy (a fork, the
+    compact copy a retained take leaves in the map) holds exactly its offset's
+    rows, and a prefill that continues from an unaligned offset (after a fork
+    stop, from such a copy, or from the padded buffers a retained take hands
+    the turn, a step multiple only by chance) extends the cache by whole
+    steps from there, so its capacity is mostly not a multiple of 256 and its
+    reserve copies whenever offset + block passes that capacity rounded down
+    to 256: on about half of warm turns and of cold turns with a fork stop
+    before this shim. At 4096 nearly every decode
     would pay it, the cost of a growth, before its first round, a loss on
     every reply shorter than ~250 tokens. The step cannot wait until after
     the reserve: generate_step appends the decode's own prompt rows before
@@ -330,6 +332,9 @@ class VLMEngine:
             max_bytes=cache_budget,
             reserve_bytes=reserve_bytes,
             store=self.fork_store,
+            # What a retained take forecasts for the slot this turn publishes:
+            # its held rows plus the step decode() pads them by.
+            decode_step=DECODE_KV_STEP,
         )
 
     @staticmethod

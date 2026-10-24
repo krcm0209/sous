@@ -17,6 +17,7 @@ pytest.importorskip("mlx.core")
 from sous.engine import draftctx, kv8, projtile  # noqa: E402 — after the guard
 from sous.engine.promptcache import PrefixCache, PromptMemo, Speculation  # noqa: E402
 from sous.engine.vlm import VLMEngine  # noqa: E402
+from sous.engine.window import DECODE_KV_STEP  # noqa: E402
 
 _WINDOW_OPEN = "projection tile window {} was open across a prefill; closed it"
 
@@ -414,6 +415,9 @@ def test_vlm_engine_enables_the_tile_after_the_kernel_and_before_the_drafter_rou
     assert seen["root"] is model.language_model
     assert engine.projection_tile_status is ptile_status
     assert engine._ptile == "active"
+    # The prompt cache forecasts a retained take's publish at the step the
+    # decode pads a slot by.
+    assert engine._cache.decode_step == DECODE_KV_STEP
     if prompt_cache:
         fields = seen["fields"]
         assert isinstance(fields, dict) and fields["ptile"] == "active"

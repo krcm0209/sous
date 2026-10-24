@@ -88,14 +88,22 @@ goal.
   directory — tests and `sous tune` (`forks=False`) never reach `~/.sous`.
   Warm turns resolve the probe too:
   a turn that starts at another session's tools fork must still publish its
-  own header fork. A `turn` slot is *copied* and left in place by the turn
-  that extends it when `_make_room` can hold the copy (Claude Code branches
-  a background subagent's conversation every 30 s with a progress-summary
-  call, and a consumed slot left the real conversation only the header
-  fork), and *moved* — removed, its arrays adopted — when it cannot, always
-  at `prompt_cache_gb = 0`. The copy is priced at the size the turn will
-  publish (the parent's own size passes budgets the publish then cannot
-  honour), and a take retires the lengths below its slot
+  own header fork. A `turn` slot is *retained* by the turn that extends it
+  when `_make_room` can hold a copy beside what the turn will publish
+  (Claude Code branches a background subagent's conversation every 30 s
+  with a progress-summary call, and a consumed slot left the real
+  conversation only the header fork): the copy, exactly the offset's rows,
+  stays in the map in the slot's place and the turn takes the padded
+  original, whose spare rows only this conversation can write into (a move
+  already handed those over); and *moved* — removed, its arrays adopted —
+  when it cannot, always at `prompt_cache_gb = 0`. The room is forecast at
+  the size the turn will publish (the parent's own size passes budgets the
+  publish then cannot honour) from the parent's held rows (`held_bytes`,
+  never its padded buffers, which carry anywhere from none to a step of
+  spare rows the publish may or may not keep) at the ids the turn will hold
+  plus one `decode_step` of padding (`DECODE_KV_STEP` on the VLM backend;
+  0 on the LM backend and in tests), less the padding the swap releases;
+  and a take retires the lengths below its slot
   (`_retire_ancestors`, read off `held`, never recorded), so a conversation
   holds its current and previous lengths and a chain a cold retry breaks
   heals on the next take. A slot is priced at `slot_bytes`, every layer's

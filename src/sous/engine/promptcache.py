@@ -144,7 +144,9 @@ FORK_MIN_TOKENS = 4096
 MAX_SLOTS = 16
 # Kept free beyond weights, resident slots and the in-flight turn's own cache
 # when the budget is derived automatically: drafter activations, mlx's
-# allocator slack, the tokenizer.
+# allocator slack, the tokenizer, and the up to 4,095 rows by which a decode's
+# 4096-row KV growth (`window.DECODE_KV_STEP`) can overshoot the window-sized
+# reserve, about 256 MiB on the default model.
 CACHE_BUDGET_SLACK = 2 << 30
 
 
@@ -220,14 +222,36 @@ def probe_boundaries(
 def slot_bytes(cache: Sequence[Any]) -> int:
     """Bytes a cache holds resident: every layer's `nbytes`. For a KVCache that
     is the whole allocated buffer, its padding and the trimmed-off generation
-    region included — the truth about residency, and an upper bound. A turn
-    slot published after a decode holds up to about 4,100 padded rows (the
-    4096-row step, plus the block the decode's reserve pads for), about 256 MiB
-    on the default model, since a decode grows its KV by
-    `window.DECODE_KV_STEP`; a cache a prefill grew, the one a fork file is
-    written from included, carries mlx-vlm's 256-step padding, and a fork copy
-    holds only its offset's rows."""
+    region included — the truth about residency, and an upper bound. On the
+    mlx-vlm backend, whose decode grows its KV by `window.DECODE_KV_STEP`, a
+    turn slot published after a decode holds up to about 4,100 padded rows
+    (the 4096-row step, plus the block the decode's reserve pads for), about
+    256 MiB on the default model; mlx-lm's decode leaves at most 255 spare
+    rows. A cache a prefill grew, the one a fork file is written from
+    included, carries the 256-step padding, and a fork copy holds only its
+    offset's rows (`held_bytes` leaves the padding out)."""
     return sum(int(getattr(c, "nbytes", 0) or 0) for c in cache)
+
+
+def held_bytes(cache: Sequence[Any]) -> int:
+    """Bytes a cache's tokens fill, its padding left out. A layer with an int
+    `offset` and a `keys` buffer counts its `nbytes` at the share of the
+    buffer's rows the offset fills (K and V are padded alike), never more than
+    the whole: a rotating window that wrapped has an offset past its capacity,
+    and every row of it is held. Any other layer counts whole — a recurrent
+    state does not grow with the tokens, and a layer the rule cannot read is
+    counted as resident, the conservative side. An empty KVCache (`keys` None)
+    reports 0 `nbytes`, so it counts 0."""
+    total = 0
+    for c in cache:
+        nbytes = int(getattr(c, "nbytes", 0) or 0)
+        offset = getattr(c, "offset", None)
+        shape = getattr(getattr(c, "keys", None), "shape", ())
+        if isinstance(offset, int) and len(shape) > 2 and shape[2] > 0:
+            total += nbytes * min(offset, shape[2]) // shape[2]
+        else:
+            total += nbytes
+    return total
 
 
 # The safetensors header's share of a fork file: 12.8 KB measured at 57K
@@ -366,7 +390,7 @@ class PromptCacheStats:
     # of a window, or the kernel at warn/critical) — what says, after a
     # restart, whether pressure or the byte cap emptied the map.
     pressure_evictions: int = 0
-    # Turn-slot takes that copied the slot and left it in the map, and those
+    # Turn-slot takes that left a copy of the slot in the map, and those
     # that removed it and adopted its arrays because the budget could not
     # hold a copy beside the live cache. Both are hits; the split says
     # whether the take left the predecessor in place for a branch of the
@@ -385,8 +409,8 @@ class PromptCacheStats:
     # render not a strict prefix) reports zeros rather than the last turn's.
     prefilled_tokens: int = 0  # stable tokens this turn had to prefill
     took_len: int = 0  # length of the slot _take returned; 0 on a miss
-    # What kind of slot that was, as the turn line names it: "turn" (copied
-    # and left in place), "turn-moved" (removed, its arrays adopted), "fork",
+    # What kind of slot that was, as the turn line names it: "turn" (a copy
+    # left in its place), "turn-moved" (removed, its arrays adopted), "fork",
     # "disk" (a prefix read off the store); "" on a miss, and after a cold
     # retry, which took no slot in the end.
     took_kind: str = ""
@@ -575,13 +599,13 @@ class Slot:
     `owner` is the thread whose mlx streams built the arrays (issue #34): the
     Thread object, not its ident — idents are recycled after a thread exits,
     a strongly held Thread object cannot falsely match a later thread. `kind`
-    is "turn" (published when a turn ends; copied and left in place by the
-    turn that extends it when the budget holds the copy, otherwise removed and
-    its arrays adopted) or "fork" (a copy taken at a shared-prefix boundary;
-    copied on every hit, left in place). Which turn slots are one
-    conversation at different lengths is read off `held` (`_ancestors`),
-    never recorded. A fork's file on disk, when the store keeps one, is
-    shared across owners; only the arrays are owner-scoped."""
+    is "turn" (published when a turn ends; the turn that extends it takes the
+    original, leaving a copy in its place at the offset's size when the budget
+    holds one and removing the slot otherwise) or "fork" (a copy taken at a
+    shared-prefix boundary; copied on every hit, left in place). Which turn
+    slots are one conversation at different lengths is read off `held`
+    (`_ancestors`), never recorded. A fork's file on disk, when the store
+    keeps one, is shared across owners; only the arrays are owner-scoped."""
 
     cache: list
     held: list[int]
@@ -601,11 +625,11 @@ class PrefixCache:
     what makes reuse possible at all.
 
     A turn looks for the longest slot its own thread owns whose ids are a
-    strict prefix of its stable render. A "turn" slot is copied and left in
-    place when the budget can hold the copy — so a branch of the same
-    conversation (a progress-summary call) still finds it — and moved, its
-    arrays extended in place, when it cannot; a "fork" slot is always copied,
-    so the next conversation sharing that prefix finds it too.
+    strict prefix of its stable render. A "turn" slot's arrays are extended
+    in place either way: it leaves a copy in its place when the budget can
+    hold one — so a branch of the same conversation (a progress-summary
+    call) still finds it — and is moved when it cannot; a "fork" slot is
+    always copied, so the next conversation sharing that prefix finds it too.
     Everything published is charged to `max_bytes`; the in-flight
     turn's own cache never is — `reserve_bytes` (one full window of KV) was
     subtracted from the machine's headroom before `max_bytes` was derived.
@@ -623,6 +647,7 @@ class PrefixCache:
         max_bytes: int = 0,
         reserve_bytes: int = 0,
         store: StoreHooks | None = None,
+        decode_step: int = 0,
     ):
         # These defaults are the orchestrator's own semantics, not the
         # user-facing ones — both engines always pass them explicitly. The
@@ -634,6 +659,11 @@ class PrefixCache:
         self.max_bytes = max_bytes
         self.reserve_bytes = reserve_bytes
         self._store = store
+        # The rows the engine's decode() grows a cache by past the tokens it
+        # holds, priced into the forecast of the slot a turn publishes. 0
+        # prices no padding: mlx-lm's decode leaves at most 255 spare rows,
+        # and a test-built cache passes none.
+        self.decode_step = decode_step
         # Held only across list and dict work, plus the deallocation a drop
         # triggers — never across prefill or decode. reset() must never wait
         # on a generation (its caller may be the turn runner's stall path
@@ -1012,8 +1042,9 @@ class PrefixCache:
         without it, for the warning. An optimization must never fail a turn,
         the rule the warm-retry and probe paths follow too; a half-built copy
         dies here, before the caller allocates anything in its place. Prefill
-        time, like the fork copies in `_run`: the copy is part of building
-        the cache the turn runs on."""
+        time, like the fork copies in `_run`: the copy is part of what the
+        turn pays to start warm — the cache it runs on for a fork, the one
+        left in the map for a turn slot."""
         hooks = self._hooks
         started = _clock()
         try:
@@ -1239,23 +1270,42 @@ class PrefixCache:
                 stats.fork_hits += 1
                 kind = "fork"
         elif slot is not None:
-            # A turn slot is copied and left in place when the budget can hold
-            # it beside the slot this turn will publish — the copy grown by
-            # this turn's tokens, forecast from the taken slot's bytes per
-            # token: the parent's own size would pass a budget the publish
-            # then cannot honour, copy and all — evicting least-recently-used
-            # slots now to make that room. So a branch of the conversation
-            # (Claude Code's progress-summary call takes the same prefix down
-            # a different last turn) does not consume the slot the real
-            # conversation extends next. When it cannot — always at a budget
-            # of 0, where the feasibility rule refuses a copy that would not
-            # fit even on an empty map — or when the owner was retired
-            # meanwhile, the slot is moved: removed from the map and its
-            # arrays adopted, the pre-retention behaviour byte for byte. A
+            # A turn slot leaves a copy in its place when the budget can hold
+            # it beside the slot this turn will publish, evicting
+            # least-recently-used slots now to make that room. So a branch of
+            # the conversation (Claude Code's progress-summary call takes the
+            # same prefix down a different last turn) does not consume the
+            # slot the real conversation extends next. When it cannot — always
+            # at a budget of 0, where the feasibility rule refuses a copy that
+            # would not fit even on an empty map — or when the owner was
+            # retired meanwhile, the slot is moved: removed from the map and
+            # its arrays adopted, the pre-retention behaviour byte for byte. A
             # copy failure is an optimization failure and falls back to the
             # move; the turn still runs warm on the original arrays.
-            projected = -(-slot.nbytes * len(stable_ids) // len(slot.held))
-            if self._make_room(projected, protect=(slot,), require=slot):
+            #
+            # The room is forecast at the size the turn will publish — the
+            # parent's own would pass a budget the publish then cannot honour,
+            # copy and all — and from the parent's held rows, not its buffers.
+            # Those hold anywhere from none to about a decode step of spare
+            # rows that the publish may or may not carry, so scaling them by
+            # stable/held misses the published size by up to a step either
+            # way, and an over-forecast evicts at take time what would have
+            # fit (the publish's cap pass catches an under-forecast; nothing
+            # undoes an eviction). Bytes per held id — the recurrent state
+            # spread over the ids too, a slight overestimate — times the ids
+            # this turn holds plus one step is what a decode that grows once
+            # publishes: over by what the padding already absorbed, never
+            # under by more than a second growth. The parent sits in the map
+            # at its padded size while the room is made, but what stays after
+            # the swap below is its held rows, so the room asked for is the
+            # forecast less the padding the swap releases; that still covers
+            # the moment the copy exists beside the padded original, since the
+            # forecast is at least the held rows plus a step and the padding
+            # at most a step and the block.
+            held = held_bytes(slot.cache)
+            projected = -(-held * (len(stable_ids) + self.decode_step) // len(slot.held))
+            room = max(0, projected - (slot.nbytes - held))
+            if self._make_room(room, protect=(slot,), require=slot):
                 warm = self._copy_of(
                     stats, slot.cache, "turn-slot copy failed", "extending the slot in place"
                 )
@@ -1263,6 +1313,20 @@ class PrefixCache:
             with self._lock:
                 if not retained:
                     self._remove(slot)
+                else:
+                    # The map keeps the copy and the turn takes the original.
+                    # A fork_copy holds exactly its offset's rows, while the
+                    # original carries the decode's padding, rows only the
+                    # conversation that extends it can write into. Left in the
+                    # map, that padding would be charged to the budget for
+                    # rows no later take reads (a retained or branch take
+                    # copies the offset's rows only) until the next take
+                    # retired it, and the turn would regrow its compact copy
+                    # from its first prefill chunk. A move already hands the
+                    # turn the original.
+                    original, slot.cache = slot.cache, warm
+                    slot.nbytes = slot_bytes(warm)
+                    warm = original
                 # The cap pass for a turn take runs here, after the decision,
                 # so bytes about to leave the map are never charged against
                 # slots that stay; a retained slot must survive it, and
