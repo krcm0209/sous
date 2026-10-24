@@ -88,17 +88,37 @@ goal.
   directory — tests and `sous tune` (`forks=False`) never reach `~/.sous`.
   Warm turns resolve the probe too:
   a turn that starts at another session's tools fork must still publish its
-  own header fork. A `turn` slot is *copied* and left in place by the turn
-  that extends it when `_make_room` can hold the copy (Claude Code branches
-  a background subagent's conversation every 30 s with a progress-summary
-  call, and a consumed slot left the real conversation only the header
-  fork), and *moved* — removed, its arrays adopted — when it cannot, always
-  at `prompt_cache_gb = 0`. The copy is priced at the size the turn will
-  publish (the parent's own size passes budgets the publish then cannot
-  honour), and a take retires the lengths below its slot
+  own header fork. A `turn` slot is *retained* by the turn that extends it
+  when `_make_room` can hold a copy beside what the turn will publish
+  (Claude Code branches a background subagent's conversation every 30 s
+  with a progress-summary call, and a consumed slot left the real
+  conversation only the header fork): the copy, exactly the offset's rows,
+  stays in the map in the slot's place and the turn takes the padded
+  original, whose spare rows only this conversation can write into (a move
+  already handed those over); and *moved* — removed, its arrays adopted —
+  when it cannot, always at `prompt_cache_gb = 0`. The room is forecast at
+  the size the turn will publish (the parent's own size passes budgets the
+  publish then cannot honour) from the parent's held rows (`held_bytes`,
+  never its padded buffers, which carry anywhere from none to a step of
+  spare rows the publish may or may not keep) at the ids the turn will hold
+  plus one `decode_step` of padding (`DECODE_KV_STEP` on the VLM backend;
+  0 on the LM backend and in tests), less the padding the swap releases;
+  and a take retires the lengths below its slot
   (`_retire_ancestors`, read off `held`, never recorded), so a conversation
   holds its current and previous lengths and a chain a cold retry breaks
-  heals on the next take. Inline `role:"system"` messages after the first user message
+  heals on the next take. A slot is priced at `slot_bytes`, every layer's
+  `nbytes`, so the whole padded buffers: `VLMEngine.decode()`, and nothing
+  else, grows the full-attention `KVCache`s by `window.DECODE_KV_STEP` =
+  4096 rows (mlx-vlm's step is 256; every `prefill()` call keeps it, while
+  the rows the decode call prefills itself, the whole prompt with the cache
+  off, grow by the decode's step, and `_decode_kv_step` puts it back on
+  every way out of the decode, with the instance's `prefix_cache_reserve`,
+  which skips mlx-vlm's DFlash reserve while the rows fit: rounded to 4096 it
+  would copy nearly every decode's whole cache before the first round), so a
+  published turn slot carries up to about 4,100 rows (the step plus the
+  block the decode's reserve pads for) past its decode's last token,
+  256 MiB on the default model, while a `fork_copy` holds only the offset's
+  rows. Inline `role:"system"` messages after the first user message
   render as `<system-reminder>` blocks in the preceding user turn (after its
   tool results), or as a user turn of their own after an assistant turn
   (`api/convert._place_inline_system`), never hoisted into the system
@@ -755,7 +775,12 @@ goal.
   inside the draft-context `seed` block just before `stream_generate`, when
   `projtile._active`, and closes it first in that loop's `finally`, in a
   `try` of its own, so kv8's close runs whatever happens (`close_window()`
-  never raises). `prefill()` finding a window open closes it and warns,
+  never raises). The KV step is a context manager (`_decode_kv_step`)
+  entered on the same `with` as the draft context, before either window
+  opens and left after both have closed, so nothing sits between the opens
+  and the `try`, and every exit path, an open or a close that raised
+  included, hands the layers back carrying what they came with (neither
+  close reads the step). `prefill()` finding a window open closes it and warns,
   naming the window's serial, before the forward: KV with the tile's bits
   would reach a fork under a key that cannot tell, and a refusal would fail
   every prompt-cache turn (each prefills before the decode that replaces
@@ -973,7 +998,15 @@ goal.
   window-sized reserve at every instant (`1.504·C + 0.504·C/16 + 272 ≤
   window`, `C = round_up(L, 256)`: the bf16 KV, the mirror, one layer's old
   buffer during a growth, and the rows a straddling verify holds past L),
-  about 84K at 131072 and 170K at 262144. The reserve, the slot budget and
+  about 84K at 131072 and 170K at 262144. A decode grows its KV by
+  `window.DECODE_KV_STEP` = 4096 rows, which can overshoot the window-sized
+  reserve by up to 4,095 rows (about 256 MiB on the default model), mirror
+  or none; under the automatic budget `promptcache.CACHE_BUDGET_SLACK`
+  (2 GiB) absorbs it, while a configured `prompt_cache_gb` holds nothing
+  back for it and a decode near L can then run about 256 MiB past the
+  recommended working set (Metal paging, not a wrong row), and either way
+  the ceiling keeps its 16 + 256 overhang term and the rows kv8 serves do
+  not depend on the decode's growth step. The reserve, the slot budget and
   the pressure valve are deliberately untouched: scaling the reserve would
   cost 4–8 GiB of slot budget, and admitting against live memory would
   make a prompt's output depend on slot occupancy. A call whose first row

@@ -464,6 +464,15 @@ class ManagedEngine:
         return getattr(self._inner, "kv_int8_status", None)
 
     @property
+    def decode_kv_step_status(self) -> dict | None:
+        # Optional like the others: the VLM backend reports the rows its
+        # decode grows a KV cache by and how many of the model's cache layers
+        # that covers (0 when the checkpoint's cache classes are not mlx-vlm's
+        # plain KVCache, where every decode keeps mlx-vlm's own step); the LM
+        # backend and fakes have none.
+        return getattr(self._inner, "decode_kv_step_status", None)
+
+    @property
     def draft_block(self) -> int | None:
         """The verify block the drafter runs with, as the engine resolved it
         at load (0 is the drafter's own policy): None without a drafter, and
@@ -820,6 +829,12 @@ class EngineManager:
                     f" kv_int8_floor={kv8['floor']}"
                     f" kv_int8_ceiling={kv8['ceiling']}"
                 )
+        # How many cache layers the decode's growth step covers follows the
+        # checkpoint's cache classes, so the config alone cannot say whether a
+        # decode grows by it or by mlx-vlm's own step.
+        step = engine.decode_kv_step_status
+        if step is not None:
+            line += f" decode_kv_step={step['step']} decode_kv_step_layers={step['layers']}"
         _logger.info(line)
         return engine
 

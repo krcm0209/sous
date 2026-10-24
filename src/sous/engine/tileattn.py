@@ -599,7 +599,9 @@ def _probe_steps(modules: list[Any], splits: int, arch: str, language: Any) -> s
     and each step's K/V inputs are evaluated before that step's launches: a
     kernel failure with a CPU-stream op in flight deadlocks mlx's exception
     path. Inputs are laid out as serving lays them out: transposed query rows,
-    K/V slices of 256-step padded buffers."""
+    K/V slices of padded buffers, which serving grows by the cache's growth step
+    (256 in prefill, 4096 inside a decode). The probe pads to a multiple of 256:
+    a slice's strides follow the capacity, not the step."""
     import mlx.core as mx
 
     global _active_splits
