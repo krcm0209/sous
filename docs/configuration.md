@@ -86,25 +86,31 @@ left once the weights, one full context window of KV
 27 GiB on a 64 GB machine with the default model and the default window, room
 for those forks and several conversations; each live conversation under the
 auto budget also keeps its previous length resident (the slot a branch of it
-starts from), so a live conversation is two slots, ~8 GiB at 63K tokens,
+starts from), so a live conversation is two slots plus the current one's
+spare room, ~8.3 GiB at 63K tokens,
 beyond the forks; a 48 GB machine should set it to `0` (forks off, one slot), or to
 more than twice one conversation slot at the length its conversations reach
-— a little over 8 GiB with the default model at ~57K tokens — because the
+— a little over 8 GiB with the default model at ~57K tokens, plus the
+~0.25 GiB of spare room the current length's slot carries — because the
 copy that keeps a conversation's previous length resident is taken only
 when that length and the longer one the turn publishes both fit; below that
 every hit moves its slot, and a branch of the conversation (a
 progress-summary call) starts from the fork instead. The copy's room comes
 from least-recently-used slots,
 forks included, so keeping a fork resident beside a retaining conversation
-wants about four slots' worth, ~14 GiB. A value below ~14 GiB makes every
+wants about four slots' worth, ~14 GiB, plus ~0.25 GiB per live
+conversation for that spare room. A value below ~14 GiB makes every
 cold turn take a fork copy that a later turn then evicts to make room for
 its own copy, so it pays the fork and never reuses it. A slot is charged
 for the buffers it holds, not for its token count: on the mlx-vlm backend
 (the default model's) a generation grows the turn's KV 4,096 tokens at a
-time (a prefill 256 at a time), so the slot a turn leaves carries up to
-about 4,100 tokens of spare room past its reply (the step, plus the block
-the generation's reserve pads for), about 256 MiB on the default model,
-while a fork holds exactly its boundary's tokens. Slots are
+time (a prompt-cache prefill 256 at a time; the tokens the generation call
+prefills itself, the whole prompt with the cache off, 4,096 as well), so the
+slot a turn leaves carries up to about 4,100 tokens of spare room past its
+reply (the step, plus the block the generation's reserve pads for), about
+256 MiB on the default model, while a fork holds exactly its boundary's
+tokens, and a conversation's previous length is kept at exactly its tokens
+too (the turn that extends it takes the padded buffers along). Slots are
 evicted least-recently-used first when the budget, a count of 16, or memory
 pressure says so. Pressure is two readings: Metal's own headroom (room for one
 more window of KV), and the kernel's memory-pressure level — at *warn* each
