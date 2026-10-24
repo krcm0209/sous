@@ -272,6 +272,44 @@ def test_the_step_goes_back_whatever_a_window_open_or_close_does(monkeypatch, mo
         assert c.step == DEFAULT_STEP
 
 
+def test_decode_clears_mlx_buffer_cache_once_per_growth_and_never_otherwise(monkeypatch):
+    """A growth frees every layer's old K and V into mlx's buffer cache, where
+    nothing on the DFlash path releases them before the generation ends. The
+    decode reads the capacity at every emitted token and clears once when it
+    moved, and leaves the cache alone through a generation that never grew."""
+    cleared: list[int] = []
+    emitted: list[str] = []
+    monkeypatch.setattr(mx, "clear_cache", lambda: cleared.append(len(emitted)))
+
+    def generating(generated: int):
+        def stream_generate(model, processor, prompt, **kwargs):
+            caches = kwargs["prompt_cache"]
+            for c in caches:
+                c.update_and_fetch(*_rows(kwargs["input_ids"].shape[1], seed=3))
+            for i in range(generated):
+                for c in caches:
+                    c.update_and_fetch(*_rows(1, seed=10 + i))
+                emitted.append("x")
+                yield _result("x")
+
+        return stream_generate
+
+    # Capacity 20 at offset 10: two prompt rows and eight tokens fill it, the
+    # ninth token grows it by one step, and the last three fit there.
+    grows = [_padded(10, 20), _padded(10, 20)]
+    _stub_mlx_vlm(monkeypatch, generating(12))
+    assert _engine().decode(grows, [4, 5], 12) == "x" * 12
+    assert cleared == [9]
+    assert [c.keys.shape[2] for c in grows] == [20 + DECODE_KV_STEP] * 2
+
+    cleared.clear()
+    emitted.clear()
+    roomy = [_padded(10, 4096), _padded(10, 4096)]
+    _stub_mlx_vlm(monkeypatch, generating(12))
+    assert _engine().decode(roomy, [4, 5], 12) == "x" * 12
+    assert cleared == []
+
+
 # ---- prefill ----------------------------------------------------------------------
 
 

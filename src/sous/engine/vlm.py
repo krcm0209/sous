@@ -137,6 +137,14 @@ def _decode_kv_step(cache: list) -> Iterator[list]:
             vars(c).update(had)
 
 
+def _capacity(layers: list) -> int:
+    """Rows the covered layers' buffers hold: a decode appends the same rows to
+    every one, so the first says it for all. 0 before anything was appended."""
+    if not layers or layers[0].keys is None:
+        return 0
+    return int(layers[0].keys.shape[2])
+
+
 class VLMEngine:
     def __init__(
         self,
@@ -622,8 +630,9 @@ class VLMEngine:
         # plus the block the reserve pads for), and slot_bytes counts it.
         with (
             self._draft_context.seed(draftctx.DraftContext.tail(context)),
-            _decode_kv_step(cache),
+            _decode_kv_step(cache) as kv_layers,
         ):
+            capacity = _capacity(kv_layers)
             # The int8 K/V mirror serves only inside this window, which spans
             # the whole generation, the one-row forward that ends its own
             # prefill segment included (that KV never outlives the turn), and
@@ -657,6 +666,22 @@ class VLMEngine:
                     # output; generate() skips them the same way.
                     if r.is_draft:
                         continue
+                    # A growth (and the reserve's copy when the rows are
+                    # short) copies every full-attention layer's K and V into
+                    # larger buffers and frees the old ones into mlx's buffer
+                    # cache, where nothing on the DFlash path releases them
+                    # before stream_generate's closing clear: the round loop
+                    # never clears (mlx-vlm's MTP and Eagle3 loops do, every
+                    # 256 tokens), and a growth never reuses a freed buffer,
+                    # since each new one is larger. Left there, a dead copy
+                    # of the whole KV (3.5 GiB at 57K keys, 12 GiB at 200K
+                    # on the default model) would sit beside the live one for
+                    # the rest of the decode, invisible to live_headroom,
+                    # which reads active memory. One clear per growth, at
+                    # most once or twice a decode, returns it.
+                    if (grown := _capacity(kv_layers)) != capacity:
+                        capacity = grown
+                        mx.clear_cache()
                     chunks.append(r.text)
                     if on_delta is not None:
                         on_delta(Delta(r.text, r.generation_tokens, r.finish_reason))
