@@ -394,10 +394,13 @@ def ceiling(window: int, splits: int) -> int:
     a straddling verify holds past L plus one capacity step. A decode grows its
     bf16 KV by window.DECODE_KV_STEP = 4096 rows, so its buffers can overshoot
     the window-sized reserve by up to 4,095 rows (about 256 MiB on the default
-    model), mirror or none; promptcache's 2 GiB CACHE_BUDGET_SLACK absorbs that,
-    so the overhang term stays 16 + 256 rows and the rows kv8 serves do not
-    depend on the decode's step. Being a step boundary, L is a verify_plan cut,
-    so no run straddles it."""
+    model), mirror or none. Under the automatic prompt-cache budget
+    promptcache's 2 GiB CACHE_BUDGET_SLACK absorbs that; a configured
+    `[model].prompt_cache_gb` holds nothing back for it, and a decode near L
+    can then run about 256 MiB past the recommended working set, which Metal
+    pages rather than kv8 mis-serves. Either way the overhang term stays
+    16 + 256 rows and the rows kv8 serves do not depend on the decode's step.
+    Being a step boundary, L is a verify_plan cut, so no run straddles it."""
     best = 0
     for b in tileattn.boundaries(window, splits):
         c = _round_up(b)
