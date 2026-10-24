@@ -954,7 +954,11 @@ def plain(module: Any, x: Any, launches: Sequence[Launch]) -> Any:
 # The prompt-cache budget, in GiB, the automatic rule must still leave beside the
 # attention and GDN copies, else the tile serves the MLP alone: the budget
 # docs/configuration.md gives a fork kept beside a retaining conversation. A copy
-# that evicts the forks costs more prefill than it saves decode.
+# that evicts the forks costs more prefill than it saves decode. That
+# arrangement has since grown by about 0.25 GiB per live conversation (a decode
+# pads the slot it publishes by window.DECODE_KV_STEP rows) and the floor
+# deliberately has not: it is what the 64 GB M5 Pro at 262144 clears by
+# 0.07 GiB, and the decision reads headroom, not slot sizes.
 TILE_COPY_MIN_BUDGET_GIB = 14
 _GIB = 1 << 30
 # The probe's through-the-hooks rows and the row it plants a NaN in, as the

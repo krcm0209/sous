@@ -6,6 +6,15 @@ from __future__ import annotations
 # mlx-lm's KVCache grows its buffers in 256-token steps; an unaligned window
 # ends in a partially-usable step.
 TOKEN_STEP = 256
+# The rows a VLM decode's full-attention KV caches grow by; mlx-vlm's KVCache
+# grows by 256. Each growth copies every row of every full-attention layer's K
+# and V: on the M5 Pro with the default model's 16 layers, 40-77 ms at 57K
+# keys and 265-305 ms at 200K, once per ~249 committed rows at 256, and each
+# growth frees a buffer of a size never asked for again, which piled up in
+# mlx's buffer cache (39 GB at 200K) until the machine hit memory pressure and
+# rounds stalled for seconds. At 4096 the growth cost per generated token is
+# 93-94 % lower at both lengths.
+DECODE_KV_STEP = 4096
 
 
 def _text_config(model_config: dict) -> dict:
