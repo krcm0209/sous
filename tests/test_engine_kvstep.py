@@ -167,19 +167,24 @@ def _first_growth(c) -> int:
 
 
 def test_a_decode_starts_without_a_copy_its_256_row_reserve_would_not_have_made(monkeypatch):
-    """Both caches end a 256-step prefill at capacity 56,659: one with room past
-    its prompt rows and the block, one 4 rows short. At mlx-vlm's step the
-    reserve leaves the roomy one alone and copies the short one, and the next
-    growth adds 256 rows; with the step at 4096 and mlx-vlm's own reserve the
-    roomy one is copied too. Inside a decode the reserve copies only the short
-    one, and the roomy one's first growth after it adds 4096 rows."""
-    roomy, short = 56_403, 56_648
+    """Three caches end a 256-step prefill at capacity 56,659: one with room past
+    its prompt rows and the block, one whose prompt rows and block end exactly
+    at the capacity, one 4 rows short. At mlx-vlm's step the reserve leaves the
+    roomy one alone and copies the other two (56,659 is no multiple of 256, so
+    an exact fit rounds up as a shortfall does), and the next growth adds 256
+    rows; with the step at 4096 and mlx-vlm's own reserve the roomy one is
+    copied too. Inside a decode the reserve copies only the short one, the
+    exact fit included among those left alone, and the roomy one's first
+    growth after it adds 4096 rows."""
+    roomy, exact, short = 56_403, 56_644, 56_648
+    capacity = 56_659
+    assert exact + PROMPT_ROWS + BLOCK == capacity
 
-    at_default = [_padded(roomy, 56_659), _padded(short, 56_659)]
-    assert _decode_start(at_default) == [(False, 56_659), (True, 56_832)]
+    at_default = [_padded(n, capacity) for n in (roomy, exact, short)]
+    assert _decode_start(at_default) == [(False, 56_659), (True, 56_832), (True, 56_832)]
     assert _first_growth(at_default[0]) == DEFAULT_STEP
 
-    step_only = _padded(roomy, 56_659)
+    step_only = _padded(roomy, capacity)
     step_only.step = DECODE_KV_STEP
     assert _decode_start([step_only]) == [(True, 57_344)], "mlx-vlm's reserve stopped copying"
 
@@ -190,12 +195,81 @@ def test_a_decode_starts_without_a_copy_its_256_row_reserve_would_not_have_made(
         seen.append((_decode_start(caches), _first_growth(caches[0])))
         yield _result("ok")
 
-    decoded = [_padded(roomy, 56_659), _padded(short, 56_659)]
+    decoded = [_padded(n, capacity) for n in (roomy, exact, short)]
     _stub_mlx_vlm(monkeypatch, stream_generate)
     assert _engine().decode(decoded, [4, 5], 8) == "ok"
-    assert seen == [([(False, 56_659), (True, 57_344)], DECODE_KV_STEP)]
+    assert seen == [([(False, 56_659), (False, 56_659), (True, 57_344)], DECODE_KV_STEP)]
     for c in decoded:
         assert set(vars(c)) == {"keys", "values", "offset"}
+
+
+def test_a_layer_with_a_step_or_reserve_of_its_own_leaves_the_decode_with_them(monkeypatch):
+    """The decode shadows both on the instance and puts back what it found,
+    rather than dropping it: a layer that came with its own step or reserve
+    keeps them, and one that came with neither leaves with neither."""
+    own_step = KVCache()
+    own_step.step = 512
+    own_reserve = KVCache()
+
+    def reserve(min_capacity_tokens):
+        return ()
+
+    own_reserve.prefix_cache_reserve = reserve  # ty: ignore[invalid-assignment]
+    plain = KVCache()
+    layers = [own_step, own_reserve, plain]
+    seen: list[object] = []
+
+    def stream_generate(model, processor, prompt, **kwargs):
+        seen.append([(c.step, c.prefix_cache_reserve is reserve) for c in layers])
+        yield _result("ok")
+
+    _stub_mlx_vlm(monkeypatch, stream_generate)
+    assert _engine().decode(list(layers), [4, 5], 8) == "ok"
+    assert seen == [[(DECODE_KV_STEP, False)] * 3]
+    assert vars(own_step)["step"] == 512 and "prefix_cache_reserve" not in vars(own_step)
+    assert vars(own_reserve)["prefix_cache_reserve"] is reserve and "step" not in vars(own_reserve)
+    assert set(vars(plain)) == {"keys", "values", "offset"}
+
+
+def _raising(name: str):
+    def raise_(*args, **kwargs):
+        raise RuntimeError(name)
+
+    return raise_
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        (kv8, "open_window"),
+        (projtile, "open_window"),
+        (projtile, "close_window"),
+        (kv8, "close_window"),
+    ],
+    ids=["kv8-open", "tile-open", "tile-close", "kv8-close"],
+)
+def test_the_step_goes_back_whatever_a_window_open_or_close_does(monkeypatch, module, name):
+    """The step is set before either window opens and put back after both
+    close, on every exit: an open that raises leaves no widened layer behind
+    for the next prefill to grow by, and a close that raises does not skip the
+    restore."""
+    monkeypatch.setattr(kv8, "_active", 1)
+    monkeypatch.setattr(projtile, "_active", 1)
+    monkeypatch.setattr(module, name, _raising(name))
+    kv = [KVCache(), KVCache()]
+    seen: list[object] = []
+
+    def stream_generate(model, processor, prompt, **kwargs):
+        seen.append([c.step for c in kv])
+        yield _result("ok")
+
+    _stub_mlx_vlm(monkeypatch, stream_generate)
+    with pytest.raises(RuntimeError, match=name):
+        _engine().decode(list(kv), [4, 5], 8)
+    assert seen == ([] if name == "open_window" else [[DECODE_KV_STEP, DECODE_KV_STEP]])
+    for c in kv:
+        assert set(vars(c)) == {"keys", "values", "offset"}
+        assert c.step == DEFAULT_STEP
 
 
 # ---- prefill ----------------------------------------------------------------------
@@ -213,9 +287,10 @@ def _shadow(c) -> set[str]:
 def test_every_prefill_grows_at_the_default_step_and_only_the_decode_widens(monkeypatch):
     """A cold turn on a hybrid cache prefills to its fork stop, copies the fork,
     prefills to the anchor and decodes; a warm turn then extends the turn slot it
-    left. Every prefill, the fork stop's included, runs with mlx-vlm's own step and
-    nothing on the instance, since the fork store saves the padded buffers a
-    prefill grew. Only the decode sets the step and the reserve, and no slot it
+    left. Every prefill() call, the fork stop's included, runs with mlx-vlm's own
+    step and nothing on the instance, since the fork store saves the padded
+    buffers a prefill grew. Only the decode sets the step and the reserve (the
+    rows the decode call prefills itself grow by its step), and no slot it
     leaves carries either."""
     boundary, prompt, generated = 4_100, 4_300, 60
     prefills: list[list[tuple[int, set[str]]]] = []

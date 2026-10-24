@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import sys
 import threading
 import warnings
-from collections.abc import Callable
+import weakref
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -74,46 +76,65 @@ def _kv_layers(cache: list) -> list:
     return [c for c in cache if kv_cache is not None and type(c) is kv_cache]
 
 
-def _widen_kv_step(layers: list) -> None:
-    for c in layers:
-        c.step = DECODE_KV_STEP
-        # mlx-vlm's DFlash round loop reserves offset + block rows on every
-        # layer before its first round, rounded up to a multiple of the step,
-        # and copies the whole cache whenever the rounded figure passes the
-        # capacity, whether the rows fit or not. At 256 a cache prefilled
-        # from empty in one segment rarely pays it, since that leaves a
-        # multiple of 256. A copy (a fork, a retained turn slot) holds exactly
-        # its offset's rows, and a prefill that continues from an unaligned
-        # offset (after a fork stop, or from such a copy) extends the cache
-        # by whole steps from there, so its capacity is mostly not a multiple
-        # of 256 and its reserve copies whenever offset + block passes that
-        # capacity rounded down to 256: on about half of warm turns and of
-        # cold turns with a fork stop. At 4096 nearly every decode would pay
-        # it, the cost of a growth, before its first round, a loss on every
-        # reply shorter than ~250 tokens. The step cannot wait until after
-        # the reserve: generate_step appends the decode's own prompt rows
-        # before the round loop starts. So this decode's reserve copies only
-        # when the rows do not fit, which spares warm turns the copy they
-        # paid at 256 as well, and then pads to the next multiple of the
-        # step, which can leave far fewer than 4096 rows past the block.
-        c.prefix_cache_reserve = functools.partial(_reserve_when_short, c)
-
-
-def _reserve_when_short(cache: Any, min_capacity_tokens: int) -> tuple:
+def _reserve_when_short(ref: weakref.ref, min_capacity_tokens: int) -> tuple:
     """mlx-vlm's prefix_cache_reserve, skipped while the buffers already hold
-    the rows it asks for."""
+    the rows it asks for. Bound to its cache through a weak reference: the shim
+    is stored on that very instance, and a strong one would be a cycle that
+    kept the buffers alive until a collector ran."""
+    cache = ref()
+    if cache is None:
+        return ()
     keys = cache.keys
     if keys is None or max(cache.offset, int(min_capacity_tokens)) <= keys.shape[2]:
         return ()
     return type(cache).prefix_cache_reserve(cache, min_capacity_tokens)
 
 
-def _restore_kv_step(layers: list) -> None:
-    """Back to the class's own step and reserve. Never raises: it runs first in
-    decode()'s finally."""
-    for c in layers:
-        vars(c).pop("step", None)
-        vars(c).pop("prefix_cache_reserve", None)
+# What decode() sets on a KVCache instance for its generation and takes off
+# again on the way out.
+_DECODE_SHADOW = ("step", "prefix_cache_reserve")
+
+
+@contextlib.contextmanager
+def _decode_kv_step(cache: list) -> Iterator[list]:
+    """For the with-block, every plain KVCache in `cache` grows by DECODE_KV_STEP
+    rows and reserves only when short; on the way out, every exit path included,
+    each instance carries exactly what it carried before. Yields the layers it
+    covers.
+
+    mlx-vlm's DFlash round loop reserves offset + block rows on every layer
+    before its first round, rounded up to a multiple of the step, and copies
+    the whole cache whenever the rounded figure passes the capacity, whether
+    the rows fit or not. At 256 a cache prefilled from empty in one segment
+    rarely pays it, since that leaves a multiple of 256. A copy (a fork, a
+    retained turn slot) holds exactly its offset's rows, and a prefill that
+    continues from an unaligned offset (after a fork stop, or from such a
+    copy) extends the cache by whole steps from there, so its capacity is
+    mostly not a multiple of 256 and its reserve copies whenever offset +
+    block passes that capacity rounded down to 256: on about half of warm
+    turns and of cold turns with a fork stop. At 4096 nearly every decode
+    would pay it, the cost of a growth, before its first round, a loss on
+    every reply shorter than ~250 tokens. The step cannot wait until after
+    the reserve: generate_step appends the decode's own prompt rows before
+    the round loop starts. So this decode's reserve copies only when the rows
+    do not fit, which spares warm turns the copy they paid at 256 as well,
+    and then pads to the next multiple of the step, which can leave far fewer
+    than 4096 rows past the block.
+
+    The prior instance entries are put back rather than dropped, so a layer
+    that arrived with a step or a reserve of its own leaves with it."""
+    layers = _kv_layers(cache)
+    prior = [(c, {k: vars(c)[k] for k in _DECODE_SHADOW if k in vars(c)}) for c in layers]
+    try:
+        for c in layers:
+            c.step = DECODE_KV_STEP
+            c.prefix_cache_reserve = functools.partial(_reserve_when_short, weakref.ref(c))
+        yield layers
+    finally:
+        for c, had in prior:
+            for k in _DECODE_SHADOW:
+                vars(c).pop(k, None)
+            vars(c).update(had)
 
 
 class VLMEngine:
@@ -590,7 +611,19 @@ class VLMEngine:
         # also owns the positions the suffix is encoded at (_positions).
         before = draftctx.rounds_snapshot(self._draft)
         kv8_state, kv8_rows = "off", 0
-        with self._draft_context.seed(draftctx.DraftContext.tail(context)):
+        # This decode's KV grows by DECODE_KV_STEP rows, and only the decode's:
+        # a fork is copied during a prefill and the fork store saves the padded
+        # buffers, so prefill() and the load-time probes keep mlx-vlm's step,
+        # and the step goes back on every way out of the block, before the
+        # cache is handed back, so every prefill() call grows by the default
+        # whichever cache it extends (the rows this call prefills itself grow
+        # by the decode's step). A published turn slot keeps the capacity this
+        # decode grew, up to about 4,100 rows past its last token (the step,
+        # plus the block the reserve pads for), and slot_bytes counts it.
+        with (
+            self._draft_context.seed(draftctx.DraftContext.tail(context)),
+            _decode_kv_step(cache),
+        ):
             # The int8 K/V mirror serves only inside this window, which spans
             # the whole generation, the one-row forward that ends its own
             # prefill segment included (that KV never outlives the turn), and
@@ -607,16 +640,6 @@ class VLMEngine:
             tile_window = bool(projtile._active)
             if tile_window:
                 projtile.open_window()
-            # This decode's KV grows by DECODE_KV_STEP rows, and only the
-            # decode's: a fork is copied during a prefill and the fork store
-            # saves the padded buffers, so prefill() and the load-time probes
-            # keep mlx-vlm's step, and the step goes back before the cache is
-            # handed back, so every prefill grows by the default whichever
-            # cache it extends. A published turn slot keeps the capacity this
-            # decode grew, up to DECODE_KV_STEP rows past its last token, and
-            # slot_bytes counts it.
-            kv_layers = _kv_layers(cache)
-            _widen_kv_step(kv_layers)
             try:
                 for r in stream_generate(
                     model,
@@ -638,8 +661,7 @@ class VLMEngine:
                     if on_delta is not None:
                         on_delta(Delta(r.text, r.generation_tokens, r.finish_reason))
             finally:
-                _restore_kv_step(kv_layers)
-                # Then the tile's close, in a try of its own: whatever kv8's
+                # The tile's close first, in a try of its own: whatever kv8's
                 # close does, the next turn's prefill finds the tile's window
                 # shut.
                 try:
