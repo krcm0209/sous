@@ -371,6 +371,17 @@ class VLMEngine:
         document's `draft_context` block."""
         return dict(self._draft_context.status)
 
+    @functools.cached_property
+    def decode_kv_step_status(self) -> dict:
+        """The rows a decode grows a KV cache by and how many of the model's
+        cache layers that covers: the model-load line's `decode_kv_step`
+        tokens. Read once, from a cache built the way every turn's is, since
+        the checkpoint's cache classes decide it: one whose make_cache() builds
+        a KVCache subclass for its attention layers (mlx-vlm's qwen4_exp) keeps
+        mlx-vlm's 256-row growth on every decode, and nothing else would say
+        so."""
+        return {"step": DECODE_KV_STEP, "layers": len(_kv_layers(self.new_cache()))}
+
     def _fork_key_fields(self, weights: str) -> dict[str, str]:
         from importlib.metadata import version
 

@@ -310,6 +310,19 @@ def test_decode_clears_mlx_buffer_cache_once_per_growth_and_never_otherwise(monk
     assert cleared == []
 
 
+def test_decode_kv_step_status_counts_the_layers_the_step_covers():
+    """The load line's token: how many of the model's cache layers the decode
+    grows by its step, read from a cache built as every turn's is, so a
+    checkpoint whose attention layers are a KVCache subclass reads 0 rather
+    than silently keeping mlx-vlm's step behind a line that names 4096."""
+    engine = _engine()
+    engine.new_cache = lambda: [KVCache(), ArraysCache(2), KVCache(), _Subclass()]  # ty: ignore[invalid-assignment]
+    assert engine.decode_kv_step_status == {"step": DECODE_KV_STEP, "layers": 2}
+    other = _engine()
+    other.new_cache = lambda: [_Subclass(), ArraysCache(2)]  # ty: ignore[invalid-assignment]
+    assert other.decode_kv_step_status == {"step": DECODE_KV_STEP, "layers": 0}
+
+
 # ---- prefill ----------------------------------------------------------------------
 
 

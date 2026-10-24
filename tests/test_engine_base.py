@@ -3301,6 +3301,7 @@ def test_get_logs_the_kv_int8_tokens_after_the_draft_block(caplog, tmp_path):
         }
         engine.draft_block = 5  # ty: ignore[unresolved-attribute]
         engine.kv_int8_status = _KV8_ACTIVE  # ty: ignore[unresolved-attribute]
+        engine.decode_kv_step_status = {"step": 4096, "layers": 16}  # ty: ignore[unresolved-attribute]
         return engine
 
     mgr = EngineManager(_cfg(tmp_path), engine_factory=factory)
@@ -3310,6 +3311,7 @@ def test_get_logs_the_kv_int8_tokens_after_the_draft_block(caplog, tmp_path):
     expected = (
         " projection_kernel=active projection_kernel_probe_s=0.37 draft_block=5"
         " kv_int8=active kv_int8_probe_s=1.84 kv_int8_floor=1536 kv_int8_ceiling=84481"
+        " decode_kv_step=4096 decode_kv_step_layers=16"
     )
     assert len(lines) == 1 and lines[0].endswith(expected), lines
 
