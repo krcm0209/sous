@@ -105,7 +105,8 @@ goal.
   `finally` puts it back, with the instance's `prefix_cache_reserve`, which
   skips mlx-vlm's DFlash reserve while the rows fit: rounded to 4096 it
   would copy nearly every decode's whole cache before the first round), so a
-  published turn slot carries up to 4,096 rows past its decode's last token,
+  published turn slot carries up to about 4,100 rows (the step plus the
+  block the decode's reserve pads for) past its decode's last token,
   256 MiB on the default model, while a `fork_copy` holds only the offset's
   rows. Inline `role:"system"` messages after the first user message
   render as `<system-reminder>` blocks in the preceding user turn (after its

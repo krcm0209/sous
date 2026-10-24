@@ -102,8 +102,9 @@ its own copy, so it pays the fork and never reuses it. A slot is charged
 for the buffers it holds, not for its token count: on the mlx-vlm backend
 (the default model's) a generation grows the turn's KV 4,096 tokens at a
 time (a prefill 256 at a time), so the slot a turn leaves carries up to
-4,096 tokens of spare room past its reply, about 256 MiB on the default
-model, while a fork holds exactly its boundary's tokens. Slots are
+about 4,100 tokens of spare room past its reply (the step, plus the block
+the generation's reserve pads for), about 256 MiB on the default model,
+while a fork holds exactly its boundary's tokens. Slots are
 evicted least-recently-used first when the budget, a count of 16, or memory
 pressure says so. Pressure is two readings: Metal's own headroom (room for one
 more window of KV), and the kernel's memory-pressure level — at *warn* each
