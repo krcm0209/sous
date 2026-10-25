@@ -2155,7 +2155,7 @@ def test_enable_refuses_an_unvalidated_mlx(monkeypatch):
 )
 def test_enable_refuses_a_changed_source(monkeypatch, key, reason):
     pfx.proj_ready(monkeypatch, real_pins=True)
-    monkeypatch.setitem(projkernel.VALIDATED_PROJ_SOURCES, key, "0" * 64)
+    monkeypatch.setitem(projkernel.VALIDATED_PROJ_SOURCES, key, frozenset({"0" * 64}))
     assert _refusal(pfx.tiny_quantized_model(), warned=True)["reason"] == reason
 
 

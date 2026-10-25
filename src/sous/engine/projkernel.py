@@ -1131,60 +1131,81 @@ SUPPORTED_DRAFTER_KINDS = frozenset({"dflash"})
 # sha256 of inspect.getsource, keyed "module:qualname". getsource follows
 # __wrapped__ through both hooks and int8's wrappers, so these are mlx's and
 # mlx-vlm's own sources whatever is installed over them. Validated on the mlx
-# releases in verifyattn.VALIDATED_MLX and on mlx-vlm 0.7.2; add a digest only
-# after re-reading that function against both hooks.
-VALIDATED_PROJ_SOURCES: dict[str, str] = {
-    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._linear": (
-        "668b9a7064f30c63348028fb72f22119b73e2897e2d246024c80fbe54e0404dd"
+# releases in verifyattn.VALIDATED_MLX and on mlx-vlm 0.7.2 and 0.7.8, one
+# digest per release that moved a function; add a digest only after re-reading
+# that function against both hooks.
+# The exact verifier, whose seven pinned methods share this prefix.
+_VERIFIER = "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward"
+VALIDATED_PROJ_SOURCES: dict[str, frozenset[str]] = {
+    f"{_VERIFIER}._linear": frozenset(
+        {"668b9a7064f30c63348028fb72f22119b73e2897e2d246024c80fbe54e0404dd"}
     ),
-    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._linears": (
-        "5cdaf151d00f3ab314f4722b475eec88a5228060be36c321c1363314ab249e0a"
+    f"{_VERIFIER}._linears": frozenset(
+        {"5cdaf151d00f3ab314f4722b475eec88a5228060be36c321c1363314ab249e0a"}
     ),
-    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._feed_forward": (
-        "df7c1083833e60422732d7b1b5dfabfb6a45f5ef073c8d1416810588dbf95434"
+    f"{_VERIFIER}._feed_forward": frozenset(
+        {
+            "df7c1083833e60422732d7b1b5dfabfb6a45f5ef073c8d1416810588dbf95434",
+            # 0.7.8: mx.stop_gradient on the MoE router's indices; the dense path is unchanged.
+            "c19fcc5153be4cbf8c45cd7ab44a7c8ecb1ca6d6df89ccfd1809e102a34ffa2a",
+        }
     ),
-    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._gated_delta": (
-        "3df1521798b530554798c23f5b2d386de0e88e2ac50fb9f391c5035d4cf8f30e"
+    f"{_VERIFIER}._gated_delta": frozenset(
+        {
+            "3df1521798b530554798c23f5b2d386de0e88e2ac50fb9f391c5035d4cf8f30e",
+            # 0.7.8: the left-padding bookkeeping call after cache.advance is gone.
+            "2ec1562939ed8624bc32376ea803fcd966b52b2c475ede757ecbb9bdd805f0e2",
+        }
     ),
-    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._model": (
-        "cec9745522cd79893849777daa1a22cfd7736f10309ecd480db7e4f7d4778fbb"
+    f"{_VERIFIER}._model": frozenset(
+        {"cec9745522cd79893849777daa1a22cfd7736f10309ecd480db7e4f7d4778fbb"}
     ),
-    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward.__call__": (
-        "969ac680c045372ddc2dfc4abfac22503ad04f30b8102528f9d3a6c499e6309c"
+    f"{_VERIFIER}.__call__": frozenset(
+        {"969ac680c045372ddc2dfc4abfac22503ad04f30b8102528f9d3a6c499e6309c"}
     ),
     # Dispatches each verify layer to _gated_delta, _attention and _feed_forward.
-    "mlx_vlm.models.qwen3_5.speculative_verifier:Qwen3_5BatchInvariantForward._layer": (
-        "3c097499afff39b8bcf44c56d70b7a1f2803cf4d67ad905119fafca1d167891a"
+    f"{_VERIFIER}._layer": frozenset(
+        {"3c097499afff39b8bcf44c56d70b7a1f2803cf4d67ad905119fafca1d167891a"}
     ),
     # Reaches linear_attn, self_attn and mlp as module calls in decode and prefill.
-    "mlx_vlm.models.qwen3_5.language:Qwen3_5DecoderLayer.__call__": (
-        "9feda6407e1129df917a478e5687d2bc7f53ea21c7986f641468b5749a90e10a"
+    "mlx_vlm.models.qwen3_5.language:Qwen3_5DecoderLayer.__call__": frozenset(
+        {"9feda6407e1129df917a478e5687d2bc7f53ea21c7986f641468b5749a90e10a"}
     ),
-    "mlx_vlm.models.qwen3_5.language:Qwen3_5MLP.__call__": (
-        "dc08d40bfdf18cf60619caad43c76a1094f3de1b14d2c53b9e2228fa698bc40a"
+    "mlx_vlm.models.qwen3_5.language:Qwen3_5MLP.__call__": frozenset(
+        {"dc08d40bfdf18cf60619caad43c76a1094f3de1b14d2c53b9e2228fa698bc40a"}
     ),
-    "mlx_vlm.models.qwen3_5.language:Qwen3_5GatedDeltaNet.__call__": (
-        "0ab0be71156568f50a248f898d431b657b36b399166e29e25c16c7a45f6cc81b"
+    "mlx_vlm.models.qwen3_5.language:Qwen3_5GatedDeltaNet.__call__": frozenset(
+        {
+            "0ab0be71156568f50a248f898d431b657b36b399166e29e25c16c7a45f6cc81b",
+            # 0.7.8: the same call minus that bookkeeping; the packed prefill kernel
+            # sits in the gated_delta_kernel it calls, bitwise with the generic one.
+            "e399b508bdd048f9704ee4f665c9a26ec16cbcad5cceca08216ca8b6129cfee7",
+        }
     ),
-    # Defined on Qwen3_5GatedDeltaNet itself in 0.7.2: decode's b and a projections.
-    "mlx_vlm.models.qwen3_5.language:Qwen3_5GatedDeltaNet._project_gates": (
-        "3d1f08bfeaa29f50a1d95aa6d5dda3766a93bc7068e81f9ce99b75b304bdbee6"
+    # Defined on Qwen3_5GatedDeltaNet itself in 0.7.2 and 0.7.8: decode's b and a
+    # projections.
+    "mlx_vlm.models.qwen3_5.language:Qwen3_5GatedDeltaNet._project_gates": frozenset(
+        {"3d1f08bfeaa29f50a1d95aa6d5dda3766a93bc7068e81f9ce99b75b304bdbee6"}
     ),
-    "mlx_vlm.generate.ar:generate_step": (
-        "ace632f74028d998d34c8b867b44632c13816e0db4567d37401a0bc657dc7a6a"
+    "mlx_vlm.generate.ar:generate_step": frozenset(
+        {
+            "ace632f74028d998d34c8b867b44632c13816e0db4567d37401a0bc657dc7a6a",
+            # 0.7.8: temperature = clamp_temperature(temperature) before the greedy test.
+            "512faa6ca6b7162d7da1d8983d65e8975b79c663f0b5584df96e6b0838a32f37",
+        }
     ),
-    "mlx.nn:QuantizedLinear.__call__": (
-        "f43bed1629a938c0f00e37b4a9c85db84be59dc93b49a27de97c44228e264b8b"
+    "mlx.nn:QuantizedLinear.__call__": frozenset(
+        {"f43bed1629a938c0f00e37b4a9c85db84be59dc93b49a27de97c44228e264b8b"}
     ),
-    "mlx_vlm.speculative.dflash:_dflash_verify": (
-        "39e4a6cd343ae7e054ae3584ff6879fc895494e413041f099ce08da14e3fc097"
+    "mlx_vlm.speculative.dflash:_dflash_verify": frozenset(
+        {"39e4a6cd343ae7e054ae3584ff6879fc895494e413041f099ce08da14e3fc097"}
     ),
-    "mlx_vlm.speculative.dflash:_dflash_verify_greedy": (
-        "1b472dc300554ab6017495bdeb18480be431578aa6958ff7b35c0145e8412971"
+    "mlx_vlm.speculative.dflash:_dflash_verify_greedy": frozenset(
+        {"1b472dc300554ab6017495bdeb18480be431578aa6958ff7b35c0145e8412971"}
     ),
     # Picks the verify call each round makes and takes its tokens from its logits.
-    "mlx_vlm.speculative.dflash:_dflash_rounds": (
-        "eee8dc9ab95a74ed87c74064607736003b7d0dafbdafc32c9fba91dc190d2b32"
+    "mlx_vlm.speculative.dflash:_dflash_rounds": frozenset(
+        {"eee8dc9ab95a74ed87c74064607736003b7d0dafbdafc32c9fba91dc190d2b32"}
     ),
 }
 # What decides how the DFlash drafter's own linears are called, keyed and hashed
@@ -1198,7 +1219,8 @@ VALIDATED_PROJ_SOURCES: dict[str, str] = {
 # 2; these prove the forward still reaches each linear by calling it. Read
 # through the loaded drafter's own classes (_draft_pins_reason), so a component
 # that overrides one of them reads as drift rather than as the pinned code.
-# Validated on mlx-vlm 0.7.2 with the v1 DFlash and the DFlash2 drafters.
+# Validated on mlx-vlm 0.7.2 with the v1 DFlash and the DFlash2 drafters, and
+# every one unchanged in 0.7.8.
 _DFLASH = "mlx_vlm.speculative.drafters.qwen3_dflash.dflash"
 _DFLASH2 = "mlx_vlm.speculative.drafters.dflash2.dflash2"
 # The drafter classes those pins were read for, by module:qualname. Any other
@@ -1664,9 +1686,9 @@ def _pins_reason() -> str | None:
     version = mx.__version__  # ty: ignore[unresolved-attribute]
     if version not in verifyattn.VALIDATED_MLX:
         return f"mlx {version} not validated"
-    for key, digest in VALIDATED_PROJ_SOURCES.items():
+    for key, digests in VALIDATED_PROJ_SOURCES.items():
         module, qualname = key.split(":")
-        if verifyattn._source_digest(module, qualname) != digest:
+        if verifyattn._source_digest(module, qualname) not in digests:
             owner = "mlx" if module.split(".")[0] == "mlx" else "mlx-vlm"
             return f"{owner} {qualname} changed"
     return None
