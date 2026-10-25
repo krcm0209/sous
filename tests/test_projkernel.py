@@ -2602,7 +2602,7 @@ def test_enable_refuses_a_probe_that_raises_and_reports_what_it_cost(monkeypatch
     assert status["reason"] == "device lost"
     assert isinstance(status["probe_seconds"], float)
     (record,) = _enabling_failures(caplog)
-    assert record.exc_info is not None and "device lost" in str(record.exc_info[1])
+    assert isinstance(record.exc_info, tuple) and "device lost" in str(record.exc_info[1])
 
 
 @pytest.mark.parametrize("kind", [None, "dflash"])
