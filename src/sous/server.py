@@ -10,7 +10,7 @@ import logging
 import os
 import signal
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import IO
 
@@ -125,7 +125,7 @@ def create_server(
     endpoint = mount_endpoint(engines, config, upstream=upstream, inflight=inflight)
 
     @contextlib.asynccontextmanager
-    async def _lifespan(_: Starlette) -> AsyncIterator[None]:
+    async def _lifespan(_: Starlette) -> AsyncGenerator[None]:
         try:
             engines.start_idle_sweep()
             yield None

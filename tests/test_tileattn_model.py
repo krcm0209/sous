@@ -14,7 +14,7 @@ Acceptance bars (manual, on the M5 Pro; about 30 minutes, most of it five cold p
 """
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -38,7 +38,7 @@ SLACK = 16
 
 
 @contextlib.contextmanager
-def _engine(*, tile: bool, drafter: bool) -> Iterator[VLMEngine]:
+def _engine(*, tile: bool, drafter: bool) -> Generator[VLMEngine]:
     engine = VLMEngine(
         DEFAULT_27B,
         temperature=0.0,

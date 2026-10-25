@@ -21,7 +21,7 @@ loads and seven cold prefills of the ~57.5K-token prompt with the prompt cache o
 
 import contextlib
 import math
-from collections.abc import Iterator
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -48,7 +48,7 @@ EXPECTED = {"floor": "served", "far": "served", "cap": "capped"}
 
 
 @contextlib.contextmanager
-def _engine(*, kv_int8: bool, drafter: bool) -> Iterator[VLMEngine]:
+def _engine(*, kv_int8: bool, drafter: bool) -> Generator[VLMEngine]:
     engine = VLMEngine(
         DEFAULT_27B,
         temperature=0.0,
@@ -67,7 +67,7 @@ def _engine(*, kv_int8: bool, drafter: bool) -> Iterator[VLMEngine]:
 
 
 @contextlib.contextmanager
-def _ceiling(line: int | None) -> Iterator[None]:
+def _ceiling(line: int | None) -> Generator[None]:
     """kv8's ceiling set to `line` for the calls inside, then put back; None leaves it alone.
     The seams read the ceiling on every call, so a loaded engine takes the new line at once."""
     saved = kv8._ceiling

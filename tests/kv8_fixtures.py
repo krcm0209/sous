@@ -6,7 +6,7 @@ mlx is imported inside each helper, so importing this module needs only what
 `kv8.availability()` itself imports."""
 
 import contextlib
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from typing import Any
 
 import pytest
@@ -167,7 +167,7 @@ def serving_codes(n: int, t: int, *, seed: int = 0) -> tuple[Any, Any, Any, Any,
 
 
 @contextlib.contextmanager
-def window(caches: Sequence[Any] = (), *, force: bool = True) -> Iterator[kv8.Window]:
+def window(caches: Sequence[Any] = (), *, force: bool = True) -> Generator[kv8.Window]:
     """kv8 active and a serving window open for the with-block: forced (every
     row from N8 served, whatever the ceiling) unless `force` is False, for a
     cap test with ceiling() set. On the way out the window is closed, which

@@ -33,7 +33,7 @@ import functools
 import logging
 import math
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -99,7 +99,7 @@ def _build(scope: bool | str, *, drafter: bool = True) -> VLMEngine:
 
 
 @contextlib.contextmanager
-def _engine(scope: bool | str, *, drafter: bool = True) -> Iterator[VLMEngine]:
+def _engine(scope: bool | str, *, drafter: bool = True) -> Generator[VLMEngine]:
     engine = _build(scope, drafter=drafter)
     try:
         yield engine
@@ -190,7 +190,7 @@ class _Trace:
 
 
 @contextlib.contextmanager
-def _tap(*, logits: bool = False) -> Iterator[list[_Trace]]:
+def _tap(*, logits: bool = False) -> Generator[list[_Trace]]:
     """One _Trace per decode inside the block. VLMEngine.decode() imports
     stream_generate from the mlx_vlm package at call time, so a wrapper set there sees
     every decode's results (the last one carries the emitted ids) and can add a logits
@@ -249,7 +249,7 @@ def _decode(engine: VLMEngine, messages: list[dict], traces: list[_Trace]) -> _T
 
 
 @contextlib.contextmanager
-def _split_runs() -> Iterator[list[tuple[int, int]]]:
+def _split_runs() -> Generator[list[tuple[int, int]]]:
     """(runs the tile should serve, runs it served) for every verifier call the
     projection kernel cut into runs: every run when each linear of the call has a
     launch on the tile, none otherwise (the head; attention and GDN at scope "mlp")."""

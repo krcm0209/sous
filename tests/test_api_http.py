@@ -10,7 +10,7 @@ import json
 import socket
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from pathlib import Path
 
 import httpx
@@ -81,7 +81,7 @@ def _endpoint_app(tmp_path: Path, engine) -> tuple[Endpoint, object]:
 @contextlib.contextmanager
 def _serve(
     app, log_level: str = "warning"
-) -> Iterator[tuple[str, uvicorn.Server, threading.Thread]]:
+) -> Generator[tuple[str, uvicorn.Server, threading.Thread]]:
     """Run the ASGI app under uvicorn in a thread, with the daemon's own
     uvicorn configuration so the graceful-shutdown bound under test is the
     real one. Yields the base URL, the server (off the main thread its
