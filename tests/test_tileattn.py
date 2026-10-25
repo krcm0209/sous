@@ -1180,7 +1180,7 @@ def test_enable_refuses_an_exception_in_a_guard_with_its_error_line(monkeypatch,
     # The warning keeps one line; the log keeps where it was raised.
     (record,) = _enabling_failures(caplog)
     assert record.levelno == logging.WARNING
-    assert record.exc_info is not None and record.exc_info[1] is error
+    assert isinstance(record.exc_info, tuple) and record.exc_info[1] is error
 
 
 def test_enable_refuses_a_probe_that_raises_and_reports_what_it_cost(monkeypatch, caplog):
@@ -1196,7 +1196,7 @@ def test_enable_refuses_a_probe_that_raises_and_reports_what_it_cost(monkeypatch
     assert isinstance(status["probe_seconds"], float)
     assert tileattn._active_splits == 0
     (record,) = _enabling_failures(caplog)
-    assert record.exc_info is not None and "device lost" in str(record.exc_info[1])
+    assert isinstance(record.exc_info, tuple) and "device lost" in str(record.exc_info[1])
 
 
 @pytest.mark.parametrize(

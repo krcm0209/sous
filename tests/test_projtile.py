@@ -1464,7 +1464,7 @@ def test_enable_refuses_an_exception_in_a_guard_with_its_error_line(monkeypatch,
     assert status["probe_seconds"] is None
     (record,) = [r for r in caplog.records if r.getMessage() == "projection tile: enabling failed"]
     assert record.levelno == logging.WARNING
-    assert record.exc_info is not None and record.exc_info[1] is error
+    assert isinstance(record.exc_info, tuple) and record.exc_info[1] is error
 
 
 # (config value, prompt cache on, configured budget, headroom, copy, reserve,
