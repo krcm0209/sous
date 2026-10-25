@@ -19,7 +19,7 @@ drafter-off decode on the kernel):
 """
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -48,7 +48,7 @@ SPLIT_BLOCK = 12
 @contextlib.contextmanager
 def _engine(
     *, kernel: bool, drafter: bool, block: int = 4, explicit: bool = False
-) -> Iterator[VLMEngine]:
+) -> Generator[VLMEngine]:
     engine = VLMEngine(
         DEFAULT_27B,
         temperature=0.0,

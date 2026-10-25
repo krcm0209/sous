@@ -19,7 +19,7 @@ import signal
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
@@ -48,7 +48,7 @@ class Spawned:
 @contextlib.contextmanager
 def bounded(
     argv: list[str], *, cwd: Path, timeout: float, merged: bool = True
-) -> Iterator[Spawned]:
+) -> Generator[Spawned]:
     """Run `argv` in `cwd` and yield it finished. `merged` puts both streams
     in one spool, in write order; otherwise each has its own. A command that
     cannot start raises what Popen raised (FileNotFoundError, PermissionError)."""

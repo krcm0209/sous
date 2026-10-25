@@ -1315,7 +1315,7 @@ def test_daemon_status_reads_the_real_daemons_config(tmp_path):
     GET /sous/status on the daemon's port, and None when nothing is
     listening."""
     import contextlib
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
     import uvicorn
 
@@ -1326,7 +1326,7 @@ def test_daemon_status_reads_the_real_daemons_config(tmp_path):
     from tests.fake_engine import FakeEngine
 
     @contextlib.contextmanager
-    def serve(app, port: int) -> Iterator[None]:
+    def serve(app, port: int) -> Generator[None]:
         server = uvicorn.Server(uvicorn_config(app, "127.0.0.1", port, log_level="warning"))
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()

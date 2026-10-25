@@ -9,7 +9,7 @@ mlx is imported inside each helper, so importing this module needs only what
 `projtile.availability()` itself imports."""
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Generator
 from typing import Any
 
 import pytest
@@ -121,7 +121,7 @@ def guard_tile_state(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @contextlib.contextmanager
-def window() -> Iterator[projtile.Window]:
+def window() -> Generator[projtile.Window]:
     """The tile's decode window open for the with-block, as decode() opens it, and
     closed on the way out unless the block closed it itself."""
     projtile.open_window()

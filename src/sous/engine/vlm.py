@@ -8,7 +8,7 @@ import sys
 import threading
 import warnings
 import weakref
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any, cast
 
@@ -96,7 +96,7 @@ _DECODE_SHADOW = ("step", "prefix_cache_reserve")
 
 
 @contextlib.contextmanager
-def _decode_kv_step(cache: list) -> Iterator[list]:
+def _decode_kv_step(cache: list) -> Generator[list]:
     """For the with-block, every plain KVCache in `cache` grows by DECODE_KV_STEP
     rows and reserves only when short; on the way out, every exit path included,
     each instance carries exactly what it carried before. Yields the layers it

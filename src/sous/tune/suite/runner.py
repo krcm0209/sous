@@ -14,7 +14,7 @@ import shutil
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -300,7 +300,7 @@ def metrics_from_transcript(path: Path) -> tuple[int, int]:
 
 
 @contextlib.contextmanager
-def interpreter_first(python: Path) -> Iterator[None]:
+def interpreter_first(python: Path) -> Generator[None]:
     """`python` on PATH resolves to the tune's own interpreter for the span:
     ScratchTools.run_command inherits this process's environment untouched,
     and the test runner a task invokes must be the Python the graders use,
