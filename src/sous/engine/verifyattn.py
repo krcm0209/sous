@@ -76,7 +76,9 @@ _SOURCES = {
     "kv_sequence_length": "mlx_vlm.models.base",
 }
 # sha256 of inspect.getsource() as validated (identical in mlx-vlm 0.7.1 and
-# 0.7.2). Add a hash only after re-reading that function against the hook.
+# 0.7.2; 0.7.8 moved only the two left-padding helpers, read against the hook
+# and listed with the release). Add a hash only after re-reading that function
+# against the hook.
 VALIDATED_MLX_VLM_SOURCES: dict[str, frozenset[str]] = {
     "Qwen3_5BatchInvariantForward._attention": frozenset(
         {"7790ae37e7a0d78d2287217a3050e03a4b9b7c10eb1e60839e4315226186cdf1"}
@@ -85,13 +87,23 @@ VALIDATED_MLX_VLM_SOURCES: dict[str, frozenset[str]] = {
         {"da21fd76217c72aa7ef15d4097e1fe428ff0022259f9556eb8fd95b59217c109"}
     ),
     "_create_qwen3_5_attention_mask": frozenset(
-        {"a74a1135eb644698e1beb6e43a5d51e27e6490d0b0f4f6d951d08dd5e908c681"}
+        {
+            "a74a1135eb644698e1beb6e43a5d51e27e6490d0b0f4f6d951d08dd5e908c681",
+            # 0.7.8: the left-padded batch branch reads the pads without a
+            # per-cache memo; the single-row path still returns
+            # create_attention_mask(h, cache).
+            "d53b142faed3095193143555611a4980bc2de16ae9262eb6a4e15d0f991e9706",
+        }
     ),
     "_qwen3_5_left_padded_attention": frozenset(
         {"e5d9f69065da9885674a6c3e11a65807948c5e9f9d7a1fef6211628328e7b312"}
     ),
     "_qwen3_5_left_padding_info": frozenset(
-        {"1cea363e3150f9262f7fb23d11d525b6be32625d3407cd324850d82d6a151fd5"}
+        {
+            "1cea363e3150f9262f7fb23d11d525b6be32625d3407cd324850d82d6a151fd5",
+            # 0.7.8: stateless (no memo on the cache); None without left padding.
+            "027c7f15e51d0380eeeb89a6f5242e573c7a1ee2334953251c8512a00c2f2b6e",
+        }
     ),
     "KVCache.update_and_fetch": frozenset(
         {"9cf2722ab3a6f71dba0e66bfb4f290b9611c740fa7958e84f61a616056d3df5b"}

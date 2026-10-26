@@ -672,8 +672,8 @@ def clear() -> None:
 # stale with every other check green. sha256 of inspect.getsource, keyed
 # (module, qualname), as verifyattn pins its own sources; getsource follows
 # __wrapped__, so a class-level wrapper never reads as drift. Validated on
-# mlx-vlm 0.7.2; add a digest only after re-reading that function against the
-# trim wrap.
+# mlx-vlm 0.7.2, and every one unchanged in 0.7.8; add a digest only after
+# re-reading that function against the trim wrap.
 VALIDATED_KV8_SOURCES: dict[tuple[str, str], str] = {
     ("mlx_vlm.models.cache", "KVCache.update_and_fetch"): (
         "9cf2722ab3a6f71dba0e66bfb4f290b9611c740fa7958e84f61a616056d3df5b"

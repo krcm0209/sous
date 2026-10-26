@@ -13,7 +13,7 @@ DEPENDENCIES = tomllib.loads(PYPROJECT.read_text())["project"]["dependencies"]
 # and whose M5 Pro checks were run. A release that hashes the same passes the
 # source tests unchanged, so this set is what holds the pin to a measured
 # release; extend it only after those checks.
-VALIDATED_MLX_VLM = frozenset({"0.7.2"})
+VALIDATED_MLX_VLM = frozenset({"0.7.2", "0.7.8"})
 
 
 def _pin(name: str) -> str:

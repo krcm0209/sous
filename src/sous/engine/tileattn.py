@@ -506,7 +506,12 @@ VALIDATED_DECODE_SOURCES: dict[str, frozenset[str]] = {
         {"b051c66057acc90f4ed78691f90254685cfdb20d5814b0d58beec4d2bb34c184"}
     ),
     "Qwen3_5Model.__call__": frozenset(
-        {"9dfc2048db0d818595bcdeb306a59e80cf1217331784fe7361c92a2dbf13ab65"}
+        {
+            "9dfc2048db0d818595bcdeb306a59e80cf1217331784fe7361c92a2dbf13ab65",
+            # 0.7.8: the left-padding bookkeeping call after cache.advance is
+            # gone; the one-row forward's path to the attention global is the same.
+            "2495496bd66ccd5e1506ff42b8820caf5cf9e62fa1d7c3afb15ad13f6d78420d",
+        }
     ),
     "LanguageModel.__call__": frozenset(
         {"af7f3f6427c2e59ab5266798b7518eaf026c3f7f749dd0962e38a6acece49cc9"}
